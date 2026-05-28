@@ -1,0 +1,46 @@
+"""内部统一数据协议 —— 所有 provider adapter 向 Runtime 输出相同的结构。
+
+按 technical_architecture.md §7.1 定义。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+# 流式回调签名
+ProgressCallback = Callable[[dict[str, int]], None]
+"""token 进度回调，参数 {"input_tokens": int, "output_tokens": int}"""
+
+TextDeltaCallback = Callable[[str], None]
+"""文本增量回调，参数为本次新增的文本片段"""
+
+
+@dataclass
+class ToolCall:
+    """模型请求执行的单个工具调用。
+
+    id        - provider 分配的唯一 ID，把工具结果喂回模型时需要对应
+    name      - 工具名称，例如 "read_file"
+    arguments - 工具参数字典，例如 {"path": "README.md"}
+    """
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ModelResponse:
+    """adapter 向 Runtime 返回的统一响应结构。
+
+    text             - 模型输出的纯文本（可能为空，例如本轮只返回了工具调用）
+    tool_calls       - 模型请求执行的工具列表；为空表示模型已给出最终答案
+    usage            - token 用量 {"input_tokens": int, "output_tokens": int}
+    provider_payload - provider 原生 content blocks（dict 列表），
+                       必须原样追加到 messages 历史再发下一轮请求
+    finish_reason    - provider 原生停止原因，例如 "end_turn" / "tool_use" / "stop"
+    """
+    text: str
+    tool_calls: list[ToolCall]
+    usage: dict[str, int]
+    provider_payload: Any
+    finish_reason: str | None = None

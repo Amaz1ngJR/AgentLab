@@ -1,0 +1,222 @@
+"""离线测试：AgentSession 多轮工具循环、审批、超限、错误。"""
+from __future__ import annotations
+
+from app.agent.approval import AutoApprove, DenyAll
+from app.agent.runtime import AgentSession, DENIED_MESSAGE
+from app.models.protocol import ModelResponse, ToolCall
+from app.tools.registry import Tool, ToolRegistry
+
+
+class FakeRouter:
+    """按预设序列返回 ModelResponse,记录每次收到的 messages。"""
+
+    def __init__(self, responses: list[ModelResponse]):
+        self._responses = list(responses)
+        self.calls: list[list[dict]] = []
+
+    @property
+    def model(self) -> str:
+        return "fake-model"
+
+    @property
+    def provider(self) -> str:
+        return "fake"
+
+    def create_message(
+        self,
+        messages,
+        tools=None,
+        system=None,
+        temperature=None,
+        max_tokens=4096,
+        on_progress=None,
+        on_text_delta=None,
+    ) -> ModelResponse:
+        # 拷贝 messages 快照,避免被后续修改污染
+        self.calls.append([dict(m) for m in messages])
+        if not self._responses:
+            return ModelResponse(text="(no more responses)", tool_calls=[],
+                                 usage={"input_tokens": 0, "output_tokens": 0},
+                                 provider_payload=[])
+        return self._responses.pop(0)
+
+
+def _resp_text(text: str, in_tokens: int = 5, out_tokens: int = 3) -> ModelResponse:
+    return ModelResponse(
+        text=text,
+        tool_calls=[],
+        usage={"input_tokens": in_tokens, "output_tokens": out_tokens},
+        provider_payload=[{"type": "text", "text": text}],
+    )
+
+
+def _resp_tool(tool_id: str, name: str, args: dict) -> ModelResponse:
+    return ModelResponse(
+        text="",
+        tool_calls=[ToolCall(id=tool_id, name=name, arguments=args)],
+        usage={"input_tokens": 5, "output_tokens": 1},
+        provider_payload=[{"type": "tool_use", "id": tool_id, "name": name, "input": args}],
+    )
+
+
+def _registry_with(*tools: Tool) -> ToolRegistry:
+    reg = ToolRegistry()
+    for t in tools:
+        reg.register(t)
+    return reg
+
+
+def _echo_tool() -> Tool:
+    return Tool(
+        name="echo",
+        description="echo back",
+        input_schema={"type": "object", "properties": {"msg": {"type": "string"}}, "required": ["msg"]},
+        executor=lambda args: f"echo: {args.get('msg', '')}",
+    )
+
+
+def _danger_tool() -> Tool:
+    return Tool(
+        name="danger",
+        description="needs approval",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        executor=lambda args: "executed danger",
+        requires_approval=True,
+    )
+
+
+def _explode_tool() -> Tool:
+    def boom(args):
+        raise RuntimeError("intentional failure")
+    return Tool(
+        name="explode",
+        description="raises",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        executor=boom,
+    )
+
+
+# ── 用例 ──────────────────────────────────────────────────────────────────────
+
+
+def test_chat_returns_text_when_no_tool_calls():
+    router = FakeRouter([_resp_text("hello")])
+    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()))
+    assert session.chat("hi") == "hello"
+    assert session.last_turn_usage["output_tokens"] == 3
+    assert session.cumulative_usage["output_tokens"] == 3
+
+
+def test_single_tool_loop():
+    router = FakeRouter([
+        _resp_tool("call_1", "echo", {"msg": "world"}),
+        _resp_text("done"),
+    ])
+    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()))
+    answer = session.chat("please echo world")
+    assert answer == "done"
+    # 第二轮请求应该带上工具结果
+    second_call = router.calls[1]
+    last_msg = second_call[-1]
+    assert last_msg["role"] == "user"
+    assert last_msg["content"][0]["type"] == "tool_result"
+    assert last_msg["content"][0]["content"] == "echo: world"
+    assert last_msg["content"][0]["is_error"] is False
+
+
+def test_approval_denied_skips_execution():
+    router = FakeRouter([
+        _resp_tool("call_x", "danger", {}),
+        _resp_text("ok, stopped"),
+    ])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_danger_tool()),
+        approval=DenyAll(),
+    )
+    answer = session.chat("do dangerous thing")
+    assert answer == "ok, stopped"
+    second_call = router.calls[1]
+    last_msg = second_call[-1]
+    # 拒绝消息被作为 tool_result 喂回模型
+    assert last_msg["content"][0]["content"] == DENIED_MESSAGE
+
+
+def test_tool_execution_error_is_reported():
+    router = FakeRouter([
+        _resp_tool("call_e", "explode", {}),
+        _resp_text("noted"),
+    ])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_explode_tool()),
+        approval=AutoApprove(),
+    )
+    session.chat("trigger explode")
+    second_call = router.calls[1]
+    tool_result = second_call[-1]["content"][0]
+    assert tool_result["is_error"] is True
+    assert "RuntimeError" in tool_result["content"]
+
+
+def test_max_steps_reached():
+    # 模型一直请求工具,永远不给文本
+    forever_tool_calls = [
+        _resp_tool(f"c{i}", "echo", {"msg": str(i)}) for i in range(20)
+    ]
+    router = FakeRouter(forever_tool_calls)
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        max_steps=3,
+    )
+    answer = session.chat("loop forever")
+    assert "最大步数" in answer
+    # 只调了 max_steps 次模型
+    assert len(router.calls) == 3
+
+
+def test_progress_and_text_callbacks_invoked():
+    seen_progress: list[dict] = []
+    seen_text: list[str] = []
+
+    class TextStreamingFake(FakeRouter):
+        def create_message(self, messages, tools=None, system=None,
+                           temperature=None, max_tokens=4096,
+                           on_progress=None, on_text_delta=None):
+            if on_text_delta:
+                on_text_delta("hel")
+                on_text_delta("lo")
+            if on_progress:
+                on_progress({"input_tokens": 7, "output_tokens": 2})
+            return super().create_message(messages, tools=tools, system=system)
+
+    router = TextStreamingFake([_resp_text("hello")])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        on_event=lambda ev: seen_text.append(ev.text) if ev.kind == "text" else None,
+        progress=lambda label: _ProgressHandle(seen_progress, seen_text),
+    )
+    session.chat("hi")
+    assert any(p.get("output_tokens") == 2 for p in seen_progress)
+
+
+class _ProgressHandle:
+    """测试用的 progress context handle。"""
+
+    def __init__(self, progress_log: list, text_log: list):
+        self._progress_log = progress_log
+        self._text_log = text_log
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def update(self, metrics):
+        self._progress_log.append(dict(metrics))
+
+    def on_text(self, delta):
+        self._text_log.append(delta)

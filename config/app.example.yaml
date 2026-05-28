@@ -1,0 +1,14 @@
+# config/app.example.yaml —— 非密钥应用配置模板
+#
+# 复制为 config/app.yaml 后修改。密钥（API Key 等）放 .env，不放这里。
+
+agent:
+  max_steps: 8                    # 单次对话最多几轮工具循环
+  default_profile: cloud_claude   # 默认激活的模型 profile（可被 --profile 覆盖）
+
+workspace:
+  root: "."                       # Agent 可访问的工作区根目录（相对于项目根）
+
+logging:
+  level: INFO                     # DEBUG / INFO / WARNING
+  file: null                      # null 表示只输出到终端；填路径则同时写文件
