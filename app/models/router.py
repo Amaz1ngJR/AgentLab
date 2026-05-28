@@ -4,7 +4,12 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from app.config.schemas import LLMConfig
-from app.models.protocol import ModelResponse, ProgressCallback, TextDeltaCallback
+from app.models.protocol import (
+    ModelResponse,
+    ProgressCallback,
+    TextDeltaCallback,
+    ToolResult,
+)
 
 
 class ModelRouter:
@@ -48,9 +53,21 @@ class ModelRouter:
             on_text_delta=on_text_delta,
         )
 
+    def format_tool_results(self, results: list[ToolResult]) -> list[dict]:
+        """把工具执行结果转成具体 provider 要求的下一轮输入项。
+
+        Runtime 不关心格式细节,只需要把返回的 list 用 messages.extend 追加。
+        三家 provider 的格式差异:
+          - Anthropic: 一条 user 消息,content 是 tool_result block 列表
+          - OpenAI Chat Completions: 每个工具一条 role=tool 消息
+          - OpenAI Responses: 每个工具一条 type=function_call_output 项
+        """
+        return self._adapter.format_tool_results(results)
+
 
 _PROVIDERS = {
     "anthropic":                "anthropic",
+    "openai":                   "openai",
     "openai_compatible":        "openai_compatible",
     "ollama":                   "openai_compatible",
     "lmstudio":                 "openai_compatible",
@@ -72,7 +89,12 @@ def build_model_router(cfg: Optional[LLMConfig] = None) -> ModelRouter:
     if canonical == "anthropic":
         from app.models.anthropic_adapter import AnthropicAdapter
         adapter = AnthropicAdapter(cfg)
+    elif canonical == "openai":
+        # OpenAI 官方 GPT 系列走 Responses API,与 Chat Completions 完全不同
+        from app.models.openai_adapter import OpenAIAdapter
+        adapter = OpenAIAdapter(cfg)
     else:
+        # Ollama / LM Studio / vLLM 等走 Chat Completions 协议子集
         from app.models.compatible_adapter import OpenAICompatibleAdapter
         adapter = OpenAICompatibleAdapter(cfg)
 

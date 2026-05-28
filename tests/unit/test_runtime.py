@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from app.agent.approval import AutoApprove, DenyAll
 from app.agent.runtime import AgentSession, DENIED_MESSAGE
-from app.models.protocol import ModelResponse, ToolCall
+from app.models.protocol import ModelResponse, ToolCall, ToolResult
 from app.tools.registry import Tool, ToolRegistry
 
 
@@ -39,6 +39,24 @@ class FakeRouter:
                                  usage={"input_tokens": 0, "output_tokens": 0},
                                  provider_payload=[])
         return self._responses.pop(0)
+
+    @staticmethod
+    def format_tool_results(results: list[ToolResult]) -> list[dict]:
+        """测试用的格式:Anthropic 风格,把多个 tool_result 包在一条 user 消息里。
+
+        生产代码三家 adapter 各自实现自己的格式,Runtime 只关心拿到 list[dict]
+        然后 messages.extend 即可。
+        """
+        blocks = [
+            {
+                "type": "tool_result",
+                "tool_use_id": r.tool_call_id,
+                "content": r.output,
+                "is_error": r.is_error,
+            }
+            for r in results
+        ]
+        return [{"role": "user", "content": blocks}]
 
 
 def _resp_text(text: str, in_tokens: int = 5, out_tokens: int = 3) -> ModelResponse:

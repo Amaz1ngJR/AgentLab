@@ -29,9 +29,11 @@ from prompt_toolkit.styles import Style
 
 from app.agent.approval import AutoApprove, InteractivePolicy
 from app.agent.runtime import AgentSession, TurnEvent
+from app.agent.tasks import TaskStore
 from app.config.loader import load_config
 from app.models.router import build_model_router
-from app.tools.builtin.files import default_tools
+from app.tools.builtin import default_tools
+from app.tools.builtin.todo import make_todo_write_tool
 from app.tools.registry import ToolRegistry
 from app.util.redact import format_exception, format_traceback
 
@@ -83,19 +85,80 @@ def _fmt_tokens(n: int) -> str:
     return f"{n / 1000:.1f}k tokens"
 
 
+# 任务列表渲染用的 ANSI 颜色 / 字符
+# 不用 prompt_toolkit Style 是为了让任务列表跟 spinner / 文本走同一条 stdout 流,
+# 避免分别用 prompt_toolkit Application 与 ANSI 写入的协调问题
+_ANSI_RESET = "\033[0m"
+_ANSI_DIM = "\033[2;90m"        # 灰色 dim (completed 划过)
+_ANSI_BLUE_BOLD = "\033[1;34m"  # 蓝色加粗 (in_progress 高亮)
+_ANSI_BOLD = "\033[1m"           # 加粗 (汇总行)
+
+
+def _format_task_lines(tasks) -> list[str]:
+    """把 TaskStore 中的任务列表渲染成多行字符串(已包含 ANSI 颜色)。
+
+    格式参考 Claude Code 的任务面板:
+        4 tasks (1 done, 1 in progress, 2 open)
+          ✓ workspace 路径限制         (灰色,已完成)
+          ❯ 错误脱敏                    (蓝色加粗,进行中)
+          ○ 工具能力声明                (普通色,待办)
+          ○ AgentSession 离线测试
+
+    返回的每一行 *不* 含末尾换行,调用方决定怎么拼。
+    任务为空时返回空列表(让调用方决定是否显示标题区)。
+    """
+    if not tasks:
+        return []
+
+    counts = {"completed": 0, "in_progress": 0, "pending": 0}
+    for t in tasks:
+        if t.status in counts:
+            counts[t.status] += 1
+
+    header = (
+        f"{_ANSI_BOLD}{len(tasks)} tasks{_ANSI_RESET} "
+        f"({counts['completed']} done, "
+        f"{counts['in_progress']} in progress, "
+        f"{counts['pending']} open)"
+    )
+    lines = [header]
+
+    for t in tasks:
+        if t.status == "completed":
+            lines.append(f"  {_ANSI_DIM}✓ {t.content}{_ANSI_RESET}")
+        elif t.status == "in_progress":
+            lines.append(f"  {_ANSI_BLUE_BOLD}❯ {t.content}{_ANSI_RESET}")
+        else:
+            lines.append(f"  ○ {t.content}")
+
+    return lines
+
+
+def _strip_ansi(s: str) -> str:
+    """计算显示宽度时要先去掉 ANSI 转义,否则会把控制字符当成可见字符宽度。"""
+    import re
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
 class _Spinner:
-    """thinking 状态行 + 实时 token 计数 + 流式文本输出。
+    """thinking 状态行 + 实时 token 计数 + 流式文本输出 + 任务列表面板。
 
-    布局：流式文本在上，spinner 行始终钉在底部。每次 token 更新或文本到达，
-    都用 ANSI 重绘 text + spinner 区域，保持 spinner 在最下面持续刷新。
+    布局(从上到下):
+      [任务列表]    ← 模型用 todo_write 维护,只在非空时显示
+      [流式文本]    ← 流式 delta 累积
+      [spinner]     ← ⠋ thinking… (...) 钉在最底,1Hz 闪动
 
-    向 Runtime 暴露两个回调入口：
+    每次 token 更新或文本到达,都用 ANSI 重绘整个区域,保持 spinner 始终在
+    最下面持续刷新。
+
+    向 Runtime 暴露两个回调入口:
       update(metrics)  - token 进度更新
-      on_text(delta)   - 文本增量；累积到 text_buffer，立即重绘
+      on_text(delta)   - 文本增量;累积到 text_buffer,立即重绘
     """
 
-    def __init__(self, label: str):
+    def __init__(self, label: str, task_store=None):
         self.label = label
+        self._task_store = task_store  # None = 不显示任务面板
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._t0 = 0.0
@@ -103,7 +166,7 @@ class _Spinner:
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self._text_buffer = ""
         self._frame_idx = 0
-        self._last_drawn_lines = 0  # 上次写入占用的屏幕行数（含 spinner 行）
+        self._last_drawn_lines = 0  # 上次写入占用的屏幕行数(含任务+文本+spinner)
 
     def __enter__(self) -> "_Spinner":
         self._t0 = time.monotonic()
@@ -114,15 +177,23 @@ class _Spinner:
         self._stop.set()
         self._thread.join(timeout=1.0)
         with self._lock:
-            # 最终态：清掉 spinner 行，只保留正文（runtime 后续打 [stats]）
+            # 最终态:擦掉 spinner 区域,把任务列表和正文留在历史里
             self._erase_last()
+
+            # 任务列表:即使本轮没新增/更新,只要存在就保留显示在历史里
+            task_lines = self._task_lines()
+            if task_lines:
+                for line in task_lines:
+                    sys.stdout.write(line + "\n")
+                sys.stdout.write("\n")
+
             if self._text_buffer:
                 sys.stdout.write(self._text_buffer)
                 if not self._text_buffer.endswith("\n"):
                     sys.stdout.write("\n")
                 sys.stdout.write("\n")
             else:
-                # 没有文本（纯 tool_use），保留一行 thinking 摘要
+                # 没有文本(纯 tool_use),保留一行 thinking 摘要
                 sys.stdout.write(f"  ✻ {self.label} ({self._fmt_status()})\n")
             sys.stdout.flush()
 
@@ -148,8 +219,14 @@ class _Spinner:
             return f"{_fmt_duration(elapsed)} · ↓ {_fmt_tokens(out_t)}"
         return _fmt_duration(elapsed)
 
+    def _task_lines(self) -> list[str]:
+        """从 task_store 取最新快照,渲染成行列表。store=None 或空时返回 []。"""
+        if self._task_store is None:
+            return []
+        return _format_task_lines(self._task_store.all())
+
     def _erase_last(self) -> None:
-        """擦掉上一次绘制的内容。光标在最后一行末尾，需要回到起点并清屏到末尾。"""
+        """擦掉上一次绘制的内容。光标在最后一行末尾,需要回到起点并清屏到末尾。"""
         if self._last_drawn_lines <= 0:
             return
         sys.stdout.write("\r")
@@ -159,26 +236,41 @@ class _Spinner:
         self._last_drawn_lines = 0
 
     def _redraw(self) -> None:
-        """擦旧 → 写 text → 写 spinner。调用方需持有 self._lock。"""
+        """擦旧 → 写任务列表 → 写 text → 写 spinner。调用方需持有 self._lock。"""
         self._erase_last()
 
         term_width = _term_width()
+        total_lines = 0
 
-        text_lines = 0
+        # ── 任务列表(如果有) ──────────────────────────────────────────────
+        task_lines = self._task_lines()
+        if task_lines:
+            for line in task_lines:
+                sys.stdout.write(line + "\n")
+                # _strip_ansi 去除颜色控制字符再算显示宽度,否则会被当成可见字符
+                visible = _strip_ansi(line)
+                w = _display_width(visible)
+                total_lines += max(1, (w + term_width - 1) // term_width) if w else 1
+            # 任务列表与文本之间留一行间隔
+            sys.stdout.write("\n")
+            total_lines += 1
+
+        # ── 流式文本 ────────────────────────────────────────────────────────
         if self._text_buffer:
             sys.stdout.write(self._text_buffer)
-            text_lines = _count_visual_lines(self._text_buffer, term_width)
+            total_lines += _count_visual_lines(self._text_buffer, term_width)
             if not self._text_buffer.endswith("\n"):
                 # 让光标移到下一行,spinner 才能独占一行
                 sys.stdout.write("\n")
 
+        # ── spinner 行 ──────────────────────────────────────────────────────
         frame = _SPINNER_FRAMES[self._frame_idx % len(_SPINNER_FRAMES)]
         spinner_line = f"  {frame} {self.label}… ({self._fmt_status()})"
         sys.stdout.write(spinner_line)
         sys.stdout.flush()
 
         spinner_lines = max(1, (_display_width(spinner_line) + term_width - 1) // term_width)
-        self._last_drawn_lines = text_lines + spinner_lines
+        self._last_drawn_lines = total_lines + spinner_lines
 
     def _run(self) -> None:
         while not self._stop.wait(0.1):
@@ -226,14 +318,26 @@ class _PlainProgress:
         sys.stdout.flush()
 
 
-@contextmanager
-def _progress(label: str):
-    if sys.stdout.isatty():
-        with _Spinner(label) as s:
-            yield s
-    else:
-        with _PlainProgress(label) as p:
-            yield p
+def _make_progress(task_store=None):
+    """构造 progress 工厂(传给 AgentSession.progress)。
+
+    把 task_store 通过闭包注入到 _Spinner,让它在重绘时能拿到最新任务列表。
+    分成工厂是因为 AgentSession 需要的 progress 签名是 Callable[[label], CM],
+    不能直接接受 task_store 参数。
+    """
+    @contextmanager
+    def _progress(label: str):
+        if sys.stdout.isatty():
+            with _Spinner(label, task_store=task_store) as s:
+                yield s
+        else:
+            with _PlainProgress(label) as p:
+                yield p
+    return _progress
+
+
+# 兼容旧调用:模块顶层仍提供一个无 task_store 的默认 _progress
+_progress = _make_progress(None)
 
 
 def _fmt(data: dict) -> str:
@@ -276,13 +380,18 @@ def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
         print(f"能力     : {', '.join(cfg.capabilities)}")
     from app.config.loader import workspace_root
     print(f"workspace: {workspace_root()}")
-    print("工具     : read_file / write_file / list_dir")
-    print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会逐次询问 [y]这次 / [a]本会话总是 / [n]拒绝")
+    print("工具     : read_file / write_file / list_dir / shell / todo_write")
+    print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
     print("输入 /reset 清空会话; exit/quit 或 Ctrl-D 退出; Ctrl-C 清空当前行.\n")
+
+    # 任务清单(模型用 todo_write 维护,CLI spinner 区域上方实时渲染)
+    task_store = TaskStore()
 
     registry = ToolRegistry()
     for tool in default_tools():
         registry.register(tool)
+    # todo_write 工具需要绑定到当前会话的 task_store,所以工厂出来
+    registry.register(make_todo_write_tool(task_store))
 
     # 启动校验:profile 声明了能力但没包含 "tools",而我们注册了工具 → 警告
     # (不阻断,用户可能想看模型如何降级表现;但提前知道比执行中崩溃好)
@@ -299,7 +408,8 @@ def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
         tools=registry,
         approval=AutoApprove() if auto_approve else InteractivePolicy(),
         on_event=_print_event,
-        progress=_progress,
+        progress=_make_progress(task_store),  # spinner 能拿到任务列表
+        task_store=task_store,
     )
 
 

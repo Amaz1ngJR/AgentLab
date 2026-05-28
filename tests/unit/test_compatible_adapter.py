@@ -113,7 +113,7 @@ def test_create_message_text_only():
 
 
 def test_provider_payload_structure():
-    """provider_payload 必须是 OpenAI assistant message dict，可原样追加到 messages。"""
+    """provider_payload 是 list[dict],单元素是 OpenAI assistant message,可被 messages.extend 原样追加。"""
     with patch("openai.OpenAI") as MockOpenAI:
         mock_client = MagicMock()
         MockOpenAI.return_value = mock_client
@@ -125,9 +125,30 @@ def test_provider_payload_structure():
         resp = adapter.create_message(messages=[{"role": "user", "content": "列目录"}])
 
     payload = resp.provider_payload
-    assert payload["role"] == "assistant"
-    assert "tool_calls" in payload
-    assert payload["tool_calls"][0]["id"] == "call_2"
+    assert isinstance(payload, list) and len(payload) == 1
+    msg = payload[0]
+    assert msg["role"] == "assistant"
+    assert "tool_calls" in msg
+    assert msg["tool_calls"][0]["id"] == "call_2"
+
+
+def test_format_tool_results_emits_tool_role_messages():
+    """format_tool_results 把 ToolResult 列表转成 OpenAI Chat 风格的 role=tool 消息列表。
+
+    Chat Completions 协议每个工具结果一条独立消息,不像 Anthropic 把多个块包在一条 user 里。
+    """
+    from app.models.protocol import ToolResult
+
+    out = OpenAICompatibleAdapter.format_tool_results([
+        ToolResult(tool_call_id="c1", output="hello", is_error=False),
+        ToolResult(tool_call_id="c2", output="boom", is_error=True),
+    ])
+    assert len(out) == 2
+    assert out[0] == {"role": "tool", "tool_call_id": "c1", "content": "hello"}
+    # 错误时在 content 前加 ERROR 让模型识别
+    assert out[1]["role"] == "tool"
+    assert out[1]["tool_call_id"] == "c2"
+    assert out[1]["content"].startswith("ERROR:")
 
 
 def test_streaming_callbacks_are_invoked():

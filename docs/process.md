@@ -17,18 +17,24 @@ AgentLab/
 │   │   ├── loader.py             # 配置加载（profile + .env）
 │   │   └── schemas.py            # LLMConfig / ModelProfile dataclass
 │   ├── models/
-│   │   ├── protocol.py           # ToolCall / ModelResponse / 流式回调类型
+│   │   ├── protocol.py           # ToolCall / ModelResponse / ToolResult / 流式回调类型
 │   │   ├── anthropic_adapter.py  # Anthropic 流式 adapter（含工具循环）
-│   │   ├── compatible_adapter.py # OpenAI-compatible 流式 adapter（含工具循环）
+│   │   ├── compatible_adapter.py # OpenAI-compatible Chat Completions（Ollama 等）
+│   │   ├── openai_adapter.py     # OpenAI Responses API（GPT 官方）
 │   │   └── router.py             # build_model_router() 工厂
 │   ├── agent/
 │   │   ├── runtime.py            # AgentSession，多轮工具循环 + 流式事件桥接
-│   │   └── approval.py           # AutoApprove / InteractivePolicy / DenyAll
+│   │   ├── approval.py           # AutoApprove / InteractivePolicy(方向键菜单) / DenyAll
+│   │   └── tasks.py              # Task / TaskStore,会话级任务清单
 │   ├── tools/
 │   │   ├── registry.py           # ToolRegistry
 │   │   └── builtin/
-│   │       └── files.py          # read_file / write_file / list_dir + workspace 限制
+│   │       ├── __init__.py       # 聚合 default_tools()
+│   │       ├── files.py          # read_file / write_file / list_dir + workspace 限制
+│   │       ├── shell.py          # 跨平台 shell 工具,requires_approval=True
+│   │       └── todo.py           # todo_write 工具(更新 TaskStore)
 │   └── util/
+│       ├── menu.py               # 方向键内联菜单(prompt_toolkit Application)
 │       └── redact.py             # 凭据脱敏
 ├── config/
 │   ├── models.yaml               # 模型 profile（local_qwen / cloud_claude / cloud_openai 等）
@@ -37,6 +43,8 @@ AgentLab/
 │   └── unit/
 │       ├── test_approval.py
 │       ├── test_compatible_adapter.py
+│       ├── test_openai_adapter.py
+│       ├── test_shell_tool.py
 │       ├── test_cli_spinner.py
 │       ├── test_workspace_paths.py
 │       ├── test_redact.py
@@ -73,7 +81,19 @@ AgentLab/
 - **能力声明 + 启动校验** (`app/config/schemas.py:LLMConfig.capabilities`)：profile.capabilities 透传到 LLMConfig；CLI banner 显示 `能力: chat, tools`；缺 `tools` 但注册了工具时给警告
 - **Agent 离线测试** (`tests/unit/test_runtime.py`)：FakeRouter mock 覆盖 6 个场景：纯文本答案、单次工具循环、审批拒绝（验证 DENIED_MESSAGE 喂回模型）、工具异常（is_error=True 传递）、max_steps 超限、progress/text_delta 回调
 
-**测试规模**：21 → **43 个单元测试**（新增 22 个：workspace 7 + redact 9 + runtime 6）
+### P1 启程：OpenAI 原生 adapter + Shell 工具
+
+- **tool_result 抽象**：协议加 `ToolResult` dataclass；`ModelRouter.format_tool_results(results)` 由各 adapter 自管格式（Anthropic 一条 user 多个 block / Chat Completions 多条 role=tool / Responses API 多条 function_call_output）；`ModelResponse.provider_payload` 改为 `list[dict]`，Runtime 用 `messages.extend` 追加；为接 OpenAI Responses API 铺路
+- **OpenAI 原生 adapter** (`app/models/openai_adapter.py`)：调 OpenAI Responses API（不是 Chat Completions），扁平工具定义、`instructions` 顶级 system、流式监听 `response.output_text.delta`，最终从 `stream.get_final_response().output` 重建 ToolCall 与 raw payload；`router.py` 注册 `openai` provider；mock 测试 5 个覆盖文本流式 / function_call 解析 / provider_payload 结构 / format_tool_results / 进度回调
+- **跨平台 Shell 工具** (`app/tools/builtin/shell.py`)：Unix 用 `bash -c`，Windows 用 `powershell -NoProfile -Command`，cwd 锁定 `workspace_root`，30s 默认超时，输出 8KB 截断，stdout/stderr/exit code 三段拼接；`requires_approval=True` 强制审批；`app/tools/builtin/__init__.py` 提供聚合 `default_tools()`；mock subprocess 9 个测试覆盖 cwd / 超时 / 截断 / 平台分支
+
+### P1 体验：审批菜单 + 任务面板
+
+- **方向键审批菜单** (`app/util/menu.py`)：用 prompt_toolkit `Application(full_screen=False, erase_when_done=True)` 实现内联菜单；header 显示工具名 + 参数预览；选项 `允许这次 / 本会话总是允许 / 拒绝`；↑↓ 移动 / Enter 确认 / 数字快捷键 / Esc 取消；非 TTY 退化为 stdin 数字输入。`InteractivePolicy` 改用 `select_menu` 替换 `input("y/a/n")`；6 个新单元测试 + menu fallback 6 个
+- **任���面板 + todo_write 工具** (`app/agent/tasks.py` + `app/tools/builtin/todo.py`)：`Task` / `TaskStore` 维护会话级任务清单；`make_todo_write_tool(store)` 工厂绑定 store 给模型用；status 取值 `pending / in_progress / completed`，未知值规范化为 pending；`AgentSession` 持有 `task_store`，`/reset` 时清空
+- **CLI 任务面板渲染** (`app/cli.py`)：`_Spinner` 在重绘时把任务列表画在最上方,流式文本居中,spinner 钉底；汇总行 `N tasks (X done, Y in progress, Z open)`；任务行 `✓ done` (dim) / `❯ in_progress` (蓝色加粗) / `○ pending`；`_make_progress(task_store)` 工厂注入；4 个新单元测试覆盖渲染逻辑
+
+**测试规模**：21 → **78 个单元测试**（新增 57 个：workspace 7 + redact 9 + runtime 6 + openai_adapter 5 + shell 9 + compatible 1 + approval 重写 7 + menu 6 + tasks 9 + cli_spinner +4 任务面板）
 
 ---
 
@@ -83,11 +103,9 @@ AgentLab/
 
 | 任务 | 完成标准 |
 |---|---|
-| OpenAI 原生 adapter | `app/models/openai_adapter.py`，GPT 在线模型，工具 + 流式事件；`config/models.yaml` 的 `cloud_openai` profile 现在 provider 写的是 `openai`，但 router 还没注册 |
 | 流式事件结构化 | 在 `ModelResponse` 之上增加 `text_delta` / `tool_call_start` / `tool_call_delta` 等事件，CLI / Web UI 可订阅 |
 | SQLite 会话持久化 | `app/storage/sqlite.py`；`sessions` / `messages` / `runs` / `tool_executions` 表；`/history` 命令恢复历史会话；启动时自动加载最近会话 |
 | FastAPI Web UI | `app/server.py` + `app/web/`；SSE 事件流；审批 API；与 CLI 共用同一 AgentSession |
-| Bash / Shell 工具 | 跨平台 shell 工具（PowerShell / zsh），高风险默认审批；超时与工作目录约束 |
 
 ### P2：Skill 与 MCP
 

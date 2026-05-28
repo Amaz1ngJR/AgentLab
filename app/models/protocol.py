@@ -29,6 +29,19 @@ class ToolCall:
 
 
 @dataclass
+class ToolResult:
+    """单个工具调用执行后的结果，由 Runtime 收集后交给 adapter 格式化回传。
+
+    tool_call_id - 对应 ToolCall.id
+    output       - 工具的输出字符串（已被审批 / 已执行）
+    is_error     - 工具是否出错（异常文本作为 output 时设为 True）
+    """
+    tool_call_id: str
+    output: str
+    is_error: bool = False
+
+
+@dataclass
 class ModelResponse:
     """adapter 向 Runtime 返回的统一响应结构。
 

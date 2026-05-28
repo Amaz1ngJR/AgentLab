@@ -18,6 +18,7 @@ from app.models.protocol import (
     ProgressCallback,
     TextDeltaCallback,
     ToolCall,
+    ToolResult,
 )
 
 
@@ -161,13 +162,38 @@ class OpenAICompatibleAdapter:
 
         usage_dict = {"input_tokens": in_tokens, "output_tokens": out_tokens}
 
+        # provider_payload 是 list[dict],由 Runtime 调 messages.extend 追加。
+        # OpenAI Chat Completions 用单条 assistant 消息表示这一轮(无论有多少
+        # 工具调用都塞在 message.tool_calls 里),所以这里只产生一个 dict,
+        # 包成单元素 list 以匹配统一接口。
         return ModelResponse(
             text=text,
             tool_calls=tool_calls,
             usage=usage_dict,
-            provider_payload=payload,
+            provider_payload=[payload],
             finish_reason=finish_reason,
         )
+
+    @staticmethod
+    def format_tool_results(results: list[ToolResult]) -> list[dict]:
+        """把工具执行结果转成 OpenAI Chat Completions 格式。
+
+        Chat Completions 规定:
+          - 每个工具结果是一条独立 role=tool 的消息
+          - tool_call_id 必须对应上一轮 assistant.tool_calls[*].id
+          - content 是工具输出字符串(无 is_error 字段,出错信息直接写在 content 里)
+
+        所以 N 个 ToolResult 会产生 N 条独立 message;is_error 通过在 content
+        里加 "ERROR: " 前缀让模型识别(Chat Completions 协议本身不区分)。
+        """
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": r.tool_call_id,
+                "content": (f"ERROR: {r.output}" if r.is_error else r.output),
+            }
+            for r in results
+        ]
 
 
 def _to_openai_tool(t: dict) -> dict:

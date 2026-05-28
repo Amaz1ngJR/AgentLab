@@ -13,6 +13,7 @@ from app.models.protocol import (
     ProgressCallback,
     TextDeltaCallback,
     ToolCall,
+    ToolResult,
 )
 
 
@@ -167,10 +168,38 @@ class AnthropicAdapter:
         if on_progress:
             on_progress(dict(usage))
 
+        # provider_payload 是 list[dict],由 Runtime 调 messages.extend(...) 追加。
+        # Anthropic 要求把这一轮所有 content block(text + tool_use)合在
+        # 同一条 assistant 消息里完整回放,否则下一轮 messages.create 会报
+        # "tool_use without matching tool_result"。所以这里只产生一个 dict,
+        # 但仍包成单元素 list 以匹配统一接口(OpenAI Responses 那边可能会有多条)。
         return ModelResponse(
             text="".join(text_parts),
             tool_calls=tool_calls,
             usage=usage,
-            provider_payload=raw_blocks,
+            provider_payload=[{"role": "assistant", "content": raw_blocks}],
             finish_reason=getattr(message, "stop_reason", None),
         )
+
+    @staticmethod
+    def format_tool_results(results: list[ToolResult]) -> list[dict]:
+        """把工具执行结果转成 Anthropic 格式,作为 messages 的下一轮输入项返回。
+
+        Anthropic Messages API 规定:
+          - 工具结果必须放在 role=user 的消息里
+          - content 是 tool_result 块列表,每个块的 tool_use_id 必须和上一轮
+            assistant 消息里某个 tool_use 块的 id 对应
+          - 一个 user 消息可以包含多个 tool_result 块(对应同一轮多个工具调用)
+
+        所以即便有 N 个 ToolResult,也只产生一条 user 消息(里面 N 个 block)。
+        """
+        blocks = [
+            {
+                "type": "tool_result",
+                "tool_use_id": r.tool_call_id,
+                "content": r.output,
+                "is_error": r.is_error,
+            }
+            for r in results
+        ]
+        return [{"role": "user", "content": blocks}]

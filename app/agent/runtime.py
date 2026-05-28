@@ -7,14 +7,20 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
 from app.agent.approval import ApprovalPolicy, AutoApprove
+from app.agent.tasks import TaskStore
+from app.models.protocol import ToolResult
 from app.models.router import ModelRouter
 from app.tools.registry import ToolRegistry
 
 DEFAULT_SYSTEM_PROMPT = """你是 AgentLab,一个本地编码助手。
 - 用户用中文与你对话时,回复也用中文。
-- 你可以使用提供的工具读写本地文件、列目录,优先用工具拿到第一手信息再回答。
+- 你可以使用提供的工具读写本地文件、列目录、执行 shell 命令,
+  优先用工具拿到第一手信息再回答。
 - 写代码时简洁优先,不要过度解释。
 - 路径不清楚时,先用 list_dir 看一眼,再决定下一步。
+- 任务复杂(需要 3 步以上,或涉及多个文件)时,先用 todo_write 列出
+  子任务清单,然后边做边把对应任务从 pending → in_progress → completed,
+  让用户看见进度。简单任务不必用 todo_write。
 - 如果工具返回"User denied execution",说明用户拒绝了这次操作,不要立即重试,
   而是向用户简短说明,询问替代方案或直接停下。"""
 
@@ -52,6 +58,7 @@ class AgentSession:
         max_steps: int = 8,
         on_event: Optional[Callable[[TurnEvent], None]] = None,
         progress: Optional[ProgressFn] = None,
+        task_store: Optional[TaskStore] = None,
     ):
         self.llm = llm
         self.tools = tools
@@ -65,6 +72,8 @@ class AgentSession:
         self.cumulative_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds: float = 0.0
         self.cumulative_seconds: float = 0.0
+        # 任务清单:模型用 todo_write 工具维护,CLI 渲染到 spinner 上方
+        self.task_store: TaskStore = task_store or TaskStore()
 
     def reset(self) -> None:
         self.messages = []
@@ -72,6 +81,7 @@ class AgentSession:
         self.cumulative_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
         self.cumulative_seconds = 0.0
+        self.task_store.clear()
 
     def chat(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
@@ -105,8 +115,10 @@ class AgentSession:
                     self.last_turn_usage[k] += v
                     self.cumulative_usage[k] += v
 
-                # provider_payload 必须原样追加到历史（Anthropic 要求 content blocks 完整回放）
-                self.messages.append({"role": "assistant", "content": resp.provider_payload})
+                # provider_payload 是 list[dict],由 adapter 决定追加哪几条 message
+                # (Anthropic 把多个 content block 合在一条 assistant 里;
+                #  OpenAI Responses 可能把 text 块和 function_call 块拆成多条)
+                self.messages.extend(resp.provider_payload)
 
                 # 文本未被流式打印过才补发 text 事件，避免重复
                 if resp.text and not text_streamed:
@@ -115,7 +127,7 @@ class AgentSession:
                 if not resp.tool_calls:
                     return resp.text
 
-                tool_results_block: list[dict[str, Any]] = []
+                tool_results: list[ToolResult] = []
                 for call in resp.tool_calls:
                     self._on_event(TurnEvent(
                         kind="tool_call",
@@ -139,15 +151,15 @@ class AgentSession:
                             elapsed_seconds=time.monotonic() - t0,
                         ))
 
-                    # Anthropic 格式的 tool_result；OpenAI 格式由 compatible_adapter 在下轮处理
-                    tool_results_block.append({
-                        "type": "tool_result",
-                        "tool_use_id": call.id,
-                        "content": output,
-                        "is_error": is_error,
-                    })
+                    tool_results.append(ToolResult(
+                        tool_call_id=call.id,
+                        output=output,
+                        is_error=is_error,
+                    ))
 
-                self.messages.append({"role": "user", "content": tool_results_block})
+                # 工具结果的回传格式由 adapter 决定(Anthropic / OpenAI Chat /
+                # OpenAI Responses 三家不一样),Runtime 不关心
+                self.messages.extend(self.llm.format_tool_results(tool_results))
 
             return "(达到最大步数仍未给出最终答案)"
         finally:
