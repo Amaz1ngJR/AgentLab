@@ -2,9 +2,29 @@
 from __future__ import annotations
 
 from app.agent.approval import AutoApprove, DenyAll
-from app.agent.runtime import AgentSession, DENIED_MESSAGE
+from app.agent.runtime import (
+    DEFAULT_SYSTEM_PROMPT,
+    DENIED_MESSAGE,
+    AgentSession,
+    build_system_prompt,
+)
 from app.models.protocol import ModelResponse, ToolCall, ToolResult
 from app.tools.registry import Tool, ToolRegistry
+
+
+def test_build_system_prompt_injects_workspace():
+    """传入 workspace 时,prompt 应包含该路径并声明"当前项目"指它。"""
+    p = build_system_prompt("/Users/me/proj")
+    assert "/Users/me/proj" in p
+    assert "当前工作目录" in p
+    # 仍保留默认准则(主动调查、不反问)
+    assert "主动调查" in p
+
+
+def test_build_system_prompt_without_workspace_is_default():
+    """workspace 为空/None 时退回纯默认 prompt(向后兼容)。"""
+    assert build_system_prompt(None) == DEFAULT_SYSTEM_PROMPT
+    assert build_system_prompt("") == DEFAULT_SYSTEM_PROMPT
 
 
 class FakeRouter:

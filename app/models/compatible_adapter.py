@@ -10,6 +10,7 @@ OpenAI 工具循环与 Anthropic 的差异：
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
 from app.config.schemas import LLMConfig
@@ -161,6 +162,28 @@ class OpenAICompatibleAdapter:
                 "function": {"name": buf["name"], "arguments": buf["args"] or "{}"},
             })
 
+        # 兜底:本地小模型(qwen2.5-coder:7b 等)经常不按模板把调用包进
+        # <tool_call> 标签,而是把裸 JSON 吐进 content,导致 Ollama 解析不出
+        # tool_calls 字段。这里在原生 tool_calls 为空、且本轮确实提供了工具时,
+        # 尝试从正文里把调用捞回来。详见 tests/unit/test_compatible_adapter.py。
+        if not tool_calls and tools and text.strip():
+            valid_names = {t["name"] for t in tools}
+            recovered = _extract_tool_calls_from_text(text, valid_names)
+            for i, (name, args) in enumerate(recovered):
+                call_id = f"call_fallback_{i}"
+                tool_calls.append(ToolCall(id=call_id, name=name, arguments=args))
+                raw_tool_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+                })
+            if recovered:
+                # 正文本身就是工具调用而非散文,清空它:既避免把这段 JSON
+                # 当作助手发言渲染给用户,也让回放时模板走 .ToolCalls 分支
+                # (模板里 content 与 tool_calls 是 if/else-if,content 非空会
+                #  压掉 tool_calls,破坏历史里的调用记录)
+                text = ""
+
         payload: dict[str, Any] = {"role": "assistant", "content": text}
         if raw_tool_calls:
             payload["tool_calls"] = raw_tool_calls
@@ -212,3 +235,87 @@ def _to_openai_tool(t: dict) -> dict:
             "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
         },
     }
+
+
+# <tool_call>...</tool_call> 标签内的内容(Qwen 模板约定的正确格式)
+_TOOL_CALL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+def _iter_json_objects(text: str):
+    """扫描文本,产出其中每个用花括号平衡配对的顶层 JSON 对象子串。
+
+    小模型常把工具调用 JSON 夹在散文中间(甚至套 ```json 围栏),整段
+    json.loads 会失败。这里靠括号配对找出每一段 {...},逐个交给调用方试解析。
+    只追踪顶层对象(深度从 0→1 开始、回到 0 结束),嵌套对象包含其中。
+    字符串内的花括号用简单状态机跳过,避免被 {"path": "{x}"} 这类值带偏。
+    """
+    depth = 0
+    start = -1
+    in_str = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    yield text[start:i + 1]
+                    start = -1
+
+
+def _extract_tool_calls_from_text(text: str, valid_names: set[str]) -> list[tuple[str, dict]]:
+    """从助手正文里捞回被当成文本输出的工具调用。
+
+    本地小模型常见的不规范输出,都在这里兜住:
+      1. 规范但被 Ollama 漏解析:<tool_call>{"name":..., "arguments":...}</tool_call>
+      2. 裸 JSON:{"name": "list_dir", "arguments": {"path": "."}}
+      3. Markdown 围栏:```json\n{...}\n```
+      4. JSON 夹在大段散文中间(前后都有解释性文字)
+
+    策略:先抓 <tool_call> 标签;没有标签就扫描整段里所有花括号配对出的
+    JSON 对象。只认 name 在 valid_names 里的对象,避免把模型正常输出的、
+    恰好长得像工具调用的 JSON(或代码示例)误判成调用。
+    返回 [(name, arguments_dict), ...]。
+    """
+    # 标签内可能还套着 ```json 围栏或多余文字,所以统一交给 _iter_json_objects;
+    # 有标签时只在标签内找,没标签时在全文找。
+    tagged = _TOOL_CALL_TAG_RE.findall(text)
+    search_spaces = tagged if tagged else [text]
+
+    results: list[tuple[str, dict]] = []
+    for space in search_spaces:
+        for raw in _iter_json_objects(space):
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            name = obj.get("name")
+            if name not in valid_names:
+                continue
+            args = obj.get("arguments", {})
+            # arguments 可能是 JSON 字符串(部分模型这么做),也可能已是 dict
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+            results.append((name, args))
+
+    return results

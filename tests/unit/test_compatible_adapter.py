@@ -175,3 +175,103 @@ def test_streaming_callbacks_are_invoked():
     final = progress_updates[-1]
     assert final["input_tokens"] == 20
     assert final["output_tokens"] == 8
+
+
+# ── 兜底:本地小模型把工具调用当文本吐出来,从正文捞回 ─────────────────────────
+
+_TOOLS = [{
+    "name": "list_dir",
+    "description": "列出目录内容",
+    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+}]
+
+
+def _run_with_text(model_text: str, tools=_TOOLS):
+    """让流只吐一段文本(无原生 tool_calls),返回 adapter 响应。"""
+    with patch("openai.OpenAI") as MockOpenAI:
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _stream_text(model_text)
+
+        adapter = OpenAICompatibleAdapter(_cfg())
+        return adapter.create_message(
+            messages=[{"role": "user", "content": "列出当前目录"}],
+            tools=tools,
+        )
+
+
+def test_fallback_recovers_bare_json_tool_call():
+    """模型漏掉 <tool_call> 标签,直接吐裸 JSON —— 应被捞回成 ToolCall。"""
+    resp = _run_with_text('{"name": "list_dir", "arguments": {"path": "."}}')
+    assert len(resp.tool_calls) == 1
+    assert resp.tool_calls[0].name == "list_dir"
+    assert resp.tool_calls[0].arguments == {"path": "."}
+    # 正文是调用本身,捞回后清空,避免当散文渲染
+    assert resp.text == ""
+    # provider_payload 里要带上 tool_calls,回放历史才完整
+    assert "tool_calls" in resp.provider_payload[0]
+
+
+def test_fallback_recovers_tagged_tool_call():
+    """带 <tool_call> 标签但 Ollama 没解析进 tool_calls 字段的情况。"""
+    resp = _run_with_text('<tool_call>\n{"name": "list_dir", "arguments": {"path": "src"}}\n</tool_call>')
+    assert len(resp.tool_calls) == 1
+    assert resp.tool_calls[0].arguments == {"path": "src"}
+
+
+def test_fallback_recovers_fenced_json_tool_call():
+    """套了 markdown ```json 围栏的裸调用(日志里出现过的形态)。"""
+    resp = _run_with_text('```json\n{"name": "list_dir", "arguments": {"path": "."}}\n```')
+    assert len(resp.tool_calls) == 1
+    assert resp.tool_calls[0].name == "list_dir"
+
+
+def test_fallback_recovers_json_embedded_in_prose():
+    """调用 JSON 夹在前后散文中间(7B 模型实际出现的形态)。"""
+    text = (
+        "好的，请稍等，我将读取并分析该目录下的文件。\n\n"
+        '```json\n{"name": "list_dir", "arguments": {"path": "/Users/weidian/yjr/AgentLab"}}\n```\n\n'
+        "请确认路径是否正确。"
+    )
+    resp = _run_with_text(text)
+    assert len(resp.tool_calls) == 1
+    assert resp.tool_calls[0].name == "list_dir"
+    assert resp.tool_calls[0].arguments == {"path": "/Users/weidian/yjr/AgentLab"}
+
+
+def test_fallback_handles_braces_inside_string_args():
+    """参数值里含花括号时,括号配对扫描不应被带偏。"""
+    resp = _run_with_text('{"name": "list_dir", "arguments": {"path": "a/{x}/b"}}')
+    assert len(resp.tool_calls) == 1
+    assert resp.tool_calls[0].arguments == {"path": "a/{x}/b"}
+
+
+def test_fallback_recovers_multiple_tagged_calls():
+    """一段正文里多个 <tool_call> 标签,全部捞回。"""
+    text = (
+        '<tool_call>{"name": "list_dir", "arguments": {"path": "a"}}</tool_call>'
+        '<tool_call>{"name": "list_dir", "arguments": {"path": "b"}}</tool_call>'
+    )
+    resp = _run_with_text(text)
+    assert [tc.arguments["path"] for tc in resp.tool_calls] == ["a", "b"]
+
+
+def test_fallback_ignores_unknown_tool_name():
+    """正文 JSON 的 name 不在工具表里 —— 不当作调用,保留为普通文本。"""
+    resp = _run_with_text('{"name": "not_a_real_tool", "arguments": {}}')
+    assert resp.tool_calls == []
+    assert resp.text != ""
+
+
+def test_fallback_ignores_plain_prose():
+    """普通中文回答不含工具 JSON —— 不误判,原样作为文本返回。"""
+    resp = _run_with_text("当前目录下有 app、tests 和 docs 三个子目录。")
+    assert resp.tool_calls == []
+    assert "app" in resp.text
+
+
+def test_fallback_not_triggered_without_tools():
+    """没提供工具时,即便正文长得像调用也不捞 —— 否则纯对话会被误伤。"""
+    resp = _run_with_text('{"name": "list_dir", "arguments": {"path": "."}}', tools=None)
+    assert resp.tool_calls == []
+    assert resp.text != ""

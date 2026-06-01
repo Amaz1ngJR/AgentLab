@@ -28,7 +28,7 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 
 from app.agent.approval import AutoApprove, InteractivePolicy
-from app.agent.runtime import AgentSession, TurnEvent
+from app.agent.runtime import AgentSession, TurnEvent, build_system_prompt
 from app.agent.tasks import TaskStore
 from app.config.loader import load_config
 from app.models.router import build_model_router
@@ -143,17 +143,19 @@ def _strip_ansi(s: str) -> str:
 class _Spinner:
     """thinking 状态行 + 实时 token 计数 + 流式文本输出 + 任务列表面板。
 
-    布局(从上到下):
-      [任务列表]    ← 模型用 todo_write 维护,只在非空时显示
-      [流式文本]    ← 流式 delta 累积
-      [spinner]     ← ⠋ thinking… (...) 钉在最底,1Hz 闪动
+    渲染策略(关键:文本一旦开始流式,就走 append-only,绝不重打已输出文本):
+      1. 任务面板:每步内固定不变(模型用 todo_write 的更新发生在 create_message
+         返回之后),首次绘制时一次性提交到滚动历史,之后不再重绘。
+      2. thinking 阶段(还没有文本):底部 spinner footer 持续闪动 + 刷新 token
+         计数。footer 只占 1~2 行,擦除用 *有界* 的相对光标上移,即使屏幕滚动
+         也不会越界。
+      3. 文本到达:擦掉 thinking footer,之后每个 delta 直接 append 到 stdout,
+         让终端自然滚动。不再有 footer,也就不会出现"重打整段缓冲"导致的滚屏
+         叠影 —— 旧实现的 bug:文本超过一屏后,相对上移擦不掉已滚走的行,于是
+         每个 delta 都把当前缓冲原样留在屏上,叠成逐行增长的瀑布。
 
-    每次 token 更新或文本到达,都用 ANSI 重绘整个区域,保持 spinner 始终在
-    最下面持续刷新。
-
-    向 Runtime 暴露两个回调入口:
-      update(metrics)  - token 进度更新
-      on_text(delta)   - 文本增量;累积到 text_buffer,立即重绘
+    代价:文本流式期间 token 计数不再实时刷新(thinking 阶段与纯工具步骤仍然
+    实时)。换来任意长度文本都不重影,最终总量仍由 [stats] 行给出。
     """
 
     def __init__(self, label: str, task_store=None):
@@ -165,8 +167,10 @@ class _Spinner:
         self._lock = threading.Lock()
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self._text_buffer = ""
+        self._text_started = False     # 文本一旦开始,转入 append-only 模式
+        self._tasks_committed = False  # 任务面板每步只提交一次
         self._frame_idx = 0
-        self._last_drawn_lines = 0  # 上次写入占用的屏幕行数(含任务+文本+spinner)
+        self._footer_lines = 0  # 当前 footer 占用的屏幕行数(0 = 未绘制)
 
     def __enter__(self) -> "_Spinner":
         self._t0 = time.monotonic()
@@ -177,23 +181,15 @@ class _Spinner:
         self._stop.set()
         self._thread.join(timeout=1.0)
         with self._lock:
-            # 最终态:擦掉 spinner 区域,把任务列表和正文留在历史里
-            self._erase_last()
-
-            # 任务列表:即使本轮没新增/更新,只要存在就保留显示在历史里
-            task_lines = self._task_lines()
-            if task_lines:
-                for line in task_lines:
-                    sys.stdout.write(line + "\n")
-                sys.stdout.write("\n")
-
-            if self._text_buffer:
-                sys.stdout.write(self._text_buffer)
-                if not self._text_buffer.endswith("\n"):
+            if self._text_started:
+                # 文本已逐段 append 到历史,这里只补足结尾换行 + 一个空行
+                if self._text_buffer and not self._text_buffer.endswith("\n"):
                     sys.stdout.write("\n")
                 sys.stdout.write("\n")
             else:
-                # 没有文本(纯 tool_use),保留一行 thinking 摘要
+                # 纯 tool_use / 无文本:擦掉 thinking footer,保留任务面板 + 一行摘要
+                self._erase_footer()
+                self._commit_tasks()
                 sys.stdout.write(f"  ✻ {self.label} ({self._fmt_status()})\n")
             sys.stdout.flush()
 
@@ -203,14 +199,24 @@ class _Spinner:
                 "input_tokens": int(metrics.get("input_tokens", 0) or 0),
                 "output_tokens": int(metrics.get("output_tokens", 0) or 0),
             }
-            self._redraw()
+            # 文本流式开始后不再有 footer 可刷;仅 thinking 阶段更新计数
+            if not self._text_started:
+                self._commit_tasks()
+                self._erase_footer()
+                self._draw_footer()
 
     def on_text(self, delta: str) -> None:
         if not delta:
             return
         with self._lock:
+            self._commit_tasks()
+            if not self._text_started:
+                # 第一段文本:擦掉 thinking footer,之后纯 append
+                self._erase_footer()
+                self._text_started = True
             self._text_buffer += delta
-            self._redraw()
+            sys.stdout.write(delta)
+            sys.stdout.flush()
 
     def _fmt_status(self) -> str:
         elapsed = time.monotonic() - self._t0
@@ -225,58 +231,57 @@ class _Spinner:
             return []
         return _format_task_lines(self._task_store.all())
 
-    def _erase_last(self) -> None:
-        """擦掉上一次绘制的内容。光标在最后一行末尾,需要回到起点并清屏到末尾。"""
-        if self._last_drawn_lines <= 0:
+    def _commit_tasks(self) -> None:
+        """一次性把任务面板打印到滚动历史(每步只调一次)。空任务则什么都不打。
+
+        面板在一个步骤内不会变(todo_write 的更新发生在 create_message 之后),
+        所以提交一次即可,无需像旧实现那样每帧重绘。
+        """
+        if self._tasks_committed:
             return
-        sys.stdout.write("\r")
-        if self._last_drawn_lines > 1:
-            sys.stdout.write(f"\033[{self._last_drawn_lines - 1}A")
-        sys.stdout.write("\033[J")
-        self._last_drawn_lines = 0
-
-    def _redraw(self) -> None:
-        """擦旧 → 写任务列表 → 写 text → 写 spinner。调用方需持有 self._lock。"""
-        self._erase_last()
-
-        term_width = _term_width()
-        total_lines = 0
-
-        # ── 任务列表(如果有) ──────────────────────────────────────────────
+        self._tasks_committed = True
         task_lines = self._task_lines()
-        if task_lines:
-            for line in task_lines:
-                sys.stdout.write(line + "\n")
-                # _strip_ansi 去除颜色控制字符再算显示宽度,否则会被当成可见字符
-                visible = _strip_ansi(line)
-                w = _display_width(visible)
-                total_lines += max(1, (w + term_width - 1) // term_width) if w else 1
-            # 任务列表与文本之间留一行间隔
-            sys.stdout.write("\n")
-            total_lines += 1
+        if not task_lines:
+            return
+        for line in task_lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.write("\n")  # 面板与下方内容留一行间隔
+        sys.stdout.flush()
 
-        # ── 流式文本 ────────────────────────────────────────────────────────
-        if self._text_buffer:
-            sys.stdout.write(self._text_buffer)
-            total_lines += _count_visual_lines(self._text_buffer, term_width)
-            if not self._text_buffer.endswith("\n"):
-                # 让光标移到下一行,spinner 才能独占一行
-                sys.stdout.write("\n")
-
-        # ── spinner 行 ──────────────────────────────────────────────────────
+    def _draw_footer(self) -> None:
+        """在当前行起点画 spinner footer,记录其占用的屏幕行数。"""
+        term_width = _term_width()
         frame = _SPINNER_FRAMES[self._frame_idx % len(_SPINNER_FRAMES)]
         spinner_line = f"  {frame} {self.label}… ({self._fmt_status()})"
         sys.stdout.write(spinner_line)
         sys.stdout.flush()
+        w = _display_width(spinner_line)
+        self._footer_lines = max(1, (w + term_width - 1) // term_width)
 
-        spinner_lines = max(1, (_display_width(spinner_line) + term_width - 1) // term_width)
-        self._last_drawn_lines = total_lines + spinner_lines
+    def _erase_footer(self) -> None:
+        """擦掉 footer。光标在 footer 末行末尾,回到 footer 起点再清到屏末。
+
+        footer 至多 1~2 行,这里的相对上移是 *有界* 的 —— 即使屏幕滚动也不会
+        越界。这正是它能稳、而旧 _redraw 重打整段文本会失效的原因。
+        """
+        if self._footer_lines <= 0:
+            return
+        sys.stdout.write("\r")
+        if self._footer_lines > 1:
+            sys.stdout.write(f"\033[{self._footer_lines - 1}A")
+        sys.stdout.write("\033[J")
+        sys.stdout.flush()
+        self._footer_lines = 0
 
     def _run(self) -> None:
         while not self._stop.wait(0.1):
             with self._lock:
+                if self._text_started:
+                    continue  # append-only 阶段,footer 已撤,无需动画
+                self._commit_tasks()
                 self._frame_idx += 1
-                self._redraw()
+                self._erase_footer()
+                self._draw_footer()
 
 
 class _PlainProgress:
@@ -473,6 +478,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
         llm=llm,
         tools=registry,
         approval=AutoApprove() if auto_approve else InteractivePolicy(),
+        system_prompt=build_system_prompt(str(workspace_root())),
         on_event=_print_event,
         progress=_make_progress(task_store),  # spinner 能拿到任务列表
         task_store=task_store,
