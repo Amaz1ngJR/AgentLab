@@ -72,6 +72,9 @@ class AgentSession:
         self.cumulative_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds: float = 0.0
         self.cumulative_seconds: float = 0.0
+        # 服务器实际返回的模型 ID。代理可能把 claude-opus-4-9 静默映射到
+        # claude-3-5-sonnet,这里记下来给 CLI 在 banner / 警告里展示
+        self.last_actual_model: Optional[str] = None
         # 任务清单:模型用 todo_write 工具维护,CLI 渲染到 spinner 上方
         self.task_store: TaskStore = task_store or TaskStore()
 
@@ -114,6 +117,10 @@ class AgentSession:
                     v = resp.usage.get(k, 0)
                     self.last_turn_usage[k] += v
                     self.cumulative_usage[k] += v
+
+                # 记下服务器实际使用的模型 ID(可能被代理静默映射到别的型号)
+                if resp.actual_model:
+                    self.last_actual_model = resp.actual_model
 
                 # provider_payload 是 list[dict],由 adapter 决定追加哪几条 message
                 # (Anthropic 把多个 content block 合在一条 assistant 里;

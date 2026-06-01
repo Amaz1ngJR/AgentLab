@@ -51,9 +51,15 @@ class ModelResponse:
     provider_payload - provider 原生 content blocks（dict 列表），
                        必须原样追加到 messages 历史再发下一轮请求
     finish_reason    - provider 原生停止原因，例如 "end_turn" / "tool_use" / "stop"
+    actual_model     - API 响应中真实使用的模型 ID。
+                       很多代理会"静默映射":请求 claude-opus-4-9 实际跑的可能是
+                       claude-3-5-sonnet。把这个值露出来,让用户能识别这种情况,
+                       不至于以为自己用上了某个不存在的型号。
+                       None 表示 provider 没返回该字段。
     """
     text: str
     tool_calls: list[ToolCall]
     usage: dict[str, int]
     provider_payload: Any
     finish_reason: str | None = None
+    actual_model: str | None = None

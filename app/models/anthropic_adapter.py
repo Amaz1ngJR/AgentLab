@@ -179,6 +179,10 @@ class AnthropicAdapter:
             usage=usage,
             provider_payload=[{"role": "assistant", "content": raw_blocks}],
             finish_reason=getattr(message, "stop_reason", None),
+            # API 实际使用的模型 ID。Anthropic 官方 API 会原样返回请求里写的
+            # model;但代理(如 ai.vdian.net)有可能映射到别的真实模型,这里把
+            # 它如实暴露给上层,Runtime / CLI 在不一致时可以警告
+            actual_model=getattr(message, "model", None),
         )
 
     @staticmethod

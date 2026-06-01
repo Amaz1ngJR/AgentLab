@@ -169,6 +169,9 @@ class OpenAIAdapter:
             # 下一轮把这些 item 原样作为 input 一起发,模型才能理解上下文。
             provider_payload=output_items,
             finish_reason=getattr(final, "status", None),
+            # 真实模型 ID:同 Anthropic 的 message.model,代理静默映射时这里
+            # 会和请求时写的 model 不同,把它向上暴露
+            actual_model=getattr(final, "model", None),
         )
 
     @staticmethod

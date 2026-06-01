@@ -94,9 +94,14 @@ class OpenAICompatibleAdapter:
         # tool_calls 流式分片到达：index -> {"id", "name", "args_str"}
         tool_calls_buf: dict[int, dict[str, str]] = {}
         finish_reason: Optional[str] = None
+        # 服务端实际使用的模型 ID。每个 chunk 都会带 model 字段,但通常都一样,
+        # 任意一个非空值即可记下来(OpenAI / 各代理普遍如此)
+        actual_model: Optional[str] = None
 
         stream = self._client.chat.completions.create(**params)
         for chunk in stream:
+            if actual_model is None and getattr(chunk, "model", None):
+                actual_model = chunk.model
             if chunk.choices:
                 choice = chunk.choices[0]
                 delta = choice.delta
@@ -172,6 +177,7 @@ class OpenAICompatibleAdapter:
             usage=usage_dict,
             provider_payload=[payload],
             finish_reason=finish_reason,
+            actual_model=actual_model,
         )
 
     @staticmethod

@@ -361,11 +361,77 @@ def _print_event(ev: TurnEvent) -> None:
         print(f"\n{ev.text}\n", flush=True)
 
 
+def _check_local_endpoint(cfg) -> None:
+    """启动时探测本地 / 局域网 Ollama 端点是否在响应。
+
+    背景:
+      用户切到 local_qwen 这种 profile 时,如果 Ollama 没启动或没装,
+      原先的报错要等到第一次工具调用 / chat 才出现,信息也是 SDK 内部
+      的 ConnectionRefused,不友好。这里在 build_session 阶段提前 ping
+      `/api/tags`,失败时给清晰的安装引导。
+
+    只对"看起来是本地或局域网"的端点做检测(localhost / 127. / 192.168 /
+    10. / 172.16-31),远程公网 OpenAI-compatible 端点不强检(可能临时网络
+    抖动,等真实请求时让 SDK 自己报错更准)。
+    """
+    # 这些 provider 都走 OpenAICompatibleAdapter,需要本地 / 自建端点
+    # (区别于 anthropic / openai 直连云端,无需检测)
+    _LOCAL_PROVIDERS = {
+        "openai_compatible", "ollama", "lmstudio", "vllm", "remote_openai_compatible",
+    }
+    if cfg.provider not in _LOCAL_PROVIDERS or not cfg.base_url:
+        return
+
+    base = cfg.base_url.lower()
+    is_local = (
+        "localhost" in base or "127.0.0.1" in base
+        or "://192.168." in base or "://10." in base
+        or "://172.1" in base or "://172.2" in base or "://172.3" in base
+    )
+    if not is_local:
+        return
+
+    # 把 /v1 之类的 OpenAI 后缀去掉,Ollama 健康检查接口是 /api/tags
+    health_base = cfg.base_url.rstrip("/")
+    if health_base.endswith("/v1"):
+        health_base = health_base[:-3]
+    health_url = f"{health_base}/api/tags"
+
+    import urllib.error
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(health_url, timeout=3)
+        return  # 服务正常
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+
+    # 服务无响应:打印引导而不是让 SDK 报模糊的连接错误
+    print(
+        f"\n⚠ 无法连接到 {cfg.base_url}",
+        file=sys.stderr,
+    )
+    print(
+        "  本地 profile 需要 Ollama 服务在运行。可能原因:\n"
+        "    1. 没装 Ollama        → 运行: bash scripts/install_local_model.sh\n"
+        "                            或下载: https://ollama.com/download\n"
+        "    2. 服务没启动         → 运行: ollama serve\n"
+        "    3. 模型还没下载       → 运行: ollama pull qwen2.5-coder:7b-instruct\n"
+        "    4. 局域网模式连不通   → 检查 5060Ti 主机防火墙 / OLLAMA_HOST=0.0.0.0\n\n"
+        "  完整指南: docs/local_model_guide.md\n",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
     cfg = load_config(profile_name=profile)
     if cfg.provider == "anthropic" and not (cfg.auth_token or cfg.api_key):
         print("未找到 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY。\n请在 .env 或 ~/.claude/settings.json 中配置后重试。", file=sys.stderr)
         sys.exit(2)
+
+    # 本地 profile:先 ping Ollama,不通就提前给安装引导(而不是等首次工具调用才报错)
+    _check_local_endpoint(cfg)
 
     llm = build_model_router(cfg)
 
@@ -413,6 +479,22 @@ def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
     )
 
 
+def _normalize_model_id(name: str | None) -> str:
+    """规范化模型 ID 用于比较,消除分隔符 / 大小写差异。
+
+    例:
+      "claude-opus-4-6"   ↔ "claude-opus-4.6"   ↔ "Claude_Opus_4.6"
+      规范化后都变成 "claude-opus-4-6",视为指向同一模型。
+
+    避免代理用 `.` 而 AgentLab 用 `-` 这种纯命名风格差异每次都误报警告。
+    真实的"模型映射"(claude-opus-4-9 → claude-3-5-sonnet-20241022)规范化后
+    仍然不同,警告会照常出来。
+    """
+    if not name:
+        return ""
+    return name.lower().replace(".", "-").replace("_", "-")
+
+
 def _print_stats(session: AgentSession) -> None:
     t, c = session.last_turn_usage, session.cumulative_usage
     print(
@@ -422,6 +504,17 @@ def _print_stats(session: AgentSession) -> None:
         f"in={c['input_tokens']} out={c['output_tokens']}",
         flush=True,
     )
+    # 服务器实际返回的模型 ID 与请求模型不一致时给警告。
+    # 这能立刻揭穿代理的"静默映射":你写 claude-opus-4-9 实际跑的是别的型号。
+    # 规范化对比:忽略 . / - / _ / 大小写差异,这些只是命名风格而非模型本身不同。
+    requested = session.llm.model
+    actual = session.last_actual_model
+    if actual and _normalize_model_id(actual) != _normalize_model_id(requested):
+        print(
+            f"  ⚠ requested '{requested}' but server returned model='{actual}'. "
+            f"代理可能把请求的模型名映射到了别的真实模型。",
+            file=sys.stderr,
+        )
 
 
 _PROMPT_STYLE = Style.from_dict({
