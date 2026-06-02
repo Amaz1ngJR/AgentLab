@@ -10,6 +10,17 @@ venv/
 .env
 .env.local
 
+# Local machine-specific config (templates *.example.yaml are tracked)
+config/mcp_servers.yaml
+config/app.yaml
+config/control.yaml
+
+# Playwright MCP runtime artifacts (console logs, page dumps)
+.playwright-mcp/
+
+# Browser profiles (contain login cookies/session — must never be committed)
+data/browser-profiles/
+
 # IDE
 .vscode/
 .idea/
