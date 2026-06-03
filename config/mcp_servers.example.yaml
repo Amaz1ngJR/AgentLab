@@ -1,0 +1,54 @@
+# config/mcp_servers.yaml —— MCP Server 注册表
+#
+# AgentLab 作为 MCP Client 连接这里配置的 Server(见 docs/technical_architecture.md §9)。
+# 复制本文件为 config/mcp_servers.yaml 再按需改;不存在该文件时程序照常启动(无 MCP 工具)。
+#
+# 安全约定:
+#   - 新 server 默认 enabled: false。启用前 CLI 会展示 server 名、transport 和工具列表。
+#   - stdio 命令用 command + args 数组直接启动,不经 shell 字符串展开。
+#   - env_allowlist 限制透传给子进程的环境变量(默认只 PATH),避免把密钥泄漏给 MCP server。
+#   - 真实 token / 密钥不写在这里;需要时用环境变量名引用(本 MVP 的 stdio server 暂未用到)。
+#
+# 审批:
+#   - MCP 工具默认每次需人工审批(动作经浏览器/外部进程执行,风险高)。
+#   - auto_approve 列出免审批的只读观察类工具(看页面不改状态),其余仍需确认。
+
+servers:
+
+  # ── Playwright 浏览器控制(微软官方 MCP server)──────────────────────────────
+  # 前置:已装 Node/npx;首次启动 npx 会下载 @playwright/mcp 与浏览器内核。
+  # 用法:把 enabled 改成 true 后启动 AgentLab,模型即可用 browser_* 工具。
+  #   工作流:browser_navigate 打开页面 → browser_snapshot 拿元素 ref →
+  #           browser_click / browser_type 用 ref 操作。
+  #
+  # Profile 选择(二选一,看你要不要保留登录态):
+  #   A. 隔离 profile(默认 / 最安全):args 里加 "--isolated" 或什么都不加。
+  #      不持久化,每次新开干净浏览器,不带任何 cookie。适合无需登录的场景。
+  #   B. Named 持久化 profile:args 加 "--user-data-dir <path>"(见下例)。
+  #      首次手动在弹出窗口登录,cookie 落盘,后续启动自动复用。适合需要登录的
+  #      内部 wiki / 文档站。注意:登录态下访问的数据进 LLM 上下文 → 离开本机,
+  #      用云端模型时 CLI 启动会给数据边界提示(PRD §7.8.2 / §12)。
+  #
+  # 启动模式:加 "--headless" 则无窗口模式;不加为 headed(默认),首次登录必须 headed。
+  playwright:
+    transport: stdio
+    command: npx
+    args:
+      - "-y"
+      - "@playwright/mcp@latest"
+      # ── 隔离 profile 示例(默认安全)── 去掉下面 --user-data-dir 两行即为隔离 ──
+      # ── Named 持久化 profile 示例 ──────────────────────────────────────────
+      - "--user-data-dir"
+      - "data/browser-profiles/example"   # 自取名字,目录已在 .gitignore
+      # ── 想 headless 跑就取消下面一行注释(首次登录前必须 headed)──
+      # - "--headless"
+    env_allowlist:
+      - PATH
+    enabled: false          # 默认禁用;确认要用浏览器控制再改 true
+    risk: browser_control
+    # 只读观察类工具免审批;点击/输入/导航等会改变页面状态的动作仍需确认
+    auto_approve:
+      - browser_snapshot
+      - browser_take_screenshot
+      - browser_console_messages
+      - browser_network_requests

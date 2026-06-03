@@ -19,6 +19,8 @@ DEFAULT_SYSTEM_PROMPT = """你是 AgentLab,一个本地编码助手。
   绝不要回一句"请问你想了解什么"或列一堆选项让用户选。先调查,后结论。
 - 缺信息时用工具去拿,不要问用户:路径不清楚就 list_dir;想知道功能就 read_file
   读 README、入口文件、关键模块。连续调用工具直到信息足够。
+- 找代码用 code_search,不要用 shell 拼 grep/find:搜函数名/字符串用 mode=text,
+  搜正则用 regex,找文件用 file,找定义用 symbol。拿到命中再用 read_file 精读。
 - 不要重复你上一条已经说过的话。如果发现自己在重复,改为调用工具或给出最终结论。
 
 【常规约定】
@@ -27,7 +29,14 @@ DEFAULT_SYSTEM_PROMPT = """你是 AgentLab,一个本地编码助手。
 - 任务复杂(需要 3 步以上,或涉及多个文件)时,先用 todo_write 列出子任务清单,
   然后边做边把任务从 pending → in_progress → completed,让用户看见进度。简单任务不必用。
 - 如果工具返回"User denied execution",说明用户拒绝了这次操作,不要立即重试,
-  而是向用户简短说明,询问替代方案或直接停下。"""
+  而是向用户简短说明,询问替代方案或直接停下。
+
+【浏览器工具(如果可用)】
+- 有 browser_* 工具时,操作网页的正确顺序:先 browser_navigate 打开 URL,
+  再 browser_snapshot 拿到页面快照和元素 ref(引用),然后用 ref 做 browser_click /
+  browser_type / browser_select_option。不要凭空猜 CSS selector,以 snapshot 里的 ref 为准。
+- 每次点击/输入改变页面后,需要时再 browser_snapshot 重新观察,再决定下一步。
+- 登录、支付、发布、删除、上传等敏感动作执行前要先向用户确认。"""
 
 
 def build_system_prompt(workspace: str | None = None) -> str:
@@ -81,6 +90,7 @@ class AgentSession:
         on_event: Optional[Callable[[TurnEvent], None]] = None,
         progress: Optional[ProgressFn] = None,
         task_store: Optional[TaskStore] = None,
+        closeables: Optional[list[Any]] = None,
     ):
         self.llm = llm
         self.tools = tools
@@ -99,6 +109,19 @@ class AgentSession:
         self.last_actual_model: Optional[str] = None
         # 任务清单:模型用 todo_write 工具维护,CLI 渲染到 spinner 上方
         self.task_store: TaskStore = task_store or TaskStore()
+        # 需要在会话结束时收尾的资源(如 MCPManager),退出时按序调用其 .stop()/.close()
+        self._closeables: list[Any] = closeables or []
+
+    def close(self) -> None:
+        """释放会话持有的外部资源(MCP server 进程等)。重复调用安全。"""
+        for c in self._closeables:
+            stop = getattr(c, "stop", None) or getattr(c, "close", None)
+            if stop is not None:
+                try:
+                    stop()
+                except Exception:
+                    pass
+        self._closeables = []
 
     def reset(self) -> None:
         self.messages = []

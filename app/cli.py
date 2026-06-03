@@ -31,6 +31,9 @@ from app.agent.approval import AutoApprove, InteractivePolicy
 from app.agent.runtime import AgentSession, TurnEvent, build_system_prompt
 from app.agent.tasks import TaskStore
 from app.config.loader import load_config
+from app.mcp.adapter import build_mcp_tools
+from app.mcp.config import enabled_servers
+from app.mcp.manager import MCPManager
 from app.models.router import build_model_router
 from app.tools.builtin import default_tools
 from app.tools.builtin.todo import make_todo_write_tool
@@ -464,6 +467,53 @@ def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
     # todo_write 工具需要绑定到当前会话的 task_store,所以工厂出来
     registry.register(make_todo_write_tool(task_store))
 
+    # ── MCP server 接入 ───────────────────────────────────────────────────────
+    # 读 config/mcp_servers.yaml 中 enabled 的 server,启动并把其工具注册进来。
+    # 没配过 / 没启用任何 server 时 mcp_manager 为 None,行为与之前完全一致。
+    mcp_manager: MCPManager | None = None
+    mcp_servers = enabled_servers()
+    if mcp_servers:
+        builtin_names = {t.name for t in registry.all()}
+        mcp_manager = MCPManager(mcp_servers)
+        print(f"MCP      : 正在连接 {len(mcp_servers)} 个 server "
+              f"({', '.join(s.name for s in mcp_servers)}) …", flush=True)
+        mcp_manager.start()
+        mcp_tools = build_mcp_tools(mcp_manager, mcp_servers, reserved_names=builtin_names)
+        for tool in mcp_tools:
+            registry.register(tool)
+        # 启用前展示:server、transport、发现的工具(落实 §9.2 "启用前展示可暴露能力")
+        for s in mcp_servers:
+            tool_names = [t.name for t in mcp_manager.tools() if t.server == s.name]
+            print(f"           ▸ {s.name} [{s.transport}] risk={s.risk} "
+                  f"工具 {len(tool_names)} 个: {', '.join(tool_names) or '(无)'}")
+        if mcp_tools:
+            print("           动作经外部 MCP server 执行;非只读工具默认每次需审批。")
+
+        # ── 云端数据边界提示(PRD §7.8.2 / §12)─────────────────────────────────
+        # 浏览器/桌面控制 + 云端模型时,页面快照/截图/DOM/表单内容会进 LLM 上下文
+        # → 离开本机。带 named profile(--user-data-dir,而非默认 --isolated)的话,
+        # 用户登录态下的真实数据更敏感。这条提示必须在首次观察之前给到用户。
+        cloud_providers = {"anthropic", "openai"}
+        browser_servers = [s for s in mcp_servers
+                           if any(t.name.startswith("browser_") for t in mcp_manager.tools()
+                                  if t.server == s.name)]
+        if browser_servers and cfg.provider in cloud_providers:
+            named = [s.name for s in browser_servers
+                     if any("--user-data-dir" in str(a) for a in s.args)]
+            print(
+                f"⚠ 数据边界:浏览器 MCP({', '.join(s.name for s in browser_servers)})"
+                f"启用,模型 provider 是云端 '{cfg.provider}'。\n"
+                f"   页面截图 / DOM 摘要 / 表单内容会发送到云端模型用于推理。",
+                file=sys.stderr,
+            )
+            if named:
+                print(
+                    f"   且 {', '.join(named)} 用 named persistent profile,"
+                    f"登录态下访问的真实数据(邮件、文档、内部页面等)同样会进上下文。\n"
+                    f"   只在你接受这种数据流向时使用。需要严格隔离请改回 isolated profile。",
+                    file=sys.stderr,
+                )
+
     # 启动校验:profile 声明了能力但没包含 "tools",而我们注册了工具 → 警告
     # (不阻断,用户可能想看模型如何降级表现;但提前知道比执行中崩溃好)
     if cfg.capabilities and "tools" not in cfg.capabilities and registry.all():
@@ -482,6 +532,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
         on_event=_print_event,
         progress=_make_progress(task_store),  # spinner 能拿到任务列表
         task_store=task_store,
+        closeables=[mcp_manager] if mcp_manager else None,
     )
 
 
@@ -589,13 +640,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         session = _build_session(auto_approve=args.yes, profile=args.profile)
 
-        if args.prompt:
-            try:
-                session.chat(args.prompt)
-            finally:
-                _print_stats(session)
-            return 0
-        return _repl(session)
+        try:
+            if args.prompt:
+                try:
+                    session.chat(args.prompt)
+                finally:
+                    _print_stats(session)
+                return 0
+            return _repl(session)
+        finally:
+            session.close()  # 关闭 MCP server 等外部资源
     except KeyboardInterrupt:
         print()
         return 130
