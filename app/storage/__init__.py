@@ -1,0 +1,260 @@
+"""SQLite 存储层 —— 会话、消息、记忆、工具执行审计的持久化。
+
+设计原则（technical_architecture.md §10.3）：
+- 标准库 sqlite3，无 ORM 依赖。
+- 默认数据库路径 data/agentlab.db，不存在时自动创建。
+- 所有写入都经 redact() 脱敏（密钥不进库）。
+- 消息和工具输出体积可大，默认只存摘要；完整内容可选存。
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from app.util.redact import redact
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "agentlab.db"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS agent_profiles (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    model_profile TEXT NOT NULL,
+    memory_policy TEXT NOT NULL DEFAULT 'none',
+    config_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    agent_id    TEXT NOT NULL DEFAULT 'default',
+    title       TEXT NOT NULL DEFAULT '',
+    model_profile TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    archived    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
+CREATE TABLE IF NOT EXISTS memories (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope       TEXT NOT NULL,
+    agent_id    TEXT,
+    session_id  TEXT,
+    workspace   TEXT,
+    content     TEXT NOT NULL,
+    confidence  REAL NOT NULL DEFAULT 1.0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tool_executions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    tool_name   TEXT NOT NULL,
+    args_summary TEXT NOT NULL DEFAULT '',
+    result_summary TEXT NOT NULL DEFAULT '',
+    is_error    INTEGER NOT NULL DEFAULT 0,
+    elapsed_seconds REAL,
+    created_at  TEXT NOT NULL
+);
+"""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _truncate(text: str, max_len: int = 500) -> str:
+    return text[:max_len] + "…" if len(text) > max_len else text
+
+
+class Storage:
+    """SQLite 存储接口。每次操作自动提交。"""
+
+    def __init__(self, db_path: Optional[Path] = None):
+        self._path = db_path or DEFAULT_DB_PATH
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._con = sqlite3.connect(str(self._path), check_same_thread=False)
+        self._con.row_factory = sqlite3.Row
+        self._con.executescript(_SCHEMA)
+        self._con.commit()
+
+    def close(self) -> None:
+        self._con.close()
+
+    @contextmanager
+    def _tx(self):
+        try:
+            yield self._con
+            self._con.commit()
+        except Exception:
+            self._con.rollback()
+            raise
+
+    # ── sessions ─────────────────────────────────────────────────────────────
+
+    def create_session(self, session_id: str, agent_id: str,
+                       model_profile: str, title: str = "") -> None:
+        now = _now()
+        with self._tx() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,0)",
+                (session_id, agent_id, title, model_profile, now, now),
+            )
+
+    def update_session_title(self, session_id: str, title: str) -> None:
+        with self._tx() as con:
+            con.execute(
+                "UPDATE sessions SET title=?, updated_at=? WHERE id=?",
+                (title, _now(), session_id),
+            )
+
+    def archive_session(self, session_id: str) -> None:
+        with self._tx() as con:
+            con.execute(
+                "UPDATE sessions SET archived=1, updated_at=? WHERE id=?",
+                (_now(), session_id),
+            )
+
+    def list_sessions(self, include_archived: bool = False) -> list[dict]:
+        q = "SELECT * FROM sessions"
+        if not include_archived:
+            q += " WHERE archived=0"
+        q += " ORDER BY updated_at DESC"
+        rows = self._con.execute(q).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_session(self, session_id: str) -> Optional[dict]:
+        row = self._con.execute(
+            "SELECT * FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    # ── messages ─────────────────────────────────────────────────────────────
+
+    def save_messages(self, session_id: str,
+                      messages: list[dict[str, Any]]) -> None:
+        """保存完整消息历史（覆盖）：先删再批量插。"""
+        with self._tx() as con:
+            con.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
+            now = _now()
+            for m in messages:
+                content = redact(json.dumps(m, ensure_ascii=False))
+                con.execute(
+                    "INSERT INTO messages(session_id,role,content,created_at) VALUES(?,?,?,?)",
+                    (session_id, m.get("role", ""), content, now),
+                )
+
+    def load_messages(self, session_id: str) -> list[dict[str, Any]]:
+        rows = self._con.execute(
+            "SELECT content FROM messages WHERE session_id=? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            try:
+                result.append(json.loads(r["content"]))
+            except json.JSONDecodeError:
+                pass
+        return result
+
+    # ── memories ─────────────────────────────────────────────────────────────
+
+    def write_memory(self, content: str, scope: str = "session",
+                     agent_id: Optional[str] = None,
+                     session_id: Optional[str] = None,
+                     workspace: Optional[str] = None,
+                     confidence: float = 1.0) -> int:
+        now = _now()
+        with self._tx() as con:
+            cur = con.execute(
+                """INSERT INTO memories(scope,agent_id,session_id,workspace,
+                   content,confidence,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (scope, agent_id, session_id, workspace,
+                 redact(content), confidence, now, now),
+            )
+            return cur.lastrowid
+
+    def search_memories(self, query: str, agent_id: Optional[str] = None,
+                        scope: Optional[str] = None,
+                        limit: int = 10) -> list[dict]:
+        """简单的 LIKE 全文搜索（无向量索引）。足够 MVP 使用。"""
+        conds = ["content LIKE ?"]
+        params: list[Any] = [f"%{query}%"]
+        if agent_id:
+            conds.append("agent_id=?")
+            params.append(agent_id)
+        if scope:
+            conds.append("scope=?")
+            params.append(scope)
+        params.append(limit)
+        rows = self._con.execute(
+            f"SELECT * FROM memories WHERE {' AND '.join(conds)} "
+            f"ORDER BY confidence DESC, updated_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_recent_memories(self, agent_id: Optional[str] = None,
+                            limit: int = 20) -> list[dict]:
+        conds = []
+        params: list[Any] = []
+        if agent_id:
+            conds.append("agent_id=?")
+            params.append(agent_id)
+        where = f"WHERE {' AND '.join(conds)}" if conds else ""
+        params.append(limit)
+        rows = self._con.execute(
+            f"SELECT * FROM memories {where} ORDER BY updated_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── tool_executions ───────────────────────────────────────────────────────
+
+    def log_tool_execution(self, session_id: str, tool_name: str,
+                           args_summary: str, result_summary: str,
+                           is_error: bool = False,
+                           elapsed_seconds: Optional[float] = None) -> None:
+        with self._tx() as con:
+            con.execute(
+                """INSERT INTO tool_executions
+                   (session_id,tool_name,args_summary,result_summary,
+                    is_error,elapsed_seconds,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (session_id, tool_name,
+                 redact(_truncate(args_summary)),
+                 redact(_truncate(result_summary)),
+                 int(is_error), elapsed_seconds, _now()),
+            )
+
+    # ── agent_profiles ────────────────────────────────────────────────────────
+
+    def upsert_agent_profile(self, agent_id: str, name: str,
+                             model_profile: str,
+                             memory_policy: str = "none",
+                             config: Optional[dict] = None) -> None:
+        with self._tx() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO agent_profiles VALUES(?,?,?,?,?)",
+                (agent_id, name, model_profile, memory_policy,
+                 json.dumps(config or {})),
+            )
+
+    def list_agent_profiles(self) -> list[dict]:
+        rows = self._con.execute("SELECT * FROM agent_profiles").fetchall()
+        return [dict(r) for r in rows]

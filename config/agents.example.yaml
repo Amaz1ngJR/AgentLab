@@ -1,0 +1,37 @@
+# config/agents.yaml —— Agent Profile 注册表
+#
+# 每个 profile 定义一个 Agent 实例的静态配置。
+# 启动后用 /session new <agent_id> 创建该 Agent 的会话。
+# 文件不存在时程序照常启动（使用默认 Agent）。
+#
+# memory_policy:
+#   none        - 不使用长期记忆（默认，最安全）
+#   read        - 会话开始时检索相关记忆注入上下文，不写入
+#   read_write  - 会话结束时将摘要写入记忆，下次可检索
+
+agents:
+
+  # 默认通用助手（不写 agents.yaml 时的默认行为）
+  default:
+    name: 默认助手
+    model_profile: cloud_claude
+    memory_policy: none
+    max_steps: 8
+
+  # 代码助手——专注于代码阅读、搜索和修改
+  coder:
+    name: 代码助手
+    model_profile: cloud_claude
+    system_prompt: |
+      你是一个专注于代码的助手。优先用 code_search 定位代码，read_file 精读，
+      shell 运行测试。写代码简洁优先，改动最小化，不要过度重构。
+    tools: []          # 空列表 = 使用全部内置工具
+    memory_policy: read_write
+    max_steps: 12
+
+  # 本地轻量助手——使用本地模型，不发数据到云端
+  local:
+    name: 本地助手
+    model_profile: local_qwen
+    memory_policy: none
+    max_steps: 8

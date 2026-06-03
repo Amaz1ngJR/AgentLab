@@ -1,304 +1,372 @@
-# AgentLab 开发进度
+# AgentLab 进展与交接文档
 
-本文档供 AI 协作时参考：当前已实现什么、PRD 还缺什么、每个模块接下来要做什么。
+本文档用于让新的 AI 或开发者快速接手项目：先看当前进展，再按 PRD 继续推进。总体目标和最终设计只维护在 [`technical_architecture.md`](./technical_architecture.md)，不要把阶段进展、更新时间或临时代码状态写进 PRD。
 
-设计目标见 [`technical_architecture.md`](./technical_architecture.md)，本文件只跟踪进度。
+维护规则：
 
----
-
-## 当前目录结构
-
-```
-AgentLab/
-├── app/
-│   ├── __main__.py
-│   ├── cli.py                    # CLI 入口 + spinner + prompt_toolkit 输入框
-│   ├── config/
-│   │   ├── loader.py             # 配置加载（profile + .env）
-│   │   └── schemas.py            # LLMConfig / ModelProfile dataclass
-│   ├── models/
-│   │   ├── protocol.py           # ToolCall / ModelResponse / ToolResult / 流式回调类型
-│   │   ├── anthropic_adapter.py  # Anthropic 流式 adapter（含工具循环）
-│   │   ├── compatible_adapter.py # OpenAI-compatible Chat Completions（Ollama 等）
-│   │   ├── openai_adapter.py     # OpenAI Responses API（GPT 官方）
-│   │   └── router.py             # build_model_router() 工厂
-│   ├── agent/
-│   │   ├── runtime.py            # AgentSession，多轮工具循环 + 流式事件桥接
-│   │   ├── approval.py           # AutoApprove / InteractivePolicy(方向键菜单) / DenyAll
-│   │   └── tasks.py              # Task / TaskStore,会话级任务清单
-│   ├── tools/
-│   │   ├── registry.py           # ToolRegistry
-│   │   └── builtin/
-│   │       ├── __init__.py       # 聚合 default_tools()
-│   │       ├── files.py          # read_file / write_file / list_dir + workspace 限制
-│   │       ├── code_search.py    # text/regex/file/symbol 搜索,rg 优先 + Python fallback
-│   │       ├── shell.py          # 跨平台 shell 工具,requires_approval=True
-│   │       └── todo.py           # todo_write 工具(更新 TaskStore)
-│   ├── mcp/
-│   │   ├── config.py             # MCPServerConfig + load_mcp_servers()(读 mcp_servers.yaml)
-│   │   ├── manager.py            # MCPManager:后台 loop 线程 + stdio session + sync↔async 桥
-│   │   └── adapter.py            # MCP 工具 → 内置 Tool(同名不覆盖内置 + 审批白名单)
-│   └── util/
-│       ├── menu.py               # 方向键内联菜单(prompt_toolkit Application)
-│       └── redact.py             # 凭据脱敏
-├── config/
-│   ├── models.yaml               # 模型 profile（local_qwen / cloud_claude / cloud_openai 等）
-│   ├── mcp_servers.example.yaml  # MCP server 模板(Playwright,默认 enabled:false)
-│   └── app.example.yaml          # 应用配置模板
-├── tests/
-│   └── unit/
-│       ├── test_approval.py
-│       ├── test_menu.py
-│       ├── test_compatible_adapter.py
-│       ├── test_openai_adapter.py
-│       ├── test_shell_tool.py
-│       ├── test_code_search.py
-│       ├── test_mcp_config.py
-│       ├── test_mcp_adapter.py
-│       ├── test_mcp_manager.py
-│       ├── test_tasks.py
-│       ├── test_cli_spinner.py
-│       ├── test_workspace_paths.py
-│       ├── test_redact.py
-│       └── test_runtime.py
-├── docs/
-│   ├── technical_architecture.md # 系统设计方案（最终目标，不描述进度）
-│   └── process.md                # 本文件
-└── .env.example
-```
+- `technical_architecture.md` 是目标方案和 PRD，只描述“最终应该是什么”。
+- `process.md` 是当前进展和执行计划，必须始终写清楚“现在做到哪里、还缺什么、下一步先做什么”。
+- 每次完成一个模块后，同步更新本文件的“当前能力快照”“模块进展与下一步”“运行与验证”。
+- 当前需要做的事情最多保留 5 项，避免变成无限待办清单。
 
 ---
 
-## 已完成
+## 1. 当前一句话状态
 
-### P0 核心骨架
+AgentLab 当前已经是一个可运行的本地 CLI Agent MVP：支持模型 profile 切换、云端/本地模型 adapter、流式输出、多轮工具调用、审批、内置文件/代码搜索/shell/todo 工具，以及 stdio MCP Client 和 Playwright MCP 浏览器控制。
 
-- **模型层**：`ModelResponse` / `ToolCall` 内部协议；Anthropic adapter（chat + 工具循环）；OpenAI-compatible adapter（chat + 工具循环，Ollama 可用）；`build_model_router()` 工厂按 provider 选 adapter
-- **配置**：唯一入口 `.env` + `config/models.yaml` profile；不再从 `~/.claude/settings.json` 兜底；未指定 ACTIVE_PROFILE 时直接报错
-- **Agent Runtime**：多轮 tool_use 循环；`requires_approval` 工具审批（y/a/n）；token 用量与耗时统计
-- **工具**：`read_file` / `write_file`（需审批）/ `list_dir`
-- **CLI**：`--profile` / `-p` / `-y` / `/reset` 命令；spinner 进度动画
-- **测试**：`test_approval.py`（6 个）；`test_compatible_adapter.py`（4 个）
-
-### P0 增强：流式与输入体验
-
-- **流式输出**：两个 adapter 都改为流式调用；新增 `ProgressCallback` / `TextDeltaCallback` 类型；token 实时增长（Anthropic 用真实 `message_delta` 配合字符数估算兜底，OpenAI 用 `stream_options.include_usage` 配合估算）
-- **CLI spinner**：`✻ thinking… (Xs · ↓ N tokens)` 钉在屏幕底部，文本流式输出在它上方；按显示宽度（中文 2 / 英文 1）+ 终端列宽算实际占用行数，软换行也能正确清屏；spinner 退出时只保留正文，不留摘要污染
-- **prompt_toolkit 输入框**：`_repl()` 用 `PromptSession` 替换内建 `input()`，解决中文宽字符 backspace 残留问题；带蓝色提示符 `▸` 与灰色分隔线区隔；自带历史回放（↑/↓）、Ctrl-A/E/W 编辑；Ctrl-C 清空当前行、Ctrl-D 退出
-
-### P0 收尾
-
-- **workspace 路径限制** (`app/tools/builtin/files.py` + `app/config/loader.py:workspace_root`)：所有文件工具受 `WORKSPACE_ROOT` 限制，越界返回 `refused: path '/etc/passwd' is outside workspace '...'`，模型可见可理解
-- **错误脱敏** (`app/util/redact.py`)：`format_exception` / `format_traceback` 用正则脱敏 `Bearer xxx` / `sk-ant-xxx` / `sk-xxx` / `cr_xxx` / `x-api-key=xxx` 等；CLI `_repl` 异常处理与 `main()` 顶层兜底都接入
-- **能力声明 + 启动校验** (`app/config/schemas.py:LLMConfig.capabilities`)：profile.capabilities 透传到 LLMConfig；CLI banner 显示 `能力: chat, tools`；缺 `tools` 但注册了工具时给警告
-- **Agent 离线测试** (`tests/unit/test_runtime.py`)：FakeRouter mock 覆盖 6 个场景：纯文本答案、单次工具循环、审批拒绝（验证 DENIED_MESSAGE 喂回模型）、工具异常（is_error=True 传递）、max_steps 超限、progress/text_delta 回调
-
-### P1 启程：OpenAI 原生 adapter + Shell 工具
-
-- **tool_result 抽象**：协议加 `ToolResult` dataclass；`ModelRouter.format_tool_results(results)` 由各 adapter 自管格式（Anthropic 一条 user 多个 block / Chat Completions 多条 role=tool / Responses API 多条 function_call_output）；`ModelResponse.provider_payload` 改为 `list[dict]`，Runtime 用 `messages.extend` 追加；为接 OpenAI Responses API 铺路
-- **OpenAI 原生 adapter** (`app/models/openai_adapter.py`)：调 OpenAI Responses API（不是 Chat Completions），扁平工具定义、`instructions` 顶级 system、流式监听 `response.output_text.delta`，最终从 `stream.get_final_response().output` 重建 ToolCall 与 raw payload；`router.py` 注册 `openai` provider；mock 测试 5 个覆盖文本流式 / function_call 解析 / provider_payload 结构 / format_tool_results / 进度回调
-- **跨平台 Shell 工具** (`app/tools/builtin/shell.py`)：Unix 用 `bash -c`，Windows 用 `powershell -NoProfile -Command`，cwd 锁定 `workspace_root`，30s 默认超时，输出 8KB 截断，stdout/stderr/exit code 三段拼接；`requires_approval=True` 强制审批；`app/tools/builtin/__init__.py` 提供聚合 `default_tools()`；mock subprocess 9 个测试覆盖 cwd / 超时 / 截断 / 平台分支
-
-### P1 体验：审批菜单 + 任务面板
-
-- **方向键审批菜单** (`app/util/menu.py`)：用 prompt_toolkit `Application(full_screen=False, erase_when_done=True)` 实现内联菜单；header 显示工具名 + 参数预览；选项 `允许这次 / 本会话总是允许 / 拒绝`；↑↓ 移动 / Enter 确认 / 数字快捷键 / Esc 取消；非 TTY 退化为 stdin 数字输入。`InteractivePolicy` 改用 `select_menu` 替换 `input("y/a/n")`；6 个新单元测试 + menu fallback 6 个
-- **任务面板 + todo_write 工具** (`app/agent/tasks.py` + `app/tools/builtin/todo.py`)：`Task` / `TaskStore` 维护会话级任务清单；`make_todo_write_tool(store)` 工厂绑定 store 给模型用；status 取值 `pending / in_progress / completed`，未知值规范化为 pending；`AgentSession` 持有 `task_store`，`/reset` 时清空
-- **CLI 任务面板渲染** (`app/cli.py`)：`_Spinner` 在重绘时把任务列表画在最上方,流式文本居中,spinner 钉底；汇总行 `N tasks (X done, Y in progress, Z open)`；任务行 `✓ done` (dim) / `❯ in_progress` (蓝色加粗) / `○ pending`；`_make_progress(task_store)` 工厂注入；4 个新单元测试覆盖渲染逻辑
-
-### P1 工具：code_search 代码搜索
-
-- **`code_search` 内置工具** (`app/tools/builtin/code_search.py`)：实现 PRD §7.7 的高频只读搜索能力，介于 `list_dir`/`read_file` 和 `shell` 之间，让模型不再拼 `shell` + `grep`/`find`
-  - 四种模式：`text`(固定字符串) / `regex`(正则) / `file`(文件名/路径) / `symbol`(函数/类/变量定义,启发式正则覆盖 def/class/func/const/let/var + `NAME =`/`NAME:`)
-  - 后端：优先 `ripgrep --json`(快、自动遵守 .gitignore)，无 `rg` 时 Python `os.walk` fallback；两条路径结果格式与列号口径一致(Python 正则统一定列号)
-  - 安全:`requires_approval=False`(风险等级 read)；workspace 越界拒绝(相对路径基于 workspace 根而非进程 CWD 解析)；命中行经 `redact()` 脱敏,`sk-xxx`/`Bearer xxx` 等疑似密钥不原样回灌(云端)模型
-  - 限制:默认遵守 `.gitignore`(pathspec,新版 `gitignore` factory + 老版 `gitwildmatch` 兜底) + 默认跳过 `node_modules`/`.venv`/`.git`/`data` 等大目录；`max_results`(默认 50) / `context_lines`(默认 2) / `timeout`(15s) / 二进制文件(NUL 探测)跳过 / 单文件 1MB 上限 / 输出 16KB 硬截断,超限标记 `truncated`
-  - 结果格式:相对 POSIX 路径 + 1-based line/column + kind + preview + context;`summary.backend` 标记走了哪条后端
-  - 注册进 `default_tools()`(files → code_search → shell 顺序);system prompt 增加一句引导模型搜代码优先用 `code_search`
-  - 23 个单元测试覆盖:四种模式 / workspace 越界 / 空 query / 未知 mode / 无效正则 / `.gitignore` / 默认忽略目录 / rg JSON 解析 / fallback / timeout / max_results / context_lines / 二进制跳过 / 疑似密钥脱敏
-
-**测试规模**：21 → 78 → **122 个单元测试**（code_search 新增 23 + 此前累计；具体见各 `tests/unit/test_*.py`）
-
-### P1 MCP:接入 Playwright 浏览器控制(MCP Client 层)
-
-- **运行环境升级**：MCP Python SDK 要求 Python ≥3.10,原 `myenv` 是 3.9.23,故新建 conda 环境 **`agentlab`(Python 3.11.15)** 承载项目(契合 PRD「Python 3.11+」);`requirements.txt` 补上 `pathspec`(修了 code_search 的隐性缺失依赖)和 `mcp`。**今后跑测试/脚本用 `conda activate agentlab`。**
-- **MCP 配置** (`app/mcp/config.py` + `config/mcp_servers.example.yaml`)：`MCPServerConfig` + `load_mcp_servers()` 读 `config/mcp_servers.yaml`(不存在则返回空,向后兼容);新 server 默认 `enabled:false`;`env_allowlist` 默认只透传 `PATH`,避免把密钥泄漏给子进程;`auto_approve` 声明免审批的只读工具白名单
-- **MCP Manager** (`app/mcp/manager.py`)：解决 **sync↔async 桥** —— Runtime 工具执行是同步的,MCP SDK 是 asyncio 且 session 要跨多次调用存活。方案:后台线程跑常驻 event loop;每个 server 一个长生命周期 `_serve()` 任务,在**同一 task 内**进入 `stdio_client`+`ClientSession` 上下文→`initialize`→`list_tools`→交出 session→`await shutdown`(anyio cancel scope 要求进入/退出同 task);工具调用走 `run_coroutine_threadsafe` 投递进 loop 同步阻塞拿结果;`CallToolResult` 转文本(图片转占位,不回传二进制)并过 `redact()`;`stop()` 优雅关闭上下文再停 loop
-- **MCP 适配器** (`app/mcp/adapter.py`)：把发现的 MCP 工具包成内置 `Tool`;**同名工具不覆盖内置**(read_file/shell 等基础能力不被 MCP 顶替,跳过并警告);审批默认 `requires_approval=True`,只有 `auto_approve` 白名单内的只读工具(`browser_snapshot` 等)免审批
-- **CLI 接入** (`app/cli.py` + `app/agent/runtime.py`)：启动时 `enabled_servers()`→`MCPManager.start()`→注册适配工具;banner 展示 server/transport/risk/工具列表(落实 §9.2「启用前展示可暴露能力」);`AgentSession` 加 `closeables` 钩子,`main()` 的 `finally` 里 `session.close()` 关掉 MCP server 进程;system prompt 加浏览器工作流引导(navigate→snapshot 拿 ref→click/type,敏感动作先确认)
-- **首个接入 server:Playwright**(`npx @playwright/mcp`,stdio)。验证已通过:真实启动列出 **23 个 browser_* 工具**,`browser_snapshot` 返回**文本无障碍树 + 元素 ref**(本地非视觉模型也能驱动);端到端 `browser_navigate`→`browser_snapshot` 打开 example.com 成功拿到标题与 ref,`stop()` 干净退出后台线程
-- **21 个新单元测试**(全程离线,不连真 server):`test_mcp_config`(5:解析/默认值/enabled 过滤)+ `test_mcp_adapter`(6:工具映射/同名跳过/审批白名单/executor 转发/错误标记/跨 server 重名)+ `test_mcp_manager`(10:`_content_to_text` 文本/图片/错误/脱敏 + 后台 loop 注入 fake session 验证 sync 桥/未知 server/超时/无 server 不起 loop/stop 幂等)
-
-### P1 浏览器:named 持久化 profile + 云端数据边界提示
-
-- **named 持久化 profile**:Playwright MCP 默认用内置 Chromium + 临时隔离 profile(每次干净、不带登录态)。要保留登录态,在 `config/mcp_servers.yaml` 的 args 加 `--user-data-dir data/browser-profiles/<name>` 并去掉 `--headless`(headed 便于首次手动登录)。首次在弹出窗口手动登录,cookie 落盘,后续启动自动复用。`config/mcp_servers.example.yaml` 已补隔离/named 两种写法的注释。
-- **profile 目录安全**:`data/browser-profiles/` 加入 `.gitignore`(含登录 cookie,绝不入库)。
-- **云端数据边界提示**(`app/cli.py`,落实 PRD §7.8.2 / §12):启动时若检测到「浏览器 MCP server 已启用」+「模型 provider 是云端(anthropic/openai)」,banner 显眼提示"页面截图/DOM/表单内容会发送到云端模型";若该 server 还用了 named persistent profile(args 含 `--user-data-dir`),额外提示"登录态下访问的真实数据同样进上下文"。本机模型(ollama)不触发此提示。
-- **重要边界澄清**:Playwright 用的是**自带的 Chromium**(装在 `~/Library/Caches/ms-playwright/`),不是系统默认浏览器,也不接管用户日常 Chrome 的 profile —— 这是 PRD §7.8.1「默认隔离、不接管主浏览器」的体现,避免污染日常浏览器和泄漏登录态。
-
-**测试规模**：21 → 78 → 122 → **143 个单元测试**（MCP 新增 21；profile/数据边界改动无新增逻辑测试,靠现有 CLI/adapter 测试覆盖;具体见各 `tests/unit/test_*.py`）
+距离 PRD 的核心缺口是：还没有多 Agent 与 `/session` 会话切换、没有长期记忆和 SQLite 持久化、没有显式 `Planner + Executor + Replanner + TaskStore` 编排、没有统一风险等级 ToolDescriptor、没有自建 Computer Control Gateway、没有 Web UI。
 
 ---
 
-## 当前 PRD 差距
+## 2. 当前需要做的事情
 
-`technical_architecture.md` 已定位为最终目标/PRD，不再记录当前实现状态。按该目标对照，当前代码主要缺口如下：
+1. 实现 `AgentProfile + SessionRouter + /session`，让一个应用里可以创建、列出、切换多个 Agent 会话。
+2. 引入 SQLite 持久化，先落 `agent_profiles / sessions / messages / tasks / memories / tool_executions`，支撑会话恢复和长期记忆。
+3. 将现有 `AgentSession` 拆成 `Planner + Executor + Replanner + TaskStore`，并输出结构化 `RunEvent`。
+4. 升级工具系统为统一 `ToolDescriptor`，补齐 `risk / target / scope / origin / audit` 等元数据和分级审批。
+5. 建立 `ComputerControlGateway`，先把 Playwright MCP 浏览器能力纳入统一观察、动作、审批、审计链路。
 
-| 模块 | 当前状态 | 与 PRD 的差距 |
+---
+
+## 3. 当前能力快照
+
+| 模块 | 当前进展 | 关键文件 |
 |---|---|---|
-| Agent Runtime | 已有同步多轮工具循环、审批、流式文本桥接；已有会话级 TaskStore/todo 面板 | 缺显式 Planner + Executor + Replanner 任务拆解模块；事件模型还不够结构化，Web/SSE、取消、持久化 run 状态未完成 |
-| 模型层 | Anthropic、OpenAI-compatible、OpenAI adapter 已有骨架和测试 | 需要统一 profile 能力探测；普通 chat/instruct 模型的 JSON action parser 尚未设计实现 |
-| 工具层 | 文件、code_search、shell、todo 已有；风险只靠 `requires_approval` 布尔值 | 需要升级为风险等级、target、scope、origin/host、审计元数据 |
-| Computer Control | 未实现 | 缺 `app/control/`，包括 Browser Adapter、Desktop Adapter、Remote Runner、Control Session |
-| 浏览器控制 | 经 Playwright MCP 接入(navigate/snapshot/click/type 等 23 工具);支持 named 持久化 profile 保留登录态;云端模型时启动给数据边界提示 | 自建 Browser Adapter(模块 5,截图落盘到受控数据目录)未做;按 origin 的细粒度审批未做(当前点击/输入统一布尔审批);改富文本文档笨,精确修改宜走 REST API |
-| 远程设备控制 | 未实现 | 缺 `config/control.yaml`、SSH host 校验、远程 workspace、远程命令/文件传输工具 |
-| 桌面控制 | 未实现 | 缺权限检测、截图、坐标动作、紧急停止；该能力应默认禁用 |
-| Skill | 未实现 | 缺 `SKILL.md` loader、metadata 校验、按需注入和工具约束 |
-| MCP | MCP Manager(stdio)+ 工具发现 + sync↔async 桥 + 同名/审批策略已实现,Playwright 已接入 | 缺 Streamable HTTP transport;工具风险只有「server 级 + auto_approve 白名单」,未做 §7.5 完整分级 |
-| 存储 | 未实现 | 缺 SQLite schema、会话恢复、tool_executions 审计 |
-| Web UI | 未实现 | 缺 FastAPI server、SSE 事件、审批 API、控制目标观察界面 |
-| 安全 | 已有 workspace 限制与错误脱敏 | 缺密钥 Keyring、分级审批、浏览器/远程/桌面专属安全策略落地 |
+| CLI | 支持交互 REPL、单次 `-p/--prompt`、`--profile`、`-y` 自动审批、`/reset`；有 prompt_toolkit 输入、spinner、任务面板、token/耗时统计 | `app/cli.py` |
+| 配置 | 以 `.env` + `config/models.yaml` 为模型配置来源；支持 `ACTIVE_PROFILE` 或 `--profile`；文件工具受 `WORKSPACE_ROOT` 限制 | `app/config/loader.py`, `app/config/schemas.py`, `config/models.yaml` |
+| 模型层 | 已有 Anthropic、OpenAI Responses、OpenAI-compatible adapter；内部协议统一为 `ModelResponse / ToolCall / ToolResult`；OpenAI-compatible 具备 JSON tool call fallback | `app/models/` |
+| Runtime | 现有同步多轮“模型 -> 工具 -> 模型”循环；支持工具审批、工具错误回灌、流式文本回调、会话级消息历史和统计 | `app/agent/runtime.py` |
+| 任务面板 | 已有轻量 `TaskStore` 和 `todo_write`，用于 CLI 展示任务清单；还不是 PRD 里的任务状态源 | `app/agent/tasks.py`, `app/tools/builtin/todo.py` |
+| 审批 | 支持自动审批、交互审批、拒绝策略；交互审批使用方向键菜单 | `app/agent/approval.py`, `app/util/menu.py` |
+| 内置工具 | 已有 `read_file / write_file / list_dir / code_search / shell / todo_write`；`code_search` 支持 text/regex/file/symbol，优先 `rg --json`，无 rg 时 Python fallback | `app/tools/builtin/` |
+| MCP | 已有 stdio MCP Manager、配置加载、工具发现、sync/async 桥、同名工具不覆盖内置、auto_approve 白名单 | `app/mcp/` |
+| 浏览器控制 | 通过 Playwright MCP 可打开页面、snapshot、点击、输入；支持 named persistent profile；云端模型启用浏览器 MCP 时有数据边界提示 | `config/mcp_servers.example.yaml`, `app/cli.py` |
+| 安全基础 | 已有 workspace 越界拒绝、错误和工具输出脱敏、MCP env allowlist、浏览器 profile 目录不入库 | `app/util/redact.py`, `app/tools/builtin/files.py`, `.gitignore` |
+| 测试 | unit 测试收集到 143 个；覆盖 runtime、adapter、MCP、code_search、shell、审批、spinner、workspace path 等 | `tests/unit/` |
 
 ---
 
-## 接下来要做（按模块）
+## 4. 当前代码结构
 
-### 1. Runtime 与事件模型
+```text
+AgentLab/
+  app/
+    cli.py                         # CLI 入口、REPL、spinner、MCP 启动、数据边界提示
+    config/
+      loader.py                    # .env + models.yaml + WORKSPACE_ROOT
+      schemas.py                   # LLMConfig / ModelProfile
+    models/
+      protocol.py                  # ToolCall / ToolResult / ModelResponse
+      anthropic_adapter.py         # Anthropic Messages API
+      openai_adapter.py            # OpenAI Responses API
+      compatible_adapter.py        # Ollama / LM Studio / vLLM 等 OpenAI-compatible
+      router.py                    # provider -> adapter
+    agent/
+      runtime.py                   # 当前 AgentSession 工具循环
+      approval.py                  # 审批策略
+      tasks.py                     # 当前轻量 TaskStore
+    tools/
+      registry.py                  # 当前 Tool 注册表，仍是 requires_approval 布尔模型
+      builtin/
+        files.py                   # read_file / write_file / list_dir
+        code_search.py             # 高频代码搜索
+        shell.py                   # 跨平台 shell
+        todo.py                    # todo_write
+    mcp/
+      config.py                    # mcp_servers.yaml loader
+      manager.py                   # stdio MCP 生命周期和调用桥
+      adapter.py                   # MCP tool -> Tool
+    util/
+      menu.py                      # 方向键菜单
+      redact.py                    # 脱敏
+  config/
+    models.yaml                    # 模型 profile
+    mcp_servers.example.yaml       # MCP 模板
+    app.example.yaml               # 应用配置模板
+  docs/
+    technical_architecture.md      # PRD 和总体技术方案
+    process.md                     # 当前进展和接下来工作
+  tests/unit/                      # 当前主要测试集
+```
 
-| 任务 | 完成标准 |
-|---|---|
-| Planner | 新增 `app/agent/planner.py`；复杂任务生成 TaskPlan，包含任务 id、title、description、dependencies、risk_hint、expected_evidence |
-| Executor | 新增 `app/agent/executor.py`；从 TaskStore claim 下一个可执行任务，驱动模型和工具执行，并写入 evidence/status |
-| Replanner | 新增 `app/agent/replanner.py`；根据工具结果、错误、用户拒绝、环境变化追加/修改/阻塞任务 |
-| TaskStore 升级 | 将当前 TaskStore 从展示型 todo 升级为任务状态源，支持 dependencies、blocked、failed、evidence、history、snapshot |
-| 结构化 RunEvent | 定义 `message_delta` / `tool_requested` / `approval_required` / `tool_completed` / `control_observation` / `run_completed` / `run_failed` 等事件；CLI 和未来 Web UI 只消费事件 |
-| 任务事件 | 新增 `task_plan_created` / `task_started` / `task_updated` / `task_blocked` / `task_completed` / `task_replanned`，CLI/Web 都通过事件渲染任务面板 |
-| 可取消 run | CLI Ctrl-C 或 Web Stop 能取消模型请求、工具执行和控制动作；取消记录进入审计 |
-| 会话状态边界 | 将 Runtime 状态拆成 session、run、messages、tool_results，方便 SQLite 和 Web API 复用 |
-| 普通模型动作解析 | 为不支持 tools 但 JSON 稳定的模型设计 `json_action_adapter`，通过测试后才允许启用 Agent 工具 |
-| Planner/Executor/Replanner 测试 | fake model 覆盖初始计划、按依赖执行、工具失败后重规划、审批拒绝后阻塞、用户追加目标、取消和 max_steps |
-
-### 2. 模型层
-
-| 任务 | 完成标准 |
-|---|---|
-| profile 能力探测 | 启动时校验 chat/tools/streaming 能力；工具不可用时阻止高风险 Agent 会话 |
-| OpenAI-compatible 兼容矩阵 | Ollama、LM Studio、vLLM 至少各有连通测试或文档化限制 |
-| ~~云端数据边界提示~~ | **部分完成**。CLI 启动时检测「浏览器 MCP + 云端 provider」即提示页面内容将离开本机,named profile 时额外提示登录态数据。完整的「事件层逐次标记」(随 RunEvent)待结构化事件模型。 |
-
-### 3. 工具与审批
-
-| 任务 | 完成标准 |
-|---|---|
-| ~~`code_search` 内置工具~~ | **已完成**(`app/tools/builtin/code_search.py`)。text/regex/file/symbol 四种模式；优先 `ripgrep --json`，无 `rg` 时 Python fallback；结果返回相对路径、行号、列号、preview、context、truncated。 |
-| ToolDescriptor 扩展 | `Tool` 增加 `risk`、`target_type`、`scope`、`requires_observation`、`audit_redactor` 等字段 |
-| 分级审批策略 | 从布尔审批升级为 read/observe/network/write/browser_control/desktop_control/remote_execute/execute/destructive |
-| 会话级授权 | 支持按 tool、origin、host、workspace 授权；支付、删除、发布、上传等动作不允许被普通会话授权覆盖 |
-| 审计摘要 | 工具参数和输出进入审计前脱敏和截断，保留可追踪但不泄露密钥 |
-| ~~`code_search` 测试~~ | **已完成**。覆盖 text/regex/file/symbol、workspace 越界、`.gitignore`、默认忽略目录、rg+fallback、max_results、context_lines、timeout、二进制跳过和疑似密钥脱敏(23 个测试)。 |
-
-### 4. Computer Control Gateway
-
-| 任务 | 完成标准 |
-|---|---|
-| `app/control/sessions.py` | 定义 ControlTarget、ControlSession、Observation、ControlAction；管理生命周期和截图引用 |
-| `ControlGateway` | 所有浏览器/桌面/远程动作必须经过 target 校验、风险判断、审批、执行、审计 |
-| 配置文件 | 新增 `config/control.example.yaml`，覆盖 browser、desktop_control、remote_hosts |
-| 测试 | fake target 覆盖允许、拒绝、取消、未知 target、越权 capability、审计记录 |
-
-### 5. 浏览器控制
-
-| 任务 | 完成标准 |
-|---|---|
-| Playwright adapter | 支持启动隔离 Chromium profile、打开 URL、关闭会话 |
-| Snapshot | 返回 URL、title、可交互元素摘要、可选截图；截图文件写入受控数据目录 |
-| 网页动作工具 | `browser_open`、`browser_snapshot`、`browser_click`、`browser_type`、`browser_press`、`browser_wait` |
-| 安全策略 | 按 origin 审批；登录、支付、授权、删除、上传、发布动作二次确认 |
-| 本地测试页 | 用本地静态 HTML 覆盖点击、输入、导航、下载路径限制 |
-
-> 说明:模块 5 是**自建** Browser Adapter,与已接入的 Playwright MCP(模块 7)互补。当前用浏览器**创建/探索**网页文档已可行;但**精确修改已有富文本文档**(如 Confluence)走浏览器 DOM 很笨(段落 ref 易变、改一句要多次点击+审批、易误伤格式)。这类"读已有内容 + 精确改 + 回写"更适合走目标系统的 **REST API**(如 Confluence `/rest/api/content` 的 GET/PUT),可做成内置工具或专用 MCP —— 见待接入 MCP 清单的 P2 Docs/Search。属"修改场景"的后续优化,非浏览器路线本身的缺陷。
-
-### 6. 远程设备控制
-
-| 任务 | 完成标准 |
-|---|---|
-| 远程 host 配置 | 只允许配置文件中的 host；凭据只引用环境变量或 Keyring，不写明文 |
-| SSH Runner | host key 校验、workspace 限制、timeout、输出截断、stderr/exit code 结构化 |
-| 文件传输 | 只允许本地 workspace 与 remote workspace 之间传输；越界额外拒绝或审批 |
-| 远程 Worker 方案 | 设计远程 Agent Worker/MCP Server，用于远程浏览器和复杂 GUI 操作 |
-
-### 7. Skill 与 MCP
-
-| 任务 | 完成标准 |
-|---|---|
-| Skill Loader | 扫描 `skills/`，解析 `SKILL.md` metadata，支持启用/禁用和按需注入 |
-| Skill 权限声明 | Skill 可声明需要的工具/MCP，但不能自动获得授权 |
-| ~~MCP Manager~~ | **已完成(stdio)**(`app/mcp/`)。后台 loop 线程做 sync↔async 桥;工具发现并映射为 Tool;同名不覆盖内置;审批默认 True + auto_approve 白名单。**Streamable HTTP transport 仍待做。** |
-| ~~MCP 安全~~ | **部分完成**。新 server 默认禁用;启用前 banner 展示 transport/risk/工具列表;env_allowlist 限制透传子进程的环境变量;输出经 redact 脱敏。完整审计(SQLite tool_executions)待存储模块。 |
-
-#### 待接入 MCP 清单
-
-原则：内置 `read_file` / `write_file` / `list_dir` / `code_search` / `shell` 是基础能力，不被 MCP 替代。MCP 主要用于连接外部系统、专业工具和可选增强能力；如果 MCP 提供同类能力，应作为增强 backend 或用户显式选择的工具。
-
-| 优先级 | MCP 类型 | 用途 | 与内置能力关系 | 完成标准 |
-|---|---|---|---|---|
-| P0 | MCP Echo/Test Server | 验证 MCP Manager、stdio transport、工具发现、调用、错误处理 | 纯测试，不面向用户能力 | 本地测试 server 可被发现；工具映射为 ToolDescriptor；审批/审计链路可跑通 |
-| P0 | Filesystem MCP（受限 workspace） | 验证外部 MCP 文件工具的安全边界 | 不替代内置文件工具，只用于测试 MCP 工具隔离和同名工具策略 | 同名工具不覆盖内置工具；越界路径被拒绝；工具风险继承 server risk |
-| P1 | Browser MCP / Playwright MCP | 网页打开、截图、DOM snapshot、点击、输入 | 可作为 `control/browser.py` 的外部 backend；内置 Browser Adapter 仍保留 | **已接入**(`@playwright/mcp`,stdio,23 工具)。能打开页面、返回 snapshot、点击输入;snapshot 免审批,点击/输入需审批;支持 named 持久化 profile 保留登录态;云端模型时给数据边界提示。origin 级细粒度审批待补。 |
-| P1 | Git MCP | 查看 diff、log、branch、status，辅助代码修改和审查 | 可增强 shell/git 操作，减少模型直接拼命令 | 只读 Git 操作默认 read；checkout/commit/reset 等写操作必须审批 |
-| P1 | GitHub MCP | issue、PR、review comment、workflow 状态 | 外部 SaaS 能力，必须经 token 和权限配置 | 能读取 issue/PR；写评论、改 PR、触发 workflow 前审批；token 不入日志 |
-| P1 | IDE / LSP MCP | diagnostics、go to definition、references、symbol search | 增强 `code_search` 的 symbol 模式，不替代基础 text/file 搜索 | 能返回 diagnostics 和 symbol references；结果路径受 workspace 限制 |
-| P2 | Database MCP（SQLite/Postgres/MySQL） | 查询开发/测试数据库 schema 和只读数据 | 外部数据源能力，风险高于代码搜索 | 默认只读；写 SQL/DDL 默认禁用或二次确认；连接串走环境变量/Keyring |
-| P2 | Remote Host MCP | 远程设备上的文件、shell、浏览器能力 | 和 `remote.py` 互补；复杂远程 GUI 优先走远程 Worker/MCP | 只允许预配置 host；host key/身份校验；远程 workspace 限制和审计 |
-| P2 | Docs/Search MCP | 内部文档、API 文档、知识库检索 | 补充 RAG，不影响本地代码搜索 | 查询结果标注来源；远程查询按 network 风险审批或会话授权 |
-| P3 | Cloud/DevOps MCP | Docker、Kubernetes、CI/CD、云资源 | 高风险外部操作 | 只读观察先接入；部署、扩缩容、删除资源必须二次确认 |
-
-接入顺序建议：
-
-1. 先完成 MCP Manager 的协议框架和 Echo/Test Server。
-2. 用受限 Filesystem MCP 验证安全边界和同名工具策略。
-3. 接 Browser MCP 或 Playwright MCP，和 Computer Control Gateway 对齐。
-4. 接 Git / GitHub / IDE-LSP MCP，服务代码理解和开发工作流。
-5. 最后接 Database、Remote Host、Cloud/DevOps 这类高风险 MCP。
-
-### 8. 存储、Web UI 与发布
-
-| 任务 | 完成标准 |
-|---|---|
-| SQLite 会话持久化 | `app/storage/sqlite.py`；`sessions` / `messages` / `runs` / `tool_executions` 表；`/history` 命令恢复历史会话；启动时自动加载最近会话 |
-| FastAPI Web UI | `app/server.py` + `app/web/`；SSE 事件流；审批 API；与 CLI 共用同一 AgentSession |
-| 控制观察 UI | Web UI 能展示浏览器截图、DOM 摘要、远程 stdout、待审批动作和 Stop 按钮 |
-| UI 配置面板 | 可查看/启用模型 profile、Skill、MCP Server、Control Target，显示工具列表与风险等级 |
-| RAG / 本地知识库 | 嵌入 + 向量检索，不影响核心对话路径 |
-| 系统 Keyring | macOS/Windows 系统 Keyring 存储 API Key，不再依赖明文 `.env` |
-| 打包评估 | 根据 Web 版本使用反馈决定是否引入 Tauri 等桌面壳 |
+尚未出现但 PRD 已规划的目录：`app/memory/`、`app/storage/`、`app/control/`、`app/skills/`、`app/server.py`、`app/web/`。
 
 ---
 
-## 运行验证
+## 5. 模块进展与下一步
 
-> 运行环境:**`conda activate agentlab`(Python 3.11)**。MCP SDK 要求 Python ≥3.10,
-> 原 3.9 的 `myenv` 跑不了 MCP 相关代码。依赖见 `requirements.txt`(含 `pathspec` / `mcp`)。
+### 5.1 Runtime 与任务拆解
+
+当前进展：
+
+- `AgentSession` 可以完成多轮工具调用、审批、工具结果回灌、流式输出和 max_steps 限制。
+- `TaskStore` 目前主要服务 `todo_write` 和 CLI 任务面板，任务结构较轻。
+
+接下来要做：
+
+- 新增 `app/agent/planner.py`，把复杂用户目标拆成 `TaskPlan`。
+- 新增 `app/agent/executor.py`，按依赖从 TaskStore claim 下一步任务并执行。
+- 新增 `app/agent/replanner.py`，根据工具结果、错误、审批拒绝和用户追加目标调整任务。
+- 升级 `tasks.py`，支持 dependencies、blocked、failed、evidence、history、snapshot。
+- 定义结构化 `RunEvent`，至少包括 `message_delta / tool_requested / approval_required / tool_completed / task_updated / run_completed / run_failed`。
+
+第一验收标准：
+
+- fake model 测试覆盖：初始计划、按依赖执行、工具失败后重规划、审批拒绝后阻塞、用户追加目标、取消和 max_steps。
+
+### 5.2 多 Agent、Session 与长期记忆
+
+当前进展：
+
+- 已实现 `AgentProfile`（`app/agent/profiles.py`）：定义 agent_id、name、model_profile、system_prompt、tools、mcp_servers、memory_policy、max_steps；`load_agent_profiles()` 读 `config/agents.yaml`（不存在时返回空，向后兼容）。
+- 已实现 `SQLite 存储层`（`app/storage/__init__.py`）：建表 agent_profiles / sessions / messages / memories / tool_executions；`Storage` 类提供会话 CRUD、消息存盘/加载、记忆写入/LIKE 搜索、工具执行审计；所有写入经 `redact()` 脱敏。
+- 已实现 `SessionRouter`（`app/agent/session_router.py`）：维护 session_id → AgentSession 映射；支持 `/session`、`/session list`、`/session agents`、`/session new`、`/session switch`、`/session rename`、`/session archive`；消息历史可从 SQLite 恢复；两个 Session 的 messages 完全隔离。
+- 已实现长期记忆层（`app/memory/__init__.py`）：`NoMemory / ReadMemory / ReadWriteMemory` 三种策略；`build_memory_policy()` 工厂；`inject_memories()` 把检索结果追加到 system prompt；`read_write` 策略在会话结束时自动把对话摘要写入记忆。
+- 已有 `config/agents.example.yaml` 模板（default / coder / local 三个示例 profile）。
+- 新增 31 个单元测试，全量 **174 passed**。
+
+接下来要做：
+
+- CLI 接入 `SessionRouter`：启动时初始化 Storage + Router，REPL 里把 `/session ...` 命令转给 Router 处理，`chat()` 后自动 `persist_current()`，会话结束时按 memory_policy 写摘要。
+- Context Builder：`AgentSession` 构建时按 AgentProfile.memory_policy 检索记忆并调用 `inject_memories()` 注入 system prompt。
+- CLI banner 显示当前 session_id 和 agent 名称，prompt 提示符带 session 标识。
+
+第一验收标准（已满足核心部分）：
+
+- `SessionRouter` 单元测试验证：两个 session 消息互不串（`test_two_sessions_are_isolated`）；切换后从 SQLite 恢复消息历史（`test_switch_restores_from_sqlite`）。
+- CLI 接入后的端到端验证：创建两个 Agent，切换，消息不串，重启后历史可恢复。
+
+### 5.3 模型层
+
+当前进展：
+
+- 支持 Anthropic、OpenAI Responses API、OpenAI-compatible。
+- 本地模型可通过 Ollama/兼容接口使用；普通模型如果不支持 tools，能力仍不完整。
+- 已有实际模型 ID 规范化和代理静默映射提示。
+
+接下来要做：
+
+- 启动时统一校验 `chat / tools / streaming / json_action` 能力。
+- 为不支持原生 tools 但能稳定输出 JSON 的模型补 `json_action_adapter`，并默认限制高风险工具。
+- 建立 Ollama、LM Studio、vLLM 的兼容矩阵，记录工具调用、流式、上下文长度限制。
+- 把云端数据边界提示从 CLI banner 升级为 RunEvent 级别，让 Web UI 也能显示。
+
+第一验收标准：
+
+- 同一个 AgentProfile 能在支持 tools 的云端模型和本地模型间切换；不支持 tools 的模型不会被误放行执行危险工具。
+
+### 5.4 工具与审批
+
+当前进展：
+
+- `Tool` 只有 `requires_approval` 布尔字段。
+- 内置工具已经覆盖基础文件、搜索代码、shell 和 todo。
+- `code_search` 是高频只读工具，应优先于 shell 拼 `grep/find`。
+
+接下来要做：
+
+- 将 `Tool` 升级为 PRD 中的 `ToolDescriptor`，补 `risk / target_type / scope / origin / host / requires_observation / audit_redactor`。
+- 审批从布尔值升级为分级策略：`read / observe / network / write / browser_control / desktop_control / remote_execute / execute / destructive`。
+- 支持会话级授权，但授权必须绑定 tool、origin、host、workspace；删除、支付、发布、上传等动作不能被普通授权绕过。
+- 内置工具、MCP 工具、浏览器动作、远程动作统一进入审计摘要。
+
+第一验收标准：
+
+- 同一个审批策略可以同时判断 `write_file`、`shell`、`browser_click`、MCP tool 和 remote command。
+
+### 5.5 MCP
+
+当前进展：
+
+- stdio MCP Client 已可用。
+- Playwright MCP 已接入，可作为当前浏览器控制能力。
+- MCP 工具默认需要审批，只有 auto_approve 白名单中的只读工具免审批。
+- MCP 同名工具不会覆盖内置基础工具。
+
+接下来要做：
+
+- 增加 Streamable HTTP transport。
+- MCP 工具映射到新版 `ToolDescriptor`，继承 server risk，并可按工具提高风险等级。
+- MCP 调用写入 `tool_executions` 审计表。
+- 增加健康状态、断线重连、连接失败事件。
+
+第一验收标准：
+
+- stdio 和 Streamable HTTP 两种 MCP 都能通过统一 ToolRegistry 调用，并能被同一套审批和审计策略处理。
+
+### 5.6 Computer Control Gateway
+
+当前进展：
+
+- 还没有 `app/control/`。
+- 浏览器控制目前直接通过 Playwright MCP 暴露为工具，没有经过统一 ControlGateway。
+- 桌面控制和远程设备控制未实现。
+
+接下来要做：
+
+- 新增 `app/control/sessions.py`，定义 `ControlTarget / ControlSession / Observation / ControlAction`。
+- 新增 `app/control/gateway.py`，所有 browser、desktop、remote 动作必须经过目标校验、风险判断、审批、执行、审计。
+- 先把 Playwright MCP 包装成 browser backend，再考虑自建 Playwright Python adapter。
+- 新增 `config/control.example.yaml`，声明 browser、desktop_control、remote_hosts。
+
+第一验收标准：
+
+- browser snapshot/click/type 都通过 ControlGateway 产生 observation、approval request 和 audit record。
+
+### 5.7 浏览器控制
+
+当前进展：
+
+- Playwright MCP 可用，适合打开网页、观察无障碍树、点击、输入。
+- named persistent profile 已有配置说明，可以保留登录态。
+- 云端模型使用浏览器 MCP 时 CLI 会提示页面数据会进入云端模型上下文。
+
+接下来要做：
+
+- 细化按 origin 的审批，登录、支付、授权、删除、上传、发布动作二次确认。
+- 截图和 snapshot 统一落到受控 data 目录，并以 observation id 引用。
+- 增加本地测试页面，覆盖点击、输入、导航、下载路径限制。
+- 对富文本系统和内部文档修改场景，优先设计 REST API/MCP 工具，不依赖脆弱 DOM 点击完成精确编辑。
+
+第一验收标准：
+
+- Agent 能在本地测试页完成打开、观察、点击、输入、提交前确认，并能在审计里回看关键动作。
+
+### 5.8 远程设备控制
+
+当前进展：
+
+- 未实现。
+
+接下来要做：
+
+- 新增远程 host 配置，只允许预配置 host。
+- SSH Runner 必须做 host key 校验、workspace 限制、timeout、输出截断、stderr/exit code 结构化。
+- 文件传输只允许本地 workspace 与 remote workspace 之间传输。
+- 复杂远程 GUI 操作优先走远程 Agent Worker 或 Remote Host MCP。
+
+第一验收标准：
+
+- Agent 可以在配置过的远程 host 的指定 workspace 内执行只读命令；越界、未知 host、危险命令都被拒绝或要求强审批。
+
+### 5.9 Skill
+
+当前进展：
+
+- 未实现 Skill Loader。
+- 当前 system prompt 中有硬编码行为准则，但还不能按任务动态加载 Skill。
+
+接下来要做：
+
+- 新增 `app/skills/loader.py` 和 `app/skills/catalog.py`，扫描 `skills/*/SKILL.md`。
+- 校验 Skill metadata，支持启用/禁用、触发规则、参考资料、工具/MCP 需求声明。
+- Skill 只能影响上下文和可见工作流，不能自动获得工具授权。
+
+第一验收标准：
+
+- 一个 Coding Skill 可以按 AgentProfile 启用，并把工作流说明注入上下文；未授权工具仍不能被调用。
+
+### 5.10 存储、Web UI 与发布
+
+当前进展：
+
+- 没有 SQLite 持久化。
+- 没有 FastAPI Web UI。
+- 会话、消息、任务、审计都只在当前进程内存中。
+
+接下来要做：
+
+- 新增 `app/storage/sqlite.py`，先实现 `agent_profiles / sessions / messages / runs / tasks / memories / tool_executions / settings`。
+- CLI 与未来 Web UI 共用同一个 Runtime service，而不是各自创建不同逻辑。
+- 新增 `app/server.py` 和 `app/web/`，提供本地 Web UI、SSE 事件、审批 API、Stop 按钮。
+- 配置面板能查看 AgentProfile、模型 profile、Skill、MCP Server、Control Target 和工具风险等级。
+
+第一验收标准：
+
+- 退出重启后可以 `/session list` 看到历史 session，并恢复消息、任务和记忆摘要。
+
+### 5.11 安全、可观测性与测试
+
+当前进展：
+
+- 已有 workspace 限制、脱敏、MCP 环境变量 allowlist、审批基础能力。
+- 测试目前主要是 unit，集成测试目录存在但还未形成主路径。
+
+接下来要做：
+
+- API Key 从 `.env` 逐步迁移到 macOS/Windows Keyring，`.env` 只做开发兜底。
+- 所有 tool execution、approval、control action、model profile、actual model 都要进入审计事件。
+- 增加 provider fake、MCP test server、本地浏览器测试页、fake SSH target。
+- 高风险模块默认禁用，首次启用必须展示能力、数据边界和风险。
+
+第一验收标准：
+
+- 一次包含模型推理、工具调用、审批、浏览器 observation 的 run 可以被完整回放为事件和审计记录。
+
+---
+
+## 6. MCP 接入路线
+
+原则：内置 `read_file / write_file / list_dir / code_search / shell` 是基础能力，不被 MCP 替代。MCP 主要用于连接外部系统、专业工具和可选增强能力。若 MCP 提供同类能力，应作为增强 backend 或用户显式选择的工具。
+
+| 优先级 | MCP 类型 | 当前状态 | 下一步 |
+|---|---|---|---|
+| P0 | Playwright MCP | 已接入 stdio，作为当前浏览器控制能力 | 纳入 ControlGateway，补 origin 级审批和审计 |
+| P1 | Git MCP | 未接入 | 先做只读 status/diff/log/branch；checkout/commit/reset 必须审批 |
+| P1 | GitHub MCP | 未接入 | issue/PR 读取先行；评论、改 PR、触发 workflow 前审批；token 不入日志 |
+| P1 | IDE/LSP MCP | 未接入 | diagnostics、definition、references、symbol search，用于增强 `code_search` |
+| P2 | Database MCP | 未接入 | 默认只读 schema/query；写 SQL/DDL 默认禁用或强审批 |
+| P2 | Remote Host MCP | 未接入 | 与 SSH Runner 互补，只允许预配置 host 和 remote workspace |
+| P2 | Docs/Search MCP | 未接入 | 内部文档、API 文档、知识库检索；结果必须标注来源 |
+| P3 | Cloud/DevOps MCP | 未接入 | 只读观察先接入；部署、扩缩容、删除资源必须二次确认 |
+
+---
+
+## 7. 运行与验证
+
+推荐环境是 conda 环境 `agentlab`，Python 3.11。当前系统 `python` 命令可能不存在，直接用系统 `python3` 也可能没有项目依赖；优先使用下面的命令。
 
 ```bash
 conda activate agentlab
 
-# 全部单元测试(143 个)
-python -m pytest tests/unit/ -v
+# 收集测试。当前收集到 143 个 unit tests。
+python -m pytest tests/unit --collect-only -q
 
-# 用 Claude 跑通（需 .env 有 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL）
-python -m app --profile cloud_claude -p "list_dir 看下 config/ 目录" -y
+# 运行全部 unit tests。
+python -m pytest tests/unit -q
 
-# 用本地 Ollama 跑通（需先 ollama pull qwen2.5-coder:7b-instruct && ollama serve）
-python -m app --profile local_qwen -p "list_dir 看下当前目录" -y
-
-# 交互模式（带流式 + 输入框）
+# 交互模式。
 python -m app
 
-# ── 浏览器控制(Playwright MCP)──────────────────────────────────────────────
-# 前置:已装 Node/npx(首次启动会 npx 下载 @playwright/mcp 和浏览器内核)
-# 1. 复制模板并启用 playwright server:
-cp config/mcp_servers.example.yaml config/mcp_servers.yaml
-#    把其中 playwright 的 enabled 改成 true
-# 2. 启动后让模型开浏览器:
-python -m app --profile cloud_claude -p "打开 https://example.com 并告诉我页面标题" -y
+# 单次 prompt。
+python -m app --profile cloud_claude -p "list_dir 看下 config/ 目录"
+
+# 本地模型。需要先启动 Ollama 并下载模型。
+python -m app --profile local_qwen -p "list_dir 看下当前目录"
 ```
+
+Playwright MCP 浏览器控制验证：
+
+```bash
+cp config/mcp_servers.example.yaml config/mcp_servers.yaml
+# 编辑 config/mcp_servers.yaml，把 playwright.enabled 改成 true。
+
+python -m app --profile cloud_claude -p "打开 https://example.com 并告诉我页面标题"
+```
+
+注意：
+
+- Playwright MCP 首次启动可能通过 `npx` 下载 server 和浏览器内核。
+- 使用 named persistent profile 时，登录态会保存在 `data/browser-profiles/<name>`，该目录不能入库。
+- 云端模型配合浏览器控制时，页面 DOM、截图摘要、表单内容可能进入云端模型上下文。
+
+---
+
+## 8. 接手注意事项
+
+- 先读 PRD 的目标设计，再读本文件判断当前代码缺口。
+- 做实现时优先保持现有模式：Python dataclass、pytest unit test、fake provider/fake manager、workspace 限制、脱敏。
+- 查代码优先用 `rg` 或 Agent 内置 `code_search`，不要让模型通过 shell 拼复杂 grep/find。
+- 修改 PRD 时只改目标设计；修改当前进度、阶段完成情况、下一步计划时只改本文件。
+- 高风险能力的顺序应是：先结构化描述和审计，再接真实执行能力。

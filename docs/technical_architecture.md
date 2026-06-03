@@ -21,10 +21,13 @@ AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS 或
 3. 能配置并调用在线模型，例如 OpenAI GPT 与 Anthropic Claude。
 4. 能加载本地 Skill，并能连接可配置的 MCP Server。
 5. 同时支持终端交互和浏览器 UI；两者复用同一个 Agent Core。
-6. 能打开网页、观察页面、点击、输入、提交表单，并将网页操作过程展示给用户。
-7. 能在用户授权下执行桌面级操作，例如截图、点击、键盘输入和启动应用，但默认关闭。
-8. 能远程登录受信设备，在远程 workspace 内执行命令、传输文件或启动远程浏览器/Agent Worker。
-9. 文件写入、命令执行、联网请求、网页提交、桌面控制、远程执行和外部 MCP 调用都必须经过权限控制与审计。
+6. 能创建多个不同职责的 Agent，例如 Coding Agent、Research Agent、Browser Agent、Ops Agent。
+7. 能通过 `/session` 创建、列出、切换不同 Agent 的会话；每个会话拥有独立上下文、任务状态和运行记录。
+8. 能具备长期记忆能力，保存用户偏好、Agent 经验、项目事实和会话摘要，并在后续会话中按权限检索使用。
+9. 能打开网页、观察页面、点击、输入、提交表单，并将网页操作过程展示给用户。
+10. 能在用户授权下执行桌面级操作，例如截图、点击、键盘输入和启动应用，但默认关闭。
+11. 能远程登录受信设备，在远程 workspace 内执行命令、传输文件或启动远程浏览器/Agent Worker。
+12. 文件写入、命令执行、联网请求、网页提交、桌面控制、远程执行和外部 MCP 调用都必须经过权限控制与审计。
 
 ### 1.2 非目标
 
@@ -49,6 +52,7 @@ AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS 或
 |---|---|---|
 | 主语言 | Python 3.11+ | macOS/Windows 开发与分发成本低；MCP 与 AI SDK 生态完整 |
 | Agent Runtime | 项目自有轻量循环，保留替换编排器的接口 | 便于精确控制审批、事件、provider 差异 |
+| 多 Agent / Session | AgentProfile + Session 绑定 + `/session` 命令 | 一个应用内运行多个不同职责 Agent，切换时不混淆上下文和权限 |
 | API 服务 | FastAPI + Uvicorn | 本地服务、流式事件和 OpenAPI 方便；Python 单栈 |
 | Web UI | FastAPI 静态页面 + Jinja2/HTMX 或轻量 TypeScript 页面 | 不要求用户先配置复杂桌面环境；可由 Python 一条命令启动 |
 | 本地推理首选 | Ollama | macOS 与 Windows 均便于安装；提供 OpenAI-compatible 接口和工具调用能力 |
@@ -58,6 +62,7 @@ AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS 或
 | 浏览器控制 | Playwright Python 作为首选 Browser Adapter | 跨 macOS/Windows/Linux，支持 Chromium/WebKit/Firefox，适合结构化网页自动化 |
 | 桌面控制 | PyAutoGUI/系统无障碍能力作为可选 Desktop Adapter | 覆盖非网页应用，但风险高、稳定性低，默认禁用并要求强审批 |
 | 远程设备控制 | SSH Runner + 可选远程 Agent Worker/MCP Server | SSH 适合命令执行和文件传输；复杂远程交互通过远程 Worker 暴露结构化工具 |
+| 长期记忆 | SQLite 结构化记忆 + 可选向量检索 | 支持用户偏好、项目事实、Agent 经验和会话摘要的长期复用 |
 | 持久化 | SQLite + 本地数据目录 | 跨平台、无需额外服务、适合单用户桌面应用 |
 | 配置 | YAML 非密钥配置 + `.env`/系统 Keyring 密钥 | 易编辑、可版本化模板、避免密钥入库 |
 | 测试 | pytest + provider fake + MCP 测试 server | Agent 循环和审批必须可离线回归 |
@@ -318,6 +323,7 @@ AgentLab/
 
   config/                           # 可版本化的非密钥配置模板
     app.example.yaml                # 应用级配置模板：workspace、日志、默认 profile、安全默认值
+    agents.example.yaml             # AgentProfile 模板：角色、模型、工具、Skill、MCP、记忆策略
     models.yaml                     # 模型 profile：provider、model、base_url、能力标签、默认参数
     mcp_servers.example.yaml        # MCP Server 模板：transport、启动命令/URL、风险等级、启用状态
     control.example.yaml            # 电脑控制模板：浏览器、桌面控制、远程主机和下载目录配置
@@ -341,6 +347,8 @@ AgentLab/
       runtime.py                    # Runtime 编排入口：串联规划、执行、重规划、事件和审计
       session.py                    # 会话与 run 生命周期：历史、当前 profile、取消、恢复
       context.py                    # 上下文构建：system prompt、Skill、Memory、工具快照、历史裁剪
+      profiles.py                   # AgentProfile：不同 Agent 的角色、默认模型、工具和记忆策略
+      session_router.py             # `/session` 切换、创建、列出、归档和当前会话解析
       planner.py                    # Planner：把用户目标拆成可执行任务清单，写入 TaskStore
       executor.py                   # Executor：按 TaskStore 取下一步任务，驱动模型和工具完成动作
       replanner.py                  # Replanner：根据工具结果、错误、用户反馈调整任务清单
@@ -386,8 +394,9 @@ AgentLab/
       blobs.py                      # 大文本、截图、下载文件等内容引用与本地数据目录管理
 
     memory/                         # 长期记忆与检索，可独立于核心对话路径启用
-      store.py                      # 用户偏好、会话摘要、长期记忆存储
+      store.py                      # 用户偏好、Agent 经验、项目事实、会话摘要等长期记忆存储
       retrieval.py                  # 本地知识检索接口：embedding/vector/rerank 的抽象边界
+      policy.py                     # 记忆写入/读取策略：作用域、敏感信息过滤、用户确认
 
     web/                            # 本地 Web UI 资源与 API 组织
       api.py                        # FastAPI route 定义：sessions、runs、approvals、control、settings
@@ -587,9 +596,12 @@ end
 
 一次会话由 Runtime 管理，至少包含：
 
+- 当前 AgentProfile：角色、system prompt、默认模型、默认 Skill/MCP/工具、记忆策略和审批策略。
+- 当前 Session：绑定某个 AgentProfile，持有独立消息历史、TaskStore、Run 历史和临时授权。
 - 当前模型 profile 和能力。
 - 消息历史与被注入的 Skill 上下文。
 - 当前启用的内置工具与 MCP 工具快照。
+- 长期记忆检索结果和本轮产生的候选记忆。
 - Planner 生成的任务计划、Executor 当前任务和 Replanner 的调整记录。
 - TaskStore 中每个任务的状态、依赖、证据、失败原因和用户可见摘要。
 - 审批策略、最大执行步数、取消信号和超时。
@@ -604,7 +616,180 @@ Runtime 采用 `Planner + Executor + Replanner + TaskStore` 的任务拆解结�
 | Replanner | 根据执行结果、错误、用户拒绝、环境变化调整任务、追加任务或标记阻塞 | Plan patch |
 | TaskStore | 持久化任务状态，供 CLI/Web 展示，也供 Runtime 恢复和审计 | Task snapshot、history |
 
-### 7.2 Runtime 内部详细图
+### 7.2 多 Agent、Session 与长期记忆
+
+AgentLab 是 Agent 开发环境，不是单一固定助手。一个 Agent 由 `AgentProfile` 定义，一个会话由 `Session` 承载。用户可以创建多个 Agent，并通过 `/session` 在不同 Agent 的会话之间切换。
+
+#### 7.2.1 核心概念
+
+| 概念 | 定义 | 典型字段 |
+|---|---|---|
+| AgentProfile | 一个可复用的 Agent 定义，描述角色、能力和默认策略 | `agent_id`、`name`、`description`、`system_prompt`、`model_profile`、`skills`、`mcp_servers`、`tools`、`memory_policy`、`approval_policy` |
+| Session | 一段与某个 AgentProfile 绑定的对话和执行上下文 | `session_id`、`agent_id`、`title`、`messages`、`task_store`、`active_run`、`temporary_grants` |
+| Run | Session 中一次用户请求的执行实例 | `run_id`、`status`、`events`、`tool_executions`、`control_observations`、`token_usage` |
+| Memory | 可跨 session 复用的长期信息 | `memory_id`、`scope`、`agent_id`、`workspace`、`content`、`source`、`confidence`、`created_at`、`last_used_at` |
+
+AgentProfile 和 Session 的关系：
+
+```plantuml
+@startuml
+title 多 Agent / Session / Memory 关系
+skinparam linetype ortho
+skinparam shadowing false
+hide circle
+
+entity "agent_profiles" as agents {
+  * agent_id
+  --
+  name
+  model_profile
+  system_prompt_ref
+  memory_policy
+}
+
+entity "sessions" as sessions {
+  * session_id
+  --
+  agent_id
+  title
+  active_run_id
+  created_at
+  updated_at
+}
+
+entity "runs" as runs {
+  * run_id
+  --
+  session_id
+  status
+}
+
+entity "tasks" as tasks {
+  * task_id
+  --
+  session_id
+  run_id
+  status
+  dependencies
+}
+
+entity "memories" as memories {
+  * memory_id
+  --
+  scope
+  agent_id
+  workspace
+  content_ref
+  confidence
+}
+
+agents ||--o{ sessions
+sessions ||--o{ runs
+sessions ||--o{ tasks
+agents ||--o{ memories
+sessions }o--o{ memories : retrieved
+@enduml
+```
+
+#### 7.2.2 `/session` 命令
+
+CLI 中的 `/session` 是多 Agent 的主入口。命令目标是“切换或管理当前会话”，而不是直接修改模型配置。
+
+```text
+/session                         # 显示当前 session、agent、模型、任务摘要和记忆状态
+/session list                    # 列出所有 session，展示 agent、title、updated_at、状态
+/session new <agent_id> [title]  # 基于指定 agent 创建新 session 并切换过去
+/session switch <session_id>     # 切换到已有 session，恢复消息历史和 TaskStore
+/session rename <title>          # 重命名当前 session
+/session archive <session_id>    # 归档 session，不删除审计记录
+/session agents                  # 列出可用 AgentProfile
+```
+
+Web UI 中应提供等价能力：Agent 列表、Session 列表、新建 Session、切换 Session、归档 Session。
+
+#### 7.2.3 AgentProfile 配置
+
+```yaml
+# config/agents.yaml
+agents:
+  coding:
+    name: Coding Agent
+    description: 代码理解、修改、测试和代码审查
+    model_profile: local_qwen
+    system_prompt: prompts/coding.md
+    skills: [code-review]
+    tools: [read_file, write_file, list_dir, code_search, shell, todo_write]
+    mcp_servers: [git, github, ide_lsp]
+    memory_policy:
+      read_scopes: [user, agent, workspace]
+      write_scopes: [agent, workspace]
+      require_confirmation_for_sensitive_memory: true
+
+  browser:
+    name: Browser Agent
+    description: 网页浏览、表单填写和网页自动化
+    model_profile: cloud_claude
+    system_prompt: prompts/browser.md
+    tools: [todo_write]
+    mcp_servers: [playwright]
+    memory_policy:
+      read_scopes: [user, agent]
+      write_scopes: [agent]
+```
+
+AgentProfile 只声明默认能力，不自动越过安全策略。即使某个 Agent 默认启用浏览器或远程主机，具体动作仍需走风险评估和审批。
+
+#### 7.2.4 长期记忆作用域
+
+长期记忆必须有明确作用域，避免不同 Agent、不同项目、不同隐私边界互相污染：
+
+| scope | 用途 | 示例 |
+|---|---|---|
+| `user` | 用户长期偏好，所有 Agent 可按策略读取 | “用户偏好中文回复，代码解释要简洁” |
+| `agent` | 某个 Agent 的经验和工作习惯 | “Coding Agent 修改 Python 前先跑 unit tests” |
+| `workspace` | 某个项目的事实和约定 | “本项目使用 FastAPI，测试命令是 pytest tests/unit” |
+| `session` | 仅当前 session 的摘要和临时事实 | “这轮正在排查 MCP timeout” |
+
+记忆写入流程：
+
+1. Runtime 从对话、工具结果、用户显式说明中产生 memory candidate。
+2. MemoryPolicy 判断作用域、敏感性、置信度和是否需要用户确认。
+3. 通过审批后写入 MemoryStore；敏感内容写入前必须脱敏或拒绝。
+4. 后续构建上下文时，按 AgentProfile 的 `read_scopes` 检索相关记忆。
+
+记忆读取要求：
+
+- 记忆注入上下文前必须标注来源和作用域。
+- 用户可查看、删除、禁用某条记忆。
+- 云端模型会接收记忆内容时，应按数据边界策略提示。
+- 密钥、token、私钥、cookie、验证码、支付信息不能作为长期记忆保存。
+
+#### 7.2.5 多 Agent 切换流程
+
+```plantuml
+@startuml
+title /session 切换 Agent 会话流程
+actor 用户 as User
+participant "CLI / Web UI" as UI
+participant "Session Router" as Router
+database "SQLite" as DB
+participant "AgentProfile Loader" as Profiles
+participant "Memory Store" as Memory
+participant "Agent Runtime" as Runtime
+
+User -> UI : /session switch <id>\n或 /session new <agent_id>
+UI -> Router : resolve session command
+Router -> DB : load/create session
+Router -> Profiles : load AgentProfile(agent_id)
+Router -> Memory : retrieve memory by policy
+Memory --> Router : scoped memories
+Router -> Runtime : bind session + profile + memories
+Runtime --> UI : session_switched event
+UI --> User : 展示 agent、session、model、memory summary
+@enduml
+```
+
+### 7.3 Runtime 内部详细图
 
 ```plantuml
 @startuml
@@ -703,7 +888,7 @@ Session --> DB
 
 Runtime 的原则是：模型只能提出计划建议、任务调整和 tool call；任务状态由 TaskStore 维护，是否执行工具、如何执行、是否需要观察或审批，都由 Runtime 的风险评估、审批策略和调度器决定。
 
-### 7.3 任务拆解与重规划流程
+### 7.4 任务拆解与重规划流程
 
 ```plantuml
 @startuml
@@ -744,7 +929,7 @@ end
 
 任务拆解不是一次性计划。每个工具结果、错误、审批拒绝或用户新输入都可能触发 Replanner 调整任务清单；TaskStore 是唯一可信任务状态来源。
 
-### 7.4 工具循环
+### 7.5 工具循环
 
 ```plantuml
 @startuml
@@ -792,7 +977,7 @@ end
 @enduml
 ```
 
-### 7.5 工具风险分类
+### 7.6 工具风险分类
 
 | 等级 | 示例 | 默认策略 |
 |---|---|---|
@@ -808,7 +993,7 @@ end
 
 工具 registry 需要为内置工具和 MCP 工具使用同一套风险元数据。模型不能自行提升权限。
 
-### 7.6 能力层与电脑控制详细图
+### 7.7 能力层与电脑控制详细图
 
 ```plantuml
 @startuml
@@ -885,11 +1070,11 @@ Http --> McpServer
 
 能力层的核心是 `ToolDescriptor`：它把所有内置工具、MCP 工具、浏览器动作、桌面动作和远程命令统一成“带风险和目标范围的能力”，再交给审批策略。
 
-### 7.7 代码搜索工具设计
+### 7.8 代码搜索工具设计
 
 代码搜索是 Agent 的高频只读能力，定位上介于 `list_dir` / `read_file` 和 `shell` 之间：它应提供稳定、结构化、受限且低成本的代码定位能力，避免模型频繁调用高风险 shell 去拼 `grep` / `find` 命令。
 
-#### 7.7.1 工具边界
+#### 7.8.1 工具边界
 
 | 工具 | 职责 | 不负责 |
 |---|---|---|
@@ -900,7 +1085,7 @@ Http --> McpServer
 
 `code_search` 必须是只读工具，风险等级为 `read`。它仍然必须受 workspace 限制，并遵守 ignore 规则、结果条数、输出大小和超时限制。
 
-#### 7.7.2 推荐工具接口
+#### 7.8.2 推荐工具接口
 
 ```python
 ToolDescriptor(
@@ -947,7 +1132,7 @@ ToolDescriptor(
 )
 ```
 
-#### 7.7.3 搜索模式
+#### 7.8.3 搜索模式
 
 | mode | 语义 | 实现策略 |
 |---|---|---|
@@ -958,7 +1143,7 @@ ToolDescriptor(
 
 搜索默认遵守 `.gitignore`，并额外跳过常见大目录：`.git/`、`node_modules/`、`.venv/`、`__pycache__/`、`dist/`、`build/`、`.agentlab/`、`data/`。用户需要搜索被忽略文件时必须显式开启对应配置。
 
-#### 7.7.4 结果格式
+#### 7.8.4 结果格式
 
 工具输出应稳定、短小、可被模型继续用 `read_file` 精读：
 
@@ -994,7 +1179,7 @@ ToolDescriptor(
 - 结果超过 `max_results` 或输出大小上限时设置 `truncated=true`。
 - 对二进制文件、超大文件和解码失败文件默认跳过，并在 summary 中统计。
 
-#### 7.7.5 实现与索引策略
+#### 7.8.5 实现与索引策略
 
 默认采用无索引搜索：
 
@@ -1009,7 +1194,7 @@ ToolDescriptor(
 - 对大型代码库接入 tree-sitter/LSP，增强 `symbol` 搜索。
 - 索引仅缓存可搜索文本和路径摘要，不缓存密钥文件内容。
 
-#### 7.7.6 安全与测试
+#### 7.8.6 安全与测试
 
 安全要求：
 
@@ -1027,11 +1212,11 @@ ToolDescriptor(
 - max_results、context_lines、timeout、二进制文件跳过。
 - 疑似密钥内容脱敏。
 
-### 7.8 电脑控制与远程执行
+### 7.9 电脑控制与远程执行
 
 电脑控制不能由通用 shell 直接承担。shell 只有文本输入输出，缺少页面状态、截图、焦点、远程目标身份、用户接管和动作级权限。因此需要把电脑控制作为独立能力层设计。
 
-#### 7.8.1 控制目标模型
+#### 7.9.1 控制目标模型
 
 所有可被操作的环境统一抽象为 `ControlTarget`：
 
@@ -1057,7 +1242,7 @@ class ControlSession:
     expires_at: datetime | None
 ```
 
-#### 7.8.2 浏览器控制
+#### 7.9.2 浏览器控制
 
 浏览器控制优先使用 Playwright，而不是通过 shell 打开系统浏览器后模拟鼠标。原因是 Playwright 能提供稳定的页面结构、选择器、事件等待、截图和多浏览器支持。
 
@@ -1081,7 +1266,7 @@ class ControlSession:
 4. 如果当前模型是云端模型，截图、DOM 文本、表单内容可能被发送到云端；UI/CLI 必须在首次观察该页面前提示。
 5. 对同一 origin 可支持会话级授权，例如“本会话允许在 `https://localhost:3000` 点击和输入”，但不覆盖支付/删除等高风险动作。
 
-#### 7.8.3 桌面控制
+#### 7.9.3 桌面控制
 
 桌面控制用于浏览器自动化无法覆盖的场景，例如操作原生应用、系统设置窗口、远程桌面客户端或安装程序。它比浏览器控制风险更高，也更不稳定，因此不应作为首选路径。
 
@@ -1093,7 +1278,7 @@ class ControlSession:
 - 不允许模型直接连续执行长动作序列。应采用“观察 -> 计划下一步 -> 审批 -> 单步动作 -> 再观察”的闭环。
 - 必须支持紧急停止：CLI 中 Ctrl-C/Web UI 中 Stop 按钮应取消 pending action，并尽量释放键盘/鼠标状态。
 
-#### 7.8.4 远程设备控制
+#### 7.9.4 远程设备控制
 
 远程控制分两层：
 
@@ -1135,7 +1320,7 @@ remote_hosts:
 - 不允许默认 agent forwarding；需要访问私有仓库时优先使用远程设备自己的凭据。
 - 远程文件传输只允许 workspace 与本地 workspace 之间，越界需要额外确认。
 
-#### 7.8.5 电脑控制执行流程
+#### 7.9.5 电脑控制执行流程
 
 ```plantuml
 @startuml
@@ -1329,16 +1514,20 @@ rectangle "配置来源" as Sources {
 }
 
 rectangle "Config Loader" as Loader {
+  [AgentProfile Resolver] as AgentResolver
   [Profile Resolver] as Profile
   [Secret Resolver\nEnv / Keyring] as Secrets
   [Control Target Resolver] as ControlTargets
   [MCP Server Resolver] as McpResolver
   [Skill Catalog Resolver] as SkillResolver
+  [Memory Policy Resolver] as MemoryResolver
   [Policy Resolver] as PolicyResolver
 }
 
 rectangle "运行时配置" as RuntimeConfig {
+  [Agent Catalog] as AgentCfg
   [ModelConfig] as ModelCfg
+  [MemoryPolicy] as MemoryCfg
   [RuntimePolicy] as PolicyCfg
   [Tool/MCP Catalog] as ToolCfg
   [Control Target Catalog] as ControlCfg
@@ -1347,17 +1536,23 @@ rectangle "运行时配置" as RuntimeConfig {
 
 CliArgs --> Profile
 UiChoice --> Profile
+UiChoice --> AgentResolver
 Env --> Secrets
+UserYaml --> AgentResolver
 UserYaml --> Profile
 UserYaml --> ControlTargets
 ProjectYaml --> McpResolver
 ProjectYaml --> SkillResolver
+ProjectYaml --> AgentResolver
 Defaults --> PolicyResolver
+AgentResolver --> AgentCfg
+AgentResolver --> MemoryResolver
 Profile --> ModelCfg
 Secrets --> ModelCfg
 ControlTargets --> ControlCfg
 McpResolver --> ToolCfg
 SkillResolver --> ToolCfg
+MemoryResolver --> MemoryCfg
 PolicyResolver --> PolicyCfg
 PolicyResolver --> StorageCfg
 @enduml
@@ -1379,9 +1574,12 @@ PolicyResolver --> StorageCfg
 
 | 表 | 用途 |
 |---|---|
-| `sessions` | 会话名称、模型 profile、创建/修改时间 |
+| `agent_profiles` | Agent 定义：名称、角色、默认模型、Skill/MCP/工具和记忆策略 |
+| `sessions` | 会话名称、绑定的 agent_id、模型 profile、创建/修改时间 |
 | `messages` | 用户与 assistant 消息、必要的结构化 content |
 | `runs` | 每次请求状态、耗时、token 用量、错误 |
+| `tasks` | Planner/Executor/Replanner 管理的任务状态、依赖和证据 |
+| `memories` | 长期记忆：用户偏好、Agent 经验、项目事实、会话摘要 |
 | `tool_executions` | 工具、参数脱敏摘要、审批决定、执行结果摘要 |
 | `settings` | 非密钥用户设置与已启用能力 |
 
@@ -1401,6 +1599,7 @@ hide circle
 entity "sessions" as sessions {
   * id
   --
+  agent_id
   name
   model_profile
   created_at
@@ -1417,6 +1616,14 @@ entity "runs" as runs {
   token_usage
 }
 
+entity "agent_profiles" as agents {
+  * id
+  --
+  name
+  model_profile
+  memory_policy
+}
+
 entity "messages" as messages {
   * id
   --
@@ -1424,6 +1631,26 @@ entity "messages" as messages {
   run_id
   role
   content_ref
+}
+
+entity "tasks" as tasks {
+  * id
+  --
+  session_id
+  run_id
+  status
+  dependencies
+  evidence_ref
+}
+
+entity "memories" as memories {
+  * id
+  --
+  scope
+  agent_id
+  workspace
+  content_ref
+  confidence
 }
 
 entity "tool_executions" as tools {
@@ -1453,11 +1680,15 @@ entity "settings" as settings {
   value
 }
 
+agents ||--o{ sessions
+agents ||--o{ memories
 sessions ||--o{ runs
 sessions ||--o{ messages
+sessions ||--o{ tasks
 runs ||--o{ messages
 runs ||--o{ tools
 runs ||--o{ observations
+runs ||--o{ tasks
 @enduml
 ```
 
@@ -1474,6 +1705,9 @@ CLI 和 Web UI 都消费 Runtime 产生的事件：
 | 事件 | 展示用途 |
 |---|---|
 | `message_delta` | 流式模型文本 |
+| `session_switched` | 展示当前 Agent、Session、模型、长期记忆摘要和任务状态 |
+| `memory_retrieved` | 展示本轮注入了哪些作用域的长期记忆 |
+| `memory_candidate` | 展示候选长期记忆，等待确认或自动忽略 |
 | `tool_requested` | 显示模型想调用的工具 |
 | `approval_required` | 弹出确认或终端询问 |
 | `tool_completed` | 展示成功、失败和耗时 |
@@ -1498,18 +1732,23 @@ actor "用户" as User
 
 rectangle "CLI" as Cli {
   [Prompt Input] as Prompt
+  [/session Commands] as SessionCmd
   [Terminal Renderer] as Term
 }
 
 rectangle "Web UI" as Web {
+  [Agent / Session Sidebar] as Sidebar
   [Chat Page] as ChatPage
+  [Memory Panel] as MemoryPanel
   [Approval Dialog] as ApprovalDialog
   [Control Snapshot Panel] as SnapshotPanel
 }
 
 rectangle "FastAPI" as Api {
+  [Agent API] as AgentApi
   [Session API] as SessionApi
   [Run API] as RunApi
+  [Memory API] as MemoryApi
   [SSE Event Stream] as Sse
   [Approval API] as ApprovalApi
   [Control API] as ControlApi
@@ -1517,22 +1756,33 @@ rectangle "FastAPI" as Api {
 
 rectangle "Shared Runtime" as Runtime {
   [Agent Session] as AgentSession
+  [Session Router] as SessionRouter
+  [Memory Store] as MemoryStore
   [Event Bus] as EventBus
   [Approval Waiter] as ApprovalWaiter
 }
 
 User --> Prompt
+User --> SessionCmd
+User --> Sidebar
 User --> ChatPage
 Prompt --> AgentSession
+SessionCmd --> SessionRouter
 Term <-- EventBus
+Sidebar --> AgentApi
 ChatPage --> SessionApi
+MemoryPanel --> MemoryApi
 RunApi --> AgentSession
 Sse <-- EventBus
 ApprovalDialog --> ApprovalApi
 SnapshotPanel --> ControlApi
 SessionApi --> AgentSession
+AgentApi --> SessionRouter
+MemoryApi --> MemoryStore
 ApprovalApi --> ApprovalWaiter
 ControlApi --> AgentSession
+SessionRouter --> AgentSession
+SessionRouter --> MemoryStore
 AgentSession --> EventBus
 AgentSession --> ApprovalWaiter
 @enduml
@@ -1540,16 +1790,35 @@ AgentSession --> ApprovalWaiter
 
 CLI 和 Web UI 不能各自实现一套 Agent 逻辑。它们只负责输入、渲染事件、展示审批和控制观察结果。
 
+CLI 必须支持 `/session` 命令族，用于多 Agent 会话切换：
+
+```text
+/session
+/session list
+/session agents
+/session new <agent_id> [title]
+/session switch <session_id>
+/session rename <title>
+/session archive <session_id>
+```
+
 | 方法与路径 | 用途 |
 |---|---|
 | `GET /` | 本地聊天页面 |
+| `GET /api/agents` | AgentProfile 列表 |
+| `POST /api/agents` | 创建或导入 AgentProfile |
 | `GET /api/models` | 可选模型与连通状态 |
 | `GET /api/skills` | Skill 列表与启用状态 |
 | `GET /api/mcp/servers` | MCP Server 状态 |
 | `GET /api/control/targets` | 浏览器、桌面、远程设备目标与启用状态 |
 | `GET /api/control/sessions/{id}/snapshot` | 查看浏览器/桌面/远程会话的最近观察结果 |
 | `POST /api/sessions` | 创建会话 |
+| `GET /api/sessions` | 列出会话，支持按 agent_id 过滤 |
+| `POST /api/sessions/{id}/switch` | 切换当前会话 |
 | `POST /api/sessions/{id}/messages` | 发送用户消息 |
+| `GET /api/memories` | 查看长期记忆，支持按 scope/agent/workspace 过滤 |
+| `POST /api/memories` | 创建或确认一条长期记忆 |
+| `DELETE /api/memories/{id}` | 删除长期记忆 |
 | `GET /api/runs/{id}/events` | SSE 事件流 |
 | `POST /api/approvals/{id}` | 允许或拒绝工具调用 |
 
