@@ -12,6 +12,7 @@ venv/
 
 # Local machine-specific config (templates *.example.yaml are tracked)
 config/mcp_servers.yaml
+config/agents.yaml
 config/app.yaml
 config/control.yaml
 
@@ -20,6 +21,9 @@ config/control.yaml
 
 # Browser profiles (contain login cookies/session — must never be committed)
 data/browser-profiles/
+
+# SQLite database (sessions/messages/memories/audit)
+data/agentlab.db
 
 # IDE
 .vscode/

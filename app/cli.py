@@ -28,13 +28,17 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 
 from app.agent.approval import AutoApprove, InteractivePolicy
+from app.agent.profiles import load_agent_profiles
 from app.agent.runtime import AgentSession, TurnEvent, build_system_prompt
+from app.agent.session_router import SessionRouter
 from app.agent.tasks import TaskStore
 from app.config.loader import load_config
 from app.mcp.adapter import build_mcp_tools
 from app.mcp.config import enabled_servers
 from app.mcp.manager import MCPManager
+from app.memory import build_memory_policy, inject_memories
 from app.models.router import build_model_router
+from app.storage import Storage
 from app.tools.builtin import default_tools
 from app.tools.builtin.todo import make_todo_write_tool
 from app.tools.registry import ToolRegistry
@@ -432,7 +436,7 @@ def _check_local_endpoint(cfg) -> None:
     sys.exit(2)
 
 
-def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
+def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     cfg = load_config(profile_name=profile)
     if cfg.provider == "anthropic" and not (cfg.auth_token or cfg.api_key):
         print("未找到 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY。\n请在 .env 或 ~/.claude/settings.json 中配置后重试。", file=sys.stderr)
@@ -453,41 +457,28 @@ def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
     if cfg.capabilities:
         print(f"能力     : {', '.join(cfg.capabilities)}")
     from app.config.loader import workspace_root
-    print(f"workspace: {workspace_root()}")
+    ws = workspace_root()
+    print(f"workspace: {ws}")
     print("工具     : read_file / write_file / list_dir / shell / todo_write")
     print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
-    print("输入 /reset 清空会话; exit/quit 或 Ctrl-D 退出; Ctrl-C 清空当前行.\n")
-
-    # 任务清单(模型用 todo_write 维护,CLI spinner 区域上方实时渲染)
-    task_store = TaskStore()
-
-    registry = ToolRegistry()
-    for tool in default_tools():
-        registry.register(tool)
-    # todo_write 工具需要绑定到当前会话的 task_store,所以工厂出来
-    registry.register(make_todo_write_tool(task_store))
+    print("输入 /reset 清空会话; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.\n")
 
     # ── MCP server 接入 ───────────────────────────────────────────────────────
-    # 读 config/mcp_servers.yaml 中 enabled 的 server,启动并把其工具注册进来。
-    # 没配过 / 没启用任何 server 时 mcp_manager 为 None,行为与之前完全一致。
+    # 读 config/mcp_servers.yaml 中 enabled 的 server,启动 manager(供所有 session 共用)。
+    # 没配过 / 没启用任何 server 时 mcp_manager 为 None,行为与之前一致。
     mcp_manager: MCPManager | None = None
     mcp_servers = enabled_servers()
     if mcp_servers:
-        builtin_names = {t.name for t in registry.all()}
         mcp_manager = MCPManager(mcp_servers)
         print(f"MCP      : 正在连接 {len(mcp_servers)} 个 server "
               f"({', '.join(s.name for s in mcp_servers)}) …", flush=True)
         mcp_manager.start()
-        mcp_tools = build_mcp_tools(mcp_manager, mcp_servers, reserved_names=builtin_names)
-        for tool in mcp_tools:
-            registry.register(tool)
         # 启用前展示:server、transport、发现的工具(落实 §9.2 "启用前展示可暴露能力")
         for s in mcp_servers:
             tool_names = [t.name for t in mcp_manager.tools() if t.server == s.name]
             print(f"           ▸ {s.name} [{s.transport}] risk={s.risk} "
                   f"工具 {len(tool_names)} 个: {', '.join(tool_names) or '(无)'}")
-        if mcp_tools:
-            print("           动作经外部 MCP server 执行;非只读工具默认每次需审批。")
+        print("           动作经外部 MCP server 执行;非只读工具默认每次需审批。")
 
         # ── 云端数据边界提示(PRD §7.8.2 / §12)─────────────────────────────────
         # 浏览器/桌面控制 + 云端模型时,页面快照/截图/DOM/表单内容会进 LLM 上下文
@@ -514,9 +505,8 @@ def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
                     file=sys.stderr,
                 )
 
-    # 启动校验:profile 声明了能力但没包含 "tools",而我们注册了工具 → 警告
-    # (不阻断,用户可能想看模型如何降级表现;但提前知道比执行中崩溃好)
-    if cfg.capabilities and "tools" not in cfg.capabilities and registry.all():
+    # 启动校验:profile 声明了能力但没包含 "tools" → 警告(不阻断)
+    if cfg.capabilities and "tools" not in cfg.capabilities:
         print(
             f"⚠ profile '{cfg.profile_name}' 没有声明 tools 能力,"
             f"模型可能不会调用工具或直接报错。\n"
@@ -524,16 +514,53 @@ def _build_session(auto_approve: bool, profile: str | None) -> AgentSession:
             file=sys.stderr,
         )
 
-    return AgentSession(
-        llm=llm,
-        tools=registry,
-        approval=AutoApprove() if auto_approve else InteractivePolicy(),
-        system_prompt=build_system_prompt(str(workspace_root())),
-        on_event=_print_event,
-        progress=_make_progress(task_store),  # spinner 能拿到任务列表
-        task_store=task_store,
-        closeables=[mcp_manager] if mcp_manager else None,
+    # ── Storage + SessionRouter ───────────────────────────────────────────────
+    storage = Storage()
+    agent_profiles = load_agent_profiles()
+    default_profile_id = cfg.profile_name or "default"
+
+    def _session_factory(agent_profile, session_id: str) -> AgentSession:
+        """按 AgentProfile 构建一个隔离的 AgentSession:独立工具表 + 任务清单 + 记忆注入。"""
+        task_store = TaskStore()
+        reg = ToolRegistry()
+        for t in default_tools():
+            reg.register(t)
+        reg.register(make_todo_write_tool(task_store))
+        # MCP 工具:所有 session 共用同一个 manager,但各自注册到自己的 registry
+        if mcp_manager:
+            mcp_tools = build_mcp_tools(mcp_manager, mcp_servers,
+                                        reserved_names={t.name for t in reg.all()})
+            for t in mcp_tools:
+                reg.register(t)
+        # Context Builder:按 memory_policy 把检索到的记忆注入 system prompt
+        mem_policy = build_memory_policy(agent_profile.memory_policy, storage)
+        recent = mem_policy.retrieve("", agent_profile.agent_id, limit=10)
+        base_prompt = agent_profile.system_prompt or build_system_prompt(str(ws))
+        sys_prompt = inject_memories(base_prompt, recent)
+        return AgentSession(
+            llm=llm,
+            tools=reg,
+            approval=AutoApprove() if auto_approve else InteractivePolicy(),
+            system_prompt=sys_prompt,
+            max_steps=agent_profile.max_steps,
+            on_event=_print_event,
+            progress=_make_progress(task_store),
+            task_store=task_store,
+            # 注意:mcp_manager 由 router 统一在退出时关闭,不放进单个 session 的
+            # closeables,否则切换/归档某个 session 会把全局 MCP 连接也关掉。
+        )
+
+    router = SessionRouter(
+        storage=storage,
+        session_factory=_session_factory,
+        profiles=agent_profiles,
+        default_profile_id=default_profile_id,
     )
+    # 把 mcp_manager 挂到 router 上,main() 退出时统一关闭
+    router.mcp_manager = mcp_manager
+    # 启动默认 session
+    router.new(agent_id=default_profile_id if default_profile_id in agent_profiles else None)
+    return router
 
 
 def _normalize_model_id(name: str | None) -> str:
@@ -589,13 +616,14 @@ def _print_input_separator() -> None:
     sys.stdout.flush()
 
 
-def _repl(session: AgentSession) -> int:
+def _repl(router: SessionRouter) -> int:
     """交互式对话。
 
     用 prompt_toolkit 替代内建 input(),解决:
       - 中文宽字符按退格只删 1 列、视觉残留的问题
       - 缺少历史回放(↑/↓)、Ctrl-A/E 编辑等
     Ctrl-C 清空当前行(不退出);Ctrl-D / exit / quit 退出。
+    斜杠命令:/reset 清空当前会话;/session ... 管理多 Agent。
     """
     pt_session: PromptSession = PromptSession(history=InMemoryHistory())
     prompt_fragments = FormattedText([("class:prompt", "▸ ")])
@@ -616,6 +644,19 @@ def _repl(session: AgentSession) -> int:
             continue
         if line in ("exit", "quit"):
             return 0
+
+        # /session ... 命令交给 router 处理
+        if line.startswith("/session"):
+            out = router.handle_command(line)
+            if out is not None:
+                print(out)
+            continue
+
+        session = router.current
+        if session is None:
+            print("当前无活跃 session。用 /session new 创建。")
+            continue
+
         if line == "/reset":
             session.reset()
             print("(history cleared)")
@@ -627,6 +668,8 @@ def _repl(session: AgentSession) -> int:
             # 脱敏后输出,避免 Authorization / API key 等凭据泄漏到终端
             print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
             continue
+        # 每轮对话后把消息历史存盘,支持下次 /session switch 恢复
+        router.persist_current()
         _print_stats(session)
 
 
@@ -638,18 +681,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        session = _build_session(auto_approve=args.yes, profile=args.profile)
+        router = _build_session(auto_approve=args.yes, profile=args.profile)
 
         try:
             if args.prompt:
+                session = router.current
                 try:
                     session.chat(args.prompt)
+                    router.persist_current()
                 finally:
                     _print_stats(session)
                 return 0
-            return _repl(session)
+            return _repl(router)
         finally:
-            session.close()  # 关闭 MCP server 等外部资源
+            router.close_all()  # 关闭所有 session + 共享的 MCP server
     except KeyboardInterrupt:
         print()
         return 130

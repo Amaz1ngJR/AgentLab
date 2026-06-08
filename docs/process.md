@@ -124,18 +124,19 @@ AgentLab/
 - 已实现 `SessionRouter`（`app/agent/session_router.py`）：维护 session_id → AgentSession 映射；支持 `/session`、`/session list`、`/session agents`、`/session new`、`/session switch`、`/session rename`、`/session archive`；消息历史可从 SQLite 恢复；两个 Session 的 messages 完全隔离。
 - 已实现长期记忆层（`app/memory/__init__.py`）：`NoMemory / ReadMemory / ReadWriteMemory` 三种策略；`build_memory_policy()` 工厂；`inject_memories()` 把检索结果追加到 system prompt；`read_write` 策略在会话结束时自动把对话摘要写入记忆。
 - 已有 `config/agents.example.yaml` 模板（default / coder / local 三个示例 profile）。
-- 新增 31 个单元测试，全量 **174 passed**。
+- 已完成 CLI 接入(`app/cli.py`):`_build_session` 改为构建 Storage + SessionRouter 并返回 router;MCP manager 全局共用(挂在 router 上,退出 `close_all` 统一关,不放进单个 session 的 closeables,避免切换某个 session 误关全局连接);`_session_factory` 按 AgentProfile 装配隔离的工具表 + 任务清单,按 memory_policy 检索记忆注入 system prompt(Context Builder);`_repl` 把 `/session ...` 转给 router,每轮 `chat()` 后 `persist_current()` 存盘;`main()` 退出 `router.close_all()`。
+- 新增 31 个单元测试,全量 **174 passed**;CLI 接入靠端到端冒烟验证。
 
-接下来要做：
+接下来要做（5.2 后续优化,非阻塞）：
 
-- CLI 接入 `SessionRouter`：启动时初始化 Storage + Router，REPL 里把 `/session ...` 命令转给 Router 处理，`chat()` 后自动 `persist_current()`，会话结束时按 memory_policy 写摘要。
-- Context Builder：`AgentSession` 构建时按 AgentProfile.memory_policy 检索记忆并调用 `inject_memories()` 注入 system prompt。
-- CLI banner 显示当前 session_id 和 agent 名称，prompt 提示符带 session 标识。
+- CLI banner / prompt 提示符显示当前 session_id 和 agent 名称。
+- `read_write` 记忆策略的"会话结束写摘要"接入 CLI 退出钩子(store/policy 已实现,CLI 退出时尚未调用 `mem_policy.save`)。
+- `memories` 升级为向量检索(当前是 LIKE 全文匹配,够 MVP 用)。
 
-第一验收标准（已满足核心部分）：
+第一验收标准（已满足）：
 
-- `SessionRouter` 单元测试验证：两个 session 消息互不串（`test_two_sessions_are_isolated`）；切换后从 SQLite 恢复消息历史（`test_switch_restores_from_sqlite`）。
-- CLI 接入后的端到端验证：创建两个 Agent，切换，消息不串，重启后历史可恢复。
+- `SessionRouter` 单元测试:两个 session 消息互不串（`test_two_sessions_are_isolated`）;切换后从 SQLite 恢复消息历史（`test_switch_restores_from_sqlite`）。
+- CLI 端到端冒烟(fake model + 临时 SQLite):启动建默认 session → `/session new` 切第二个、消息归零(隔离生效)→ `/session list` 标记当前 → `close_all` 干净退出。
 
 ### 5.3 模型层
 

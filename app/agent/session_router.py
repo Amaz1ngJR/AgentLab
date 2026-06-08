@@ -35,6 +35,9 @@ class SessionRouter:
         self._default_profile_id = default_profile_id
         self._sessions: dict[str, AgentSession] = {}
         self.current_id: Optional[str] = None
+        # 由 CLI 注入的全局共享资源(如 MCPManager),在 close_all 时统一关闭。
+        # 不放进单个 session 的 closeables,避免切换/归档某个 session 时误关全局连接。
+        self.mcp_manager = None
 
     # ── 属性 ──────────────────────────────────────────────────────────────────
 
@@ -111,6 +114,13 @@ class SessionRouter:
         for s in self._sessions.values():
             s.close()
         self._sessions.clear()
+        # 关闭全局共享资源(MCP server 进程等)
+        if self.mcp_manager is not None:
+            try:
+                self.mcp_manager.stop()
+            except Exception:
+                pass
+            self.mcp_manager = None
 
     # ── CLI 命令解析 ──────────────────────────────────────────────────────────
 
