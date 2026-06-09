@@ -72,6 +72,42 @@ def test_switch_restores_from_sqlite(tmp_path):
     assert r.current.messages[0]["content"] == "saved"
 
 
+def test_resume_or_new_creates_when_empty(tmp_path):
+    """首次启动:没有历史 session → 新建。"""
+    r = _make_router(Storage(tmp_path / "db"), _profiles())
+    sid, resumed = r.resume_or_new(agent_id="default")
+    assert resumed is False
+    assert r.current_id == sid
+    assert len(r.list_sessions()) == 1
+
+
+def test_resume_or_new_resumes_latest(tmp_path):
+    """再次启动:有历史 session → 恢复最近一个,不新建。"""
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles())
+    sid = r.new("default")
+    r.current.messages = [{"role": "user", "content": "earlier"}]
+    r.persist_current()
+    # 模拟重启:新 router 接同一个库
+    r2 = _make_router(db, _profiles())
+    resumed_id, resumed = r2.resume_or_new(agent_id="default")
+    assert resumed is True
+    assert resumed_id == sid                       # 恢复的是同一个 session
+    assert len(r2.list_sessions()) == 1            # 没堆出新会话
+    assert r2.current.messages[0]["content"] == "earlier"  # 历史消息回来了
+
+
+def test_resume_or_new_skips_archived(tmp_path):
+    """归档过的不该被恢复 → 新建。"""
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles())
+    r.new("default")
+    r.archive()                                    # 归档后列表为空
+    r2 = _make_router(db, _profiles())
+    _, resumed = r2.resume_or_new(agent_id="default")
+    assert resumed is False                        # 归档的不恢复,新建
+
+
 def test_archive_removes_session(tmp_path):
     r = _make_router(Storage(tmp_path / "db"), _profiles())
     r.new("default")

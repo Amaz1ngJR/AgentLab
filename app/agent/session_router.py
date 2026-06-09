@@ -88,6 +88,17 @@ class SessionRouter:
         self.current_id = session_id
         return True
 
+    def resume_or_new(self, agent_id: Optional[str] = None) -> tuple[str, bool]:
+        """启动时调用:有未归档的历史 session 就恢复最近一个,否则新建。
+
+        返回 (session_id, resumed):resumed=True 表示恢复了历史会话。
+        "最近"按 list_sessions 的 updated_at DESC 顺序取第一个。
+        """
+        rows = self._storage.list_sessions()  # 已过滤 archived,按 updated_at DESC
+        if rows and self.switch(rows[0]["id"]):
+            return rows[0]["id"], True
+        return self.new(agent_id=agent_id), False
+
     def rename(self, title: str) -> None:
         if self.current_id:
             self._storage.update_session_title(self.current_id, title)

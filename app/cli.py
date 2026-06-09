@@ -559,8 +559,17 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     )
     # 把 mcp_manager 挂到 router 上,main() 退出时统一关闭
     router.mcp_manager = mcp_manager
-    # 启动默认 session
-    router.new(agent_id=default_profile_id if default_profile_id in agent_profiles else None)
+    # 启动:有未归档历史 session 就恢复最近一个,否则新建(避免每次启动堆积空会话)
+    start_agent = default_profile_id if default_profile_id in agent_profiles else None
+    sid, resumed = router.resume_or_new(agent_id=start_agent)
+    row = storage.get_session(sid)
+    title = row["title"] if row else ""
+    if resumed:
+        msg_count = len(router.current.messages) if router.current else 0
+        print(f"会话     : 恢复 {sid}  ({title})  历史消息 {msg_count} 条 "
+              f"— /session new 开新会话, /session list 看全部\n")
+    else:
+        print(f"会话     : 新建 {sid}  ({title})\n")
     return router
 
 
