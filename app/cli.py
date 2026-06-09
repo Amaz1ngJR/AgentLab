@@ -39,6 +39,7 @@ from app.mcp.config import enabled_servers
 from app.mcp.manager import MCPManager
 from app.memory import build_memory_policy, inject_memories
 from app.models.router import build_model_router
+from app.skills import SkillCatalog
 from app.storage import Storage
 from app.tools.builtin import default_tools
 from app.tools.builtin.todo import make_todo_write_tool
@@ -520,6 +521,15 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     agent_profiles = load_agent_profiles()
     default_profile_id = cfg.profile_name or "default"
 
+    # ── Skill Catalog ─────────────────────────────────────────────────────────
+    # 扫描 skills/*/SKILL.md 生成 catalog（目录不存在则为空，行为与之前一致）。
+    # Skill 只影响上下文（注入工作流说明），不授予工具权限。
+    skill_catalog = SkillCatalog.from_dir()
+    if skill_catalog.all():
+        print(f"Skill    : 发现 {len(skill_catalog.all())} 个 "
+              f"({', '.join(s.skill_id for s in skill_catalog.all())});"
+              f" 默认启用 {len(skill_catalog.enabled_skills())} 个")
+
     def _session_factory(agent_profile, session_id: str) -> AgentSession:
         """按 AgentProfile 构建一个隔离的 AgentSession:独立工具表 + 任务清单 + 记忆注入。"""
         task_store = TaskStore()
@@ -537,7 +547,10 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
         mem_policy = build_memory_policy(agent_profile.memory_policy, storage)
         recent = mem_policy.retrieve("", agent_profile.agent_id, limit=10)
         base_prompt = agent_profile.system_prompt or build_system_prompt(str(ws))
-        sys_prompt = inject_memories(base_prompt, recent)
+        # 先注入 Skill 工作流（按 AgentProfile.skills 显式启用），再注入记忆。
+        # Skill 只加上下文，不放宽工具授权：上面 reg 注册的工具集才是实际可用集。
+        with_skills = skill_catalog.inject(base_prompt, agent_profile.skills)
+        sys_prompt = inject_memories(with_skills, recent)
         return AgentSession(
             llm=llm,
             tools=reg,

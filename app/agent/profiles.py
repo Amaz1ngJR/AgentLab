@@ -25,6 +25,8 @@ class AgentProfile:
     system_prompt   - 覆盖默认 system prompt（None 则用全局默认）
     tools           - 明确允许的内置工具名单（空列表 = 使用全部内置工具）
     mcp_servers     - 允许加载的 MCP server 名单（空列表 = 继承全局配置）
+    skills          - 显式启用的 Skill 名单（skill_id），注入工作流上下文；
+                      仅影响上下文，不授予工具权限（见 app/skills）
     memory_policy   - 记忆策略：none/read/read_write（默认 none）
     max_steps       - 最大工具循环步数（默认 8）
     """
@@ -34,6 +36,7 @@ class AgentProfile:
     system_prompt: Optional[str] = None
     tools: list[str] = field(default_factory=list)
     mcp_servers: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
     memory_policy: str = "none"   # none | read | read_write
     max_steps: int = 8
 
@@ -57,6 +60,7 @@ def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
             system_prompt=body.get("system_prompt"),
             tools=list(body.get("tools") or []),
             mcp_servers=list(body.get("mcp_servers") or []),
+            skills=list(body.get("skills") or []),
             memory_policy=body.get("memory_policy", "none"),
             max_steps=int(body.get("max_steps", 8)),
         )

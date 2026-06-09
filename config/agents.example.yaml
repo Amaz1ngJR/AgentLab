@@ -26,6 +26,7 @@ agents:
       你是一个专注于代码的助手。优先用 code_search 定位代码，read_file 精读，
       shell 运行测试。写代码简洁优先，改动最小化，不要过度重构。
     tools: []          # 空列表 = 使用全部内置工具
+    skills: [code-review]   # 显式启用的 Skill;只注入工作流上下文,不授予工具权限
     memory_policy: read_write
     max_steps: 12
 
