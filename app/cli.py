@@ -629,7 +629,8 @@ _SESSION_SUBCOMMANDS = {
     "new": "新建并切换到一个 Agent 会话",
     "switch": "切换到已有 session",
     "rename": "重命名当前 session",
-    "archive": "归档当前 session",
+    "archive": "归档当前 session(软删除,可恢复)",
+    "delete": "彻底删除 session 及消息(不可恢复)",
 }
 
 
@@ -672,10 +673,10 @@ class _SlashCompleter(Completer):
                     yield Completion(sub, start_position=-len(prefix), display_meta=desc)
             return
 
-        # ── 第三级:switch <session_id> / new <agent_id> 的参数 ──
+        # ── 第三级:switch/delete <session_id> / new <agent_id> 的参数 ──
         sub = parts[1]
         arg_prefix = parts[2] if (len(parts) >= 3 and not text.endswith(" ")) else ""
-        if sub == "switch":
+        if sub in ("switch", "delete"):
             for row in self._router.list_sessions():
                 if row["id"].startswith(arg_prefix):
                     yield Completion(row["id"], start_position=-len(arg_prefix),

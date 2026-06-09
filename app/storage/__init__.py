@@ -129,6 +129,17 @@ class Storage:
                 (_now(), session_id),
             )
 
+    def delete_session(self, session_id: str) -> None:
+        """硬删除:把 session 及其消息、工具执行审计一并从库里抹掉,不可恢复。
+
+        区别于 archive_session(只置 archived=1 软隐藏)。memories 不动 ——
+        长期记忆按设计跨 session 留存,不随单个 session 删除。
+        """
+        with self._tx() as con:
+            con.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
+            con.execute("DELETE FROM tool_executions WHERE session_id=?", (session_id,))
+            con.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+
     def list_sessions(self, include_archived: bool = False) -> list[dict]:
         q = "SELECT * FROM sessions"
         if not include_archived:

@@ -7,7 +7,8 @@ CLI 命令族：
   /session new [agent_id] [title]  - 创建新 session（并切换进去）
   /session switch <session_id>     - 切换到已有 session
   /session rename <title>          - 重命名当前 session
-  /session archive                 - 归档当前 session
+  /session archive                 - 归档当前 session（软删除,数据保留,从列表隐藏）
+  /session delete [session_id]     - 彻底删除 session 及其消息（硬删除,不可恢复;留空删当前）
 """
 from __future__ import annotations
 
@@ -99,6 +100,21 @@ class SessionRouter:
                 session.close()
             self.current_id = None
 
+    def delete(self, session_id: str) -> bool:
+        """硬删除指定 session(连消息一起抹掉,不可恢复)。返回是否成功。
+
+        允许删非当前 session;删的是当前 session 时,清空 current_id。
+        """
+        if self._storage.get_session(session_id) is None:
+            return False
+        session = self._sessions.pop(session_id, None)
+        if session:
+            session.close()
+        self._storage.delete_session(session_id)
+        if self.current_id == session_id:
+            self.current_id = None
+        return True
+
     def list_sessions(self) -> list[dict]:
         return self._storage.list_sessions()
 
@@ -165,7 +181,15 @@ class SessionRouter:
             old = self.current_id
             self.archive()
             return f"已归档 session {old}。当前无活跃 session，用 /session new 创建。"
-        return f"未知子命令: {sub}。可用: list / agents / new / switch / rename / archive"
+        if sub == "delete":
+            target = arg or self.current_id
+            if not target:
+                return "用法: /session delete <session_id>(留空则删当前 session)"
+            if self.delete(target):
+                return f"已彻底删除 session {target}(消息已一并抹除,不可恢复)。"
+            return f"找不到 session: {target}"
+        return ("未知子命令: {0}。可用: list / agents / new / switch / "
+                "rename / archive / delete").format(sub)
 
     def _cmd_info(self) -> str:
         if not self.current_id:

@@ -80,6 +80,36 @@ def test_archive_removes_session(tmp_path):
     assert r.list_sessions() == []
 
 
+def test_delete_current_session(tmp_path):
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles())
+    sid = r.new("default")
+    assert r.delete(sid) is True
+    assert r.current_id is None
+    assert db.get_session(sid) is None       # 硬删,库里也没了
+
+
+def test_delete_other_session_keeps_current(tmp_path):
+    r = _make_router(Storage(tmp_path / "db"), _profiles())
+    s1 = r.new("default")
+    s2 = r.new("coder")          # 当前是 s2
+    assert r.delete(s1) is True  # 删的是非当前 session
+    assert r.current_id == s2    # 当前不受影响
+
+
+def test_delete_unknown_returns_false(tmp_path):
+    r = _make_router(Storage(tmp_path / "db"), _profiles())
+    assert r.delete("nope") is False
+
+
+def test_handle_command_delete(tmp_path):
+    r = _make_router(Storage(tmp_path / "db"), _profiles())
+    sid = r.new("default")
+    out = r.handle_command(f"/session delete {sid}")
+    assert "已彻底删除" in out
+    assert r.list_sessions() == []
+
+
 def test_rename(tmp_path):
     db = Storage(tmp_path / "db")
     r = _make_router(db, _profiles())

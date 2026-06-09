@@ -34,6 +34,32 @@ def test_messages_round_trip(tmp_path):
     assert loaded[1]["content"] == "hi"
 
 
+def test_delete_session_hard_removes(tmp_path):
+    s = _store(tmp_path)
+    s.create_session("s1", "default", "cloud_claude")
+    s.save_messages("s1", [{"role": "user", "content": "hello"}])
+    s.log_tool_execution("s1", "read_file", "{}", "x")
+    s.delete_session("s1")
+    # session、消息、审计都应抹掉;连 archived 列表也查不到
+    assert s.get_session("s1") is None
+    assert s.list_sessions(include_archived=True) == []
+    assert s.load_messages("s1") == []
+
+
+def test_delete_vs_archive(tmp_path):
+    """archive 软删(数据留),delete 硬删(数据无)。"""
+    s = _store(tmp_path)
+    s.create_session("a", "default", "cloud_claude")
+    s.create_session("b", "default", "cloud_claude")
+    s.archive_session("a")
+    s.delete_session("b")
+    # a 软删:默认列表无,带 archived 能查到
+    assert "a" not in [r["id"] for r in s.list_sessions()]
+    assert "a" in [r["id"] for r in s.list_sessions(include_archived=True)]
+    # b 硬删:彻底没了
+    assert s.get_session("b") is None
+
+
 def test_save_messages_overwrites(tmp_path):
     s = _store(tmp_path)
     s.create_session("s1", "default", "cloud_claude")

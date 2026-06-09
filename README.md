@@ -129,7 +129,8 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 | `/session new [agent_id] [标题]` | 新建并切换到一个 Agent 会话 |
 | `/session switch <session_id>` | 切换到已有 session（可从 SQLite 恢复历史） |
 | `/session rename <标题>` | 重命名当前 session |
-| `/session archive` | 归档当前 session |
+| `/session archive` | 归档当前 session（软删除，数据保留、从列表隐藏，可日后 switch 回来） |
+| `/session delete [session_id]` | 彻底删除 session 及其消息（硬删除，不可恢复；留空删当前） |
 | `exit` / `quit` / Ctrl-D | 退出 |
 
 不同 session 的消息历史、任务清单互相隔离，切换时不串。
