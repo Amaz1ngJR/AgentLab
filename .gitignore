@@ -36,3 +36,7 @@ data/vector_store/
 # (个人 Skill 不上传 GitHub；只保留 skills/README.md 作说明)
 skills/*
 !skills/README.md
+!*.skill
+
+#other
+.DS_Store

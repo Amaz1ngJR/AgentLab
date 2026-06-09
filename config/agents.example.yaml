@@ -14,7 +14,7 @@ agents:
   # 默认通用助手（不写 agents.yaml 时的默认行为）
   default:
     name: 默认助手
-    model_profile: cloud_claude
+    model_profile: cloud_claude_opus
     memory_policy: none
     max_steps: 8
 
