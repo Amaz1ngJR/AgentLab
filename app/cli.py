@@ -23,6 +23,7 @@ import unicodedata
 from contextlib import contextmanager
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
@@ -616,6 +617,77 @@ def _print_input_separator() -> None:
     sys.stdout.flush()
 
 
+# 顶层斜杠命令 → 说明,用于补全菜单右侧 meta 文本
+_SLASH_COMMANDS = {
+    "/reset": "清空当前会话的消息和任务",
+    "/session": "管理多 Agent 会话",
+}
+# /session 子命令 → 说明
+_SESSION_SUBCOMMANDS = {
+    "list": "列出所有活跃 session",
+    "agents": "列出可用的 Agent",
+    "new": "新建并切换到一个 Agent 会话",
+    "switch": "切换到已有 session",
+    "rename": "重命名当前 session",
+    "archive": "归档当前 session",
+}
+
+
+class _SlashCompleter(Completer):
+    """斜杠命令补全器:输入 `/` 时弹出命令,并对 /session 做子命令 / 参数补全。
+
+    三级补全:
+      1. `/` / `/se…`           → 顶层命令(/reset, /session)
+      2. `/session ` + 子命令前缀 → list/agents/new/switch/rename/archive
+      3. `/session switch ` + 前缀 → 已有 session id(从 router 实时取)
+         `/session new ` + 前缀    → 可用 agent id
+    普通文本(不以 / 开头)不补全,不打扰正常对话输入。
+    """
+
+    def __init__(self, router: SessionRouter):
+        self._router = router
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return  # 普通对话输入,不补全
+
+        parts = text.split()
+        # ── 第一级:顶层命令 ──（还没打空格,或就一个 token）
+        if len(parts) <= 1 and not text.endswith(" "):
+            word = parts[0] if parts else "/"
+            for cmd, desc in _SLASH_COMMANDS.items():
+                if cmd.startswith(word):
+                    yield Completion(cmd, start_position=-len(word), display_meta=desc)
+            return
+
+        if parts[0] != "/session":
+            return  # 只有 /session 有更深层补全
+
+        # ── 第二级:/session 子命令 ──
+        if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
+            prefix = parts[1] if len(parts) == 2 else ""
+            for sub, desc in _SESSION_SUBCOMMANDS.items():
+                if sub.startswith(prefix):
+                    yield Completion(sub, start_position=-len(prefix), display_meta=desc)
+            return
+
+        # ── 第三级:switch <session_id> / new <agent_id> 的参数 ──
+        sub = parts[1]
+        arg_prefix = parts[2] if (len(parts) >= 3 and not text.endswith(" ")) else ""
+        if sub == "switch":
+            for row in self._router.list_sessions():
+                if row["id"].startswith(arg_prefix):
+                    yield Completion(row["id"], start_position=-len(arg_prefix),
+                                     display_meta=row.get("title", ""))
+        elif sub == "new":
+            for aid, prof in self._router.list_profiles().items():
+                if aid.startswith(arg_prefix):
+                    yield Completion(aid, start_position=-len(arg_prefix),
+                                     display_meta=getattr(prof, "name", ""))
+
+
+
 def _repl(router: SessionRouter) -> int:
     """交互式对话。
 
@@ -624,8 +696,13 @@ def _repl(router: SessionRouter) -> int:
       - 缺少历史回放(↑/↓)、Ctrl-A/E 编辑等
     Ctrl-C 清空当前行(不退出);Ctrl-D / exit / quit 退出。
     斜杠命令:/reset 清空当前会话;/session ... 管理多 Agent。
+    输入 `/` 时弹出命令补全(由 _SlashCompleter 提供)。
     """
-    pt_session: PromptSession = PromptSession(history=InMemoryHistory())
+    pt_session: PromptSession = PromptSession(
+        history=InMemoryHistory(),
+        completer=_SlashCompleter(router),
+        complete_while_typing=True,   # 边打边弹,不用按 Tab
+    )
     prompt_fragments = FormattedText([("class:prompt", "▸ ")])
 
     while True:
