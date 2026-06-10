@@ -1,15 +1,3 @@
-# config/models.yaml —— 模型 profile 注册表
-#
-# 每个 profile 是一个命名配置，包含 provider、模型 ID、端点、凭据引用和能力声明。
-# 启动时用 --profile <name> 或 ACTIVE_PROFILE=<name> 选择。
-# 不指定 profile 时，程序回退到 .env 里的 LLM_* 变量（向后兼容）。
-#
-# 凭据规则：
-#   api_key_env / auth_token_env / base_url_env 填环境变量名，不填真实值。
-#   真实值放在 .env 或系统 Keyring，不入库。
-#
-# 模型 ID 支持 ${ENV_VAR:-default} 语法。
-
 models:
 
   # ── 本地模型（Ollama）────────────────────────────────────────────────────────
@@ -70,6 +58,30 @@ models:
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     api_key_env: ANTHROPIC_API_KEY
     base_url_env: ANTHROPIC_BASE_URL
+    capabilities: [chat, tools]
+    params:
+      temperature: 0.2
+
+  # ── 硅基流动 SiliconFlow（OpenAI 兼容）────────────────────────────────────────
+  # 协议同 OpenAI Chat Completions，走 openai_compatible adapter，无需改代码。
+  # 凭据：把 API Key 放进 .env 的 SILICONFLOW_API_KEY，不要写在这里。
+  # 模型 ID 用硅基流动控制台里的完整名（带组织前缀），可用 SILICONFLOW_MODEL 覆盖。
+  #   例：deepseek-ai/DeepSeek-V3 / Qwen/Qwen2.5-72B-Instruct / deepseek-ai/DeepSeek-R1
+  siliconflow:
+    provider: openai_compatible
+    model: ${SILICONFLOW_MODEL:-Qwen/Qwen3-8B}
+    base_url: https://api.siliconflow.cn/v1
+    api_key_env: SILICONFLOW_API_KEY
+    capabilities: [chat, tools]
+    params:
+      temperature: 0.2
+
+  # ── OpenAI 官方 GPT 模型（GPT-3.5 （gpt-3.5-turbo）/ GPT-5 （gpt-5））────────────────────────────────────
+  gpt_official:
+    provider: openai
+    model: ${OPENAI_MODEL:-gpt-3.5-turbo}
+    api_key_env: OPENAI_API_KEY
+    base_url: https://api.openai.com/v1
     capabilities: [chat, tools]
     params:
       temperature: 0.2
