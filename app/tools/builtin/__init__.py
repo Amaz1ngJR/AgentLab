@@ -12,5 +12,9 @@ from app.tools.registry import Tool
 
 
 def default_tools() -> list[Tool]:
-    """返回所有内置工具的合集。顺序仅影响 banner 显示。"""
+    """返回所有内置工具的合集。顺序仅影响 banner 显示。
+
+    注意:交互式会话工具(pty_*)是有状态的,需要绑定会话级 PtySessionManager,
+    所以不在这里,由 CLI 用 make_pty_tools(manager) 工厂按会话注入(同 todo_write)。
+    """
     return [*_file_tools(), *_code_search_tools(), *_shell_tools()]

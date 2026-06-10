@@ -42,6 +42,7 @@ from app.models.router import build_model_router
 from app.skills import SkillCatalog
 from app.storage import Storage
 from app.tools.builtin import default_tools
+from app.tools.builtin.interactive import PtySessionManager, make_terminal_tools
 from app.tools.builtin.todo import make_todo_write_tool
 from app.tools.registry import ToolRegistry
 from app.util.redact import format_exception, format_traceback
@@ -150,21 +151,19 @@ def _strip_ansi(s: str) -> str:
 
 
 class _Spinner:
-    """thinking 状态行 + 实时 token 计数 + 流式文本输出 + 任务列表面板。
+    """常驻底部状态行(footer) + 实时 token 计数 + 流式文本输出 + 任务列表面板。
 
-    渲染策略(关键:文本一旦开始流式,就走 append-only,绝不重打已输出文本):
+    渲染策略(关键:footer 贯穿整个 turn 常驻屏幕最底部,正文在其上方滚动):
       1. 任务面板:每步内固定不变(模型用 todo_write 的更新发生在 create_message
          返回之后),首次绘制时一次性提交到滚动历史,之后不再重绘。
-      2. thinking 阶段(还没有文本):底部 spinner footer 持续闪动 + 刷新 token
-         计数。footer 只占 1~2 行,擦除用 *有界* 的相对光标上移,即使屏幕滚动
-         也不会越界。
-      3. 文本到达:擦掉 thinking footer,之后每个 delta 直接 append 到 stdout,
-         让终端自然滚动。不再有 footer,也就不会出现"重打整段缓冲"导致的滚屏
-         叠影 —— 旧实现的 bug:文本超过一屏后,相对上移擦不掉已滚走的行,于是
-         每个 delta 都把当前缓冲原样留在屏上,叠成逐行增长的瀑布。
+      2. footer:始终钉在屏幕最底部,持续闪动 + 实时刷新 token 计数(thinking
+         阶段显示 ↑input,生成阶段显示 ↓output),直到 turn 结束才撤掉。
+      3. 正文到达:先擦掉 footer,把 delta append 到 stdout(终端自然滚动),
+         再在新位置重画 footer。这样 token 在整个 turn 全程实时刷新。
 
-    代价:文本流式期间 token 计数不再实时刷新(thinking 阶段与纯工具步骤仍然
-    实时)。换来任意长度文本都不重影,最终总量仍由 [stats] 行给出。
+    擦除的 *有界性* —— 这是不重影的关键:每次擦除只回收 footer 自己 + 当前那条
+    还没换行的正文行(_line_buf),两者都至多几行,相对光标上移绝不越屏。已经
+    换行滚走的正文永远不碰,所以不会出现旧实现"重打整段缓冲"导致的滚屏叠影。
     """
 
     def __init__(self, label: str, task_store=None):
@@ -175,11 +174,11 @@ class _Spinner:
         self._t0 = 0.0
         self._lock = threading.Lock()
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
-        self._text_buffer = ""
-        self._text_started = False     # 文本一旦开始,转入 append-only 模式
+        self._any_text = False         # 整个 turn 是否出现过正文(决定退出收尾)
+        self._line_buf = ""            # 当前还没换行的正文尾行(擦除/重画 footer 时要复原)
         self._tasks_committed = False  # 任务面板每步只提交一次
         self._frame_idx = 0
-        self._footer_lines = 0  # 当前 footer 占用的屏幕行数(0 = 未绘制)
+        self._footer_rows = 0          # 当前 footer 占用的屏幕行数(0 = 未绘制)
 
     def __enter__(self) -> "_Spinner":
         self._t0 = time.monotonic()
@@ -190,15 +189,15 @@ class _Spinner:
         self._stop.set()
         self._thread.join(timeout=1.0)
         with self._lock:
-            if self._text_started:
-                # 文本已逐段 append 到历史,这里只补足结尾换行 + 一个空行
-                if self._text_buffer and not self._text_buffer.endswith("\n"):
+            self._erase_footer()
+            self._commit_tasks()
+            if self._any_text:
+                # 正文已逐段 append 到历史:补足结尾换行 + 一个空行,不再打摘要
+                if self._line_buf:
                     sys.stdout.write("\n")
                 sys.stdout.write("\n")
             else:
-                # 纯 tool_use / 无文本:擦掉 thinking footer,保留任务面板 + 一行摘要
-                self._erase_footer()
-                self._commit_tasks()
+                # 纯 tool_use / 无文本:保留任务面板 + 一行摘要
                 sys.stdout.write(f"  ✻ {self.label} ({self._fmt_status()})\n")
             sys.stdout.flush()
 
@@ -208,30 +207,32 @@ class _Spinner:
                 "input_tokens": int(metrics.get("input_tokens", 0) or 0),
                 "output_tokens": int(metrics.get("output_tokens", 0) or 0),
             }
-            # 文本流式开始后不再有 footer 可刷;仅 thinking 阶段更新计数
-            if not self._text_started:
-                self._commit_tasks()
-                self._erase_footer()
-                self._draw_footer()
+            self._render()
 
     def on_text(self, delta: str) -> None:
         if not delta:
             return
         with self._lock:
+            self._erase_footer()
             self._commit_tasks()
-            if not self._text_started:
-                # 第一段文本:擦掉 thinking footer,之后纯 append
-                self._erase_footer()
-                self._text_started = True
-            self._text_buffer += delta
+            self._any_text = True
             sys.stdout.write(delta)
+            # 维护"当前未换行尾行":有换行则取最后一段,否则累加到现有尾行
+            if "\n" in delta:
+                self._line_buf = delta.rsplit("\n", 1)[1]
+            else:
+                self._line_buf += delta
+            self._draw_footer()
             sys.stdout.flush()
 
     def _fmt_status(self) -> str:
         elapsed = time.monotonic() - self._t0
         out_t = self._metrics["output_tokens"]
+        in_t = self._metrics["input_tokens"]
         if out_t > 0:
             return f"{_fmt_duration(elapsed)} · ↓ {_fmt_tokens(out_t)}"
+        if in_t > 0:
+            return f"{_fmt_duration(elapsed)} · ↑ {_fmt_tokens(in_t)}"
         return _fmt_duration(elapsed)
 
     def _task_lines(self) -> list[str]:
@@ -244,7 +245,8 @@ class _Spinner:
         """一次性把任务面板打印到滚动历史(每步只调一次)。空任务则什么都不打。
 
         面板在一个步骤内不会变(todo_write 的更新发生在 create_message 之后),
-        所以提交一次即可,无需像旧实现那样每帧重绘。
+        所以提交一次即可,无需像旧实现那样每帧重绘。调用前必须已 _erase_footer,
+        否则会把面板打在 footer 中间。
         """
         if self._tasks_committed:
             return
@@ -257,40 +259,61 @@ class _Spinner:
         sys.stdout.write("\n")  # 面板与下方内容留一行间隔
         sys.stdout.flush()
 
+    def _render(self) -> None:
+        """擦旧 footer → (首次)提交任务面板 → 重画 footer。供动画 / token 刷新调用。"""
+        self._erase_footer()
+        self._commit_tasks()
+        self._draw_footer()
+        sys.stdout.flush()
+
     def _draw_footer(self) -> None:
-        """在当前行起点画 spinner footer,记录其占用的屏幕行数。"""
+        """在正文下方画 footer,记录其占用行数,供 _erase_footer 复原。
+
+        若当前有未换行尾行(_line_buf),先写一个 \\n 把 footer 推到下一行,避免
+        footer 跟正文挤在同一行;否则光标已在行首,直接画。这个 \\n 只是 _line_buf
+        与 footer 之间的边界,不额外占一整屏行 —— 擦除时不计入上移行数。
+        """
         term_width = _term_width()
+        if self._line_buf:
+            sys.stdout.write("\n")
         frame = _SPINNER_FRAMES[self._frame_idx % len(_SPINNER_FRAMES)]
         spinner_line = f"  {frame} {self.label}… ({self._fmt_status()})"
         sys.stdout.write(spinner_line)
-        sys.stdout.flush()
         w = _display_width(spinner_line)
-        self._footer_lines = max(1, (w + term_width - 1) // term_width)
+        self._footer_rows = max(1, (w + term_width - 1) // term_width)
 
     def _erase_footer(self) -> None:
-        """擦掉 footer。光标在 footer 末行末尾,回到 footer 起点再清到屏末。
+        """擦掉 footer,并把光标复原到正文尾行末尾,准备继续 append。
 
-        footer 至多 1~2 行,这里的相对上移是 *有界* 的 —— 即使屏幕滚动也不会
-        越界。这正是它能稳、而旧 _redraw 重打整段文本会失效的原因。
+        光标此刻在 footer 末行末尾。从正文尾行(_line_buf)起点到 footer 末行,
+        共占 lb_rows + footer_rows 个屏幕行(_draw_footer 里那个 \\n 只是边界,
+        不额外占一整屏行),光标在最后一行,故上移 lb_rows + footer_rows - 1
+        行即到正文尾行行首,清屏到末,再重打 _line_buf 把光标送回正文末尾。
+
+        所有相对上移都 *有界*(footer 1~2 行 + 一条正文行),即使屏幕滚动也不越界
+        —— 已换行滚走的正文从不触碰,这正是它稳、而旧实现重打整段文本会失效的原因。
         """
-        if self._footer_lines <= 0:
+        if self._footer_rows <= 0:
             return
+        term_width = _term_width()
+        lb_rows = 0
+        if self._line_buf:
+            w = _display_width(self._line_buf)
+            lb_rows = max(1, (w + term_width - 1) // term_width)
+        up = lb_rows + self._footer_rows - 1
         sys.stdout.write("\r")
-        if self._footer_lines > 1:
-            sys.stdout.write(f"\033[{self._footer_lines - 1}A")
+        if up > 0:
+            sys.stdout.write(f"\033[{up}A")
         sys.stdout.write("\033[J")
-        sys.stdout.flush()
-        self._footer_lines = 0
+        if self._line_buf:
+            sys.stdout.write(self._line_buf)
+        self._footer_rows = 0
 
     def _run(self) -> None:
         while not self._stop.wait(0.1):
             with self._lock:
-                if self._text_started:
-                    continue  # append-only 阶段,footer 已撤,无需动画
-                self._commit_tasks()
                 self._frame_idx += 1
-                self._erase_footer()
-                self._draw_footer()
+                self._render()
 
 
 class _PlainProgress:
@@ -461,7 +484,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     from app.config.loader import workspace_root
     ws = workspace_root()
     print(f"workspace: {ws}")
-    print("工具     : read_file / write_file / list_dir / shell / todo_write")
+    print("工具     : read_file / write_file / list_dir / shell / terminal_* (交互式会话) / todo_write")
     print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
     print("输入 /reset 清空会话; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.\n")
 
@@ -537,6 +560,11 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
         for t in default_tools():
             reg.register(t)
         reg.register(make_todo_write_tool(task_store))
+        # 交互式终端会话:每个 session 一个 PtySessionManager(子进程随会话生死),
+        # 注册 terminal_open/send/close/list。cwd 锁 workspace,跟 shell 一致。
+        pty_manager = PtySessionManager(cwd=str(ws))
+        for t in make_terminal_tools(pty_manager):
+            reg.register(t)
         # MCP 工具:所有 session 共用同一个 manager,但各自注册到自己的 registry
         if mcp_manager:
             mcp_tools = build_mcp_tools(mcp_manager, mcp_servers,
@@ -560,8 +588,10 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
             on_event=_print_event,
             progress=_make_progress(task_store),
             task_store=task_store,
-            # 注意:mcp_manager 由 router 统一在退出时关闭,不放进单个 session 的
-            # closeables,否则切换/归档某个 session 会把全局 MCP 连接也关掉。
+            # PtySessionManager 随会话关闭(close_all 杀掉残留的交互式子进程)。
+            # mcp_manager 不放这里:它由 router 全局统一关,否则切换/归档某个
+            # session 会把全局 MCP 连接也关掉。
+            closeables=[pty_manager],
         )
 
     router = SessionRouter(

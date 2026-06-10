@@ -13,7 +13,7 @@
 
 ## 1. 当前一句话状态
 
-AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/shell/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）。
+AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）。
 
 距离 PRD 的核心缺口：还没有显式 `Planner + Executor + Replanner` 编排与结构化 `RunEvent`、没有统一风险等级 `ToolDescriptor` 与分级审批、没有自建 Computer Control Gateway、没有 Web UI。
 
@@ -44,6 +44,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 - `read_file / write_file / list_dir`（受 `WORKSPACE_ROOT` 限制）、`shell`（跨平台、cwd 锁定 workspace）、`todo_write`（CLI 任务面板 `✓/❯/○`）。
 - `code_search`（`app/tools/builtin/code_search.py`）：text/regex/file/symbol 四种模式，优先 `rg --json`，无 rg 时 Python fallback；遵守 `.gitignore`、命中行密钥脱敏。
+- 交互式终端会话（`app/tools/builtin/interactive.py`）：`PtySession` 在伪终端里起子进程，`read-until-idle` 通用驱动（不依赖提示符/哨兵）；`terminal_open / terminal_send / terminal_close / terminal_list` 四个工具按会话注入；用于远程登录（`zsh -ic 'vsm <device>'`、ssh）、REPL、交互式安装器等 `shell` 搞不定的有状态会话。子进程随 AgentSession 关闭而清理。
 
 ### 3.3 MCP Client 层（stdio）+ Playwright 浏览器控制
 
@@ -79,7 +80,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **217 个 unit tests**（全离线），覆盖：runtime、三种 adapter、MCP（config/adapter/manager）、code_search、shell、审批、menu、spinner、workspace path、redact、AgentProfile、storage、memory、session_router、CLI 斜杠补全、Skill loader/catalog。
+- **235 个 unit tests**（全离线），覆盖：runtime、三种 adapter、MCP（config/adapter/manager）、code_search、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage、memory、session_router、CLI 斜杠补全、Skill loader/catalog。
 
 ---
 
@@ -96,12 +97,12 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |
 | 任务面板 | 轻量 `TaskStore` + `todo_write`；还不是 PRD 的任务状态源 | `app/agent/tasks.py`, `app/tools/builtin/todo.py` |
 | 审批 | 自动 / 交互（方向键）/ 拒绝；仍是 `requires_approval` 布尔模型 | `app/agent/approval.py`, `app/util/menu.py` |
-| 内置工具 | `read_file / write_file / list_dir / code_search / shell / todo_write` | `app/tools/builtin/` |
+| 内置工具 | `read_file / write_file / list_dir / code_search / shell / todo_write`；`terminal_*` 交互式终端会话 | `app/tools/builtin/` |
 | MCP | stdio Manager、工具发现、sync/async 桥、同名不覆盖、auto_approve 白名单 | `app/mcp/` |
 | 浏览器控制 | Playwright MCP：打开/snapshot/点击/输入；named profile；数据边界提示 | `config/mcp_servers.example.yaml`, `app/cli.py` |
 | 存储 | SQLite：sessions/messages/memories/tool_executions；尚无 runs/tasks/settings 表与 Web 复用 | `app/storage/` |
 | 安全基础 | workspace 越界拒绝、脱敏、MCP env allowlist、敏感目录不入库 | `app/util/redact.py`, `.gitignore` |
-| 测试 | 217 个 unit tests | `tests/unit/` |
+| 测试 | 235 个 unit tests | `tests/unit/` |
 
 ---
 
@@ -132,6 +133,7 @@ AgentLab/
         files.py                   # read_file / write_file / list_dir
         code_search.py             # 高频代码搜索
         shell.py                   # 跨平台 shell
+        interactive.py             # 交互式终端会话(PTY)：PtySession + manager + terminal_* 工具
         todo.py                    # todo_write
     mcp/
       config.py                    # mcp_servers.yaml loader
@@ -158,7 +160,7 @@ AgentLab/
   docs/
     technical_architecture.md      # PRD 和总体技术方案
     process.md                     # 当前进展和接下来工作
-  tests/unit/                      # 217 个 unit tests
+  tests/unit/                      # 235 个 unit tests
 ```
 
 尚未出现但 PRD 已规划的目录：`app/control/`、`app/server.py`、`app/web/`。
@@ -261,16 +263,16 @@ AgentLab/
 
 ### 6.8 远程设备控制
 
-当前状态：未实现。
+当前状态：已有**通用交互式终端会话**能力（见 3.2 / `app/tools/builtin/interactive.py`），可通过 `terminal_open("zsh -ic 'vsm <device>'")` + `terminal_send` 登录远程设备并逐条执行命令（已在真实 orangepi 设备上验证 open→命令→close 全链路）。这是 PTY 驱动的通用能力，ssh / REPL / 交互式程序同样适用，凭据留在本机命令配置里、不进工具参数。尚无"预配置 host 白名单 + 结构化 SSH Runner"那一层。
 
 接下来要做：
 
-- 新增远程 host 配置，只允许预配置 host。
-- SSH Runner 做 host key 校验、workspace 限制、timeout、输出截断、stderr/exit code 结构化。
+- 新增远程 host / device 配置，按白名单限制 `terminal_open` 可连接的目标（当前不限制，靠 requires_approval 兜底）。
+- 把交互式会话动作纳入审计（tool_executions），记录 device、命令、时间。
 - 文件传输只允许本地 workspace 与 remote workspace 之间。
 - 复杂远程 GUI 操作优先走远程 Agent Worker 或 Remote Host MCP。
 
-验收标准：Agent 可在配置过的远程 host 指定 workspace 内执行只读命令；越界、未知 host、危险命令都被拒绝或要求强审批。
+验收标准：Agent 可在配置过的远程 host 指定 workspace 内执行只读命令；越界、未知 host、危险命令都被拒绝或要求强审批。（交互式登录+执行已可用，白名单与审计待补。）
 
 ### 6.9 Skill
 
@@ -337,7 +339,7 @@ AgentLab/
 ```bash
 conda activate agentlab
 
-# 收集测试。当前 217 个 unit tests。
+# 收集测试。当前 235 个 unit tests。
 python -m pytest tests/unit --collect-only -q
 
 # 运行全部 unit tests。
