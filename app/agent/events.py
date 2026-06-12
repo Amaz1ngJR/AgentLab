@@ -19,6 +19,12 @@
   run_completed      run 正常结束(text = 最终答复,payload.tasks = 最终 snapshot)
   run_failed         run 异常/卡死/取消结束(text = 原因)
 
+  上下文预算与压缩(§7.3,由 ContextManager 在稳定点发出):
+  context_budget_warning      预计输入超过窗口的 70%(payload 携带预算明细)
+  context_compaction_started  开始压缩旧历史(payload.token_before)
+  context_compaction_completed 压缩完成(payload: token_before/after/range/summary)
+  context_compaction_failed   压缩失败,保留原始尾部(text = 原因)
+
 设计原则:RunEvent 是只读的事实通知,消费者(CLI/Web/TUI)只渲染,不回写状态。
 审批的"询问—回答"仍由 ApprovalPolicy 同步完成;approval_required 只是给 UI 一个
 展示时机。
@@ -40,6 +46,12 @@ TOOL_DENIED = "tool_denied"
 TASK_UPDATED = "task_updated"
 RUN_COMPLETED = "run_completed"
 RUN_FAILED = "run_failed"
+
+# 上下文预算与压缩(§7.3)
+CONTEXT_BUDGET_WARNING = "context_budget_warning"
+CONTEXT_COMPACTION_STARTED = "context_compaction_started"
+CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"
+CONTEXT_COMPACTION_FAILED = "context_compaction_failed"
 
 
 @dataclass

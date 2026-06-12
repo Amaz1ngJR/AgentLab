@@ -149,6 +149,12 @@ class SessionRouter:
         store = getattr(sess, "task_store", None)
         if store is not None:
             self._storage.save_tasks(self.current_id, store.snapshot())
+        # 上下文压缩摘要审计:把本轮产生的 ContextSummary flush 到 context_summaries。
+        # 原始消息已由 save_messages 保留 —— 压缩只换"模型输入里的旧片段",不删原文。
+        ctx = getattr(sess, "context_manager", None)
+        if ctx is not None:
+            for summary in ctx.drain_records():
+                self._storage.save_context_summary(self.current_id, summary.to_record())
         # 编排 run 审计:有 goal 才记(单轮 legacy chat 不写 runs)
         goal = getattr(sess, "last_goal", "") or ""
         status = getattr(sess, "last_run_status", "") or ""

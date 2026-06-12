@@ -94,6 +94,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     position     INTEGER NOT NULL DEFAULT 0,
     updated_at   TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS context_summaries (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    summary_json  TEXT NOT NULL DEFAULT '{}',
+    range_start   INTEGER NOT NULL DEFAULT 0,
+    range_end     INTEGER NOT NULL DEFAULT 0,
+    source_run_ids TEXT NOT NULL DEFAULT '[]',
+    token_before  INTEGER NOT NULL DEFAULT 0,
+    token_after   INTEGER NOT NULL DEFAULT 0,
+    compression_model_profile TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL
+);
 """
 
 
@@ -164,6 +177,7 @@ class Storage:
             con.execute("DELETE FROM tool_executions WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM tasks WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM runs WHERE session_id=?", (session_id,))
+            con.execute("DELETE FROM context_summaries WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM sessions WHERE id=?", (session_id,))
 
     def list_sessions(self, include_archived: bool = False) -> list[dict]:
@@ -348,6 +362,50 @@ class Storage:
             (session_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── context_summaries(上下文压缩摘要审计,§7.3.3)────────────────────────────
+
+    def save_context_summary(self, session_id: str, record: dict) -> int:
+        """写入一条压缩摘要审计记录。
+
+        record 是 ContextSummary.to_record() 的输出:summary_json / source_message_range
+        / source_run_ids / token_count_before/after / compression_model_profile。
+        summary_json 已是 JSON 文本(其字符串值在压缩阶段已脱敏),这里再兜底脱敏一次。
+        原始消息不在这里删除 —— 压缩只换"模型输入里的旧片段",原始消息由消息表保留。
+        """
+        rng = record.get("source_message_range") or [0, 0]
+        start = int(rng[0]) if len(rng) > 0 else 0
+        end = int(rng[1]) if len(rng) > 1 else 0
+        with self._tx() as con:
+            cur = con.execute(
+                """INSERT INTO context_summaries
+                   (session_id,summary_json,range_start,range_end,source_run_ids,
+                    token_before,token_after,compression_model_profile,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (session_id,
+                 redact(str(record.get("summary_json", "{}"))),
+                 start, end,
+                 json.dumps(record.get("source_run_ids", []), ensure_ascii=False),
+                 int(record.get("token_count_before", 0)),
+                 int(record.get("token_count_after", 0)),
+                 str(record.get("compression_model_profile", "")),
+                 _now()),
+            )
+            return cur.lastrowid
+
+    def list_context_summaries(self, session_id: str, limit: int = 50) -> list[dict]:
+        rows = self._con.execute(
+            "SELECT * FROM context_summaries WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def latest_context_summary(self, session_id: str) -> Optional[dict]:
+        row = self._con.execute(
+            "SELECT * FROM context_summaries WHERE session_id=? ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     # ── agent_profiles ───────────────────────────────────────────────────────
     def upsert_agent_profile(self, agent_id: str, name: str,

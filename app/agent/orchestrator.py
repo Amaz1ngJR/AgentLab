@@ -51,6 +51,7 @@ class Orchestrator:
         on_event: Optional[Callable[[RunEvent], None]] = None,
         progress: Optional[ProgressFn] = None,
         messages: Optional[list[dict[str, Any]]] = None,
+        context_manager: Optional[Any] = None,
     ):
         self._llm = llm
         self._tools = tools
@@ -67,6 +68,9 @@ class Orchestrator:
         # 跨任务、跨 run 共享的对话历史(后做的任务能看到先做任务的上下文)。
         # 允许外部传入一个已存在的 list(AgentSession 把自己的 messages 交进来共享)。
         self.messages: list[dict[str, Any]] = messages if messages is not None else []
+        # 上下文预算/压缩协调者(可选,§7.3)。None 时不做任何预算检查与压缩,
+        # 行为与之前完全一致(既有测试不受影响)。
+        self._ctx = context_manager
         self._run_seq = 0  # run 计数,用于给任务 id 加 run 前缀,避免跨 run 撞 id
         # run 级统计:每次 run() 重置,供 AgentSession 拷回去展示
         self.last_run_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
@@ -98,6 +102,24 @@ class Orchestrator:
             kind=events.TASK_UPDATED, task_id=task_id, task_status=status,
             text=note, payload={"tasks": self.store.snapshot()},
         ))
+
+    def _maybe_compact(self) -> None:
+        """在稳定点(规划后 / 每个任务完成后)检查上下文预算并按需压缩。
+
+        无 context_manager 时直接返回(默认行为)。压缩就地改短 self.messages;
+        切点只落在已闭合的历史里,不会破坏正在执行任务的 tool_use/tool_result 对。
+        压缩异常一律吞掉:上下文压缩是兜底优化,绝不能让它中断主任务。
+        """
+        if self._ctx is None:
+            return
+        try:
+            with self._progress("compacting") as handle:
+                on_progress = getattr(handle, "update", None)
+                self._ctx.maybe_compact(
+                    self.messages, system=self._system, on_progress=on_progress,
+                )
+        except Exception:
+            pass
 
     def run(self, goal: str, *, cancel: Optional[CancelToken] = None) -> str:
         """规划并执行一个目标,返回最终答复文本。
@@ -132,6 +154,9 @@ class Orchestrator:
         self.store.extend(self._namespace_tasks(plan.tasks))
         self._emit(RunEvent(kind=events.PLAN_CREATED,
                             payload={"tasks": self.store.snapshot()}))
+        # 规划后是第一个稳定点:此时只追加了 goal,通常还不到阈值,但若上一轮 run
+        # 已让历史很长,这里先压一次,避免第一个任务就带着超长上下文起步。
+        self._maybe_compact()
 
         # ── 2. 执行 + 重规划循环 ──────────────────────────────────────────────
         steps_left = self._max_steps
@@ -159,6 +184,10 @@ class Orchestrator:
                 self._emit_task_update(task.id, patch.new_status, patch.note)
                 if outcome.text:
                     last_text = outcome.text
+
+                # 任务之间是干净的稳定点:此时 tool_use/tool_result 都已闭合,
+                # 安全压缩旧历史(若预算触发)。
+                self._maybe_compact()
 
         except Cancelled:
             self.last_run_status = "cancelled"

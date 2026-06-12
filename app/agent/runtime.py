@@ -97,6 +97,7 @@ class AgentSession:
         orchestrate: bool = False,
         planner: Optional[Any] = None,
         on_run_event: Optional[Callable[[RunEvent], None]] = None,
+        context_manager: Optional[Any] = None,
     ):
         self.llm = llm
         self.tools = tools
@@ -124,6 +125,9 @@ class AgentSession:
         self._planner = planner
         self._on_run_event = on_run_event or (lambda e: None)
         self._orch = None  # 懒构建(见 _ensure_orchestrator)
+        # 上下文预算/压缩协调者(可选,§7.3)。交给 Orchestrator 在稳定点调用。
+        # None 时编排路径不做预算检查与压缩(默认,既有测试不受影响)。
+        self.context_manager = context_manager
         # 编排 run 的目标与结果状态,供 SessionRouter.persist_current 写 runs 审计
         self.last_goal: str = ""
         self.last_run_status: str = ""
@@ -169,6 +173,7 @@ class AgentSession:
                 on_event=self._on_run_event,
                 progress=self._progress,
                 messages=self.messages,
+                context_manager=self.context_manager,
             )
         # 每次都重新指向当前 messages:switch/reset 可能换过引用
         self._orch.messages = self.messages

@@ -30,6 +30,9 @@ from prompt_toolkit.styles import Style
 
 from app.agent.approval import AutoApprove, InteractivePolicy
 from app.agent.cancel import CancelToken
+from app.agent.context import ContextManager
+from app.agent.context_budget import ContextBudget
+from app.agent.context_compaction import ContextCompressor
 from app.agent.events import RunEvent
 from app.agent import events as run_events
 from app.agent.planner import Planner
@@ -475,6 +478,81 @@ def _print_run_event(ev: RunEvent) -> None:
             for line in _format_task_lines(tasks):
                 print(line, flush=True)
         print(flush=True)
+    elif kind == run_events.CONTEXT_BUDGET_WARNING:
+        rep = ev.payload or {}
+        pct = int(rep.get("usage_ratio", 0) * 100)
+        print(f"  ⓘ 上下文已用 ~{pct}%(下个稳定点将压缩旧历史)", flush=True)
+    elif kind == run_events.CONTEXT_COMPACTION_STARTED:
+        print("  ✻ 压缩上下文 …", flush=True)
+    elif kind == run_events.CONTEXT_COMPACTION_COMPLETED:
+        p = ev.payload or {}
+        before, after = p.get("token_before", 0), p.get("token_after", 0)
+        print(f"  ✓ 已压缩旧历史(~{before} → ~{after} tokens)", flush=True)
+    elif kind == run_events.CONTEXT_COMPACTION_FAILED:
+        print(f"  ⚠ 上下文压缩跳过:{ev.text}", flush=True)
+
+
+def _handle_context_command(session: AgentSession, line: str) -> str:
+    """处理 /context 命令族(§7.3 的 CLI 入口)。
+
+      /context                      显示预算 + recent window + summary 状态
+      /context compact              立即压缩当前会话的可压缩历史
+      /context summary              查看当前生效的压缩摘要
+      /context disable-auto-compact 禁用本会话自动压缩
+      /context enable-auto-compact  重新启用本会话自动压缩
+    """
+    ctx = getattr(session, "context_manager", None)
+    if ctx is None:
+        return "本会话未启用上下文预算(legacy 路径无压缩)。"
+    parts = line.split(maxsplit=1)
+    sub = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub == "":
+        rep = ctx.report(session.messages, system=session.system_prompt)
+        pct = int(rep["usage_ratio"] * 100)
+        lines = [
+            f"模型窗口   : {rep['model_context_limit']} tokens"
+            f"(预留输出 {rep['reserved_output_tokens']})",
+            f"预计输入   : ~{rep['estimated_input_tokens']} tokens(~{pct}%) "
+            f"[{rep['status']}]",
+            f"阈值       : 警告 {rep['warn_threshold']} / 强制压缩 {rep['compact_threshold']}",
+            f"消息条数   : {rep['messages']}(压缩时至少保留最近 {rep['keep_recent']} 条)",
+            f"自动压缩   : {'开' if rep['auto_compact'] else '关'}",
+            f"已生成摘要 : {rep['summaries']} 段"
+            f"{'(有生效摘要)' if rep['has_summary'] else ''}",
+        ]
+        return "\n".join(lines)
+
+    if sub == "compact":
+        compacted = ctx.maybe_compact(
+            session.messages, system=session.system_prompt, force=True,
+        )
+        if compacted:
+            return "已手动压缩当前会话的可压缩历史。"
+        return "未压缩(没有可安全压缩的历史,或摘要生成失败)。"
+
+    if sub == "summary":
+        s = ctx.last_summary
+        if s is None:
+            return "当前没有生效的压缩摘要。历史还短或尚未触发压缩。"
+        rng = s.source_message_range
+        return (
+            f"摘要范围   : 原始消息 [{rng[0]}, {rng[1]})  "
+            f"压缩模型 {s.compression_model_profile or '(默认)'}\n"
+            f"token      : 压缩前 ~{s.token_count_before} → 摘要 ~{s.token_count_after}\n"
+            f"───\n{s.to_message_text()}"
+        )
+
+    if sub == "disable-auto-compact":
+        ctx.auto_compact = False
+        return "已禁用本会话自动压缩。仍可用 /context compact 手动压缩。"
+
+    if sub == "enable-auto-compact":
+        ctx.auto_compact = True
+        return "已启用本会话自动压缩。"
+
+    return ("未知子命令: {0}。可用: compact / summary / "
+            "disable-auto-compact / enable-auto-compact").format(sub)
 
 
 def _check_local_endpoint(cfg) -> None:
@@ -658,6 +736,17 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
         # Skill 只加上下文，不放宽工具授权：上面 reg 注册的工具集才是实际可用集。
         with_skills = skill_catalog.inject(base_prompt, agent_profile.skills)
         sys_prompt = inject_memories(with_skills, recent)
+        # ── 上下文预算 + 压缩(§7.3)──────────────────────────────────────────
+        # 按当前模型窗口(profile 声明的 context_size 优先,否则按模型名查表)派生
+        # 预算,在编排稳定点接近 85% 时自动压缩旧历史,避免长 run 撞 token 上限。
+        ctx_budget = ContextBudget.from_model(
+            model=cfg.model, declared_context_size=cfg.context_size,
+        )
+        ctx_manager = ContextManager(
+            budget=ctx_budget,
+            compressor=ContextCompressor(llm, model_profile=cfg.profile_name or ""),
+            on_event=_print_run_event,
+        )
         return AgentSession(
             llm=llm,
             tools=reg,
@@ -678,6 +767,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
             orchestrate=True,
             planner=Planner(llm),
             on_run_event=_print_run_event,
+            context_manager=ctx_manager,
         )
 
     router = SessionRouter(
@@ -759,6 +849,7 @@ def _print_input_separator() -> None:
 _SLASH_COMMANDS = {
     "/reset": "清空当前会话的消息和任务",
     "/session": "管理多 Agent 会话",
+    "/context": "查看上下文预算 / 手动压缩 / 摘要",
 }
 # /session 子命令 → 说明
 _SESSION_SUBCOMMANDS = {
@@ -769,6 +860,13 @@ _SESSION_SUBCOMMANDS = {
     "rename": "重命名当前 session",
     "archive": "归档当前 session(软删除,可恢复)",
     "delete": "彻底删除 session 及消息(不可恢复)",
+}
+# /context 子命令 → 说明
+_CONTEXT_SUBCOMMANDS = {
+    "compact": "立即压缩当前会话的可压缩历史",
+    "summary": "查看当前生效的压缩摘要",
+    "disable-auto-compact": "禁用本会话的自动压缩",
+    "enable-auto-compact": "重新启用本会话的自动压缩",
 }
 
 
@@ -800,8 +898,17 @@ class _SlashCompleter(Completer):
                     yield Completion(cmd, start_position=-len(word), display_meta=desc)
             return
 
-        if parts[0] != "/session":
-            return  # 只有 /session 有更深层补全
+        if parts[0] not in ("/session", "/context"):
+            return  # 只有 /session 和 /context 有更深层补全
+
+        # ── 第二级:/context 子命令 ──
+        if parts[0] == "/context":
+            if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
+                prefix = parts[1] if len(parts) == 2 else ""
+                for sub, desc in _CONTEXT_SUBCOMMANDS.items():
+                    if sub.startswith(prefix):
+                        yield Completion(sub, start_position=-len(prefix), display_meta=desc)
+            return
 
         # ── 第二级:/session 子命令 ──
         if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
@@ -914,6 +1021,10 @@ def _repl(router: SessionRouter) -> int:
         if line == "/reset":
             session.reset()
             print("(history cleared)")
+            continue
+
+        if line == "/context" or line.startswith("/context "):
+            print(_handle_context_command(session, line))
             continue
 
         try:

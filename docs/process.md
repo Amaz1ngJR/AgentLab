@@ -13,19 +13,19 @@
 
 ## 1. 当前一句话状态
 
-AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）、`Planner + Executor + Replanner` 编排路径（带依赖 TaskStore + 结构化 `RunEvent`，已接入 CLI 主路径，支持 Ctrl-C 协作式取消与任务状态持久化恢复）。
+AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）、`Planner + Executor + Replanner` 编排路径（带依赖 TaskStore + 结构化 `RunEvent`，已接入 CLI 主路径，支持 Ctrl-C 协作式取消与任务状态持久化恢复）、上下文预算与自动压缩（`ContextBudget` + `ContextCompressor` + 结构化摘要 + `/context` 命令族，编排稳定点超阈值自动压缩、可审计）。
 
-距离 PRD 的核心缺口：没有上下文预算与自动压缩（长任务可能撞 token 上限）、没有统一风险等级 `ToolDescriptor` 与分级审批、没有自建 Computer Control Gateway、没有终端 TUI、没有 Web UI。
+距离 PRD 的核心缺口：没有统一风险等级 `ToolDescriptor` 与分级审批、没有自建 Computer Control Gateway、没有终端 TUI、没有 Web UI。
 
 ---
 
 ## 2. 当前需要做的事情（最多 5 项）
 
-1. 实现上下文预算 + 自动压缩（`ContextBudget` / `ContextCompressor` / 结构化摘要 + `/context` 命令族），让长对话和复杂编排 run 不撞 token 上限（见 6.13）。
-2. 把 `Tool` 升级为统一 `ToolDescriptor`，审批从布尔值改为分级策略（read/write/execute/browser_control/...）（见 6.4）。
-3. 建立 `ComputerControlGateway`，把 Playwright MCP 浏览器能力纳入统一观察、动作、审批、审计链路（见 6.6）。
-4. 新增终端 TUI（`app/tui/`）：顶部大号 **Amaz1ng** 欢迎栏 + 会话/任务/审批/对话分区，复用同一 Runtime 事件（见 6.12）。
-5. FastAPI Web UI + SSE 事件，与 CLI 共用同一 Runtime service（见 6.10）。
+1. 把 `Tool` 升级为统一 `ToolDescriptor`，审批从布尔值改为分级策略（read/write/execute/browser_control/...）（见 6.4）。
+2. 建立 `ComputerControlGateway`，把 Playwright MCP 浏览器能力纳入统一观察、动作、审批、审计链路（见 6.6）。
+3. 新增终端 TUI（`app/tui/`）：顶部大号 **Amaz1ng** 欢迎栏 + 会话/任务/审批/对话分区，复用同一 Runtime 事件（见 6.12）。
+4. FastAPI Web UI + SSE 事件，与 CLI 共用同一 Runtime service（见 6.10）。
+5. 把 `runs / tasks / context_summaries` 落库的审计接出 CLI 查看入口（如 `/runs`、任务历史回看）（见 6.1）。
 
 ---
 
@@ -81,7 +81,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **268 个 unit tests**（全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、三种 adapter、MCP（config/adapter/manager）、code_search、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage（含 tasks/runs 持久化）、memory、session_router（含任务快照恢复）、CLI 斜杠补全、Skill loader/catalog。
+- **301 个 unit tests**（全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager）、code_search、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage（含 tasks/runs/context_summaries 持久化）、memory、session_router（含任务快照恢复）、CLI 斜杠补全、Skill loader/catalog。
 
 ### 3.8 Planner / Executor / Replanner 编排与结构化 RunEvent
 
@@ -101,6 +101,17 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `app/storage/__init__.py`：新增 `runs / tasks` 两表 + `save_tasks / load_tasks`(整表覆盖,按 position 排序,evidence/error 脱敏)、`log_run / list_runs`;`delete_session` 一并清 tasks/runs。`app/agent/tasks.py` 新增 `TaskStore.restore(snapshot)`(就地重建,不换引用)。
 - `app/agent/session_router.py`：`switch` 从 SQLite 恢复消息后再 `restore` 任务快照;`persist_current` 同时存消息 + 任务快照,并在 session 记录了 goal/run_status 时写一条 runs 审计。
 - 测试:`test_runtime.py`(编排委托拷统计、取消、legacy 默认不受影响)、`test_storage.py`(tasks/runs round-trip、覆盖、脱敏、删除连带清理)、`test_session_router.py`(switch 恢复任务快照)。
+
+### 3.10 上下文构建与压缩(§7.3 / §6.13)
+
+- `app/agent/context_budget.py`:`estimate_tokens`(CJK 友好、偏保守的离线字符启发式,不依赖 tokenizer/网络)、`resolve_context_limit`(profile 声明的 context_size 优先,否则按模型名前缀查表,未知退 8192)、`ContextBudget.from_model`(派生 reserved_output / system_and_tools / memory / summary / recent / evidence 各项预算)、70% 警告 / 85% 强制压缩阈值与 `status_for`。
+- `app/agent/context_compaction.py`:`ContextSummary`(§7.3.3 结构化字段 + source_message_range/source_run_ids/token_before/after/compression_model_profile 审计元数据)、`ContextCompressor`:`_safe_split_point` 选段(保留最近窗口 + 不切开 tool_use/tool_result 对,避免悬空 tool_call)→ 调模型产出结构化 JSON 摘要 → 必填字段校验(user_goal/handoff_note)+ 递归脱敏 → 用一条摘要消息就地顶掉旧前缀;摘要非法/模型异常/无可压段时不压缩(保留原始尾部)。
+- `app/agent/context.py`:`ContextManager` 黏合 budget + compressor。`maybe_compact` 在稳定点检查预算:ok 不动 / warn 发 `context_budget_warning` / compact 触发压缩并发 `context_compaction_started/completed/failed`;`report()` 供 `/context` 展示预算+recent window+摘要状态;`drain_records()` 把压缩摘要交给持久化;`force=True` 供 `/context compact` 手动压缩;`auto_compact` 开关。
+- `app/agent/events.py`:新增 `context_budget_warning / context_compaction_started / context_compaction_completed / context_compaction_failed` 四个 RunEvent kind。
+- `app/agent/orchestrator.py`:新增可选 `context_manager`,在规划后与每个任务完成后(稳定点,此时 tool 对已闭合)调 `_maybe_compact`;压缩异常一律吞掉,绝不中断主任务;无 context_manager 时行为完全不变。`AgentSession` 透传 `context_manager` 给 Orchestrator。
+- `app/storage/__init__.py`:新增 `context_summaries` 表(summary_json / range_start/end / source_run_ids / token_before/after / compression_model_profile / created_at)+ `save_context_summary / list_context_summaries / latest_context_summary`,写入再兜底脱敏;`delete_session` 连带清理。`SessionRouter.persist_current` 把本轮 `drain_records()` 的摘要 flush 落库(原始消息仍由 save_messages 保留,压缩只换模型输入里的旧片段)。
+- `app/cli.py`:`_session_factory` 按 `cfg.context_size`/模型窗口构建 `ContextManager` 装配进 session;`_print_run_event` 渲染 context_* 事件(警告百分比 / 压缩前后 token);`/context` 命令族(看预算 / `compact` 手动压缩 / `summary` 看摘要 / `disable-auto-compact` / `enable-auto-compact`)+ 斜杠补全二级子命令。
+- 测试 `tests/unit/test_context.py`(33 个):token 估算、窗口解析、预算阈值、安全选段(含不切 tool 对)、摘要解析/校验/脱敏、ContextManager 触发与不触发/禁用/force/drain/report、storage round-trip + 脱敏 + 删除清理、Orchestrator 稳定点压缩 + 无 context_manager 向后兼容。
 
 ---
 
@@ -124,8 +135,8 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 存储 | SQLite：sessions/messages/memories/tool_executions/runs/tasks；settings 表与 Web 复用待做 | `app/storage/` |
 | 安全基础 | workspace 越界拒绝、脱敏、MCP env allowlist、敏感目录不入库 | `app/util/redact.py`, `.gitignore` |
 | 取消 | Ctrl-C 协作式取消(CancelToken):首次置位、当前步骤后停止,连按强制中断 | `app/agent/cancel.py`, `app/cli.py` |
-| 上下文压缩 | 规划中(§6.13):PRD §7.3 已定方案,当前每轮发全量 messages、无预算与自动压缩 | `app/agent/context.py`(待建) |
-| 测试 | 268 个 unit tests | `tests/unit/` |
+| 上下文压缩 | ContextBudget + ContextCompressor + 结构化摘要;编排稳定点超 85% 自动压缩、可审计;`/context` 命令族 | `app/agent/context.py`, `context_budget.py`, `context_compaction.py` |
+| 测试 | 301 个 unit tests | `tests/unit/` |
 
 ---
 
@@ -156,8 +167,9 @@ AgentLab/
       tasks.py                     # TaskStore：任务状态唯一源(依赖/claim/blocked/failed/evidence/snapshot/restore)
       profiles.py                  # AgentProfile + load_agent_profiles
       session_router.py            # SessionRouter + /session 命令族
-      context_budget.py            # (规划中,§6.13) 上下文预算:模型窗口/预留输出/压缩阈值
-      context_compaction.py        # (规划中,§6.13) 上下文压缩:历史分段/结构化摘要/压缩事件
+      context.py                   # ContextManager:稳定点预算检查 + 按需压缩 + 审计记录 flush
+      context_budget.py            # 上下文预算:模型窗口解析/token 估算/各项预算/70%-85% 阈值
+      context_compaction.py        # 上下文压缩:安全选段/结构化摘要/校验脱敏/就地替换旧历史
     tools/
       registry.py                  # Tool 注册表（仍是 requires_approval 布尔模型）
       builtin/
@@ -191,7 +203,7 @@ AgentLab/
   docs/
     technical_architecture.md      # PRD 和总体技术方案
     process.md                     # 当前进展和接下来工作
-  tests/unit/                      # 235 个 unit tests
+  tests/unit/                      # 301 个 unit tests
 ```
 
 尚未出现但 PRD 已规划的目录：`app/control/`、`app/tui/`、`app/server.py`、`app/web/`。
@@ -359,19 +371,17 @@ AgentLab/
 
 ### 6.13 上下文构建与压缩
 
-当前状态：尚未实现。PRD §7.3 已定义完整方案(`ContextBudget` + `ContextCompressor` + 结构化 `ContextSummary` + `context_summaries` 表 + `/context` 命令族 + `context_*` 事件)。当前 Runtime 每轮把完整 `messages` 直接发给模型,没有预算估算,也不会在接近窗口上限时压缩 —— 长对话和复杂编排 run(子任务指令逐轮累积,见 6.1)有撞 token 上限的风险。
+当前状态：核心已完成(见 3.10)。`ContextBudget`(窗口解析 + token 估算 + 各项预算 + 70%/85% 阈值)、`ContextCompressor`(安全选段 + 结构化摘要 + 校验脱敏 + 就地替换)、`ContextManager`(稳定点 `maybe_compact` + context_* 事件 + 审计 flush)、`context_summaries` 表、`/context` 命令族、编排路径接入均已落地;无 context_manager 时行为完全不变。剩下的是非阻塞增强。
 
-接下来要做:
+接下来要做(均为非阻塞增强):
 
-- 新增 `app/agent/context_budget.py`:按模型 profile 的窗口算 `ContextBudget`(预留输出、system+tools 固定预算、memory/summary/recent/evidence 各项预算),并实现 70% 警告 / 85% 强制压缩阈值。
-- 新增 `app/agent/context_compaction.py`:选取可压缩历史段 → 调模型产出结构化 `ContextSummary`(user_goal/decisions/open_tasks/tool_evidence 引用/failed_attempts 等)→ 校验引用+脱敏+必填字段 → 写 `context_summaries`,并发 `context_budget_warning / context_compaction_started/completed/failed` 事件。
-- 改造 `app/agent/context.py`(目前 system prompt 由 `build_system_prompt` + Skill + Memory 拼成):按 §7.3.1 的稳定顺序组装 System / Active Task / Skill / Tool / Memory / **Context Summary** / Recent Messages / Evidence,把摘要插在最近消息之前。
-- 压缩边界:未闭合的 tool_call/tool_result 对、当前未完成 run、最后一条用户请求、pending approval 不能被压缩(正好保护编排路径正在执行的任务);摘要不自动写长期记忆;敏感数据可要求本地小模型摘要。
-- 存储:新增 `context_summaries` 表(source_message_range / source_run_ids / token_before/after / compression_model_profile);原始消息不删,压缩只换"模型输入中的旧片段"。
-- CLI/TUI/Web 入口:`/context`(看预算+recent window+summary 状态)、`/context compact`(手动压缩)、`/context summary`(看当前摘要)、`/context disable-auto-compact`。
-- `RunEvent` 扩展:把 `context_budget_warning / context_compaction_*` 纳入事件流,CLI 在 spinner/状态行提示压缩发生。
+- §7.3.1 的"完整稳定顺序上下文组装":目前 system prompt 仍由 `build_system_prompt` + Skill + Memory 在 CLI 侧拼成,摘要走"就地顶掉旧消息"而非独立的 Context Summary 段;后续可把 System / Active Task / Skill / Tool / Memory / **Context Summary** / Recent / Evidence 收进统一的 Context Builder。
+- 切换到更小窗口模型 / session 恢复时主动重算预算并压缩(当前只在编排稳定点按阈值触发)。
+- CompressionPolicy:敏感本地数据要求本地小模型做摘要,或云端模型参与前二次确认(当前统一用会话模型 + 脱敏)。
+- `memory_candidates` → 经 MemoryPolicy 确认后写长期记忆的人工入口(当前只作为摘要候选字段,不落库)。
+- TUI / Web 复用 `/context` 能力(report/compact/summary)。
 
-验收标准:一个会超出模型窗口的长 session,在 85% 阈值自动压缩后仍能继续推进;压缩摘要保留 user_goal/decisions/open_tasks 且不丢未完成 run;`/context` 可查看预算与摘要,`/context compact` 可手动触发;压缩前后 token 数与摘要范围可审计。
+验收标准:一个会超出模型窗口的长 session,在 85% 阈值自动压缩后仍能继续推进;压缩摘要保留 user_goal/decisions/open_tasks 且不丢未完成 run;`/context` 可查看预算与摘要,`/context compact` 可手动触发;压缩前后 token 数与摘要范围可审计。(已满足,见 3.10 与 `tests/unit/test_context.py`。)
 
 ---
 
@@ -399,7 +409,7 @@ AgentLab/
 ```bash
 conda activate agentlab
 
-# 收集测试。当前 235 个 unit tests。
+# 收集测试。当前 301 个 unit tests。
 python -m pytest tests/unit --collect-only -q
 
 # 运行全部 unit tests。
