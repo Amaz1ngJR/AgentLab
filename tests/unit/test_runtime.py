@@ -258,3 +258,57 @@ class _ProgressHandle:
 
     def on_text(self, delta):
         self._text_log.append(delta)
+
+
+# ── 编排模式委托(orchestrate=True)─────────────────────────────────────────────
+
+
+def _plan_json(*tasks):
+    import json
+    return ModelResponse(
+        text=json.dumps({"tasks": list(tasks)}, ensure_ascii=False),
+        tool_calls=[], usage={"input_tokens": 4, "output_tokens": 2},
+        provider_payload=[],
+    )
+
+
+def test_orchestrated_chat_delegates_and_copies_stats():
+    """orchestrate=True 时,chat 委托 Orchestrator,并把 run 统计拷回 session。"""
+    from app.agent.events import RUN_COMPLETED
+    router = FakeRouter([
+        _plan_json({"id": "t1", "content": "唯一任务", "dependencies": []}),
+        _resp_text("做完了", in_tokens=6, out_tokens=4),
+    ])
+    seen: list = []
+    session = AgentSession(
+        llm=router, tools=_registry_with(_echo_tool()),
+        orchestrate=True, on_run_event=seen.append,
+    )
+    answer = session.chat("帮我做点事")
+    assert answer == "做完了"
+    # 发了 run_completed;统计被拷回 session
+    assert any(e.kind == RUN_COMPLETED for e in seen)
+    assert session.last_turn_usage["output_tokens"] > 0
+    assert session.last_run_status == "completed"
+    assert session.last_goal == "帮我做点事"
+
+
+def test_orchestrated_chat_cancel_stops_run():
+    """传入已取消的 CancelToken,编排路径在规划前就干净退出。"""
+    from app.agent.cancel import CancelToken
+    router = FakeRouter([_plan_json({"id": "t1", "content": "x"})])
+    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()), orchestrate=True)
+    token = CancelToken()
+    token.cancel()
+    answer = session.chat("做事", cancel=token)
+    assert answer == "已取消。"
+    assert session.last_run_status == "cancelled"
+
+
+def test_legacy_chat_unaffected_by_orchestrate_flag_default():
+    """默认 orchestrate=False:仍走单轮循环,行为与历史一致。"""
+    router = FakeRouter([_resp_text("hi")])
+    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()))
+    assert session.chat("hello") == "hi"
+    # legacy 路径不写 run 状态
+    assert session.last_run_status == ""

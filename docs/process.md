@@ -13,18 +13,19 @@
 
 ## 1. 当前一句话状态
 
-AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）。
+AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）、`Planner + Executor + Replanner` 编排路径（带依赖 TaskStore + 结构化 `RunEvent`，已接入 CLI 主路径，支持 Ctrl-C 协作式取消与任务状态持久化恢复）。
 
-距离 PRD 的核心缺口：还没有显式 `Planner + Executor + Replanner` 编排与结构化 `RunEvent`、没有统一风险等级 `ToolDescriptor` 与分级审批、没有自建 Computer Control Gateway、没有 Web UI。
+距离 PRD 的核心缺口：没有上下文预算与自动压缩（长任务可能撞 token 上限）、没有统一风险等级 `ToolDescriptor` 与分级审批、没有自建 Computer Control Gateway、没有终端 TUI、没有 Web UI。
 
 ---
 
 ## 2. 当前需要做的事情（最多 5 项）
 
-1. 将 `AgentSession` 拆成 `Planner + Executor + Replanner`，升级 `TaskStore` 为任务状态源，并输出结构化 `RunEvent`（见 5.1）。
-2. 把 `Tool` 升级为统一 `ToolDescriptor`，审批从布尔值改为分级策略（read/write/execute/browser_control/...）（见 5.4）。
-3. 建立 `ComputerControlGateway`，把 Playwright MCP 浏览器能力纳入统一观察、动作、审批、审计链路（见 5.6）。
-4. FastAPI Web UI + SSE 事件，与 CLI 共用同一 Runtime service（见 5.10）。
+1. 实现上下文预算 + 自动压缩（`ContextBudget` / `ContextCompressor` / 结构化摘要 + `/context` 命令族），让长对话和复杂编排 run 不撞 token 上限（见 6.13）。
+2. 把 `Tool` 升级为统一 `ToolDescriptor`，审批从布尔值改为分级策略（read/write/execute/browser_control/...）（见 6.4）。
+3. 建立 `ComputerControlGateway`，把 Playwright MCP 浏览器能力纳入统一观察、动作、审批、审计链路（见 6.6）。
+4. 新增终端 TUI（`app/tui/`）：顶部大号 **Amaz1ng** 欢迎栏 + 会话/任务/审批/对话分区，复用同一 Runtime 事件（见 6.12）。
+5. FastAPI Web UI + SSE 事件，与 CLI 共用同一 Runtime service（见 6.10）。
 
 ---
 
@@ -80,7 +81,26 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **235 个 unit tests**（全离线），覆盖：runtime、三种 adapter、MCP（config/adapter/manager）、code_search、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage、memory、session_router、CLI 斜杠补全、Skill loader/catalog。
+- **268 个 unit tests**（全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、三种 adapter、MCP（config/adapter/manager）、code_search、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage（含 tasks/runs 持久化）、memory、session_router（含任务快照恢复）、CLI 斜杠补全、Skill loader/catalog。
+
+### 3.8 Planner / Executor / Replanner 编排与结构化 RunEvent
+
+- `app/agent/tasks.py`：`TaskStore` 升级为任务状态唯一来源。`Task` 新增 `dependencies / evidence / error / history`；状态增 `blocked / failed`（编排路径专用,`todo_write` 仍只写简单三态）。新增 `add / extend / get / update_status / claim_next（按依赖）/ has_runnable / has_open / is_done / is_stalled / snapshot`。`summary()` 向后兼容(保留 total/pending/in_progress/completed,加 blocked/failed)。
+- `app/agent/events.py`：结构化 `RunEvent`，kind 覆盖 `run_started / plan_created / task_started / message_delta / tool_requested / approval_required / tool_completed / tool_denied / task_updated / run_completed / run_failed`;`payload.tasks` 携带任务 snapshot。
+- `app/agent/planner.py`：`Planner` 让模型只输出 JSON 计划,`_extract_json` 容忍 markdown 围栏/前后散文,`_parse_tasks` 跳过非法项并去重 id;解析失败或模型异常时退化为单任务计划,保证永不卡死。
+- `app/agent/executor.py`：`Executor.run_task` 按"单个子任务"驱动有限步工具循环,把任务指令注入共享 messages,产出 `TaskOutcome(completed/failed/blocked)`;工具出错→failed,审批被拒→blocked,步数耗尽→failed;发 `RunEvent`,不直接写 TaskStore。
+- `app/agent/replanner.py`：`Replanner.apply` 把 `TaskOutcome` 回写 TaskStore;失败任务追加一次"复查并修复"补救任务(重试任务再失败不再追加,避免无限循环),阻塞不追加。
+- `app/agent/orchestrator.py`：`Orchestrator.run(goal)` 串联 规划→claim→执行→重规划,带全局 `max_steps` 预算与协作式取消(`app/agent/cancel.py` 的 `CancelToken`);多次 `run()` 在已有任务之上追加新计划(任务 id 加 `rN-` 前缀避免跨 run 撞车),实现"用户中途追加目标";收工/卡死/取消/超预算分别发对应 RunEvent。
+- 测试 `tests/unit/test_orchestrator.py`(覆盖 §6.1 验收:初始计划、按依赖执行、工具失败后重规划、审批拒绝后阻塞、用户追加目标、取消、max_steps)。
+
+### 3.9 编排路径接入 CLI + 任务状态持久化
+
+- `app/agent/runtime.py`：`AgentSession` 新增 `orchestrate / planner / on_run_event` 参数与 `chat(cancel=...)`。`orchestrate=True` 时 `chat` 委托给懒构建的 `Orchestrator`(共享同一份 `messages` 与 `task_store`),把 run 级 token 用量 / actual_model / `last_run_status` 拷回 session;`orchestrate=False`(默认)仍走原 legacy 单轮循环,既有 runtime 测试行为不变。`reset()` 改为就地 `messages.clear()`,保持 Orchestrator 共享引用有效。
+- `app/agent/executor.py` / `planner.py` / `orchestrator.py`：补 progress(spinner)与 token 用量回传 —— Executor 每轮 `create_message` 包进 progress CM 并支持流式 `on_text_delta`、累加 `usage_acc`、回传 actual_model;Planner 暴露 `last_usage`/`last_actual_model`;Orchestrator 规划阶段也走 progress,汇总 `last_run_usage` 与 `last_run_status`,并接受外部传入的共享 `messages`。
+- `app/cli.py`：`_session_factory` 用 `orchestrate=True` + `Planner(llm)` + `on_run_event=_print_run_event` 装配 session。新增 `_print_run_event` 把 RunEvent 映射到终端(message_delta 流式补打、tool_* 工具行、plan_created/run_completed/run_failed 打任务面板与原因);`_format_task_lines` 兼容 Task 对象与 snapshot dict,新增 blocked(⊘黄)/failed(✗红)字形。新增 `_chat_with_cancel`:装 SIGINT 处理器,首次 Ctrl-C 置 `CancelToken`(当前步骤后干净停止),连按强制中断;`_repl` 与单次 `-p` 均走该包装。
+- `app/storage/__init__.py`：新增 `runs / tasks` 两表 + `save_tasks / load_tasks`(整表覆盖,按 position 排序,evidence/error 脱敏)、`log_run / list_runs`;`delete_session` 一并清 tasks/runs。`app/agent/tasks.py` 新增 `TaskStore.restore(snapshot)`(就地重建,不换引用)。
+- `app/agent/session_router.py`：`switch` 从 SQLite 恢复消息后再 `restore` 任务快照;`persist_current` 同时存消息 + 任务快照,并在 session 记录了 goal/run_status 时写一条 runs 审计。
+- 测试:`test_runtime.py`(编排委托拷统计、取消、legacy 默认不受影响)、`test_storage.py`(tasks/runs round-trip、覆盖、脱敏、删除连带清理)、`test_session_router.py`(switch 恢复任务快照)。
 
 ---
 
@@ -91,18 +111,21 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | CLI | 交互 REPL、`-p`、`--profile`、`-y`、`/reset`、`/session` 命令族 + 斜杠补全；spinner、任务面板、统计 | `app/cli.py` |
 | 配置 | `.env` + `config/models.yaml`（模型）+ `config/agents.yaml`（Agent）+ `config/mcp_servers.yaml`（MCP） | `app/config/`, `app/agent/profiles.py`, `app/mcp/config.py` |
 | 模型层 | Anthropic / OpenAI Responses / OpenAI-compatible；统一内部协议；JSON tool call fallback | `app/models/` |
-| Runtime | 同步多轮工具循环、审批、错误回灌、流式、max_steps；尚无 Planner/Executor/RunEvent | `app/agent/runtime.py` |
-| 多 Agent / Session | AgentProfile + SessionRouter + `/session` 命令族；SQLite 持久化、恢复、隔离 | `app/agent/profiles.py`, `app/agent/session_router.py`, `app/storage/` |
+| Runtime | CLI 主路径已切到编排:`AgentSession(orchestrate=True)` 委托 Orchestrator;`orchestrate=False` 仍保留 legacy 单轮循环 | `app/agent/runtime.py`, `app/agent/orchestrator.py` |
+| 编排 | Planner(JSON 计划) + Executor(单任务工具循环,带 progress/流式/用量) + Replanner(失败追加补救) + CancelToken + 结构化 RunEvent;已接 CLI | `app/agent/planner.py`, `app/agent/executor.py`, `app/agent/replanner.py`, `app/agent/events.py`, `app/agent/cancel.py` |
+| 多 Agent / Session | AgentProfile + SessionRouter + `/session` 命令族；SQLite 持久化、恢复、隔离（含任务快照恢复） | `app/agent/profiles.py`, `app/agent/session_router.py`, `app/storage/` |
 | 长期记忆 | none/read/read_write 三策略 + 注入；LIKE 检索（未做向量） | `app/memory/` |
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |
-| 任务面板 | 轻量 `TaskStore` + `todo_write`；还不是 PRD 的任务状态源 | `app/agent/tasks.py`, `app/tools/builtin/todo.py` |
+| 任务面板 / TaskStore | 任务状态唯一源:依赖/claim/blocked/failed/evidence/history/snapshot/restore;`todo_write` 走简单三态;CLI 面板渲染(含 blocked/failed 字形) | `app/agent/tasks.py`, `app/tools/builtin/todo.py` |
 | 审批 | 自动 / 交互（方向键）/ 拒绝；仍是 `requires_approval` 布尔模型 | `app/agent/approval.py`, `app/util/menu.py` |
 | 内置工具 | `read_file / write_file / list_dir / code_search / shell / todo_write`；`terminal_*` 交互式终端会话 | `app/tools/builtin/` |
 | MCP | stdio Manager、工具发现、sync/async 桥、同名不覆盖、auto_approve 白名单 | `app/mcp/` |
 | 浏览器控制 | Playwright MCP：打开/snapshot/点击/输入；named profile；数据边界提示 | `config/mcp_servers.example.yaml`, `app/cli.py` |
-| 存储 | SQLite：sessions/messages/memories/tool_executions；尚无 runs/tasks/settings 表与 Web 复用 | `app/storage/` |
+| 存储 | SQLite：sessions/messages/memories/tool_executions/runs/tasks；settings 表与 Web 复用待做 | `app/storage/` |
 | 安全基础 | workspace 越界拒绝、脱敏、MCP env allowlist、敏感目录不入库 | `app/util/redact.py`, `.gitignore` |
-| 测试 | 235 个 unit tests | `tests/unit/` |
+| 取消 | Ctrl-C 协作式取消(CancelToken):首次置位、当前步骤后停止,连按强制中断 | `app/agent/cancel.py`, `app/cli.py` |
+| 上下文压缩 | 规划中(§6.13):PRD §7.3 已定方案,当前每轮发全量 messages、无预算与自动压缩 | `app/agent/context.py`(待建) |
+| 测试 | 268 个 unit tests | `tests/unit/` |
 
 ---
 
@@ -122,11 +145,19 @@ AgentLab/
       compatible_adapter.py        # Ollama / LM Studio / vLLM 等 OpenAI-compatible
       router.py                    # provider -> adapter
     agent/
-      runtime.py                   # AgentSession 工具循环
+      runtime.py                   # AgentSession：legacy 单轮循环 + orchestrate 委托 Orchestrator
+      orchestrator.py              # Orchestrator：串联 Planner/Executor/Replanner + 步数预算 + 取消
+      planner.py                   # Planner：目标 -> JSON 计划 -> TaskPlan(带依赖);失败退化为单任务
+      executor.py                  # Executor：单任务工具循环 -> TaskOutcome(completed/failed/blocked)
+      replanner.py                 # Replanner：TaskOutcome 回写 TaskStore;失败追加补救任务
+      events.py                    # 结构化 RunEvent(run/plan/task/tool/approval 生命周期)
+      cancel.py                    # CancelToken：协作式取消
       approval.py                  # 审批策略
-      tasks.py                     # 轻量 TaskStore
+      tasks.py                     # TaskStore：任务状态唯一源(依赖/claim/blocked/failed/evidence/snapshot/restore)
       profiles.py                  # AgentProfile + load_agent_profiles
       session_router.py            # SessionRouter + /session 命令族
+      context_budget.py            # (规划中,§6.13) 上下文预算:模型窗口/预留输出/压缩阈值
+      context_compaction.py        # (规划中,§6.13) 上下文压缩:历史分段/结构化摘要/压缩事件
     tools/
       registry.py                  # Tool 注册表（仍是 requires_approval 布尔模型）
       builtin/
@@ -140,7 +171,7 @@ AgentLab/
       manager.py                   # stdio MCP 生命周期 + sync↔async 桥
       adapter.py                   # MCP tool -> Tool
     storage/
-      __init__.py                  # SQLite：sessions/messages/memories/tool_executions
+      __init__.py                  # SQLite：sessions/messages/memories/tool_executions/runs/tasks
     memory/
       __init__.py                  # 记忆策略 + 注入
     skills/
@@ -163,7 +194,7 @@ AgentLab/
   tests/unit/                      # 235 个 unit tests
 ```
 
-尚未出现但 PRD 已规划的目录：`app/control/`、`app/server.py`、`app/web/`。
+尚未出现但 PRD 已规划的目录：`app/control/`、`app/tui/`、`app/server.py`、`app/web/`。
 
 ---
 
@@ -173,17 +204,16 @@ AgentLab/
 
 ### 6.1 Runtime 与任务拆解
 
-当前状态：同步多轮工具循环可用；`TaskStore` 仅服务 `todo_write` 和 CLI 面板，结构较轻；没有显式编排和结构化事件。
+当前状态：编排核心(见 3.8)与 CLI 接入 + 任务持久化(见 3.9)均已完成。CLI 默认 `AgentSession(orchestrate=True)`,一轮对话走 规划→按依赖执行→失败重规划;`RunEvent` 经 `_print_run_event` 渲染到 spinner、任务面板(含 blocked/failed 字形)与工具行;Ctrl-C 触发 `CancelToken` 协作式取消;TaskStore 快照落 SQLite `runs/tasks`,`/session switch` 与重启后可恢复任务状态。
 
-接下来要做：
+接下来要做(均为非阻塞增强):
 
-- 新增 `app/agent/planner.py`，把复杂用户目标拆成 `TaskPlan`。
-- 新增 `app/agent/executor.py`，按依赖从 TaskStore claim 下一步任务并执行。
-- 新增 `app/agent/replanner.py`，根据工具结果、错误、审批拒绝和用户追加目标调整任务。
-- 升级 `tasks.py`，支持 dependencies、blocked、failed、evidence、history、snapshot。
-- 定义结构化 `RunEvent`：`message_delta / tool_requested / approval_required / tool_completed / task_updated / run_completed / run_failed`。
+- `approval_required` 目前靠 Executor 内同步调 `ApprovalPolicy`(方向键菜单已生效);后续可把审批也做成异步 RunEvent,便于 Web UI/TUI 统一弹窗。
+- Replanner 当前是启发式;后续可选"让模型看 outcome 产出 plan patch"的 LLM 重规划。
+- `runs / tasks` 已落库,但还没有 CLI/Web 查看入口(如 `/runs`、任务历史回看)。
+- 编排路径会把"子任务指令"作为 user 消息写进历史,多轮后上下文偏长。PRD §7.3 的上下文压缩(见 6.13)会在 token 接近窗口上限时自动压缩旧历史兜底,任务不会因超限中断;"用独立通道传子任务指令、根本不进对话历史"是可选的源头优化,优先级下调。
 
-验收标准：fake model 测试覆盖初始计划、按依赖执行、工具失败后重规划、审批拒绝后阻塞、用户追加目标、取消和 max_steps。
+验收标准:CLI 跑一个复杂目标时,能看到计划生成、任务按依赖推进、失败自动补救、审批拒绝后阻塞,且 Ctrl-C 能干净取消、重启后任务状态可恢复。(已满足,见 3.8 / 3.9 与 `tests/unit/test_orchestrator.py`、`test_runtime.py`、`test_storage.py`、`test_session_router.py`。)
 
 ### 6.2 多 Agent、Session 与长期记忆
 
@@ -312,6 +342,36 @@ AgentLab/
 - 高风险模块默认禁用，首次启用必须展示能力、数据边界和风险。
 
 验收标准：一次包含模型推理、工具调用、审批、浏览器 observation 的 run 可被完整回放为事件和审计记录。
+
+### 6.12 终端 TUI
+
+当前状态：还没有 `app/tui/`；交互只有行式 CLI REPL（`app/cli.py`），没有全屏分区界面，也没有欢迎栏。
+
+接下来要做：
+
+- 新增 `app/tui/`（建议 Textual / Rich）：`app.py` 布局、`banner.py` 大号欢迎栏、`widgets.py` 组件、`events.py` 订阅 Runtime Event Bus。
+- 顶部一个很大的欢迎栏，用 ASCII art 大字渲染 **Amaz1ng** 标题，附当前 Agent 和模型 profile；窄终端自动降级为单行标题。
+- 分区布局：侧边栏（Agent/Session 列表）、任务面板、对话区、内嵌审批对话框、状态栏（provider + 云端数据边界 + token/耗时）。
+- 与 CLI / Web 共用同一 Runtime service，不复制 Agent 逻辑；`/session` 命令族在 TUI 同样可用。
+- 新增启动入口 `python -m app tui`，并提供明显的 Stop / 取消入口对应紧急停止。
+
+验收标准：`python -m app tui` 启动后显示 Amaz1ng 欢迎栏，可在 TUI 内切换 session、看到流式输出、任务面板和键盘可操作的审批。
+
+### 6.13 上下文构建与压缩
+
+当前状态：尚未实现。PRD §7.3 已定义完整方案(`ContextBudget` + `ContextCompressor` + 结构化 `ContextSummary` + `context_summaries` 表 + `/context` 命令族 + `context_*` 事件)。当前 Runtime 每轮把完整 `messages` 直接发给模型,没有预算估算,也不会在接近窗口上限时压缩 —— 长对话和复杂编排 run(子任务指令逐轮累积,见 6.1)有撞 token 上限的风险。
+
+接下来要做:
+
+- 新增 `app/agent/context_budget.py`:按模型 profile 的窗口算 `ContextBudget`(预留输出、system+tools 固定预算、memory/summary/recent/evidence 各项预算),并实现 70% 警告 / 85% 强制压缩阈值。
+- 新增 `app/agent/context_compaction.py`:选取可压缩历史段 → 调模型产出结构化 `ContextSummary`(user_goal/decisions/open_tasks/tool_evidence 引用/failed_attempts 等)→ 校验引用+脱敏+必填字段 → 写 `context_summaries`,并发 `context_budget_warning / context_compaction_started/completed/failed` 事件。
+- 改造 `app/agent/context.py`(目前 system prompt 由 `build_system_prompt` + Skill + Memory 拼成):按 §7.3.1 的稳定顺序组装 System / Active Task / Skill / Tool / Memory / **Context Summary** / Recent Messages / Evidence,把摘要插在最近消息之前。
+- 压缩边界:未闭合的 tool_call/tool_result 对、当前未完成 run、最后一条用户请求、pending approval 不能被压缩(正好保护编排路径正在执行的任务);摘要不自动写长期记忆;敏感数据可要求本地小模型摘要。
+- 存储:新增 `context_summaries` 表(source_message_range / source_run_ids / token_before/after / compression_model_profile);原始消息不删,压缩只换"模型输入中的旧片段"。
+- CLI/TUI/Web 入口:`/context`(看预算+recent window+summary 状态)、`/context compact`(手动压缩)、`/context summary`(看当前摘要)、`/context disable-auto-compact`。
+- `RunEvent` 扩展:把 `context_budget_warning / context_compaction_*` 纳入事件流,CLI 在 spinner/状态行提示压缩发生。
+
+验收标准:一个会超出模型窗口的长 session,在 85% 阈值自动压缩后仍能继续推进;压缩摘要保留 user_goal/decisions/open_tasks 且不丢未完成 run;`/context` 可查看预算与摘要,`/context compact` 可手动触发;压缩前后 token 数与摘要范围可审计。
 
 ---
 

@@ -36,7 +36,7 @@ def make_todo_write_tool(store: TaskStore) -> Tool:
                 return f"refused: tasks[{i}] missing content"
             status = str(item.get("status") or PENDING)
             if status not in _VALID_STATUS:
-                # 未知状态规范化为 pending,而不是报错(模���偶尔写 done / wip 等变体)
+                # 未知状态规范化为 pending,而不是报错(模型偶尔写 done / wip 等变体)
                 status = PENDING
             tasks.append(Task(id=tid, content=content, status=status))
 

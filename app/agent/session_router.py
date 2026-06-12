@@ -84,6 +84,10 @@ class SessionRouter:
                 )
             session = self._factory(profile, session_id)
             session.messages = self._storage.load_messages(session_id)
+            # 恢复任务快照(若有):让 /session switch 后任务面板与编排状态接上
+            tasks_snapshot = self._storage.load_tasks(session_id)
+            if tasks_snapshot and getattr(session, "task_store", None) is not None:
+                session.task_store.restore(tasks_snapshot)
             self._sessions[session_id] = session
         self.current_id = session_id
         return True
@@ -133,9 +137,31 @@ class SessionRouter:
         return self._profiles
 
     def persist_current(self) -> None:
-        """把当前 session 的消息历史存盘（每次 chat 后调用）。"""
-        if self.current_id and self.current:
-            self._storage.save_messages(self.current_id, self.current.messages)
+        """把当前 session 的消息历史 + 任务快照存盘（每次 chat 后调用）。
+
+        任务快照让退出重启后 /session switch 能恢复任务状态;若本轮是编排 run
+        (session 记录了 last_goal/last_run_status),额外写一条 runs 审计。
+        """
+        if not (self.current_id and self.current):
+            return
+        sess = self.current
+        self._storage.save_messages(self.current_id, sess.messages)
+        store = getattr(sess, "task_store", None)
+        if store is not None:
+            self._storage.save_tasks(self.current_id, store.snapshot())
+        # 编排 run 审计:有 goal 才记(单轮 legacy chat 不写 runs)
+        goal = getattr(sess, "last_goal", "") or ""
+        status = getattr(sess, "last_run_status", "") or ""
+        if goal and status:
+            usage = getattr(sess, "last_turn_usage", {}) or {}
+            self._storage.log_run(
+                self.current_id, goal, status,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+            )
+            # 写完清空,避免下一轮无 goal 时重复记账
+            sess.last_goal = ""
+            sess.last_run_status = ""
 
     def close_all(self) -> None:
         for s in self._sessions.values():

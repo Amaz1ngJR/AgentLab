@@ -126,7 +126,7 @@ def parse_skill(skill_dir: Path) -> Optional[Skill]:
     name = (meta.get("name") or "").strip()
     description = (meta.get("description") or "").strip()
     if not name and not description:
-        # 缺少最基本的 metadata，视为无效���不进 catalog
+        # 缺少最基本的 metadata,视为无效,不进 catalog
         return None
 
     refs: list[Path] = []

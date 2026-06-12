@@ -72,6 +72,28 @@ def test_switch_restores_from_sqlite(tmp_path):
     assert r.current.messages[0]["content"] == "saved"
 
 
+def test_switch_restores_task_snapshot(tmp_path):
+    """persist 会存任务快照;switch 从 SQLite 恢复时把任务也接回 task_store。"""
+    from app.agent.tasks import COMPLETED, PENDING, Task
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles())
+    sid = r.new("default")
+    r.current.task_store.extend([
+        Task("t1", "第一步", COMPLETED, evidence="done"),
+        Task("t2", "第二步", PENDING, dependencies=["t1"]),
+    ])
+    r.persist_current()
+    # 模拟重启:换内存,从库恢复
+    del r._sessions[sid]
+    r.current_id = None
+    assert r.switch(sid)
+    snap = r.current.task_store.snapshot()
+    assert [t["id"] for t in snap] == ["t1", "t2"]
+    assert snap[0]["status"] == COMPLETED
+    assert snap[0]["evidence"] == "done"
+    assert snap[1]["dependencies"] == ["t1"]
+
+
 def test_resume_or_new_creates_when_empty(tmp_path):
     """首次启动:没有历史 session → 新建。"""
     r = _make_router(Storage(tmp_path / "db"), _profiles())

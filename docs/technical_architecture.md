@@ -20,14 +20,15 @@ AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS 或
 2. 本地模型下载完成后，只修改配置即可切换模型，不修改 Agent 业务逻辑。
 3. 能配置并调用在线模型，例如 OpenAI GPT 与 Anthropic Claude。
 4. 能加载本地 Skill，并能连接可配置的 MCP Server。
-5. 同时支持终端交互和浏览器 UI；两者复用同一个 Agent Core。
+5. 同时支持行式 CLI、全屏终端 TUI 和浏览器 Web UI 三种交互方式；三者复用同一个 Agent Core。
 6. 能创建多个不同职责的 Agent，例如 Coding Agent、Research Agent、Browser Agent、Ops Agent。
 7. 能通过 `/session` 创建、列出、切换不同 Agent 的会话；每个会话拥有独立上下文、任务状态和运行记录。
 8. 能具备长期记忆能力，保存用户偏好、Agent 经验、项目事实和会话摘要，并在后续会话中按权限检索使用。
-9. 能打开网页、观察页面、点击、输入、提交表单，并将网页操作过程展示给用户。
-10. 能在用户授权下执行桌面级操作，例如截图、点击、键盘输入和启动应用，但默认关闭。
-11. 能远程登录受信设备，在远程 workspace 内执行命令、传输文件或启动远程浏览器/Agent Worker。
-12. 文件写入、命令执行、联网请求、网页提交、桌面控制、远程执行和外部 MCP 调用都必须经过权限控制与审计。
+9. 能在长对话和复杂任务中自动压缩上下文，在模型上下文窗口接近上限时保留关键目标、约束、决策、证据、任务状态和最近消息。
+10. 能打开网页、观察页面、点击、输入、提交表单，并将网页操作过程展示给用户。
+11. 能在用户授权下执行桌面级操作，例如截图、点击、键盘输入和启动应用，但默认关闭。
+12. 能远程登录受信设备，在远程 workspace 内执行命令、传输文件或启动远程浏览器/Agent Worker。
+13. 文件写入、命令执行、联网请求、网页提交、桌面控制、远程执行和外部 MCP 调用都必须经过权限控制与审计。
 
 ### 1.2 非目标
 
@@ -54,6 +55,7 @@ AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS 或
 | Agent Runtime | 项目自有轻量循环，保留替换编排器的接口 | 便于精确控制审批、事件、provider 差异 |
 | 多 Agent / Session | AgentProfile + Session 绑定 + `/session` 命令 | 一个应用内运行多个不同职责 Agent，切换时不混淆上下文和权限 |
 | API 服务 | FastAPI + Uvicorn | 本地服务、流式事件和 OpenAPI 方便；Python 单栈 |
+| 终端 TUI | Textual / Rich 全屏终端界面，复用同一 Runtime 事件 | 在不离开终端的前提下提供分区布局、欢迎栏、会话/任务/审批面板，比纯行式 REPL 更直观 |
 | Web UI | FastAPI 静态页面 + Jinja2/HTMX 或轻量 TypeScript 页面 | 不要求用户先配置复杂桌面环境；可由 Python 一条命令启动 |
 | 本地推理首选 | Ollama | macOS 与 Windows 均便于安装；提供 OpenAI-compatible 接口和工具调用能力 |
 | 本地推理可选 | LM Studio、vLLM、llama.cpp server | 通过 adapter 隔离，不成为核心硬依赖 |
@@ -63,6 +65,7 @@ AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS 或
 | 桌面控制 | PyAutoGUI/系统无障碍能力作为可选 Desktop Adapter | 覆盖非网页应用，但风险高、稳定性低，默认禁用并要求强审批 |
 | 远程设备控制 | SSH Runner + 可选远程 Agent Worker/MCP Server | SSH 适合命令执行和文件传输；复杂远程交互通过远程 Worker 暴露结构化工具 |
 | 长期记忆 | SQLite 结构化记忆 + 可选向量检索 | 支持用户偏好、项目事实、Agent 经验和会话摘要的长期复用 |
+| 上下文压缩 | ContextBudget + ContextCompressor + 结构化摘要 | 长任务不会因 token 超限中断；压缩摘要可审计、可恢复、与长期记忆边界清晰 |
 | 持久化 | SQLite + 本地数据目录 | 跨平台、无需额外服务、适合单用户桌面应用 |
 | 配置 | YAML 非密钥配置 + `.env`/系统 Keyring 密钥 | 易编辑、可版本化模板、避免密钥入库 |
 | 测试 | pytest + provider fake + MCP 测试 server | Agent 循环和审批必须可离线回归 |
@@ -105,7 +108,7 @@ rectangle "L2 Agent Runtime 层" as L2 {
   [Executor] as L2Executor
   [Replanner] as L2Replanner
   [TaskStore] as L2Tasks
-  [Context Builder] as L2Context
+  [Context Builder / Compressor] as L2Context
   [Approval / Policy] as L2Policy
   [Event Bus] as L2Events
   L2Session -[hidden]right- L2Planner
@@ -185,7 +188,7 @@ rectangle "交互层" as UI {
 rectangle "Agent Runtime" as Runtime {
   [Session / Run Manager] as Core
   [Planner / Executor / Replanner] as TaskLoop
-  [TaskStore / Context / Approval / Event Bus] as Control
+  [TaskStore / Context / Compression / Approval / Event Bus] as Control
   Core -[hidden]right- TaskLoop
   TaskLoop -[hidden]right- Control
 }
@@ -335,9 +338,15 @@ AgentLab/
       scripts/                      # Skill 附带脚本；只能经受控工具和审批执行
 
   app/                              # AgentLab 应用主包；所有运行时代码都在这里
-    __main__.py                     # `python -m app` 入口，只负责分发到 CLI/server
+    __main__.py                     # `python -m app` 入口，只负责分发到 CLI/TUI/server
     cli.py                          # CLI REPL：输入、流式渲染、审批交互、状态展示
     server.py                       # FastAPI 启动入口：HTTP API、SSE、静态 Web UI 托管
+
+    tui/                            # 全屏终端 TUI；复用 Runtime 事件，不实现 Agent 决策
+      app.py                        # TUI 应用入口与布局：欢迎栏、会话/任务/审批/对话面板
+      banner.py                     # 大号欢迎栏：ASCII art 渲染 "Amaz1ng" 标题
+      widgets.py                    # 会话列表、任务面板、审批对话框、控制观察等组件
+      events.py                     # 订阅 Runtime Event Bus，把事件映射到 TUI 组件刷新
 
     config/                         # 配置加载与 schema
       loader.py                     # 合并 CLI/UI/env/YAML/默认值，输出运行时配置对象
@@ -346,7 +355,9 @@ AgentLab/
     agent/                          # Agent Runtime 核心，不依赖具体 UI
       runtime.py                    # Runtime 编排入口：串联规划、执行、重规划、事件和审计
       session.py                    # 会话与 run 生命周期：历史、当前 profile、取消、恢复
-      context.py                    # 上下文构建：system prompt、Skill、Memory、工具快照、历史裁剪
+      context.py                    # 上下文构建：system prompt、Skill、Memory、工具快照、压缩摘要、最近消息
+      context_budget.py             # 上下文预算：模型窗口、预留输出、工具 schema、压缩触发阈值
+      context_compaction.py         # 上下文压缩：历史分段、摘要生成、摘要校验、压缩事件
       profiles.py                   # AgentProfile：不同 Agent 的角色、默认模型、工具和记忆策略
       session_router.py             # `/session` 切换、创建、列出、归档和当前会话解析
       planner.py                    # Planner：把用户目标拆成可执行任务清单，写入 TaskStore
@@ -600,6 +611,7 @@ end
 - 当前 Session：绑定某个 AgentProfile，持有独立消息历史、TaskStore、Run 历史和临时授权。
 - 当前模型 profile 和能力。
 - 消息历史与被注入的 Skill 上下文。
+- 上下文预算、压缩摘要、最近消息窗口和可回溯内容引用。
 - 当前启用的内置工具与 MCP 工具快照。
 - 长期记忆检索结果和本轮产生的候选记忆。
 - Planner 生成的任务计划、Executor 当前任务和 Replanner 的调整记录。
@@ -628,6 +640,7 @@ AgentLab 是 Agent 开发环境，不是单一固定助手。一个 Agent 由 `A
 | Session | 一段与某个 AgentProfile 绑定的对话和执行上下文 | `session_id`、`agent_id`、`title`、`messages`、`task_store`、`active_run`、`temporary_grants` |
 | Run | Session 中一次用户请求的执行实例 | `run_id`、`status`、`events`、`tool_executions`、`control_observations`、`token_usage` |
 | Memory | 可跨 session 复用的长期信息 | `memory_id`、`scope`、`agent_id`、`workspace`、`content`、`source`、`confidence`、`created_at`、`last_used_at` |
+| ContextSummary | 对单个 session 中旧消息和已完成 run 的压缩摘要 | `summary_id`、`session_id`、`source_message_range`、`summary_ref`、`token_count_before`、`token_count_after`、`created_at` |
 
 AgentProfile 和 Session 的关系：
 
@@ -683,11 +696,22 @@ entity "memories" as memories {
   confidence
 }
 
+entity "context_summaries" as summaries {
+  * summary_id
+  --
+  session_id
+  source_message_range
+  summary_ref
+  token_count_before
+  token_count_after
+}
+
 agents ||--o{ sessions
 sessions ||--o{ runs
 sessions ||--o{ tasks
 agents ||--o{ memories
 sessions }o--o{ memories : retrieved
+sessions ||--o{ summaries
 @enduml
 ```
 
@@ -789,7 +813,143 @@ UI --> User : 展示 agent、session、model、memory summary
 @enduml
 ```
 
-### 7.3 Runtime 内部详细图
+### 7.3 上下文构建与压缩
+
+上下文压缩是 Runtime 的核心能力之一。它的目标不是把所有历史都变成长期记忆，而是在单个 session 内控制模型输入长度，让长对话和复杂任务可以持续推进。
+
+#### 7.3.1 上下文组成
+
+每次模型调用前，Context Builder 按稳定顺序组装上下文：
+
+| 部分 | 来源 | 说明 |
+|---|---|---|
+| System Prompt | AgentProfile + Runtime 默认规则 | 角色、行为边界、安全规则 |
+| Active Task | TaskStore | 当前任务、依赖、完成标准、风险提示 |
+| Skill Context | Skill Loader | 当前任务匹配到的 Skill 说明和必要参考 |
+| Tool Snapshot | ToolRegistry + MCP Manager | 当前可用工具 schema、风险和能力边界 |
+| Memory Context | MemoryStore | 按 memory_policy 检索出的长期记忆，必须标注 scope/source |
+| Context Summary | ContextCompressor | 本 session 中旧消息和已完成 run 的压缩摘要 |
+| Recent Messages | Message Store | 最近的用户消息、assistant 回复、未完成工具调用和必要工具结果 |
+| Evidence References | Storage/Blob Store | 大文本、截图、下载文件、长工具输出的引用和摘要 |
+
+上下文压缩只替换“模型输入中的旧历史片段”，不删除原始消息、工具审计或控制观察记录。原始内容的保留与删除由数据保留策略决定，不能由压缩流程隐式删除。
+
+#### 7.3.2 上下文预算
+
+Runtime 必须根据当前模型 profile 的上下文窗口计算 `ContextBudget`：
+
+| 预算项 | 策略 |
+|---|---|
+| `model_context_limit` | 来自模型 profile 或 provider 能力探测 |
+| `reserved_output_tokens` | 为最终回答、工具参数和重规划预留输出空间 |
+| `system_and_tools_budget` | system prompt、Skill、tool schema 的固定预算 |
+| `memory_budget` | 长期记忆注入上限，超过则按相关性和 scope 裁剪 |
+| `summary_budget` | 压缩摘要上限，优先保留最近一次有效摘要 |
+| `recent_messages_budget` | 最近消息窗口，必须保留最后用户请求和当前未完成 run |
+| `evidence_budget` | 工具结果和观察摘要预算，大内容只放引用 |
+
+推荐触发阈值：
+
+| 触发点 | 动作 |
+|---|---|
+| 预计输入超过上下文窗口的 70% | 发出 `context_budget_warning`，下一次稳定点准备压缩 |
+| 预计输入超过上下文窗口的 85% | 在下一次模型调用前强制压缩旧历史 |
+| 切换到上下文更小的模型 profile | 重新计算预算并压缩到新模型可接受范围 |
+| 一个复杂 run 完成后历史明显增长 | 后台生成 session summary，降低下一轮延迟 |
+| session 恢复或 `/session switch` | 加载最近 summary + recent messages，而不是全量历史 |
+| 用户手动执行 `/context compact` | 立即压缩当前 session 的可压缩历史 |
+
+#### 7.3.3 压缩摘要结构
+
+ContextCompressor 输出结构化摘要，而不是自由散文。摘要至少包含：
+
+```yaml
+summary:
+  user_goal: 当前用户目标和成功标准
+  active_constraints: 用户明确约束、禁止事项、偏好
+  decisions: 已确认的设计决定和原因
+  current_state: 当前代码/网页/远程设备/任务状态
+  open_tasks: 未完成任务、阻塞原因、下一步建议
+  tool_evidence:
+    - source: tool_execution_id 或 observation_id
+      finding: 可复用结论
+  files_and_artifacts: 涉及的文件、截图、下载文件、外部页面引用
+  failed_attempts: 已尝试但失败的方案，避免重复
+  approvals_and_risks: 本 session 已授权范围、被拒绝动作和高风险提示
+  memory_candidates: 可能写入长期记忆的候选，不自动落库
+  handoff_note: 给后续模型调用的简短交接说明
+```
+
+压缩摘要必须带 `source_message_range`、`source_run_ids`、`token_count_before`、`token_count_after`、`compression_model_profile` 和 `created_at`。如果摘要中引用了工具结果、截图或文件内容，应引用 evidence id 或 content ref，避免把大内容重复塞回模型上下文。
+
+#### 7.3.4 压缩流程
+
+```plantuml
+@startuml
+title 上下文预算与压缩流程
+skinparam linetype ortho
+skinparam shadowing false
+
+participant "Runtime" as Runtime
+participant "Context Builder" as Builder
+participant "ContextBudget" as Budget
+participant "ContextCompressor" as Compressor
+participant "Model Router" as Model
+database "SQLite / Blob Store" as Store
+participant "Event Bus" as Events
+
+Runtime -> Builder : build_context(session, run)
+Builder -> Store : load recent messages\ncontext summaries\nmemories\ntask snapshot
+Builder -> Budget : estimate tokens by model profile
+
+alt within budget
+  Budget --> Builder : ok
+else over warning threshold
+  Budget -> Events : context_budget_warning
+end
+
+alt must compact before model call
+  Builder -> Compressor : select compactable segments
+  Compressor -> Store : load source messages + evidence summaries
+  Compressor -> Model : summarize with compression prompt
+  Model --> Compressor : structured ContextSummary
+  Compressor -> Compressor : validate references\nredact sensitive data\ncheck required fields
+  alt valid summary
+    Compressor -> Store : write context_summaries\nmark prompt segment compacted
+    Compressor -> Events : context_compaction_completed
+  else invalid summary
+    Compressor -> Events : context_compaction_failed
+    Compressor --> Builder : keep raw recent tail only\nor ask user to switch larger model
+  end
+end
+
+Builder -> Store : reload summary + recent tail
+Builder -> Budget : final estimate
+Builder --> Runtime : assembled context
+Runtime -> Model : messages + tools
+@enduml
+```
+
+#### 7.3.5 压缩边界与安全规则
+
+- 当前未完成 run、最后一条用户请求、pending approval、未闭合的 tool call/tool result 对不能被压缩掉。
+- 压缩不能改变审计事实：审批记录、工具参数摘要、工具结果摘要、控制动作和错误必须保留结构化记录。
+- 压缩摘要进入云端模型前，必须经过与普通上下文相同的数据边界提示和脱敏策略。
+- 如果当前 session 包含敏感本地数据，CompressionPolicy 可以要求使用本地小模型做摘要，或要求用户确认后才允许云端模型参与压缩。
+- 压缩摘要不能自动写入长期记忆。只有 MemoryPolicy 明确允许并通过确认的 `memory_candidate` 才能进入 MemoryStore。
+- 摘要需要保留“不确定性”：无法确认的事实必须标记为 unknown 或 unresolved，不能为了缩短上下文而编造结论。
+- 用户应能查看当前压缩摘要，并能请求重新压缩或禁用本 session 的自动压缩。
+
+#### 7.3.6 与长期记忆的区别
+
+| 能力 | 作用域 | 是否跨 session | 主要用途 |
+|---|---|---|---|
+| Context Summary | 单个 session | 默认不跨 session | 让长对话在有限上下文窗口内继续 |
+| Session Summary Memory | `session` memory | 可用于恢复当前 session | 会话摘要和交接信息 |
+| Long-term Memory | user/agent/workspace | 可跨 session | 用户偏好、项目事实、Agent 经验 |
+| Evidence Reference | run/tool/control | 按审计策略保留 | 回看工具结果、截图、下载文件和操作证据 |
+
+### 7.4 Runtime 内部详细图
 
 ```plantuml
 @startuml
@@ -822,6 +982,10 @@ rectangle "上下文构建" as ContextBox {
   [System Prompt] as Prompt
   [Skill Context] as Skill
   [Memory / Retrieval Context] as Memory
+  [Context Budget] as ContextBudget
+  [Context Compressor] as Compressor
+  [Context Summary] as Summary
+  [Evidence References] as Evidence
   [Tool Snapshot] as ToolSnapshot
 }
 
@@ -859,11 +1023,19 @@ Run --> History
 Run --> Prompt
 Run --> Skill
 Run --> Memory
+Run --> ContextBudget
+Run --> Summary
+Run --> Evidence
 Run --> ToolSnapshot
 History --> Loop
 Prompt --> Loop
 Skill --> Loop
 Memory --> Loop
+ContextBudget --> Compressor : compact if needed
+Compressor --> Summary : structured summary
+Compressor --> DB : context_summaries
+Summary --> Loop
+Evidence --> Loop
 ToolSnapshot --> Loop
 Loop --> Step
 Step --> Model
@@ -888,7 +1060,7 @@ Session --> DB
 
 Runtime 的原则是：模型只能提出计划建议、任务调整和 tool call；任务状态由 TaskStore 维护，是否执行工具、如何执行、是否需要观察或审批，都由 Runtime 的风险评估、审批策略和调度器决定。
 
-### 7.4 任务拆解与重规划流程
+### 7.5 任务拆解与重规划流程
 
 ```plantuml
 @startuml
@@ -929,7 +1101,7 @@ end
 
 任务拆解不是一次性计划。每个工具结果、错误、审批拒绝或用户新输入都可能触发 Replanner 调整任务清单；TaskStore 是唯一可信任务状态来源。
 
-### 7.5 工具循环
+### 7.6 工具循环
 
 ```plantuml
 @startuml
@@ -938,7 +1110,7 @@ actor 用户 as User
 participant "UI" as UI
 participant "Agent Runtime" as Agent
 participant "TaskStore" as Store
-participant "Context / Skill Loader" as Skill
+participant "Context Builder" as Context
 participant "Model Adapter" as LLM
 participant "Approval Policy" as Policy
 participant "Tool Registry / MCP" as Tool
@@ -947,8 +1119,8 @@ database "Audit Store" as Audit
 User -> UI : 输入任务
 UI -> Agent : send_message()
 Agent -> Store : 创建/更新任务计划
-Agent -> Skill : 构建提示、选取工具
-Skill --> Agent : 上下文 + tool schemas
+Agent -> Context : 构建上下文\n预算检查\n必要时压缩旧历史
+Context --> Agent : prompt + summaries + memories + tool schemas
 loop 直到回答完成或达到 max_steps
   Agent -> Store : 读取当前任务
   Agent -> LLM : messages + available tools
@@ -977,7 +1149,7 @@ end
 @enduml
 ```
 
-### 7.6 工具风险分类
+### 7.7 工具风险分类
 
 | 等级 | 示例 | 默认策略 |
 |---|---|---|
@@ -993,7 +1165,7 @@ end
 
 工具 registry 需要为内置工具和 MCP 工具使用同一套风险元数据。模型不能自行提升权限。
 
-### 7.7 能力层与电脑控制详细图
+### 7.8 能力层与电脑控制详细图
 
 ```plantuml
 @startuml
@@ -1070,11 +1242,11 @@ Http --> McpServer
 
 能力层的核心是 `ToolDescriptor`：它把所有内置工具、MCP 工具、浏览器动作、桌面动作和远程命令统一成“带风险和目标范围的能力”，再交给审批策略。
 
-### 7.8 代码搜索工具设计
+### 7.9 代码搜索工具设计
 
 代码搜索是 Agent 的高频只读能力，定位上介于 `list_dir` / `read_file` 和 `shell` 之间：它应提供稳定、结构化、受限且低成本的代码定位能力，避免模型频繁调用高风险 shell 去拼 `grep` / `find` 命令。
 
-#### 7.8.1 工具边界
+#### 7.9.1 工具边界
 
 | 工具 | 职责 | 不负责 |
 |---|---|---|
@@ -1085,7 +1257,7 @@ Http --> McpServer
 
 `code_search` 必须是只读工具，风险等级为 `read`。它仍然必须受 workspace 限制，并遵守 ignore 规则、结果条数、输出大小和超时限制。
 
-#### 7.8.2 推荐工具接口
+#### 7.9.2 推荐工具接口
 
 ```python
 ToolDescriptor(
@@ -1132,7 +1304,7 @@ ToolDescriptor(
 )
 ```
 
-#### 7.8.3 搜索模式
+#### 7.9.3 搜索模式
 
 | mode | 语义 | 实现策略 |
 |---|---|---|
@@ -1143,7 +1315,7 @@ ToolDescriptor(
 
 搜索默认遵守 `.gitignore`，并额外跳过常见大目录：`.git/`、`node_modules/`、`.venv/`、`__pycache__/`、`dist/`、`build/`、`.agentlab/`、`data/`。用户需要搜索被忽略文件时必须显式开启对应配置。
 
-#### 7.8.4 结果格式
+#### 7.9.4 结果格式
 
 工具输出应稳定、短小、可被模型继续用 `read_file` 精读：
 
@@ -1179,7 +1351,7 @@ ToolDescriptor(
 - 结果超过 `max_results` 或输出大小上限时设置 `truncated=true`。
 - 对二进制文件、超大文件和解码失败文件默认跳过，并在 summary 中统计。
 
-#### 7.8.5 实现与索引策略
+#### 7.9.5 实现与索引策略
 
 默认采用无索引搜索：
 
@@ -1194,7 +1366,7 @@ ToolDescriptor(
 - 对大型代码库接入 tree-sitter/LSP，增强 `symbol` 搜索。
 - 索引仅缓存可搜索文本和路径摘要，不缓存密钥文件内容。
 
-#### 7.8.6 安全与测试
+#### 7.9.6 安全与测试
 
 安全要求：
 
@@ -1212,11 +1384,11 @@ ToolDescriptor(
 - max_results、context_lines、timeout、二进制文件跳过。
 - 疑似密钥内容脱敏。
 
-### 7.9 电脑控制与远程执行
+### 7.10 电脑控制与远程执行
 
 电脑控制不能由通用 shell 直接承担。shell 只有文本输入输出，缺少页面状态、截图、焦点、远程目标身份、用户接管和动作级权限。因此需要把电脑控制作为独立能力层设计。
 
-#### 7.9.1 控制目标模型
+#### 7.10.1 控制目标模型
 
 所有可被操作的环境统一抽象为 `ControlTarget`：
 
@@ -1242,7 +1414,7 @@ class ControlSession:
     expires_at: datetime | None
 ```
 
-#### 7.9.2 浏览器控制
+#### 7.10.2 浏览器控制
 
 浏览器控制优先使用 Playwright，而不是通过 shell 打开系统浏览器后模拟鼠标。原因是 Playwright 能提供稳定的页面结构、选择器、事件等待、截图和多浏览器支持。
 
@@ -1266,7 +1438,7 @@ class ControlSession:
 4. 如果当前模型是云端模型，截图、DOM 文本、表单内容可能被发送到云端；UI/CLI 必须在首次观察该页面前提示。
 5. 对同一 origin 可支持会话级授权，例如“本会话允许在 `https://localhost:3000` 点击和输入”，但不覆盖支付/删除等高风险动作。
 
-#### 7.9.3 桌面控制
+#### 7.10.3 桌面控制
 
 桌面控制用于浏览器自动化无法覆盖的场景，例如操作原生应用、系统设置窗口、远程桌面客户端或安装程序。它比浏览器控制风险更高，也更不稳定，因此不应作为首选路径。
 
@@ -1278,7 +1450,7 @@ class ControlSession:
 - 不允许模型直接连续执行长动作序列。应采用“观察 -> 计划下一步 -> 审批 -> 单步动作 -> 再观察”的闭环。
 - 必须支持紧急停止：CLI 中 Ctrl-C/Web UI 中 Stop 按钮应取消 pending action，并尽量释放键盘/鼠标状态。
 
-#### 7.9.4 远程设备控制
+#### 7.10.4 远程设备控制
 
 远程控制分两层：
 
@@ -1320,7 +1492,7 @@ remote_hosts:
 - 不允许默认 agent forwarding；需要访问私有仓库时优先使用远程设备自己的凭据。
 - 远程文件传输只允许 workspace 与本地 workspace 之间，越界需要额外确认。
 
-#### 7.9.5 电脑控制执行流程
+#### 7.10.5 电脑控制执行流程
 
 ```plantuml
 @startuml
@@ -1577,6 +1749,7 @@ PolicyResolver --> StorageCfg
 | `agent_profiles` | Agent 定义：名称、角色、默认模型、Skill/MCP/工具和记忆策略 |
 | `sessions` | 会话名称、绑定的 agent_id、模型 profile、创建/修改时间 |
 | `messages` | 用户与 assistant 消息、必要的结构化 content |
+| `context_summaries` | 上下文压缩摘要：来源消息范围、摘要引用、压缩前后 token、压缩模型 |
 | `runs` | 每次请求状态、耗时、token 用量、错误 |
 | `tasks` | Planner/Executor/Replanner 管理的任务状态、依赖和证据 |
 | `memories` | 长期记忆：用户偏好、Agent 经验、项目事实、会话摘要 |
@@ -1587,6 +1760,7 @@ PolicyResolver --> StorageCfg
 
 - 默认不长期保存完整工具输出；提供“保存会话”选项后再持久化。
 - 含凭据的环境变量、请求 header 和工具输出中的疑似密钥必须在日志中遮蔽。
+- 上下文压缩摘要与原始消息一样受数据保留和脱敏策略约束；摘要不能包含被拒绝保存的密钥、cookie、验证码或支付信息。
 - 切换到在线模型时，在会话头部明确展示“内容可能发送至云端”。
 
 ```plantuml
@@ -1631,6 +1805,18 @@ entity "messages" as messages {
   run_id
   role
   content_ref
+  compacted_by
+}
+
+entity "context_summaries" as summaries {
+  * id
+  --
+  session_id
+  source_message_range
+  summary_ref
+  token_count_before
+  token_count_after
+  compression_model_profile
 }
 
 entity "tasks" as tasks {
@@ -1684,11 +1870,13 @@ agents ||--o{ sessions
 agents ||--o{ memories
 sessions ||--o{ runs
 sessions ||--o{ messages
+sessions ||--o{ summaries
 sessions ||--o{ tasks
 runs ||--o{ messages
 runs ||--o{ tools
 runs ||--o{ observations
 runs ||--o{ tasks
+summaries ||--o{ messages : compacts
 @enduml
 ```
 
@@ -1696,11 +1884,11 @@ runs ||--o{ tasks
 
 ---
 
-## 11. CLI 与本地 Web UI
+## 11. CLI、终端 TUI 与本地 Web UI
 
 ### 11.1 交互接口统一
 
-CLI 和 Web UI 都消费 Runtime 产生的事件：
+CLI、终端 TUI 和 Web UI 都消费 Runtime 产生的事件：
 
 | 事件 | 展示用途 |
 |---|---|
@@ -1708,6 +1896,10 @@ CLI 和 Web UI 都消费 Runtime 产生的事件：
 | `session_switched` | 展示当前 Agent、Session、模型、长期记忆摘要和任务状态 |
 | `memory_retrieved` | 展示本轮注入了哪些作用域的长期记忆 |
 | `memory_candidate` | 展示候选长期记忆，等待确认或自动忽略 |
+| `context_budget_warning` | 展示当前上下文接近模型窗口上限，可能触发压缩 |
+| `context_compaction_started` | 展示正在压缩旧消息和已完成 run |
+| `context_compaction_completed` | 展示压缩前后 token、摘要范围和可查看入口 |
+| `context_compaction_failed` | 展示压缩失败原因，以及切换更大模型或手动裁剪的入口 |
 | `tool_requested` | 显示模型想调用的工具 |
 | `approval_required` | 弹出确认或终端询问 |
 | `tool_completed` | 展示成功、失败和耗时 |
@@ -1716,7 +1908,46 @@ CLI 和 Web UI 都消费 Runtime 产生的事件：
 | `run_completed` | 最终回答及使用统计 |
 | `run_failed` | 可理解的错误与重试入口 |
 
-### 11.2 Web 服务接口
+### 11.2 终端 TUI
+
+终端 TUI 是介于行式 CLI 和浏览器 Web UI 之间的全屏终端界面，目标是在不离开终端、不启动浏览器的前提下提供分区布局和更强的可视化。建议使用 Textual / Rich 实现，复用同一 Runtime 与事件协议，不实现任何 Agent 决策逻辑。
+
+TUI 布局自上而下：
+
+| 区域 | 内容 |
+|---|---|
+| 欢迎栏 | 顶部一个很大的欢迎横幅，用 ASCII art / Rich 大字渲染 **Amaz1ng** 标题，并附当前版本、当前 Agent 和模型 profile |
+| 侧边栏 | Agent / Session 列表，支持新建、切换、归档当前会话 |
+| 任务面板 | TaskStore 快照：任务状态、依赖、证据（`✓/❯/○`） |
+| 上下文状态 | 当前 token 预算、recent window、压缩摘要状态和手动 compact 入口 |
+| 对话区 | 流式模型文本、工具请求、工具结果和长期记忆注入提示 |
+| 审批区 | `approval_required` 与 `control_action_pending` 的内嵌确认对话框 |
+| 状态栏 | 当前 provider、数据边界提示（云端模型时高亮）、token / 耗时统计 |
+
+欢迎栏示意：
+
+```text
++---------------------------------------------------------+
+|                                                         |
+|        ###   #   #   ###   #####    #    #   #   ###    |
+|       #   #  ## ##  #   #     #    ##    ##  #  #       |
+|       #####  # # #  #####    #      #    # # #  #  ##   |
+|       #   #  #   #  #   #   #       #    #  ##  #   #   |
+|       #   #  #   #  #   #  #####   ###   #   #   ###    |
+|                                                         |
+|      本地 Agent 开发环境 · agent=coder · model=cloud_claude     |
++---------------------------------------------------------+
+```
+
+设计约束：
+
+1. TUI 只负责输入、渲染事件、展示审批和控制观察，与 CLI / Web UI 共用同一 Runtime service，不复制 Agent 逻辑。
+2. 欢迎栏在窄终端下自动降级为单行标题，避免 ASCII art 折行错乱。
+3. `/session` 命令族在 TUI 中既可用命令输入，也可用侧边栏交互触发，行为与 CLI 一致。
+4. 审批和电脑控制确认必须可用键盘完成；提供明显的 Stop / 取消入口对应紧急停止。
+5. 启动入口与 CLI / Web 并列：`python -m app tui`。
+
+### 11.3 Web 服务接口
 
 Web UI 可以由 Python 进程直接提供静态资源与接口：
 
@@ -1740,6 +1971,7 @@ rectangle "Web UI" as Web {
   [Agent / Session Sidebar] as Sidebar
   [Chat Page] as ChatPage
   [Memory Panel] as MemoryPanel
+  [Context Panel] as ContextPanel
   [Approval Dialog] as ApprovalDialog
   [Control Snapshot Panel] as SnapshotPanel
 }
@@ -1749,6 +1981,7 @@ rectangle "FastAPI" as Api {
   [Session API] as SessionApi
   [Run API] as RunApi
   [Memory API] as MemoryApi
+  [Context API] as ContextApi
   [SSE Event Stream] as Sse
   [Approval API] as ApprovalApi
   [Control API] as ControlApi
@@ -1757,6 +1990,7 @@ rectangle "FastAPI" as Api {
 rectangle "Shared Runtime" as Runtime {
   [Agent Session] as AgentSession
   [Session Router] as SessionRouter
+  [Context Builder] as ContextBuilder
   [Memory Store] as MemoryStore
   [Event Bus] as EventBus
   [Approval Waiter] as ApprovalWaiter
@@ -1772,6 +2006,7 @@ Term <-- EventBus
 Sidebar --> AgentApi
 ChatPage --> SessionApi
 MemoryPanel --> MemoryApi
+ContextPanel --> ContextApi
 RunApi --> AgentSession
 Sse <-- EventBus
 ApprovalDialog --> ApprovalApi
@@ -1779,11 +2014,13 @@ SnapshotPanel --> ControlApi
 SessionApi --> AgentSession
 AgentApi --> SessionRouter
 MemoryApi --> MemoryStore
+ContextApi --> ContextBuilder
 ApprovalApi --> ApprovalWaiter
 ControlApi --> AgentSession
 SessionRouter --> AgentSession
 SessionRouter --> MemoryStore
 AgentSession --> EventBus
+AgentSession --> ContextBuilder
 AgentSession --> ApprovalWaiter
 @enduml
 ```
@@ -1802,6 +2039,15 @@ CLI 必须支持 `/session` 命令族，用于多 Agent 会话切换：
 /session archive <session_id>
 ```
 
+CLI、TUI 和 Web UI 也必须提供上下文压缩的可见入口：
+
+```text
+/context                         # 显示当前上下文预算、recent window、summary 状态
+/context compact                 # 手动触发当前 session 的上下文压缩
+/context summary                 # 查看当前生效的压缩摘要
+/context disable-auto-compact    # 禁用当前 session 的自动压缩
+```
+
 | 方法与路径 | 用途 |
 |---|---|
 | `GET /` | 本地聊天页面 |
@@ -1816,6 +2062,9 @@ CLI 必须支持 `/session` 命令族，用于多 Agent 会话切换：
 | `GET /api/sessions` | 列出会话，支持按 agent_id 过滤 |
 | `POST /api/sessions/{id}/switch` | 切换当前会话 |
 | `POST /api/sessions/{id}/messages` | 发送用户消息 |
+| `GET /api/sessions/{id}/context` | 查看上下文预算、recent window 和当前摘要 |
+| `POST /api/sessions/{id}/context/compact` | 手动触发上下文压缩 |
+| `GET /api/context-summaries/{id}` | 查看某条上下文压缩摘要 |
 | `GET /api/memories` | 查看长期记忆，支持按 scope/agent/workspace 过滤 |
 | `POST /api/memories` | 创建或确认一条长期记忆 |
 | `DELETE /api/memories/{id}` | 删除长期记忆 |

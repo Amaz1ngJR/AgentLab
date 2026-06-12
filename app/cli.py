@@ -29,6 +29,10 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 
 from app.agent.approval import AutoApprove, InteractivePolicy
+from app.agent.cancel import CancelToken
+from app.agent.events import RunEvent
+from app.agent import events as run_events
+from app.agent.planner import Planner
 from app.agent.profiles import load_agent_profiles
 from app.agent.runtime import AgentSession, TurnEvent, build_system_prompt
 from app.agent.session_router import SessionRouter
@@ -102,17 +106,30 @@ _ANSI_RESET = "\033[0m"
 _ANSI_DIM = "\033[2;90m"        # 灰色 dim (completed 划过)
 _ANSI_BLUE_BOLD = "\033[1;34m"  # 蓝色加粗 (in_progress 高亮)
 _ANSI_BOLD = "\033[1m"           # 加粗 (汇总行)
+_ANSI_YELLOW = "\033[33m"        # 黄色 (blocked)
+_ANSI_RED = "\033[31m"           # 红色 (failed)
+
+
+def _task_field(t, name: str):
+    """从任务项读字段,兼容 Task dataclass(属性)和 snapshot dict(键)。"""
+    if isinstance(t, dict):
+        return t.get(name, "")
+    return getattr(t, name, "")
 
 
 def _format_task_lines(tasks) -> list[str]:
-    """把 TaskStore 中的任务列表渲染成多行字符串(已包含 ANSI 颜色)。
+    """把任务列表渲染成多行字符串(已包含 ANSI 颜色)。
+
+    既接受 TaskStore.all() 的 Task 对象(spinner 面板用),也接受
+    TaskStore.snapshot() 的 dict 列表(RunEvent 收尾面板用)。
 
     格式参考 Claude Code 的任务面板:
         4 tasks (1 done, 1 in progress, 2 open)
           ✓ workspace 路径限制         (灰色,已完成)
           ❯ 错误脱敏                    (蓝色加粗,进行中)
           ○ 工具能力声明                (普通色,待办)
-          ○ AgentSession 离线测试
+          ⊘ 被阻塞的任务                (黄色,blocked)
+          ✗ 失败的任务                  (红色,failed)
 
     返回的每一行 *不* 含末尾换行,调用方决定怎么拼。
     任务为空时返回空列表(让调用方决定是否显示标题区)。
@@ -120,26 +137,39 @@ def _format_task_lines(tasks) -> list[str]:
     if not tasks:
         return []
 
-    counts = {"completed": 0, "in_progress": 0, "pending": 0}
+    counts = {"completed": 0, "in_progress": 0, "pending": 0, "blocked": 0, "failed": 0}
     for t in tasks:
-        if t.status in counts:
-            counts[t.status] += 1
+        st = _task_field(t, "status")
+        if st in counts:
+            counts[st] += 1
 
+    parts = [
+        f"{counts['completed']} done",
+        f"{counts['in_progress']} in progress",
+        f"{counts['pending']} open",
+    ]
+    if counts["blocked"]:
+        parts.append(f"{counts['blocked']} blocked")
+    if counts["failed"]:
+        parts.append(f"{counts['failed']} failed")
     header = (
-        f"{_ANSI_BOLD}{len(tasks)} tasks{_ANSI_RESET} "
-        f"({counts['completed']} done, "
-        f"{counts['in_progress']} in progress, "
-        f"{counts['pending']} open)"
+        f"{_ANSI_BOLD}{len(tasks)} tasks{_ANSI_RESET} ({', '.join(parts)})"
     )
     lines = [header]
 
     for t in tasks:
-        if t.status == "completed":
-            lines.append(f"  {_ANSI_DIM}✓ {t.content}{_ANSI_RESET}")
-        elif t.status == "in_progress":
-            lines.append(f"  {_ANSI_BLUE_BOLD}❯ {t.content}{_ANSI_RESET}")
+        st = _task_field(t, "status")
+        content = _task_field(t, "content")
+        if st == "completed":
+            lines.append(f"  {_ANSI_DIM}✓ {content}{_ANSI_RESET}")
+        elif st == "in_progress":
+            lines.append(f"  {_ANSI_BLUE_BOLD}❯ {content}{_ANSI_RESET}")
+        elif st == "blocked":
+            lines.append(f"  {_ANSI_YELLOW}⊘ {content}{_ANSI_RESET}")
+        elif st == "failed":
+            lines.append(f"  {_ANSI_RED}✗ {content}{_ANSI_RESET}")
         else:
-            lines.append(f"  ○ {t.content}")
+            lines.append(f"  ○ {content}")
 
     return lines
 
@@ -398,6 +428,55 @@ def _print_event(ev: TurnEvent) -> None:
         print(f"\n{ev.text}\n", flush=True)
 
 
+def _print_run_event(ev: RunEvent) -> None:
+    """把编排路径的 RunEvent 渲染到终端。
+
+    分工(与 spinner 配合,见 6.1):
+      - message_delta:模型文本若没被 spinner 流式打印过(text_streamed=False),
+        在这里补打;已流式过的不会再发 message_delta,避免重复。
+      - tool_requested / tool_completed / tool_denied:工具调用在 spinner 退出后
+        发生,直接打到 stdout。
+      - plan_created / task_started:轻量进度提示。
+      - task_updated:不单独打行(spinner 面板已实时反映任务状态)。
+      - run_completed / run_failed:打最终任务面板(snapshot)+ 失败原因。
+    """
+    kind = ev.kind
+    if kind == run_events.MESSAGE_DELTA:
+        if ev.text:
+            print(f"\n{ev.text}\n", flush=True)
+    elif kind == run_events.TOOL_REQUESTED:
+        print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
+    elif kind == run_events.TOOL_COMPLETED:
+        preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
+        tag = "ERR" if ev.tool_error else "ok"
+        t = (f" ({ev.elapsed_seconds * 1000:.0f}ms)" if ev.elapsed_seconds < 1
+             else f" ({ev.elapsed_seconds:.1f}s)")
+        print(f"    [{tag}]{t} {preview}", flush=True)
+    elif kind == run_events.TOOL_DENIED:
+        print(f"    [denied] 已拒绝 {ev.tool_name}", flush=True)
+    elif kind == run_events.PLAN_CREATED:
+        tasks = ev.payload.get("tasks", [])
+        if len(tasks) > 1:  # 单任务计划不值得打面板,省噪音
+            print(f"\n  ✻ 计划:{len(tasks)} 个子任务", flush=True)
+            for line in _format_task_lines(tasks):
+                print(line, flush=True)
+            print(flush=True)
+    elif kind == run_events.RUN_COMPLETED:
+        tasks = ev.payload.get("tasks", [])
+        if len(tasks) > 1:
+            print("  ✻ 完成:", flush=True)
+            for line in _format_task_lines(tasks):
+                print(line, flush=True)
+            print(flush=True)
+    elif kind == run_events.RUN_FAILED:
+        print(f"\n  ⚠ {ev.text}", flush=True)
+        tasks = ev.payload.get("tasks", [])
+        if len(tasks) > 1:
+            for line in _format_task_lines(tasks):
+                print(line, flush=True)
+        print(flush=True)
+
+
 def _check_local_endpoint(cfg) -> None:
     """启动时探测本地 / 局域网 Ollama 端点是否在响应。
 
@@ -592,6 +671,13 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
             # mcp_manager 不放这里:它由 router 全局统一关,否则切换/归档某个
             # session 会把全局 MCP 连接也关掉。
             closeables=[pty_manager],
+            # ── 编排路径(§6.1)──────────────────────────────────────────────
+            # 用 Planner/Executor/Replanner 编排:目标先拆任务,按依赖执行,失败
+            # 重规划。Planner 用同一个 llm;system prompt 由 Orchestrator 注入到
+            # 规划与执行两阶段。RunEvent 经 _print_run_event 渲染。
+            orchestrate=True,
+            planner=Planner(llm),
+            on_run_event=_print_run_event,
         )
 
     router = SessionRouter(
@@ -741,6 +827,44 @@ class _SlashCompleter(Completer):
 
 
 
+def _chat_with_cancel(session: AgentSession, line: str) -> str:
+    """跑一轮 chat,并把 Ctrl-C 接到协作式取消(对应 PRD 紧急停止)。
+
+    编排路径(orchestrate=True)的模型调用是同步阻塞的,无法被强行打断;取消采用
+    协作式:Ctrl-C 时把 CancelToken 置位,Orchestrator 在下一个安全检查点(claim
+    下一个任务前 / 调模型前 / 执行工具前)抛 Cancelled 干净退出。第一次 Ctrl-C 触发
+    取消;若用户连按(取消尚未生效),让默认 KeyboardInterrupt 冒泡到上层中断。
+
+    只在主线程、且 stdin 为 TTY 时装 SIGINT 处理器;非交互(单测 / 管道)直接跑。
+    """
+    import signal
+
+    token = CancelToken()
+    can_trap = threading.current_thread() is threading.main_thread()
+    prev_handler = None
+
+    if can_trap:
+        def _on_sigint(signum, frame):
+            if not token.cancelled:
+                token.cancel()
+                print("\n  ⏹ 正在取消…(将在当前步骤后停止;再次 Ctrl-C 强制中断)",
+                      flush=True)
+            else:
+                # 已请求过取消仍按:恢复默认行为,抛 KeyboardInterrupt 强制中断
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                raise KeyboardInterrupt
+        try:
+            prev_handler = signal.signal(signal.SIGINT, _on_sigint)
+        except ValueError:
+            can_trap = False  # 不在主线程,signal 不可用
+
+    try:
+        return session.chat(line, cancel=token)
+    finally:
+        if can_trap and prev_handler is not None:
+            signal.signal(signal.SIGINT, prev_handler)
+
+
 def _repl(router: SessionRouter) -> int:
     """交互式对话。
 
@@ -793,12 +917,12 @@ def _repl(router: SessionRouter) -> int:
             continue
 
         try:
-            session.chat(line)
+            _chat_with_cancel(session, line)
         except Exception as exc:
             # 脱敏后输出,避免 Authorization / API key 等凭据泄漏到终端
             print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
             continue
-        # 每轮对话后把消息历史存盘,支持下次 /session switch 恢复
+        # 每轮对话后把消息历史 + 任务快照存盘,支持下次 /session switch 恢复
         router.persist_current()
         _print_stats(session)
 
@@ -817,7 +941,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.prompt:
                 session = router.current
                 try:
-                    session.chat(args.prompt)
+                    _chat_with_cancel(session, args.prompt)
                     router.persist_current()
                 finally:
                     _print_stats(session)

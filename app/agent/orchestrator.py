@@ -1,0 +1,191 @@
+"""Orchestrator —— 串联 Planner + Executor + Replanner + TaskStore 的编排入口。
+
+一次 run 的流程(technical_architecture.md §7.4):
+  1. Planner.create_plan(goal) 产出初始任务,写入 TaskStore -> 发 plan_created。
+  2. 循环:从 TaskStore claim 下一个可执行任务 -> Executor.run_task 执行 ->
+     Replanner.apply 回写状态(必要时追加补救任务)-> 发 task_updated。
+  3. 直到:全部任务到终态(收工)、卡死(剩余任务依赖被 failed 卡住)、
+     取消、或全局步数预算耗尽。
+  4. 发 run_completed(或 run_failed),返回最终答复文本。
+
+与 AgentSession 的分工:
+  AgentSession 仍是 CLI 当前主路径(单轮工具循环)。Orchestrator 是 §6.1 要求的
+  显式编排路径,持有跨任务共享的 messages,产出结构化 RunEvent,供测试和未来
+  Web UI/TUI 使用。两者复用同一套 ModelRouter / ToolRegistry / ApprovalPolicy。
+
+run(goal) 可多次调用:第二次会在已有 messages 和 TaskStore 之上追加新计划,
+实现"用户中途追加目标"。TaskStore 是唯一可信任务状态源,可被 UI 随时快照。
+"""
+from __future__ import annotations
+
+from contextlib import nullcontext
+from typing import Any, Callable, ContextManager, Optional
+
+from app.agent import events
+from app.agent.approval import ApprovalPolicy, AutoApprove
+from app.agent.cancel import Cancelled, CancelToken
+from app.agent.events import RunEvent
+from app.agent.executor import Executor
+from app.agent.planner import Planner
+from app.agent.replanner import Replanner
+from app.agent.tasks import COMPLETED, TaskStore
+from app.models.router import ModelRouter
+from app.tools.registry import ToolRegistry
+
+ProgressFn = Callable[[str], ContextManager[Any]]
+
+
+class Orchestrator:
+    """编排一次(或多次)目标的规划—执行—重规划。"""
+
+    def __init__(
+        self,
+        llm: ModelRouter,
+        tools: ToolRegistry,
+        approval: Optional[ApprovalPolicy] = None,
+        system: str = "",
+        *,
+        max_steps: int = 12,
+        task_store: Optional[TaskStore] = None,
+        planner: Optional[Planner] = None,
+        on_event: Optional[Callable[[RunEvent], None]] = None,
+        progress: Optional[ProgressFn] = None,
+        messages: Optional[list[dict[str, Any]]] = None,
+    ):
+        self._llm = llm
+        self._tools = tools
+        self._approval: ApprovalPolicy = approval or AutoApprove()
+        self._system = system
+        self._max_steps = max_steps
+        self.store: TaskStore = task_store or TaskStore()
+        self._planner = planner or Planner(llm)
+        self._replanner = Replanner(self.store)
+        self._progress: ProgressFn = progress or (lambda label: nullcontext())
+        self._executor = Executor(llm, tools, self._approval,
+                                  on_event=self._forward, progress=self._progress)
+        self._emit = on_event or (lambda e: None)
+        # 跨任务、跨 run 共享的对话历史(后做的任务能看到先做任务的上下文)。
+        # 允许外部传入一个已存在的 list(AgentSession 把自己的 messages 交进来共享)。
+        self.messages: list[dict[str, Any]] = messages if messages is not None else []
+        self._run_seq = 0  # run 计数,用于给任务 id 加 run 前缀,避免跨 run 撞 id
+        # run 级统计:每次 run() 重置,供 AgentSession 拷回去展示
+        self.last_run_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+        self.last_actual_model: Optional[str] = None
+        self.last_run_status: str = ""  # completed / blocked / failed / cancelled
+
+    def _namespace_tasks(self, tasks: list) -> list:
+        """给一批新计划的任务 id 加 run 前缀,并同步重映射其 dependencies。
+
+        Planner 每次都从 t1 开始编号,多次 run 会撞 id 被 store.add 去重丢弃。
+        加上 rN- 前缀后,既保证跨 run 唯一,又保留 plan 内部的依赖关系。
+        第一个 run(_run_seq==1)不加前缀,保持单 run 场景 id 简洁(t1/t2)。
+        """
+        if self._run_seq <= 1:
+            return tasks
+        prefix = f"r{self._run_seq}-"
+        local_ids = {t.id for t in tasks}
+        for t in tasks:
+            t.dependencies = [prefix + d if d in local_ids else d for d in t.dependencies]
+            t.id = prefix + t.id
+        return tasks
+
+    def _forward(self, ev: RunEvent) -> None:
+        """Executor 的事件直接转发给外部 on_event。"""
+        self._emit(ev)
+
+    def _emit_task_update(self, task_id: str, status: str, note: str = "") -> None:
+        self._emit(RunEvent(
+            kind=events.TASK_UPDATED, task_id=task_id, task_status=status,
+            text=note, payload={"tasks": self.store.snapshot()},
+        ))
+
+    def run(self, goal: str, *, cancel: Optional[CancelToken] = None) -> str:
+        """规划并执行一个目标,返回最终答复文本。
+
+        cancel 用于协作式取消;不传则不可取消。多次调用会在已有任务之上追加新计划。
+        """
+        cancel = cancel or CancelToken()
+        self._run_seq += 1
+        self.last_run_usage = {"input_tokens": 0, "output_tokens": 0}
+        self.last_run_status = ""
+        self.messages.append({"role": "user", "content": goal})
+        self._emit(RunEvent(kind=events.RUN_STARTED, text=goal))
+
+        def _record_model(m: str) -> None:
+            self.last_actual_model = m
+
+        # ── 1. 规划 ──────────────────────────────────────────────────────────
+        try:
+            cancel.raise_if_cancelled()
+            with self._progress("planning") as handle:
+                on_progress = getattr(handle, "update", None)
+                plan = self._planner.create_plan(goal, context=self._system,
+                                                 on_progress=on_progress)
+        except Cancelled:
+            self.last_run_status = "cancelled"
+            self._emit(RunEvent(kind=events.RUN_FAILED, text="已取消(规划阶段)"))
+            return "已取消。"
+        for k in ("input_tokens", "output_tokens"):
+            self.last_run_usage[k] += self._planner.last_usage.get(k, 0)
+        if self._planner.last_actual_model:
+            self.last_actual_model = self._planner.last_actual_model
+        self.store.extend(self._namespace_tasks(plan.tasks))
+        self._emit(RunEvent(kind=events.PLAN_CREATED,
+                            payload={"tasks": self.store.snapshot()}))
+
+        # ── 2. 执行 + 重规划循环 ──────────────────────────────────────────────
+        steps_left = self._max_steps
+        last_text = ""
+        try:
+            while steps_left > 0:
+                cancel.raise_if_cancelled()
+                task = self.store.claim_next()
+                if task is None:
+                    break  # 没有可跑的任务:要么收工,要么卡死(循环外判定)
+
+                self._emit(RunEvent(kind=events.TASK_STARTED, task_id=task.id,
+                                    task_content=task.content))
+
+                # 给这个任务切一块步数预算(至少 1 步,至多剩余预算)
+                budget = max(1, min(steps_left, self._max_steps))
+                outcome = self._executor.run_task(
+                    task, self.messages,
+                    system=self._system, max_steps=budget, cancel=cancel,
+                    usage_acc=self.last_run_usage, on_actual_model=_record_model,
+                )
+                steps_left -= max(1, outcome.tool_calls_made)
+
+                patch = self._replanner.apply(task, outcome)
+                self._emit_task_update(task.id, patch.new_status, patch.note)
+                if outcome.text:
+                    last_text = outcome.text
+
+        except Cancelled:
+            self.last_run_status = "cancelled"
+            self._emit(RunEvent(kind=events.RUN_FAILED, text="已取消",
+                                payload={"tasks": self.store.snapshot()}))
+            return "已取消。"
+
+        # ── 3. 收尾 ──────────────────────────────────────────────────────────
+        snapshot = self.store.snapshot()
+        if self.store.is_stalled():
+            self.last_run_status = "blocked"
+            self._emit(RunEvent(kind=events.RUN_FAILED, text="部分任务被阻塞或失败,无法继续",
+                                payload={"tasks": snapshot}))
+            return last_text or "部分任务未能完成(被阻塞或失败)。"
+
+        if steps_left <= 0 and self.store.has_open():
+            self.last_run_status = "failed"
+            self._emit(RunEvent(kind=events.RUN_FAILED, text="达到最大步数仍未完成全部任务",
+                                payload={"tasks": snapshot}))
+            return last_text or "达到最大步数,任务未全部完成。"
+
+        self.last_run_status = "completed"
+        self._emit(RunEvent(kind=events.RUN_COMPLETED, text=last_text,
+                            payload={"tasks": snapshot}))
+        return last_text or "已完成。"
+
+    def all_completed(self) -> bool:
+        """是否所有任务都成功完成(无 failed/blocked)。供测试/UI 判定。"""
+        snap = self.store.snapshot()
+        return bool(snap) and all(t["status"] == COMPLETED for t in snap)

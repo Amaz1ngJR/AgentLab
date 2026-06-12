@@ -101,3 +101,63 @@ def test_upsert_agent_profile(tmp_path):
     rows = s.list_agent_profiles()
     assert rows[0]["id"] == "coder"
     assert rows[0]["memory_policy"] == "read_write"
+
+
+def test_tasks_round_trip(tmp_path):
+    """save_tasks / load_tasks 应保留顺序、状态、依赖、证据、history。"""
+    s = _store(tmp_path)
+    s.create_session("s1", "default", "cloud_claude")
+    snapshot = [
+        {"id": "t1", "content": "第一步", "status": "completed",
+         "dependencies": [], "evidence": "done", "error": "",
+         "history": ["-> in_progress (claimed)", "completed"]},
+        {"id": "t2", "content": "第二步", "status": "pending",
+         "dependencies": ["t1"], "evidence": "", "error": "", "history": []},
+    ]
+    s.save_tasks("s1", snapshot)
+    loaded = s.load_tasks("s1")
+    assert [t["id"] for t in loaded] == ["t1", "t2"]
+    assert loaded[0]["status"] == "completed"
+    assert loaded[0]["history"] == ["-> in_progress (claimed)", "completed"]
+    assert loaded[1]["dependencies"] == ["t1"]
+
+
+def test_save_tasks_overwrites(tmp_path):
+    s = _store(tmp_path)
+    s.create_session("s1", "default", "cloud_claude")
+    s.save_tasks("s1", [{"id": "a", "content": "x", "status": "pending"}])
+    s.save_tasks("s1", [{"id": "b", "content": "y", "status": "completed"}])
+    loaded = s.load_tasks("s1")
+    assert [t["id"] for t in loaded] == ["b"]  # 整表覆盖
+
+
+def test_tasks_redacts_evidence(tmp_path):
+    s = _store(tmp_path)
+    s.create_session("s1", "default", "cloud_claude")
+    s.save_tasks("s1", [{"id": "t1", "content": "x", "status": "completed",
+                         "evidence": "token=sk-abcdefghijklmnopqrstuvwxyz0123"}])
+    loaded = s.load_tasks("s1")
+    assert "sk-abcdefghij" not in loaded[0]["evidence"]
+
+
+def test_runs_logged_and_listed(tmp_path):
+    s = _store(tmp_path)
+    s.create_session("s1", "default", "cloud_claude")
+    s.log_run("s1", "做两步任务", "completed", input_tokens=10, output_tokens=5)
+    s.log_run("s1", "另一个目标", "blocked", input_tokens=3, output_tokens=1)
+    runs = s.list_runs("s1")
+    assert len(runs) == 2
+    # 最新在前
+    assert runs[0]["status"] == "blocked"
+    assert runs[1]["status"] == "completed"
+    assert runs[1]["input_tokens"] == 10
+
+
+def test_delete_session_clears_tasks_and_runs(tmp_path):
+    s = _store(tmp_path)
+    s.create_session("s1", "default", "cloud_claude")
+    s.save_tasks("s1", [{"id": "t1", "content": "x", "status": "pending"}])
+    s.log_run("s1", "目标", "completed")
+    s.delete_session("s1")
+    assert s.load_tasks("s1") == []
+    assert s.list_runs("s1") == []

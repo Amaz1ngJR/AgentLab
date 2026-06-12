@@ -25,7 +25,7 @@ function Write-Err($msg)   { Write-Host "  X $msg" -ForegroundColor Red }
 
 Write-Host ""
 Write-Host "===================================================="
-Write-Host "  AgentLab 本地模型一键安��"
+Write-Host "  AgentLab 本地模型一键安装"
 Write-Host "  模型: $Model"
 Write-Host "  端点: $Endpoint"
 Write-Host "===================================================="

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
 from app.agent.approval import ApprovalPolicy, AutoApprove
+from app.agent.cancel import CancelToken
+from app.agent.events import RunEvent
 from app.agent.tasks import TaskStore
 from app.models.protocol import ToolResult
 from app.models.router import ModelRouter
@@ -91,6 +93,10 @@ class AgentSession:
         progress: Optional[ProgressFn] = None,
         task_store: Optional[TaskStore] = None,
         closeables: Optional[list[Any]] = None,
+        *,
+        orchestrate: bool = False,
+        planner: Optional[Any] = None,
+        on_run_event: Optional[Callable[[RunEvent], None]] = None,
     ):
         self.llm = llm
         self.tools = tools
@@ -111,6 +117,16 @@ class AgentSession:
         self.task_store: TaskStore = task_store or TaskStore()
         # 需要在会话结束时收尾的资源(如 MCPManager),退出时按序调用其 .stop()/.close()
         self._closeables: list[Any] = closeables or []
+        # ── 编排路径(可选)────────────────────────────────────────────────────
+        # orchestrate=True 时,chat() 委托给 Orchestrator(Planner/Executor/Replanner),
+        # 否则走下面的 legacy 单轮工具循环(默认,保持所有既有测试行为不变)。
+        self._orchestrate = orchestrate
+        self._planner = planner
+        self._on_run_event = on_run_event or (lambda e: None)
+        self._orch = None  # 懒构建(见 _ensure_orchestrator)
+        # 编排 run 的目标与结果状态,供 SessionRouter.persist_current 写 runs 审计
+        self.last_goal: str = ""
+        self.last_run_status: str = ""
 
     def close(self) -> None:
         """释放会话持有的外部资源(MCP server 进程等)。重复调用安全。"""
@@ -124,14 +140,72 @@ class AgentSession:
         self._closeables = []
 
     def reset(self) -> None:
-        self.messages = []
+        # 就地清空 messages(而非重新赋值),保持 Orchestrator 共享的引用有效
+        self.messages.clear()
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.cumulative_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
         self.cumulative_seconds = 0.0
+        self.last_goal = ""
+        self.last_run_status = ""
         self.task_store.clear()
 
-    def chat(self, user_input: str) -> str:
+    def _ensure_orchestrator(self):
+        """懒构建 Orchestrator,并让它与本 session 共享 messages / task_store。
+
+        懒构建是因为 SessionRouter.switch 会在构造后整体替换 self.messages
+        (从 SQLite 读回历史)。等首次 chat 时再绑定,确保拿到的是最终的 list。
+        """
+        from app.agent.orchestrator import Orchestrator  # 延迟导入避免环依赖
+        if self._orch is None:
+            self._orch = Orchestrator(
+                llm=self.llm,
+                tools=self.tools,
+                approval=self.approval,
+                system=self.system_prompt,
+                max_steps=self.max_steps,
+                task_store=self.task_store,
+                planner=self._planner,
+                on_event=self._on_run_event,
+                progress=self._progress,
+                messages=self.messages,
+            )
+        # 每次都重新指向当前 messages:switch/reset 可能换过引用
+        self._orch.messages = self.messages
+        return self._orch
+
+    def chat(self, user_input: str, *, cancel: Optional[CancelToken] = None) -> str:
+        """处理一轮用户输入。
+
+        orchestrate=True 时委托给 Orchestrator(规划→执行→重规划,产出 RunEvent);
+        否则走 legacy 单轮工具循环。cancel 仅编排路径生效(legacy 路径忽略)。
+        """
+        if self._orchestrate:
+            return self._chat_orchestrated(user_input, cancel=cancel)
+        return self._chat_legacy(user_input)
+
+    def _chat_orchestrated(self, user_input: str, *, cancel: Optional[CancelToken] = None) -> str:
+        self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
+        self.last_turn_seconds = 0.0
+        self.last_goal = user_input
+        self.last_run_status = ""
+        turn_start = time.monotonic()
+        try:
+            orch = self._ensure_orchestrator()
+            answer = orch.run(user_input, cancel=cancel)
+            # 把 run 级统计拷回 session,供 CLI 展示 / 持久化
+            self.last_turn_usage = dict(orch.last_run_usage)
+            for k in ("input_tokens", "output_tokens"):
+                self.cumulative_usage[k] += orch.last_run_usage.get(k, 0)
+            if orch.last_actual_model:
+                self.last_actual_model = orch.last_actual_model
+            self.last_run_status = orch.last_run_status
+            return answer
+        finally:
+            self.last_turn_seconds = time.monotonic() - turn_start
+            self.cumulative_seconds += self.last_turn_seconds
+
+    def _chat_legacy(self, user_input: str) -> str:
         self.messages.append({"role": "user", "content": user_input})
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0

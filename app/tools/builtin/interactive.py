@@ -16,7 +16,7 @@
     时间(说明程序在等下一次输入)或到硬超时。**不依赖任何提示符/哨兵约定**,
     所以对 vsm / ssh / python REPL 一视同仁。
   - PtySessionManager 按 id 管理多个会话,会话级生命周期(挂到 AgentSession
-    的 closeables,会话结束时 close_all 杀掉��有子进程)。
+    的 closeables,会话结束时 close_all 杀掉所有子进程)。
 
 安全:
   - 工具默认 requires_approval=True:开会话/发输入都可能在本机或远程执行任意

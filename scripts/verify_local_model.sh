@@ -47,7 +47,7 @@ print(f'  base_url: {cfg.base_url}')
 ok "配置 OK"
 echo
 
-# ── 2. Ollama 端点存活 + 模型已下载 ────────────────��────────────────────────
+# ── 2. Ollama 端点存活 + 模型已下载 ──────────────────────────────────────────
 step "[2/5] 检查 Ollama 与模型"
 MODEL=$(python -c "
 from app.config.loader import load_config
@@ -62,7 +62,7 @@ fi
 ok "Ollama 服务正常,模型 $MODEL 已就绪"
 echo
 
-# ── 3. 简单对话 ─────────────────────────────────────��───────────────────────
+# ── 3. 简单对话 ──────────────────────────────────────────────────────────────
 step "[3/5] 简单对话(无工具)"
 OUT=$(python -m app --profile "$PROFILE" -p "请只回复 OK 两个字符,不要别的" -y 2>&1)
 if echo "$OUT" | grep -q "OK"; then

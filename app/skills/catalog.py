@@ -20,7 +20,7 @@ from app.skills.loader import Skill, load_skills
 
 
 class SkillCatalog:
-    """Skill 目录 + 启用状态 + 解析/注入逻辑��"""
+    """Skill 目录 + 启用状态 + 解析/注入逻辑。"""
 
     def __init__(self, skills: Optional[dict[str, Skill]] = None):
         self._skills: dict[str, Skill] = dict(skills or {})
@@ -35,7 +35,7 @@ class SkillCatalog:
     def from_dir(cls, skills_dir: Optional[Path] = None) -> "SkillCatalog":
         return cls(load_skills(skills_dir))
 
-    # ── 查询 ──────────────────────────���─────────────────────────────────────
+    # ── 查询 ────────────────────────────────────────────────────────────────
 
     def all(self) -> list[Skill]:
         return list(self._skills.values())
@@ -49,7 +49,7 @@ class SkillCatalog:
     def enabled_skills(self) -> list[Skill]:
         return [self._skills[sid] for sid in self._enabled if sid in self._skills]
 
-    # ── 启用 / 禁用 ──────���───────────────────────────────────────────────────
+    # ── 启用 / 禁用 ──────────────────────────────────────────────────────────
 
     def enable(self, skill_id: str) -> bool:
         """启用一个 Skill，返回是否成功（未知 skill_id 返回 False）。"""
@@ -103,7 +103,7 @@ class SkillCatalog:
         """把选中的 Skill 拼成注入 system prompt 的文本块。空列表返回 ""。"""
         if not skills:
             return ""
-        blocks: list[str] = ["【已启用 Skill（任务指导，不授予���具权限）】"]
+        blocks: list[str] = ["【已启用 Skill（任务指导，不授予工具权限）】"]
         for s in skills:
             blocks.append(f"\n## Skill: {s.name}")
             if s.description:

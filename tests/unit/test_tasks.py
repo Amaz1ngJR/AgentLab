@@ -1,5 +1,13 @@
 """离线测试：TaskStore 与 todo_write 工具。"""
-from app.agent.tasks import COMPLETED, IN_PROGRESS, PENDING, Task, TaskStore
+from app.agent.tasks import (
+    BLOCKED,
+    COMPLETED,
+    FAILED,
+    IN_PROGRESS,
+    PENDING,
+    Task,
+    TaskStore,
+)
 from app.tools.builtin.todo import make_todo_write_tool
 
 
@@ -19,7 +27,8 @@ def test_task_store_summary():
         Task("4", "d", PENDING),
     ])
     s = store.summary()
-    assert s == {"total": 4, "completed": 1, "in_progress": 1, "pending": 2}
+    assert s == {"total": 4, "completed": 1, "in_progress": 1, "pending": 2,
+                 "blocked": 0, "failed": 0}
 
 
 def test_task_store_clear():
@@ -82,3 +91,94 @@ def test_todo_write_does_not_require_approval():
     tool = make_todo_write_tool(TaskStore())
     assert tool.requires_approval is False
     assert tool.name == "todo_write"
+
+
+# ── 编排路径:依赖 / claim / 状态回写 / 收工判定 ────────────────────────────────
+
+
+def test_add_ignores_duplicate_id():
+    store = TaskStore()
+    store.add(Task("t1", "first"))
+    store.add(Task("t1", "second"))  # 同 id 不覆盖
+    assert len(store.all()) == 1
+    assert store.get("t1").content == "first"
+
+
+def test_claim_next_respects_dependencies():
+    store = TaskStore()
+    store.extend([
+        Task("t1", "first"),
+        Task("t2", "needs t1", dependencies=["t1"]),
+    ])
+    # t2 依赖 t1,未完成前只能 claim 到 t1
+    first = store.claim_next()
+    assert first.id == "t1"
+    assert first.status == IN_PROGRESS
+    # t1 还在进行,t2 依赖未满足,claim 不到东西
+    assert store.claim_next() is None
+    # t1 完成后,t2 才可被 claim
+    store.update_status("t1", COMPLETED)
+    second = store.claim_next()
+    assert second.id == "t2"
+
+
+def test_claim_next_missing_dependency_treated_satisfied():
+    """依赖一个不存在的 id 不应永久卡死(容忍模型写错依赖)。"""
+    store = TaskStore()
+    store.add(Task("t1", "x", dependencies=["nope"]))
+    assert store.claim_next().id == "t1"
+
+
+def test_update_status_records_evidence_error_history():
+    store = TaskStore()
+    store.add(Task("t1", "x"))
+    store.update_status("t1", FAILED, evidence="ran tool", error="boom", note="failed: boom")
+    t = store.get("t1")
+    assert t.status == FAILED
+    assert t.evidence == "ran tool"
+    assert t.error == "boom"
+    assert t.history[-1] == "failed: boom"
+
+
+def test_is_done_and_stalled():
+    store = TaskStore()
+    store.extend([
+        Task("t1", "a"),
+        Task("t2", "b", dependencies=["t1"]),
+    ])
+    assert not store.is_done()
+    # t1 失败 -> t2 依赖永远满足不了 -> 卡死
+    store.update_status("t1", FAILED)
+    assert store.is_stalled()
+    assert not store.is_done()
+    assert not store.has_runnable()
+
+
+def test_is_done_when_all_terminal():
+    store = TaskStore()
+    store.extend([Task("t1", "a"), Task("t2", "b")])
+    store.update_status("t1", COMPLETED)
+    store.update_status("t2", FAILED)
+    assert store.is_done()  # completed + failed 都是终态
+    assert not store.is_stalled()
+
+
+def test_snapshot_is_plain_data():
+    store = TaskStore()
+    store.add(Task("t1", "x", dependencies=["d"], evidence="e", error="r"))
+    snap = store.snapshot()
+    assert snap == [{
+        "id": "t1", "content": "x", "status": PENDING,
+        "dependencies": ["d"], "evidence": "e", "error": "r", "history": [],
+    }]
+
+
+def test_summary_counts_blocked_and_failed():
+    store = TaskStore()
+    store.extend([Task("t1", "a"), Task("t2", "b"), Task("t3", "c")])
+    store.update_status("t1", BLOCKED)
+    store.update_status("t2", FAILED)
+    s = store.summary()
+    assert s["blocked"] == 1
+    assert s["failed"] == 1
+    assert s["pending"] == 1

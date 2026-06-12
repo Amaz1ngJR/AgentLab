@@ -103,7 +103,7 @@ def test_parse_skill_enabled_defaults_false(tmp_path):
     assert skill.enabled is False
 
 
-# ── load_skills ───────────────────���─────────────────────────────────────────
+# ── load_skills ─────────────────────────────────────────────────────────────
 
 def test_load_skills_scans_dirs(tmp_path):
     _write_skill(tmp_path, "code-review")

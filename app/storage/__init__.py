@@ -70,6 +70,30 @@ CREATE TABLE IF NOT EXISTS tool_executions (
     elapsed_seconds REAL,
     created_at  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    goal        TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT '',
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT NOT NULL,
+    task_id      TEXT NOT NULL,
+    content      TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'pending',
+    dependencies TEXT NOT NULL DEFAULT '[]',
+    evidence     TEXT NOT NULL DEFAULT '',
+    error        TEXT NOT NULL DEFAULT '',
+    history      TEXT NOT NULL DEFAULT '[]',
+    position     INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL
+);
 """
 
 
@@ -138,6 +162,8 @@ class Storage:
         with self._tx() as con:
             con.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM tool_executions WHERE session_id=?", (session_id,))
+            con.execute("DELETE FROM tasks WHERE session_id=?", (session_id,))
+            con.execute("DELETE FROM runs WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM sessions WHERE id=?", (session_id,))
 
     def list_sessions(self, include_archived: bool = False) -> list[dict]:
@@ -253,8 +279,77 @@ class Storage:
                  int(is_error), elapsed_seconds, _now()),
             )
 
-    # ── agent_profiles ────────────────────────────────────────────────────────
+    # ── tasks(TaskStore 持久化,支持退出重启恢复任务状态)──────────────────────
 
+    def save_tasks(self, session_id: str, snapshot: list[dict]) -> None:
+        """覆盖保存某 session 的任务快照(先删再批量插)。
+
+        snapshot 是 TaskStore.snapshot() 的输出(id/content/status/dependencies/
+        evidence/error/history)。dependencies / history 以 JSON 文本存。position
+        保留任务顺序,读回时按它排序。evidence/error 经 redact 脱敏。
+        """
+        with self._tx() as con:
+            con.execute("DELETE FROM tasks WHERE session_id=?", (session_id,))
+            now = _now()
+            for pos, t in enumerate(snapshot or []):
+                con.execute(
+                    """INSERT INTO tasks
+                       (session_id,task_id,content,status,dependencies,
+                        evidence,error,history,position,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (session_id, str(t.get("id", "")), str(t.get("content", "")),
+                     str(t.get("status", "pending")),
+                     json.dumps(t.get("dependencies", []), ensure_ascii=False),
+                     redact(str(t.get("evidence", ""))),
+                     redact(str(t.get("error", ""))),
+                     json.dumps(t.get("history", []), ensure_ascii=False),
+                     pos, now),
+                )
+
+    def load_tasks(self, session_id: str) -> list[dict]:
+        """读回某 session 的任务快照(按 position 排序),格式同 TaskStore.snapshot()。"""
+        rows = self._con.execute(
+            "SELECT * FROM tasks WHERE session_id=? ORDER BY position", (session_id,)
+        ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                deps = json.loads(r["dependencies"])
+            except (json.JSONDecodeError, TypeError):
+                deps = []
+            try:
+                hist = json.loads(r["history"])
+            except (json.JSONDecodeError, TypeError):
+                hist = []
+            out.append({
+                "id": r["task_id"], "content": r["content"], "status": r["status"],
+                "dependencies": deps, "evidence": r["evidence"],
+                "error": r["error"], "history": hist,
+            })
+        return out
+
+    # ── runs(每次编排 run 的目标 / 状态 / token 审计)───────────────────────────
+
+    def log_run(self, session_id: str, goal: str, status: str,
+                input_tokens: int = 0, output_tokens: int = 0) -> int:
+        with self._tx() as con:
+            cur = con.execute(
+                """INSERT INTO runs
+                   (session_id,goal,status,input_tokens,output_tokens,created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (session_id, redact(_truncate(goal, 200)), status,
+                 int(input_tokens), int(output_tokens), _now()),
+            )
+            return cur.lastrowid
+
+    def list_runs(self, session_id: str, limit: int = 50) -> list[dict]:
+        rows = self._con.execute(
+            "SELECT * FROM runs WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── agent_profiles ───────────────────────────────────────────────────────
     def upsert_agent_profile(self, agent_id: str, name: str,
                              model_profile: str,
                              memory_policy: str = "none",
