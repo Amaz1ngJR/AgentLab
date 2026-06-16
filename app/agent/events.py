@@ -53,6 +53,21 @@ CONTEXT_COMPACTION_STARTED = "context_compaction_started"
 CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"
 CONTEXT_COMPACTION_FAILED = "context_compaction_failed"
 
+# Loop Engineering 模式(§7.6)
+GOAL_DEFINED = "goal_defined"
+LOOP_STARTED = "loop_started"
+LOOP_ITERATION_STARTED = "loop_iteration_started"
+VERIFICATION_STARTED = "verification_started"
+VERIFICATION_COMPLETED = "verification_completed"
+REPAIR_PLANNED = "repair_planned"
+LEARNER_CANDIDATE_CREATED = "learner_candidate_created"
+LOOP_COMPLETED = "loop_completed"
+LOOP_BLOCKED = "loop_blocked"
+LOOP_BUDGET_EXHAUSTED = "loop_budget_exhausted"
+WORKTREE_PREPARED = "worktree_prepared"
+SUBAGENT_STARTED = "subagent_started"
+SUBAGENT_COMPLETED = "subagent_completed"
+
 
 @dataclass
 class RunEvent:

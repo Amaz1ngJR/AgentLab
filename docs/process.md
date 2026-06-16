@@ -15,17 +15,19 @@
 
 AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）、`Planner + Executor + Replanner` 编排路径（带依赖 TaskStore + 结构化 `RunEvent`，已接入 CLI 主路径，支持 Ctrl-C 协作式取消与任务状态持久化恢复）、上下文预算与自动压缩（`ContextBudget` + `ContextCompressor` + 结构化摘要 + `/context` 命令族，编排稳定点超阈值自动压缩、可审计）。
 
-距离 PRD 的核心缺口：没有统一风险等级 `ToolDescriptor` 与分级审批、没有自建 Computer Control Gateway、没有终端 TUI、没有 Web UI。
+当前编排相当于 PRD 的 **Task 模式**（Planner→Executor→Replanner，目标是把任务跑完）。PRD 新增的 **Loop 模式（Loop Engineering，§7.6）** 核心组件已落地、待集成：`GoalSpec` + 校验、`Verifier`（command/file_assertion）、`LoopRunner` 状态机框架、`WorktreeManager` 隔离工作区、`loop_store`（6 表）、Loop RunEvent、`/goal` `/loop` 命令框架均已实现并测试（见 3.11）；尚未打通的是 LoopRunner 与 Orchestrator 的深度集成、CLI 主循环接入、Verifier 扩展（browser/api/human）、`Learner` / `Project Knowledge` / 子 Agent / 后台 Loop。
+
+距离 PRD 的核心缺口：Loop Engineering 尚未端到端跑通（核心组件已就绪，缺集成）、没有统一风险等级 `ToolDescriptor` 与分级审批、没有自建 Computer Control Gateway、没有终端 TUI、没有 Web UI。
 
 ---
 
 ## 2. 当前需要做的事情（最多 5 项）
 
-1. 把 `Tool` 升级为统一 `ToolDescriptor`，审批从布尔值改为分级策略（read/write/execute/browser_control/...）（见 6.4）。
-2. 建立 `ComputerControlGateway`，把 Playwright MCP 浏览器能力纳入统一观察、动作、审批、审计链路（见 6.6）。
-3. 新增终端 TUI（`app/tui/`）：顶部大号 **Amaz1ng** 欢迎栏 + 会话/任务/审批/对话分区，复用同一 Runtime 事件（见 6.12）。
-4. FastAPI Web UI + SSE 事件，与 CLI 共用同一 Runtime service（见 6.10）。
-5. 把 `runs / tasks / context_summaries` 落库的审计接出 CLI 查看入口（如 `/runs`、任务历史回看）（见 6.1）。
+1. **集成 Loop Engineering 端到端闭环**（PRD §7.6，核心组件见 3.11）：把 `LoopRunner` 的 `_execute_iteration` 真正接到 `Orchestrator.run()`（按 worktree 切 cwd、传 CancelToken、累计工具调用数）；CLI 主循环接入 `/goal` `/loop`（`LoopCommandHandler`）+ `Storage` 初始化时建 loop 表 + `_print_run_event` 渲染 Loop 事件（见 6.14）。
+2. 把 `Tool` 升级为统一 `ToolDescriptor`，审批从布尔值改为分级策略（read/write/execute/browser_control/...）（见 6.4）。
+3. 建立 `ComputerControlGateway`，把 Playwright MCP 浏览器能力纳入统一观察、动作、审批、审计链路（见 6.6）。
+4. 新增终端 TUI（`app/tui/`）：顶部大号 **Amaz1ng** 欢迎栏 + 会话/任务/审批/对话分区，复用同一 Runtime 事件（见 6.12）。
+5. FastAPI Web UI + SSE 事件，与 CLI 共用同一 Runtime service（见 6.10）。
 
 ---
 
@@ -81,7 +83,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **301 个 unit tests**（全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager）、code_search、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage（含 tasks/runs/context_summaries 持久化）、memory、session_router（含任务快照恢复）、CLI 斜杠补全、Skill loader/catalog。
+- **343 个 unit tests**（全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager）、code_search、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage（含 tasks/runs/context_summaries 持久化）、memory、session_router（含任务快照恢复）、CLI 斜杠补全、Skill loader/catalog、Loop Engineering（GoalSpec 校验 / Verifier command+file / WorktreeManager）。
 
 ### 3.8 Planner / Executor / Replanner 编排与结构化 RunEvent
 
@@ -113,6 +115,16 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `app/cli.py`:`_session_factory` 按 `cfg.context_size`/模型窗口构建 `ContextManager` 装配进 session;`_print_run_event` 渲染 context_* 事件(警告百分比 / 压缩前后 token);`/context` 命令族(看预算 / `compact` 手动压缩 / `summary` 看摘要 / `disable-auto-compact` / `enable-auto-compact`)+ 斜杠补全二级子命令。
 - 测试 `tests/unit/test_context.py`(33 个):token 估算、窗口解析、预算阈值、安全选段(含不切 tool 对)、摘要解析/校验/脱敏、ContextManager 触发与不触发/禁用/force/drain/report、storage round-trip + 脱敏 + 删除清理、Orchestrator 稳定点压缩 + 无 context_manager 向后兼容。
 
+### 3.11 Loop Engineering 基础（部分完成）
+
+- **GoalSpec** (`app/agent/goals.py`)：目标定义 dataclass（objective/success_criteria/constraints/budgets/verification_plan/stop_conditions/workspace_mode/learning_policy）+ `validate()` 校验（objective 非空、success_criteria 可验证、至少一个 verifier、高风险禁止只用 llm_judge、预算 > 0）+ `is_valid()` 快速判断。10 个单元测试覆盖所有校验规则。
+- **Verifier** (`app/agent/verifier.py`)：验证器统一入口 + `VerificationResult` / `CheckResult` 结构化输出。已实现 `command`（运行命令检查 exit code）、`file_assertion`（检查文件存在/内容包含/不包含）；未实现类型（browser/api/database/remote/human/llm_judge）优雅降级返回 blocked。18 个单元测试覆盖命令执行、文件断言、多检查组合、优先级。
+- **LoopRunner 状态机** (`app/agent/loop_runner.py`)：驱动"执行→验证→诊断→修复→学习"循环的状态机框架（Ready→Planning→Executing→Verifying→{Succeeded/Diagnosing→Repairing}→Learning，含 Blocked/BudgetExhausted/Cancelled）。复用 Orchestrator 作为 Task 层；每 iteration 检查预算、执行任务、运行验证、诊断并修复；成功后生成 diff summary 和合并建议。待完善：与 Orchestrator 深度集成、Learner 调用。
+- **WorktreeManager** (`app/workspace/worktree.py`)：Git worktree 隔离工作区生命周期管理。`create()`（创建 worktree + 新分支、可选 require_clean_base）、`get_diff_summary()`（统计改动）、`check_dirty()`（检查未提交改动）、`remove()`（删除 worktree，dirty 需 force）、`merge_suggestion()`（生成合并命令供用户确认）。11 个单元测试覆盖创建/删除/diff/dirty 检查/安全边界。
+- **loop_store** (`app/storage/loop_store.py`)：6 张新表（goal_specs / loop_runs / loop_iterations / verification_results / worktrees / subagent_runs）+ 索引；`save_goal_spec / load_goal_spec / save_loop_run / load_loop_run / save_verification_result / save_worktree`；所有写入经 `redact()` 脱敏，大内容存 blobs 只留引用。
+- **Loop RunEvent** (`app/agent/events.py`)：新增 13 个 Loop 生命周期事件常量（goal_defined / loop_started / loop_iteration_started / verification_started / verification_completed / repair_planned / learner_candidate_created / loop_completed / loop_blocked / loop_budget_exhausted / worktree_prepared / subagent_started / subagent_completed）。
+- **Loop CLI 命令** (`app/agent/loop_commands.py`)：`LoopCommandHandler` 处理 `/goal` 和 `/loop` 命令族的基础框架；`/goal` (show/new/show <id>)、`/loop` (start/status/stop)；当前返回功能说明和集成指引，完整实现待接入 CLI 主循环。
+
 ---
 
 ## 4. 当前能力快照
@@ -123,7 +135,8 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 配置 | `.env` + `config/models.yaml`（模型）+ `config/agents.yaml`（Agent）+ `config/mcp_servers.yaml`（MCP） | `app/config/`, `app/agent/profiles.py`, `app/mcp/config.py` |
 | 模型层 | Anthropic / OpenAI Responses / OpenAI-compatible；统一内部协议；JSON tool call fallback | `app/models/` |
 | Runtime | CLI 主路径已切到编排:`AgentSession(orchestrate=True)` 委托 Orchestrator;`orchestrate=False` 仍保留 legacy 单轮循环 | `app/agent/runtime.py`, `app/agent/orchestrator.py` |
-| 编排 | Planner(JSON 计划) + Executor(单任务工具循环,带 progress/流式/用量) + Replanner(失败追加补救) + CancelToken + 结构化 RunEvent;已接 CLI | `app/agent/planner.py`, `app/agent/executor.py`, `app/agent/replanner.py`, `app/agent/events.py`, `app/agent/cancel.py` |
+| 编排 | Planner(JSON 计划) + Executor(单任务工具循环,带 progress/流式/用量) + Replanner(失败追加补救) + CancelToken + 结构化 RunEvent;已接 CLI（PRD 的 Task 模式） | `app/agent/planner.py`, `app/agent/executor.py`, `app/agent/replanner.py`, `app/agent/events.py`, `app/agent/cancel.py` |
+| Loop Engineering | **部分实现**：GoalSpec ✓ / Verifier (command+file) ✓ / LoopRunner (状态机框架) ✓ / WorktreeManager ✓ / loop_store (6 表) ✓ / Loop RunEvent ✓；待完善：LoopRunner 与 Orchestrator 集成、Learner、Project Knowledge、子 Agent、CLI 命令完整接入（见 6.14） | `app/agent/goals.py`, `verifier.py`, `loop_runner.py`, `app/workspace/worktree.py`, `app/storage/loop_store.py` |
 | 多 Agent / Session | AgentProfile + SessionRouter + `/session` 命令族；SQLite 持久化、恢复、隔离（含任务快照恢复） | `app/agent/profiles.py`, `app/agent/session_router.py`, `app/storage/` |
 | 长期记忆 | none/read/read_write 三策略 + 注入；LIKE 检索（未做向量） | `app/memory/` |
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |
@@ -136,7 +149,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 安全基础 | workspace 越界拒绝、脱敏、MCP env allowlist、敏感目录不入库 | `app/util/redact.py`, `.gitignore` |
 | 取消 | Ctrl-C 协作式取消(CancelToken):首次置位、当前步骤后停止,连按强制中断 | `app/agent/cancel.py`, `app/cli.py` |
 | 上下文压缩 | ContextBudget + ContextCompressor + 结构化摘要;编排稳定点超 85% 自动压缩、可审计;`/context` 命令族 | `app/agent/context.py`, `context_budget.py`, `context_compaction.py` |
-| 测试 | 301 个 unit tests | `tests/unit/` |
+| 测试 | 343 个 unit tests | `tests/unit/` |
 
 ---
 
@@ -170,20 +183,27 @@ AgentLab/
       context.py                   # ContextManager:稳定点预算检查 + 按需压缩 + 审计记录 flush
       context_budget.py            # 上下文预算:模型窗口解析/token 估算/各项预算/70%-85% 阈值
       context_compaction.py        # 上下文压缩:安全选段/结构化摘要/校验脱敏/就地替换旧历史
+      goals.py                     # [Loop] GoalSpec + 校验(objective/success_criteria/verifier/预算)
+      verifier.py                  # [Loop] Verifier:command/file_assertion + VerificationResult
+      loop_runner.py               # [Loop] LoopRunner 状态机框架(执行→验证→诊断→修复)
+      loop_commands.py             # [Loop] LoopCommandHandler:/goal /loop 命令处理(待接 CLI)
+    workspace/                     # [Loop] 工作区隔离与项目知识
+      worktree.py                  # WorktreeManager:git worktree 创建/diff/dirty/删除/合并建议
     tools/
       registry.py                  # Tool 注册表（仍是 requires_approval 布尔模型）
       builtin/
         files.py                   # read_file / write_file / list_dir
         code_search.py             # 高频代码搜索
         shell.py                   # 跨平台 shell
-        interactive.py             # 交互式终端会话(PTY)：PtySession + manager + terminal_* 工具
+        interactive.py             # 交互式终端会话(PTY)：PtySession + manager + terminal_* 工具(Windows 优雅降级)
         todo.py                    # todo_write
     mcp/
       config.py                    # mcp_servers.yaml loader
       manager.py                   # stdio MCP 生命周期 + sync↔async 桥
       adapter.py                   # MCP tool -> Tool
     storage/
-      __init__.py                  # SQLite：sessions/messages/memories/tool_executions/runs/tasks
+      __init__.py                  # SQLite：sessions/messages/memories/tool_executions/runs/tasks/context_summaries
+      loop_store.py                # [Loop] 6 表:goal_specs/loop_runs/loop_iterations/verification_results/worktrees/subagent_runs
     memory/
       __init__.py                  # 记忆策略 + 注入
     skills/
@@ -203,10 +223,10 @@ AgentLab/
   docs/
     technical_architecture.md      # PRD 和总体技术方案
     process.md                     # 当前进展和接下来工作
-  tests/unit/                      # 301 个 unit tests
+  tests/unit/                      # 343 个 unit tests
 ```
 
-尚未出现但 PRD 已规划的目录：`app/control/`、`app/tui/`、`app/server.py`、`app/web/`。
+尚未出现但 PRD 已规划的目录/模块：`app/agent/learner.py`、`app/agent/subagents.py`、`app/workspace/knowledge.py`、`app/workspace/scheduler.py`、`app/control/`、`app/tui/`、`app/server.py`、`app/web/`。（Loop 核心 `goals.py` / `verifier.py` / `loop_runner.py` / `loop_store.py` / `app/workspace/worktree.py` 已落地，见 3.11。）
 
 ---
 
@@ -216,7 +236,7 @@ AgentLab/
 
 ### 6.1 Runtime 与任务拆解
 
-当前状态：编排核心(见 3.8)与 CLI 接入 + 任务持久化(见 3.9)均已完成。CLI 默认 `AgentSession(orchestrate=True)`,一轮对话走 规划→按依赖执行→失败重规划;`RunEvent` 经 `_print_run_event` 渲染到 spinner、任务面板(含 blocked/failed 字形)与工具行;Ctrl-C 触发 `CancelToken` 协作式取消;TaskStore 快照落 SQLite `runs/tasks`,`/session switch` 与重启后可恢复任务状态。
+当前状态：编排核心(见 3.8)与 CLI 接入 + 任务持久化(见 3.9)均已完成，对应 PRD 的 **Task 模式**。CLI 默认 `AgentSession(orchestrate=True)`,一轮对话走 规划→按依赖执行→失败重规划;`RunEvent` 经 `_print_run_event` 渲染到 spinner、任务面板(含 blocked/failed 字形)与工具行;Ctrl-C 触发 `CancelToken` 协作式取消;TaskStore 快照落 SQLite `runs/tasks`,`/session switch` 与重启后可恢复任务状态。PRD 新增的 **Loop 模式**（GoalSpec/LoopRunner/Verifier/Learner）在此之上，单列 6.14。
 
 接下来要做(均为非阻塞增强):
 
@@ -331,13 +351,13 @@ AgentLab/
 
 ### 6.10 存储、Web UI 与发布
 
-当前状态：SQLite 已落 `sessions / messages / memories / tool_executions`（见 3.4）；尚无 `runs / tasks / settings` 表；没有 Web UI；CLI 与未来 Web 尚未抽出共用 Runtime service。
+当前状态：SQLite 已落 `sessions / messages / memories / tool_executions / runs / tasks / context_summaries`（见 3.4 / 3.9 / 3.10）；尚无 `settings` 表与 Loop 相关表（`goal_specs / loop_runs / loop_iterations / verification_results / worktrees / subagent_runs`，见 6.14）；没有 Web UI；CLI 与未来 Web 尚未抽出共用 Runtime service。
 
 接下来要做：
 
-- 补 `runs / tasks / settings` 表，把审计事件结构化落库。
+- 补 `settings` 表；Loop 相关表随 6.14 一起落库（建议放 `app/storage/loop_store.py`）。
 - 抽出 Runtime service，让 CLI 与 Web UI 共用同一逻辑。
-- 新增 `app/server.py` 和 `app/web/`，提供本地 Web UI、SSE 事件、审批 API、Stop 按钮。
+- 新增 `app/server.py` 和 `app/web/`，提供本地 Web UI、SSE 事件、审批 API、Loop Dashboard / Loop API、Stop 按钮。
 - 配置面板能查看 AgentProfile、模型 profile、Skill、MCP Server、Control Target 和工具风险等级。
 
 验收标准：退出重启后可 `/session list` 看到历史 session，并恢复消息、任务和记忆摘要（消息与记忆恢复已实现，任务恢复待 6.1）。
@@ -363,7 +383,7 @@ AgentLab/
 
 - 新增 `app/tui/`（建议 Textual / Rich）：`app.py` 布局、`banner.py` 大号欢迎栏、`widgets.py` 组件、`events.py` 订阅 Runtime Event Bus。
 - 顶部一个很大的欢迎栏，用 ASCII art 大字渲染 **Amaz1ng** 标题，附当前 Agent 和模型 profile；窄终端自动降级为单行标题。
-- 分区布局：侧边栏（Agent/Session 列表）、任务面板、对话区、内嵌审批对话框、状态栏（provider + 云端数据边界 + token/耗时）。
+- 分区布局：侧边栏（Agent/Session 列表）、Loop 面板（GoalSpec/iteration/验证结果/预算/worktree）、任务面板、上下文状态、对话区、内嵌审批对话框、状态栏（provider + 云端数据边界 + token/耗时）。
 - 与 CLI / Web 共用同一 Runtime service，不复制 Agent 逻辑；`/session` 命令族在 TUI 同样可用。
 - 新增启动入口 `python -m app tui`，并提供明显的 Stop / 取消入口对应紧急停止。
 
@@ -382,6 +402,40 @@ AgentLab/
 - TUI / Web 复用 `/context` 能力(report/compact/summary)。
 
 验收标准:一个会超出模型窗口的长 session,在 85% 阈值自动压缩后仍能继续推进;压缩摘要保留 user_goal/decisions/open_tasks 且不丢未完成 run;`/context` 可查看预算与摘要,`/context compact` 可手动触发;压缩前后 token 数与摘要范围可审计。(已满足,见 3.10 与 `tests/unit/test_context.py`。)
+
+### 6.14 Loop Engineering 模式（新增，未实现）
+
+当前状态：**基础组件已完成**（见 3.11）。GoalSpec + Verifier (command/file) + LoopRunner 状态机框架 + WorktreeManager + loop_store (6 表) + Loop RunEvent 已实现并通过测试。现有 `Planner + Executor + Replanner`（见 3.8 / 6.1）是 Loop 内部 Task 层的基础，可直接复用。
+
+PRD 模式分层（§7.6.1）：Prompt 模式（单轮）→ Task 模式（Planner/Executor/Replanner，已实现）→ Loop 模式（GoalSpec + Verifier + 沉淀，**核心已实现，待集成**）。
+
+接下来要做（从集成到完整功能）：
+
+✅ **已完成**（见 3.11）：
+- `app/agent/goals.py`：GoalSpec + 校验 + 10 个测试 ✓
+- `app/agent/verifier.py`：command/file_assertion + 18 个测试 ✓
+- `app/agent/loop_runner.py`：状态机框架 ✓
+- `app/workspace/worktree.py`：WorktreeManager + 11 个测试 ✓
+- `app/storage/loop_store.py`：6 张表 + CRUD ✓
+- `app/agent/events.py`：13 个 Loop RunEvent ✓
+- `app/agent/loop_commands.py`：命令处理框架 ✓
+
+🔧 **待完善**（优先级从高到低）：
+
+- **LoopRunner 与 Orchestrator 深度集成**：当前 LoopRunner._execute_iteration 是简化实现，需要真正调用 Orchestrator.run() 并根据 worktree 切换工作目录；处理 TaskStore 状态、工具调用计数、取消信号传递。
+- **CLI 完整接入**：在 `app/cli.py` 的 `_repl` 中添加 `/goal` 和 `/loop` 命令处理（调用 `LoopCommandHandler`）；初始化 loop_store 表（在 Storage.__init__ 中调用 `init_loop_tables`）；`_print_run_event` 渲染 Loop 事件（loop_started/iteration/verification/completed 等）。
+- **Verifier 扩展**：browser（Playwright MCP）、api（HTTP 请求）、human（人工确认）类型；flaky 重试逻辑；evidence_ref 链接到 tool_executions。
+- `app/agent/learner.py`：仅在稳定点（成功/阻塞/预算耗尽/停止）生成 `memory_candidate / skill_update_proposal / project_knowledge_update / anti_pattern` 候选，不自动落库；密钥/cookie/私钥/验证码不写记忆。
+- `app/workspace/knowledge.py`：Project Knowledge 索引（README/AGENTS/CLAUDE/SKILL/测试命令/历史 loop 经验），每条标来源；与实际代码冲突时以代码和验证结果为准。
+- `app/agent/subagents.py`：子 Agent 协作（Executor/Verifier/Reviewer/Research），独立 session + TaskStore snapshot + 临时授权；不能降低 GoalSpec 或扩权；输出回父 LoopRunner 统一审计；验证 Agent 不复用执行 Agent 私有推理上下文。
+- `app/storage/loop_store.py` + 新表 `goal_specs / loop_runs / loop_iterations / verification_results / worktrees / subagent_runs`（PRD §10.3）。
+- `app/agent/events.py`：新增 loop 生命周期 RunEvent（`goal_defined / loop_started / loop_iteration_started / verification_started / verification_completed / repair_planned / learner_candidate_created / loop_completed / loop_blocked / loop_budget_exhausted / worktree_prepared / subagent_started / subagent_completed`）。
+- CLI 命令族 `/goal`（show/new/edit/verify，改成功标准需确认）与 `/loop`（start/status/stop/evidence/diff/learn）+ 斜杠补全；`config/loop.example.yaml`（默认预算 / require_verifier / worktree / scheduler）。
+- 定时/后台 Loop（`app/workspace/scheduler.py`）：手动 `/loop` / 本地 cron / GitHub Actions 三类入口；后台 loop 默认禁用、只跑预配置 GoalSpec、高风险动作转人工审批。优先级最低，可放最后。
+
+安全要求（PRD §12）：Loop 默认要求至少一个非 `llm_judge` verifier；默认 `git_worktree`；默认禁用后台自动运行 / 自动 push / 发布 / 部署；模型提出降低 success_criteria 必须审批。
+
+验收标准：CLI 用 `/goal new` + `/loop start` 跑一个带 `command` verifier 的代码目标，能看到 GoalSpec 校验、worktree 准备、规划→执行→验证→（失败则）诊断修复再验证、预算耗尽/验证通过/用户停止分别落到对应状态与 RunEvent，证据和 diff 可在 `/loop evidence` `/loop diff` 回看，且主工作区不被未验证改动污染。
 
 ---
 
@@ -409,7 +463,7 @@ AgentLab/
 ```bash
 conda activate agentlab
 
-# 收集测试。当前 301 个 unit tests。
+# 收集测试。当前 343 个 unit tests。
 python -m pytest tests/unit --collect-only -q
 
 # 运行全部 unit tests。

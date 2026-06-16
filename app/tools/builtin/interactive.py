@@ -23,17 +23,26 @@
     命令,属高风险。
   - 不持有任何凭据:要连远程就 terminal_open 一个本机已配置好的命令(如
     `zsh -ic 'vsm <device>'`,凭据留在用户 shell 配置里),工具不碰账号密码。
+
+Windows 兼容性:
+  - pty 模块只在 Unix/Linux/macOS 上存在。Windows 上会优雅降级:工具仍注册,
+    但调用时返回 "不支持" 错误而不是导入失败崩溃整个 CLI。
 """
 from __future__ import annotations
 
 import errno
 import os
-import pty
+import platform
 import re
-import select
 import shlex
 import signal
 import time
+
+# pty 和 select 只在 Unix 系统上存在
+_IS_WINDOWS = platform.system() == "Windows"
+if not _IS_WINDOWS:
+    import pty
+    import select
 
 # 单次返回给模型的输出上限,避免巨型日志撑爆上下文。
 MAX_OUTPUT_BYTES = 8_000
@@ -64,9 +73,11 @@ def _clip(text: str) -> str:
 
 
 class PtySession:
-    """跑在伪终端里的一个子进程会话。"""
+    """跑在伪终端里的一个子进程会话。Unix/Linux/macOS only."""
 
     def __init__(self, session_id: str, argv: list[str], cwd: str | None = None):
+        if _IS_WINDOWS:
+            raise NotImplementedError("PTY sessions are not supported on Windows")
         self.id = session_id
         self.argv = argv
         self._pid, self._fd = pty.fork()
@@ -136,11 +147,13 @@ class PtySession:
         return True
 
     def close(self) -> None:
-        """关闭会话:先发 SIGTERM,再关 fd,回收子进程。重复调用安全。"""
+        """关闭会话:先发 SIGTERM(Unix)或 SIGINT(Win),再关 fd,回收子进程。重复调用安全。"""
         if self._closed and self._fd < 0:
             return
         try:
-            os.kill(self._pid, signal.SIGTERM)
+            # Windows 上没有 SIGTERM，用 SIGINT 代替
+            sig = signal.SIGTERM if hasattr(signal, 'SIGTERM') else signal.SIGINT
+            os.kill(self._pid, sig)
         except OSError:
             pass
         try:
@@ -213,6 +226,11 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
     from app.tools.registry import Tool
 
     def _open(args: dict) -> str:
+        if _IS_WINDOWS:
+            return (
+                "交互式终端会话在 Windows 上不支持(需要 Unix PTY)。\n"
+                "Windows 用户请直接在命令行/PowerShell 执行交互式命令,或考虑 WSL。"
+            )
         command = (args.get("command") or "").strip()
         if not command:
             return "refused: empty command"
