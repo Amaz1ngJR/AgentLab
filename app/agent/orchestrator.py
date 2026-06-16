@@ -121,19 +121,28 @@ class Orchestrator:
         except Exception:
             pass
 
-    def run(self, goal: str, *, cancel: Optional[CancelToken] = None) -> str:
+    def run(self, goal: str, *, cancel: Optional[CancelToken] = None, resume: bool = False) -> str:
         """规划并执行一个目标,返回最终答复文本。
 
-        cancel 用于协作式取消;不传则不可取消。每次调用前清空旧任务,确保任务面板
-        只展示当前轮的计划,不与历史任务混叠。
+        cancel 用于协作式取消;不传则不可取消。
+        resume=True 时不清空旧任务(继续上一轮未完成的任务,失败任务重置为 pending);
+        resume=False(默认)时清空,确保任务面板只展示当前轮的计划。
         """
         cancel = cancel or CancelToken()
         self._run_seq += 1
         self.last_run_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_run_status = ""
-        # 每轮新目标清空旧任务:任务面板只反映当前轮,避免历史任务(包括从 session
-        # 恢复的快照)与新计划混叠刷屏。
-        self.store.clear()
+        if not resume:
+            # 非 resume 模式:清空旧任务,只展示本轮计划
+            self.store.clear()
+        else:
+            # resume 模式:保留已有任务,把 failed 重置为 pending,继续推进
+            reset_count = self.store.reset_failed()
+            if reset_count > 0:
+                self._emit(RunEvent(
+                    kind=events.RUN_STARTED,
+                    text=f"继续上一轮任务(已重置 {reset_count} 个失败任务)",
+                ))
         self.messages.append({"role": "user", "content": goal})
         self._emit(RunEvent(kind=events.RUN_STARTED, text=goal))
 

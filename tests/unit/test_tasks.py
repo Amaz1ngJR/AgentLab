@@ -38,6 +38,31 @@ def test_task_store_clear():
     assert store.is_empty()
 
 
+def test_task_store_reset_failed():
+    """reset_failed 把 failed 任务改回 pending,返回重置数量,不动其它状态。"""
+    store = TaskStore()
+    store.replace_all([
+        Task("1", "a", COMPLETED),
+        Task("2", "b", FAILED),
+        Task("3", "c", FAILED),
+        Task("4", "d", PENDING),
+    ])
+    count = store.reset_failed()
+    assert count == 2
+    by_id = {t.id: t.status for t in store.all()}
+    assert by_id["1"] == COMPLETED   # 已完成不动
+    assert by_id["2"] == PENDING     # failed -> pending
+    assert by_id["3"] == PENDING     # failed -> pending
+    assert by_id["4"] == PENDING     # 本来就 pending
+
+
+def test_task_store_reset_failed_none():
+    """没有 failed 任务时返回 0。"""
+    store = TaskStore()
+    store.replace_all([Task("1", "a", COMPLETED), Task("2", "b", PENDING)])
+    assert store.reset_failed() == 0
+
+
 def test_task_store_all_returns_copy():
     """all() 返回副本,外部修改不应影响内部状态。"""
     store = TaskStore()

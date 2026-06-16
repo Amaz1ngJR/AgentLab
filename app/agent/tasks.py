@@ -84,6 +84,15 @@ class TaskStore:
         """清空。CLI 的 /reset 命令会调它。"""
         self._tasks = []
 
+    def reset_failed(self) -> int:
+        """把所有 failed 任务重置为 pending,返回重置数量。供 /resume 用。"""
+        count = 0
+        for t in self._tasks:
+            if t.status == FAILED:
+                t.status = PENDING
+                count += 1
+        return count
+
     def is_empty(self) -> bool:
         return not self._tasks
 

@@ -427,6 +427,9 @@ def _make_progress(task_store=None):
     compacting),若每个 spinner 都提交一次任务面板,面板就被重复打印 5~6 次。
     用一个跨 spinner 共享的 `panel_state` 记住"上次提交的面板签名",只有面板
     内容真正变化时才重新提交,消除重复噪音。
+
+    返回 (progress_fn, panel_state):progress_fn 供 AgentSession 用,panel_state
+    供 _print_run_event 等外部路径复用同一去重状态。
     """
     panel_state = {"last": None}  # 跨 spinner 共享:上次已提交的面板签名
 
@@ -438,7 +441,7 @@ def _make_progress(task_store=None):
         else:
             with _PlainProgress(label) as p:
                 yield p
-    return _progress
+    return _progress, panel_state
 
 
 # 兼容旧调用:模块顶层仍提供一个无 task_store 的默认 _progress
@@ -466,7 +469,7 @@ def _print_event(ev: TurnEvent) -> None:
         print(f"\n{ev.text}\n", flush=True)
 
 
-def _print_run_event(ev: RunEvent) -> None:
+def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
     """把编排路径的 RunEvent 渲染到终端。
 
     分工(与 spinner 配合,见 6.1):
@@ -477,6 +480,9 @@ def _print_run_event(ev: RunEvent) -> None:
       - plan_created / task_started:轻量进度提示。
       - task_updated:不单独打行(spinner 面板已实时反映任务状态)。
       - run_completed / run_failed:打最终任务面板(snapshot)+ 失败原因。
+
+    panel_state 供去重:与 spinner 内部的 _commit_tasks 共享同一签名字典,
+    避免 RUN_COMPLETED/RUN_FAILED 又重复打印面板。
     """
     kind = ev.kind
     if kind == run_events.MESSAGE_DELTA:
@@ -502,15 +508,29 @@ def _print_run_event(ev: RunEvent) -> None:
     elif kind == run_events.RUN_COMPLETED:
         tasks = ev.payload.get("tasks", [])
         if len(tasks) > 1:
+            task_lines = _format_task_lines(tasks)
+            # 去重:与 spinner 内 _commit_tasks 共享 panel_state,签名相同则跳过
+            if panel_state is not None:
+                signature = "\n".join(task_lines)
+                if signature == panel_state.get("last"):
+                    return  # 已在 spinner 内打印过,不重复
+                panel_state["last"] = signature
             print("  ✻ 完成:", flush=True)
-            for line in _format_task_lines(tasks):
+            for line in task_lines:
                 print(line, flush=True)
             print(flush=True)
     elif kind == run_events.RUN_FAILED:
         print(f"\n  ⚠ {ev.text}", flush=True)
         tasks = ev.payload.get("tasks", [])
         if len(tasks) > 1:
-            for line in _format_task_lines(tasks):
+            task_lines = _format_task_lines(tasks)
+            # 去重:与 spinner 内 _commit_tasks 共享 panel_state
+            if panel_state is not None:
+                signature = "\n".join(task_lines)
+                if signature == panel_state.get("last"):
+                    return  # 已打印过,不重复
+                panel_state["last"] = signature
+            for line in task_lines:
                 print(line, flush=True)
         print(flush=True)
     elif kind == run_events.CONTEXT_BUDGET_WARNING:
@@ -678,7 +698,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     print(f"workspace: {ws}")
     print("工具     : read_file / write_file / list_dir / shell / terminal_* (交互式会话) / todo_write")
     print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
-    print("输入 /reset 清空会话; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.\n")
+    print("输入 /reset 清空会话; /resume 继续未完成任务; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.\n")
 
     # ── MCP server 接入 ───────────────────────────────────────────────────────
     # 读 config/mcp_servers.yaml 中 enabled 的 server,启动 manager(供所有 session 共用)。
@@ -782,6 +802,13 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
             compressor=ContextCompressor(llm, model_profile=cfg.profile_name or ""),
             on_event=_print_run_event,
         )
+        # ── progress 工厂 + panel_state(任务面板去重状态)────────────────────
+        # _make_progress 返回 (progress_fn, panel_state),后者供 _print_run_event
+        # 复用,避免 RUN_COMPLETED/RUN_FAILED 重复打印面板。
+        progress_fn, panel_state = _make_progress(task_store)
+        # 用 partial 把 panel_state 绑定到 _print_run_event,供 on_run_event 用
+        from functools import partial
+        print_run_event_with_state = partial(_print_run_event, panel_state=panel_state)
         return AgentSession(
             llm=llm,
             tools=reg,
@@ -789,7 +816,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
             system_prompt=sys_prompt,
             max_steps=agent_profile.max_steps,
             on_event=_print_event,
-            progress=_make_progress(task_store),
+            progress=progress_fn,
             task_store=task_store,
             # PtySessionManager 随会话关闭(close_all 杀掉残留的交互式子进程)。
             # mcp_manager 不放这里:它由 router 全局统一关,否则切换/归档某个
@@ -801,7 +828,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
             # 规划与执行两阶段。RunEvent 经 _print_run_event 渲染。
             orchestrate=True,
             planner=Planner(llm),
-            on_run_event=_print_run_event,
+            on_run_event=print_run_event_with_state,
             context_manager=ctx_manager,
         )
 
@@ -883,6 +910,7 @@ def _print_input_separator() -> None:
 # 顶层斜杠命令 → 说明,用于补全菜单右侧 meta 文本
 _SLASH_COMMANDS = {
     "/reset": "清空当前会话的消息和任务",
+    "/resume": "继续上一轮未完成/失败的任务",
     "/session": "管理多 Agent 会话",
     "/context": "查看上下文预算 / 手动压缩 / 摘要",
 }
@@ -969,13 +997,15 @@ class _SlashCompleter(Completer):
 
 
 
-def _chat_with_cancel(session: AgentSession, line: str) -> str:
+def _chat_with_cancel(session: AgentSession, line: str, *, resume: bool = False) -> str:
     """跑一轮 chat,并把 Ctrl-C 接到协作式取消(对应 PRD 紧急停止)。
 
     编排路径(orchestrate=True)的模型调用是同步阻塞的,无法被强行打断;取消采用
     协作式:Ctrl-C 时把 CancelToken 置位,Orchestrator 在下一个安全检查点(claim
     下一个任务前 / 调模型前 / 执行工具前)抛 Cancelled 干净退出。第一次 Ctrl-C 触发
     取消;若用户连按(取消尚未生效),让默认 KeyboardInterrupt 冒泡到上层中断。
+
+    resume=True 时继续上一轮未完成的任务(失败任务重置为 pending)。
 
     只在主线程、且 stdin 为 TTY 时装 SIGINT 处理器;非交互(单测 / 管道)直接跑。
     """
@@ -1001,7 +1031,7 @@ def _chat_with_cancel(session: AgentSession, line: str) -> str:
             can_trap = False  # 不在主线程,signal 不可用
 
     try:
-        return session.chat(line, cancel=token)
+        return session.chat(line, cancel=token, resume=resume)
     finally:
         if can_trap and prev_handler is not None:
             signal.signal(signal.SIGINT, prev_handler)
@@ -1060,6 +1090,29 @@ def _repl(router: SessionRouter) -> int:
 
         if line == "/context" or line.startswith("/context "):
             print(_handle_context_command(session, line))
+            continue
+
+        # /resume:继续上一轮未完成的任务(失败任务重置为 pending 重试)。
+        # 可带补充说明(/resume <提示>),否则用默认继续指令。
+        if line == "/resume" or line.startswith("/resume "):
+            store = getattr(session, "task_store", None)
+            if store is None or store.is_empty():
+                print("没有可继续的任务(任务列表为空)。直接输入新目标即可开始。")
+                continue
+            summary = store.summary()
+            if not summary.get("failed") and not summary.get("pending") \
+                    and not summary.get("blocked") and not summary.get("in_progress"):
+                print("所有任务都已完成,没有需要继续的任务。")
+                continue
+            extra = line[len("/resume"):].strip()
+            goal = extra or "继续完成上一轮未完成的任务。"
+            try:
+                _chat_with_cancel(session, goal, resume=True)
+            except Exception as exc:
+                print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
+                continue
+            router.persist_current()
+            _print_stats(session)
             continue
 
         try:

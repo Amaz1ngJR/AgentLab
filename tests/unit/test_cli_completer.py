@@ -26,7 +26,7 @@ def _complete(c, text):
 
 def test_top_level_slash():
     c = _completer()
-    assert set(_complete(c, "/")) == {"/reset", "/session", "/context"}
+    assert set(_complete(c, "/")) == {"/reset", "/resume", "/session", "/context"}
 
 
 def test_top_level_prefix():

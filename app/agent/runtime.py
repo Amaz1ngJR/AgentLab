@@ -179,17 +179,20 @@ class AgentSession:
         self._orch.messages = self.messages
         return self._orch
 
-    def chat(self, user_input: str, *, cancel: Optional[CancelToken] = None) -> str:
+    def chat(self, user_input: str, *, cancel: Optional[CancelToken] = None,
+             resume: bool = False) -> str:
         """处理一轮用户输入。
 
         orchestrate=True 时委托给 Orchestrator(规划→执行→重规划,产出 RunEvent);
-        否则走 legacy 单轮工具循环。cancel 仅编排路径生效(legacy 路径忽略)。
+        否则走 legacy 单轮循环。cancel 仅编排路径生效(legacy 路径忽略)。
+        resume=True 时继续上一轮未完成的任务(失败任务重置为 pending),仅编排路径生效。
         """
         if self._orchestrate:
-            return self._chat_orchestrated(user_input, cancel=cancel)
+            return self._chat_orchestrated(user_input, cancel=cancel, resume=resume)
         return self._chat_legacy(user_input)
 
-    def _chat_orchestrated(self, user_input: str, *, cancel: Optional[CancelToken] = None) -> str:
+    def _chat_orchestrated(self, user_input: str, *, cancel: Optional[CancelToken] = None,
+                           resume: bool = False) -> str:
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
         self.last_goal = user_input
@@ -197,7 +200,7 @@ class AgentSession:
         turn_start = time.monotonic()
         try:
             orch = self._ensure_orchestrator()
-            answer = orch.run(user_input, cancel=cancel)
+            answer = orch.run(user_input, cancel=cancel, resume=resume)
             # 把 run 级统计拷回 session,供 CLI 展示 / 持久化
             self.last_turn_usage = dict(orch.last_run_usage)
             for k in ("input_tokens", "output_tokens"):
