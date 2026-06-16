@@ -93,14 +93,16 @@ class SessionRouter:
         return True
 
     def resume_or_new(self, agent_id: Optional[str] = None) -> tuple[str, bool]:
-        """启动时调用:有未归档的历史 session 就恢复最近一个,否则新建。
+        """启动时调用:有未归档且非空的历史 session 就恢复最近一个,否则新建。
 
         返回 (session_id, resumed):resumed=True 表示恢复了历史会话。
-        "最近"按 list_sessions 的 updated_at DESC 顺序取第一个。
+        "最近"按 list_sessions 的 updated_at DESC 顺序;跳过 0 消息的空会话,
+        避免恢复到一个从未对话过的空壳(否则用户会以为"历史丢了")。
         """
         rows = self._storage.list_sessions()  # 已过滤 archived,按 updated_at DESC
-        if rows and self.switch(rows[0]["id"]):
-            return rows[0]["id"], True
+        for row in rows:
+            if self._storage.count_messages(row["id"]) > 0 and self.switch(row["id"]):
+                return row["id"], True
         return self.new(agent_id=agent_id), False
 
     def rename(self, title: str) -> None:
@@ -146,6 +148,11 @@ class SessionRouter:
             return
         sess = self.current
         self._storage.save_messages(self.current_id, sess.messages)
+        # 标记最后活跃时间:让 resume_or_new 的"最近"= 最后对话时间,而非创建/
+        # 重命名时间,避免每次启动恢复到从未对话过的空壳 session。只在确有消息时
+        # touch,空会话不抢占"最近"位置。
+        if sess.messages:
+            self._storage.touch_session(self.current_id)
         store = getattr(sess, "task_store", None)
         if store is not None:
             self._storage.save_tasks(self.current_id, store.snapshot())

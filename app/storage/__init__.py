@@ -159,6 +159,18 @@ class Storage:
                 (title, _now(), session_id),
             )
 
+    def touch_session(self, session_id: str) -> None:
+        """更新 session 的 updated_at 为当前时间(标记"最后活跃")。
+
+        每次保存消息后调用,让 resume_or_new 的"最近"= 最后对话时间,而不是
+        创建/重命名时间,避免每次启动恢复到一个从未对话过的空壳 session。
+        """
+        with self._tx() as con:
+            con.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?",
+                (_now(), session_id),
+            )
+
     def archive_session(self, session_id: str) -> None:
         with self._tx() as con:
             con.execute(
@@ -221,6 +233,14 @@ class Storage:
             except json.JSONDecodeError:
                 pass
         return result
+
+    def count_messages(self, session_id: str) -> int:
+        """返回某 session 的消息条数。供 resume_or_new 跳过空会话。"""
+        row = self._con.execute(
+            "SELECT COUNT(*) AS c FROM messages WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        return int(row["c"]) if row else 0
 
     # ── memories ─────────────────────────────────────────────────────────────
 

@@ -130,6 +130,46 @@ def test_resume_or_new_skips_archived(tmp_path):
     assert resumed is False                        # 归档的不恢复,新建
 
 
+def test_resume_or_new_skips_empty_sessions(tmp_path):
+    """有多个 session,最近的是空壳(0 消息)→ 跳过空壳,恢复有历史的那个。"""
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles())
+    # 第一个 session:有历史
+    sid1 = r.new("default")
+    r.current.messages = [{"role": "user", "content": "first"}]
+    r.persist_current()
+    # 第二个 session:新建但没对话,0 消息(模拟空壳)
+    sid2 = r.new("default")
+    r.persist_current()  # persist 了但 messages 空,updated_at 更新但不抢占"最近"
+    # 手动让空壳的 updated_at 比有历史的更晚(模拟旧 bug 场景:空壳被 rename 过)
+    import time
+    time.sleep(0.01)  # 确保时间戳不同
+    db.update_session_title(sid2, "empty-but-recent")
+    # 模拟重启:新 router 应恢复 sid1(有消息),而非 sid2(空壳)
+    r2 = _make_router(db, _profiles())
+    resumed_id, resumed = r2.resume_or_new(agent_id="default")
+    assert resumed is True
+    assert resumed_id == sid1  # 跳过空壳,恢复有历史的
+    assert r2.current.messages[0]["content"] == "first"
+
+
+def test_persist_current_touches_updated_at(tmp_path):
+    """persist_current 应更新 session 的 updated_at,标记最后活跃时间。"""
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles())
+    sid = r.new("default")
+    sess_before = db.get_session(sid)
+    updated_before = sess_before["updated_at"]
+    # 对话并 persist
+    import time
+    time.sleep(0.01)  # 确保时间戳变化
+    r.current.messages = [{"role": "user", "content": "new msg"}]
+    r.persist_current()
+    sess_after = db.get_session(sid)
+    updated_after = sess_after["updated_at"]
+    assert updated_after > updated_before  # updated_at 被 touch 了
+
+
 def test_archive_removes_session(tmp_path):
     r = _make_router(Storage(tmp_path / "db"), _profiles())
     r.new("default")
