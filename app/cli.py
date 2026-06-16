@@ -120,6 +120,20 @@ def _task_field(t, name: str):
     return getattr(t, name, "")
 
 
+def _truncate_task_content(content: str, max_chars: int = 60) -> str:
+    """任务面板每行只占一行:超长 content(如退化单任务把整段 prompt 当任务)截断。
+
+    取首行(模型偶尔把多行塞进 content),再按字符数截断加省略号,避免面板被
+    整段用户问题撑成多行刷屏。
+    """
+    if not content:
+        return content
+    first_line = content.splitlines()[0].strip()
+    if len(first_line) > max_chars:
+        return first_line[:max_chars].rstrip() + "…"
+    return first_line
+
+
 def _format_task_lines(tasks) -> list[str]:
     """把任务列表渲染成多行字符串(已包含 ANSI 颜色)。
 
@@ -163,6 +177,7 @@ def _format_task_lines(tasks) -> list[str]:
     for t in tasks:
         st = _task_field(t, "status")
         content = _task_field(t, "content")
+        content = _truncate_task_content(content)
         if st == "completed":
             lines.append(f"  {_ANSI_DIM}✓ {content}{_ANSI_RESET}")
         elif st == "in_progress":
@@ -199,9 +214,12 @@ class _Spinner:
     换行滚走的正文永远不碰,所以不会出现旧实现"重打整段缓冲"导致的滚屏叠影。
     """
 
-    def __init__(self, label: str, task_store=None):
+    def __init__(self, label: str, task_store=None, panel_state=None):
         self.label = label
         self._task_store = task_store  # None = 不显示任务面板
+        # 跨 spinner 共享的面板去重状态({"last": <上次提交的面板签名>});
+        # None 时退化为本 spinner 内自己去重(_tasks_committed)
+        self._panel_state = panel_state
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._t0 = 0.0
@@ -280,6 +298,10 @@ class _Spinner:
         面板在一个步骤内不会变(todo_write 的更新发生在 create_message 之后),
         所以提交一次即可,无需像旧实现那样每帧重绘。调用前必须已 _erase_footer,
         否则会把面板打在 footer 中间。
+
+        去重:一次 chat 会起多个 spinner(planning / thinking / compacting),
+        若每个都提交一次面板就会重复刷屏。用跨 spinner 共享的 _panel_state 记住
+        上次已提交的面板签名,内容没变就跳过,只在任务状态真正变化时才重新打印。
         """
         if self._tasks_committed:
             return
@@ -287,6 +309,12 @@ class _Spinner:
         task_lines = self._task_lines()
         if not task_lines:
             return
+        # 跨 spinner 去重:面板签名与上次相同则不重复提交
+        if self._panel_state is not None:
+            signature = "\n".join(task_lines)
+            if signature == self._panel_state.get("last"):
+                return
+            self._panel_state["last"] = signature
         for line in task_lines:
             sys.stdout.write(line + "\n")
         sys.stdout.write("\n")  # 面板与下方内容留一行间隔
@@ -394,11 +422,18 @@ def _make_progress(task_store=None):
     把 task_store 通过闭包注入到 _Spinner,让它在重绘时能拿到最新任务列表。
     分成工厂是因为 AgentSession 需要的 progress 签名是 Callable[[label], CM],
     不能直接接受 task_store 参数。
+
+    一次 chat 内会创建多个 spinner(planning / 每个 task 的 thinking /
+    compacting),若每个 spinner 都提交一次任务面板,面板就被重复打印 5~6 次。
+    用一个跨 spinner 共享的 `panel_state` 记住"上次提交的面板签名",只有面板
+    内容真正变化时才重新提交,消除重复噪音。
     """
+    panel_state = {"last": None}  # 跨 spinner 共享:上次已提交的面板签名
+
     @contextmanager
     def _progress(label: str):
         if sys.stdout.isatty():
-            with _Spinner(label, task_store=task_store) as s:
+            with _Spinner(label, task_store=task_store, panel_state=panel_state) as s:
                 yield s
         else:
             with _PlainProgress(label) as p:

@@ -124,12 +124,16 @@ class Orchestrator:
     def run(self, goal: str, *, cancel: Optional[CancelToken] = None) -> str:
         """规划并执行一个目标,返回最终答复文本。
 
-        cancel 用于协作式取消;不传则不可取消。多次调用会在已有任务之上追加新计划。
+        cancel 用于协作式取消;不传则不可取消。每次调用前清空旧任务,确保任务面板
+        只展示当前轮的计划,不与历史任务混叠。
         """
         cancel = cancel or CancelToken()
         self._run_seq += 1
         self.last_run_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_run_status = ""
+        # 每轮新目标清空旧任务:任务面板只反映当前轮,避免历史任务(包括从 session
+        # 恢复的快照)与新计划混叠刷屏。
+        self.store.clear()
         self.messages.append({"role": "user", "content": goal})
         self._emit(RunEvent(kind=events.RUN_STARTED, text=goal))
 

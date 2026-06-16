@@ -306,8 +306,8 @@ def test_orchestrator_blocks_on_denied_approval():
     assert any(e.kind == events.RUN_FAILED for e in log)
 
 
-def test_orchestrator_user_can_add_goal():
-    """第二次 run 在已有任务之上追加新计划,共享对话历史。"""
+def test_orchestrator_second_run_clears_tasks():
+    """第二次 run 清空旧任务,只展示本轮计划,不与历史任务混叠。"""
     router = FakeRouter([
         _plan_json({"id": "t1", "content": "第一个目标", "dependencies": []}),
         _resp_text("目标一完成"),
@@ -316,9 +316,12 @@ def test_orchestrator_user_can_add_goal():
     ])
     orch = Orchestrator(router, _registry(_echo_tool()))
     orch.run("目标一")
-    first_count = len(orch.store.snapshot())
-    orch.run("目标二")  # 追加目标
-    assert len(orch.store.snapshot()) > first_count
+    assert orch.store.snapshot()[0]["content"] == "第一个目标"
+    orch.run("目标二")
+    # 第二轮清空后只有第二个目标,不与第一轮混叠
+    snap = orch.store.snapshot()
+    assert len(snap) == 1
+    assert snap[0]["content"] == "第二个目标"
     assert orch.all_completed()
 
 
