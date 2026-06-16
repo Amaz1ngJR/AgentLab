@@ -251,3 +251,40 @@ def test_task_panel_committed_once(monkeypatch):
         sp.on_text(d)
     # 任务内容只出现一次(不是每个 delta 一次)
     assert _strip_ansi(sink.getvalue()).count("读取项目结构") == 1
+
+
+def test_plan_created_then_spinner_same_state_dedup(monkeypatch):
+    """PLAN_CREATED 打印面板后,紧跟的同状态 spinner 不重复打印(跨路径去重)。
+
+    回归点:orchestrator 在 PLAN_CREATED 后立刻 _maybe_compact() 开一个
+    "compacting" spinner,此时还没 claim 任务,task_store 仍全 pending,与
+    PLAN_CREATED 面板状态完全相同。两者共享 panel_state 才能去重。
+    """
+    import app.cli as cli
+    from app.agent import events as run_events
+    from app.agent.events import RunEvent
+    from app.agent.tasks import PENDING
+
+    sink = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", sink)
+
+    # 共享的 panel_state(模拟 _make_progress 返回的那个)
+    panel_state = {"last": None}
+    store = TaskStore()
+    store.replace_all([Task("t1", "任务一", PENDING), Task("t2", "任务二", PENDING)])
+    snapshot = store.snapshot()
+
+    # 1. PLAN_CREATED 事件打印面板(全 pending)
+    cli._print_run_event(
+        RunEvent(kind=run_events.PLAN_CREATED, payload={"tasks": snapshot}),
+        panel_state=panel_state,
+    )
+    # 2. 紧跟的 compacting spinner 读同一全 pending 状态
+    sp = _Spinner("compacting", task_store=store, panel_state=panel_state)
+    sp._t0 = 0.0
+    sp._commit_tasks()
+
+    out = _strip_ansi(sink.getvalue())
+    # 任务内容只出现一次(PLAN_CREATED 打了,spinner 去重跳过)
+    assert out.count("任务一") == 1
+    assert out.count("任务二") == 1

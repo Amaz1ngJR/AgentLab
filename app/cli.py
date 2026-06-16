@@ -501,8 +501,13 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
     elif kind == run_events.PLAN_CREATED:
         tasks = ev.payload.get("tasks", [])
         if len(tasks) > 1:  # 单任务计划不值得打面板,省噪音
+            task_lines = _format_task_lines(tasks)
+            # 去重:打印后更新 panel_state,避免紧接着的 spinner _commit_tasks
+            # 又把同一个面板打一遍(PLAN_CREATED 后第一个任务的 spinner 会重绘)。
+            if panel_state is not None:
+                panel_state["last"] = "\n".join(task_lines)
             print(f"\n  ✻ 计划:{len(tasks)} 个子任务", flush=True)
-            for line in _format_task_lines(tasks):
+            for line in task_lines:
                 print(line, flush=True)
             print(flush=True)
     elif kind == run_events.RUN_COMPLETED:
