@@ -253,10 +253,11 @@ class SessionRouter:
         rows = self.list_sessions()
         if not rows:
             return "暂无活跃 session。"
-        lines = ["ID       Agent     标题"]
+        lines = ["ID       Agent     消息数  标题"]
         for r in rows:
             marker = "▸" if r["id"] == self.current_id else " "
-            lines.append(f"{marker} {r['id']:<8} {r['agent_id']:<9} {r['title']}")
+            msg_count = self._storage.count_messages(r["id"])
+            lines.append(f"{marker} {r['id']:<8} {r['agent_id']:<9} {msg_count:<7} {r['title']}")
         return "\n".join(lines)
 
     def _cmd_agents(self) -> str:
