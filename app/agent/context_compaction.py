@@ -23,7 +23,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from app.agent.context_budget import estimate_messages_tokens
+from app.agent.context_budget import estimate_messages_tokens, estimate_message_tokens
 from app.util.redact import redact
 
 # 给压缩模型的系统指令:只输出结构化 JSON 摘要,不调用工具、不写散文。
@@ -137,18 +137,47 @@ def _is_tool_result_message(m: dict[str, Any]) -> bool:
     return False
 
 
-def _safe_split_point(messages: list[dict[str, Any]], keep_recent: int) -> int:
+def _safe_split_point(
+    messages: list[dict[str, Any]],
+    keep_recent: int,
+    recent_budget: Optional[int] = None,
+) -> int:
     """求一个"干净"的压缩切点 split:把 messages[0:split) 压缩,messages[split:] 保留。
 
     约束:
-      - 至少保留 keep_recent 条最近消息(含最后一条用户请求所在的尾部窗口)。
+      - 至少保留 keep_recent 条最近消息(下限,含最后一条用户请求所在的尾部窗口)。
+      - 若给了 recent_budget(token 上限):在保住 keep_recent 条的前提下,继续往前
+        把更多最近消息纳入"保留窗口",直到累计 token 超过 recent_budget 为止。
+        这让"按 token 而非条数"决定保留多少 —— 一条超大消息会更早吃满预算,从而
+        被排除出保留窗口、落进可压缩区,不再无脑霸占窗口。
       - 切点处的"第一条被保留消息"不能是 tool_result —— 否则它对应的 tool_use
         落在被压缩区,会变成悬空 tool_call,provider 报错。遇到就把切点往前挪。
 
     返回 0 表示没有可安全压缩的前缀(调用方应放弃本次压缩)。
     """
     n = len(messages)
-    split = n - max(0, keep_recent)
+    keep = max(0, keep_recent)
+    if n - keep <= 0:
+        return 0
+
+    # 从尾部向前累计:前 keep 条无条件纳入保留窗口(下限);超过 keep 条后,只有在
+    # 给了 recent_budget 且累计 token 仍不超预算时才继续纳入。无 budget 则停在 keep
+    # 条(纯条数模式,向后兼容)。
+    acc = 0
+    count = 0
+    i = n
+    while i > 0:
+        t = estimate_message_tokens(messages[i - 1])
+        if count >= keep:
+            # 已达下限:无预算就停(条数模式);有预算则在不超支时继续扩。
+            if recent_budget is None or recent_budget <= 0:
+                break
+            if acc + t > recent_budget:
+                break
+        acc += t
+        count += 1
+        i -= 1
+    split = i
     if split <= 0:
         return 0
     # 若切点处第一条保留消息是 tool_result,说明它的 tool_use 在压缩区 → 往前挪,
@@ -225,16 +254,19 @@ class ContextCompressor:
         messages: list[dict[str, Any]],
         *,
         keep_recent: int,
+        recent_budget: Optional[int] = None,
         source_run_ids: Optional[list[str]] = None,
         on_progress=None,
     ) -> CompactionResult:
         """就地压缩 messages 的可压缩前缀。成功时 messages 被原地改短。
 
-        keep_recent: 至少保留的最近消息条数(保护最后用户请求与正在执行的任务)。
+        keep_recent: 至少保留的最近消息条数(下限,保护最后用户请求与正在执行的任务)。
+        recent_budget: 最近窗口的 token 上限(可选);给了就按 token 决定保留多少,
+            超大单条消息会被挤出保留窗口、纳入可压缩区。
         返回 CompactionResult;失败/无可压段时 messages 不变、compacted=False。
         """
         self.last_usage = {"input_tokens": 0, "output_tokens": 0}
-        split = _safe_split_point(messages, keep_recent)
+        split = _safe_split_point(messages, keep_recent, recent_budget)
         if split <= 0:
             return CompactionResult(False, reason="无可安全压缩的前缀")
 
@@ -270,6 +302,14 @@ class ContextCompressor:
         )
         summary_msg = {"role": "user", "content": summary.to_message_text()}
         summary.token_count_after = estimate_messages_tokens([summary_msg])
+
+        # 兜底:若摘要并不比被压缩的原前缀短(短前缀 + 结构化摘要骨架开销可能反而
+        # 更长),压缩没有收益,不替换 —— 否则白白消耗一次模型调用还可能让上下文变大。
+        if summary.token_count_after >= token_before:
+            return CompactionResult(
+                False,
+                reason=f"压缩后 token 数({summary.token_count_after})未减少,跳过",
+            )
 
         # 就地替换:用一条摘要消息顶掉被压缩的前缀,保留 recent tail。
         messages[:split] = [summary_msg]

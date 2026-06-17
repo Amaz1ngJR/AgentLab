@@ -44,8 +44,11 @@ _MODEL_CONTEXT_LIMITS: dict[str, int] = {
 DEFAULT_CONTEXT_LIMIT = 8_192
 
 # 阈值:预计输入超过窗口的这个比例就触发对应动作(§7.3.2)。
-WARN_RATIO = 0.70
-COMPACT_RATIO = 0.85
+# 贴近 Claude Code 的做法(~92-95% 触发自动压缩):压缩有真实开销(一次模型调用),
+# 过早压缩反而浪费,所以把强制压缩点抬到 92%,留足缓冲又不撞窗口;警告点 80% 提前
+# 给用户一次预告。
+WARN_RATIO = 0.80
+COMPACT_RATIO = 0.92
 
 
 def resolve_context_limit(

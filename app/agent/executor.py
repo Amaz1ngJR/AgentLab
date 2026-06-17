@@ -30,6 +30,34 @@ DENIED_MESSAGE = (
     "User denied execution of this tool. Do not retry without first confirming with the user."
 )
 
+# 工具输出进入对话历史前的截断上限(字符数)。超大输出(读大文件、长 shell stdout)
+# 若原样塞进 messages,会一条消息就撑爆上下文窗口,且压缩也压不动(它落在最近窗口
+# 受保护区)。参考 Claude Code / Aider 的做法:在工具结果进入历史时就截断,保留头尾
+# 两端(头部含主要内容,尾部常含结论/报错),中间用标记说明省略量,让模型知道被截断。
+TOOL_OUTPUT_HEAD_CHARS = 8_000   # 保留开头多少字符
+TOOL_OUTPUT_TAIL_CHARS = 2_000   # 保留结尾多少字符
+TOOL_OUTPUT_MAX_CHARS = TOOL_OUTPUT_HEAD_CHARS + TOOL_OUTPUT_TAIL_CHARS  # 超过才截断
+
+
+def _truncate_tool_output(output: str, max_chars: int = TOOL_OUTPUT_MAX_CHARS) -> str:
+    """把过长的工具输出截断成"头部 + 省略标记 + 尾部",防止单条结果撑爆上下文。
+
+    不超过 max_chars 原样返回;超过则保留前 TOOL_OUTPUT_HEAD_CHARS 字符与后
+    TOOL_OUTPUT_TAIL_CHARS 字符,中间插一行标记说明省略了多少字符。这样模型既能
+    看到主要内容和结尾(报错/结论常在末尾),也明确知道中间有内容被省略。
+    """
+    if not output or len(output) <= max_chars:
+        return output
+    head = output[:TOOL_OUTPUT_HEAD_CHARS]
+    tail = output[-TOOL_OUTPUT_TAIL_CHARS:]
+    omitted = len(output) - TOOL_OUTPUT_HEAD_CHARS - TOOL_OUTPUT_TAIL_CHARS
+    return (
+        f"{head}\n"
+        f"\n[... 工具输出过长,已省略中间 {omitted} 个字符(共 {len(output)} 字符);"
+        f"如需完整内容请用更精确的参数重新调用 ...]\n\n"
+        f"{tail}"
+    )
+
 # progress 工厂签名:接收 label,返回一个上下文管理器(可带 .update / .on_text)
 ProgressFn = Callable[[str], ContextManager[Any]]
 
@@ -165,6 +193,9 @@ class Executor:
                 else:
                     t0 = time.monotonic()
                     output, is_error = self._tools.execute(call.name, call.arguments)
+                    # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
+                    # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
+                    output = _truncate_tool_output(output)
                     self._emit(RunEvent(
                         kind=events.TOOL_COMPLETED, task_id=task.id,
                         tool_name=call.name, tool_output=output, tool_error=is_error,

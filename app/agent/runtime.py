@@ -277,6 +277,9 @@ class AgentSession:
                     else:
                         t0 = time.monotonic()
                         output, is_error = self.tools.execute(call.name, call.arguments)
+                        # 进入历史前截断超大输出(与编排路径一致,见 executor)。
+                        from app.agent.executor import _truncate_tool_output
+                        output = _truncate_tool_output(output)
                         self._on_event(TurnEvent(
                             kind="tool_result",
                             tool_name=call.name,

@@ -334,9 +334,14 @@ def test_manager_disable_auto_compact_blocks():
 
 def test_manager_force_compacts_even_when_disabled():
     llm = FakeRouter([_summary_resp()])
-    mgr = _manager(llm, limit=200_000, auto=False)
-    msgs = _long_messages(14)
-    assert mgr.maybe_compact(msgs, force=True) is True
+    # 用小 limit 让 recent_budget 也小,不至于保护所有消息
+    mgr = _manager(llm, limit=2_000, auto=False)
+    # 用足够长的消息,让摘要确实比原前缀短(回滚保护允许压缩)
+    msgs = [{"role": "user" if i % 2 == 0 else "assistant",
+             "content": f"消息 {i} " + "内容很长很长很长" * 50} for i in range(14)]
+
+    result = mgr.maybe_compact(msgs, force=True)
+    assert result is True
 
 
 def test_manager_drain_records():
@@ -433,3 +438,53 @@ def test_orchestrator_without_context_manager_unchanged():
     orch = Orchestrator(llm, ToolRegistry(), planner=Planner(llm), on_event=sink.append)
     orch.run("一个目标")
     assert not any(e.kind.startswith("context_") for e in sink)
+
+
+# ── 新增:token 切点 + 压缩回滚测试 ───────────────────��─────────────────────────
+
+
+def test_safe_split_with_token_budget_caps_recent_window():
+    """给了 recent_budget 时,按 token 而非条数决定保留窗口大小。"""
+    # 造很多条长消息,每条 ~200 token
+    msgs = [{"role": "user", "content": f"消息 {i} " + "内容很长" * 50} for i in range(20)]
+
+    # 无 budget:keep_recent=10 保护最后 10 条(不管 token 多少)
+    split_no_budget = _safe_split_point(msgs, keep_recent=10, recent_budget=None)
+    assert split_no_budget == 10  # 保留 [10..19]
+
+    # 给 budget=1000 token,每条 ~200 token,只能保护 ~5 条就超预算
+    # keep_recent=3 作为下限,budget=1000 作为上限 → 保护 3-5 条之间
+    split_with_budget = _safe_split_point(msgs, keep_recent=3, recent_budget=1000)
+    # 应该保护更少消息(因为 budget 限制),split > 10
+    assert split_with_budget > split_no_budget  # budget 让保护窗口变小
+
+
+def test_compressor_rollback_when_summary_not_shorter():
+    """摘要不比原前缀短时,不替换 messages,返回 compacted=False。"""
+    # 造极短的前缀(只 2 条短消息 ~20 token),摘要模板本身就 ~200 token,压不短
+    msgs = [{"role": "user", "content": "a"}, {"role": "user", "content": "b"},
+            {"role": "user", "content": "c"}, {"role": "user", "content": "d"}]
+    llm = FakeRouter([_summary_resp()])
+    comp = ContextCompressor(llm)
+    snapshot = [dict(m) for m in msgs]
+
+    result = comp.compact(msgs, keep_recent=2)  # 只压缩前 2 条(极短)
+    # 摘要比原文长 → 不压缩,messages 不变
+    assert not result.compacted
+    assert "未减少" in result.reason
+    assert msgs == snapshot  # 原地未改
+
+
+def test_compressor_succeeds_when_summary_shorter():
+    """摘要确实比原前缀短时,正常压缩。"""
+    # 造足够长的前缀(每条 ~100 token,8 条 ~800 token),摘要 ~200 token,能压短
+    msgs = [{"role": "user", "content": f"消息 {i} " + "长内容" * 30} for i in range(10)]
+    llm = FakeRouter([_summary_resp()])
+    comp = ContextCompressor(llm)
+
+    result = comp.compact(msgs, keep_recent=2)  # 压缩前 8 条
+    assert result.compacted
+    assert result.summary.token_count_after < result.summary.token_count_before
+    # messages 被替换:1 条摘要 + 2 条保留
+    assert len(msgs) == 3
+    assert "上下文摘要" in msgs[0]["content"]

@@ -116,6 +116,7 @@ class ContextManager:
         ))
         result = self._compressor.compact(
             messages, keep_recent=self.keep_recent,
+            recent_budget=self.budget.recent_messages_budget,
             source_run_ids=source_run_ids, on_progress=on_progress,
         )
         if not result.compacted or result.summary is None:
