@@ -7,7 +7,7 @@
     python -m app --profile cloud_claude       # 使用指定 profile
 
 退出: exit / quit / Ctrl-D
-中断当前输入: Ctrl-C
+中断执行: Esc 或 Ctrl-C(停下后可直接输入新指令调整方向)
 重置会话: /reset
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import sys
 import threading
@@ -703,7 +704,8 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     print(f"workspace: {ws}")
     print("工具     : read_file / write_file / list_dir / shell / terminal_* (交互式会话) / todo_write")
     print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
-    print("输入 /reset 清空会话; /resume 继续未完成任务; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.\n")
+    print("输入 /reset 清空会话; /resume 继续未完成任务; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
+    print("执行中按 Esc 或 Ctrl-C 可中断,停下后直接输入新指令即可调整方向。\n")
 
     # ── MCP server 接入 ───────────────────────────────────────────────────────
     # 读 config/mcp_servers.yaml 中 enabled 的 server,启动 manager(供所有 session 共用)。
@@ -1002,6 +1004,108 @@ class _SlashCompleter(Completer):
 
 
 
+def _scan_for_esc(data: bytes) -> bool:
+    """判断一段从 stdin 读到的字节里是否含"单独的 Esc 键"。
+
+    Esc 键本身是单字节 0x1b。但方向键 / 功能键等也以 0x1b 开头(转义序列,如
+    方向键是 ESC [ A)。区分办法:0x1b 后面紧跟 '[' 或 'O' 的是转义序列,不算;
+    0x1b 是这段数据的最后一个字节、或后面跟的不是 '[' / 'O',才认定为真正的 Esc。
+
+    抽成纯函数便于单测(终端 raw mode 本身难自动化测)。
+    """
+    i = 0
+    n = len(data)
+    while i < n:
+        if data[i] == 0x1B:  # ESC
+            nxt = data[i + 1] if i + 1 < n else None
+            if nxt in (0x5B, 0x4F):  # '[' or 'O' → 转义序列(方向键等),跳过整段
+                i += 2
+                continue
+            return True  # 单独的 Esc
+        i += 1
+    return False
+
+
+class _EscWatcher:
+    """监听 stdin 的 Esc 键,按下时调 on_esc()。用作上下文管理器。
+
+    为什么需要它:模型调用是同步阻塞的,普通按键(非信号)无法像 Ctrl-C 那样靠
+    signal 打断。这里把终端切到 cbreak(非规范、无回显),起一个 daemon 线程轮询
+    stdin;读到单独的 Esc 就回调(通常去置位 CancelToken),实现"按 Esc 中断当前
+    回复、回到提示符重新引导"。
+
+    优雅降级:非 TTY(管道/重定向)或 Windows(无 termios)时不启用,直接空转,
+    用户仍可用 Ctrl-C。退出时务必恢复终端原状(finally)。
+    """
+
+    def __init__(self, on_esc):
+        self._on_esc = on_esc
+        self._stop = threading.Event()
+        self._thread = None
+        self._fd = None
+        self._saved = None
+        self._enabled = self._can_enable()
+
+    @staticmethod
+    def _can_enable() -> bool:
+        if platform.system() == "Windows":
+            return False
+        try:
+            return sys.stdin.isatty()
+        except (ValueError, AttributeError):
+            return False
+
+    def __enter__(self) -> "_EscWatcher":
+        if not self._enabled:
+            return self
+        import termios
+        import tty
+        try:
+            self._fd = sys.stdin.fileno()
+            self._saved = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)  # 非规范模式:按键即可读,无需回车;保留 Ctrl-C 信号
+        except (termios.error, ValueError, OSError):
+            self._enabled = False  # 拿不到终端属性就放弃,降级到仅 Ctrl-C
+            return self
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        if self._enabled and self._saved is not None and self._fd is not None:
+            import termios
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+            except (termios.error, ValueError, OSError):
+                pass
+
+    def _run(self) -> None:
+        import select
+        fired = False
+        while not self._stop.is_set():
+            try:
+                r, _, _ = select.select([self._fd], [], [], 0.1)
+            except (ValueError, OSError):
+                break  # fd 被关闭(主线程在退出),停
+            if not r:
+                continue
+            try:
+                data = os.read(self._fd, 64)
+            except (OSError, ValueError):
+                break
+            if not data:
+                continue
+            if not fired and _scan_for_esc(data):
+                fired = True  # 只触发一次,避免连发
+                try:
+                    self._on_esc()
+                except Exception:
+                    pass
+
+
 def _chat_with_cancel(session: AgentSession, line: str, *, resume: bool = False) -> str:
     """跑一轮 chat,并把 Ctrl-C 接到协作式取消(对应 PRD 紧急停止)。
 
@@ -1012,6 +1116,12 @@ def _chat_with_cancel(session: AgentSession, line: str, *, resume: bool = False)
 
     resume=True 时继续上一轮未完成的任务(失败任务重置为 pending)。
 
+    取消有两个入口,都置位同一个 CancelToken:
+      - Ctrl-C:signal 处理器(连按强制中断);
+      - Esc:_EscWatcher 监听 stdin(按一下中断,回提示符后可重新输入引导方向)。
+    中断后历史保持可继续状态(executor 会给未执行工具补合成结果),下一轮输入即可
+    在被中断的上下文上调整方向(steering)。
+
     只在主线程、且 stdin 为 TTY 时装 SIGINT 处理器;非交互(单测 / 管道)直接跑。
     """
     import signal
@@ -1020,12 +1130,16 @@ def _chat_with_cancel(session: AgentSession, line: str, *, resume: bool = False)
     can_trap = threading.current_thread() is threading.main_thread()
     prev_handler = None
 
+    def _request_cancel(via: str) -> None:
+        if not token.cancelled:
+            token.cancel()
+            print(f"\n  ⏹ 已请求中断({via});将在当前步骤后停止。"
+                  f"停下后可直接输入新指令调整方向,或 /resume 继续。", flush=True)
+
     if can_trap:
         def _on_sigint(signum, frame):
             if not token.cancelled:
-                token.cancel()
-                print("\n  ⏹ 正在取消…(将在当前步骤后停止;再次 Ctrl-C 强制中断)",
-                      flush=True)
+                _request_cancel("Ctrl-C")
             else:
                 # 已请求过取消仍按:恢复默认行为,抛 KeyboardInterrupt 强制中断
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -1036,7 +1150,8 @@ def _chat_with_cancel(session: AgentSession, line: str, *, resume: bool = False)
             can_trap = False  # 不在主线程,signal 不可用
 
     try:
-        return session.chat(line, cancel=token, resume=resume)
+        with _EscWatcher(on_esc=lambda: _request_cancel("Esc")):
+            return session.chat(line, cancel=token, resume=resume)
     finally:
         if can_trap and prev_handler is not None:
             signal.signal(signal.SIGINT, prev_handler)

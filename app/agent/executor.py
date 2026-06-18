@@ -19,7 +19,7 @@ from typing import Any, Callable, ContextManager, Optional
 
 from app.agent import events
 from app.agent.approval import ApprovalPolicy, AutoApprove
-from app.agent.cancel import CancelToken
+from app.agent.cancel import CancelToken, Cancelled
 from app.agent.events import RunEvent
 from app.agent.tasks import BLOCKED, COMPLETED, FAILED, Task
 from app.models.protocol import ToolResult
@@ -29,6 +29,11 @@ from app.tools.registry import ToolRegistry
 DENIED_MESSAGE = (
     "User denied execution of this tool. Do not retry without first confirming with the user."
 )
+
+# 取消 / 早返回时,给"模型已请求但未执行"的工具补的合成结果。Anthropic 要求每个
+# tool_use 都必须有配对的 tool_result,否则下一轮请求会因悬空 tool_call 报错。
+# 中断后用户往往要重新引导(steering),历史必须处于可继续状态,所以这里兜底补齐。
+INTERRUPTED_TOOL_RESULT = "[用户已中断,此工具未执行]"
 
 # 工具输出进入对话历史前的截断上限(字符数)。超大输出(读大文件、长 shell stdout)
 # 若原样塞进 messages,会一条消息就撑爆上下文窗口,且压缩也压不动(它落在最近窗口
@@ -172,48 +177,75 @@ class Executor:
 
             tool_results: list[ToolResult] = []
             denied_any = False
-            for call in resp.tool_calls:
-                if cancel is not None:
-                    cancel.raise_if_cancelled()
-                tool_calls_made += 1
-                self._emit(RunEvent(kind=events.TOOL_REQUESTED, task_id=task.id,
-                                    tool_name=call.name, tool_input=call.arguments))
+            # 记录本轮已产出结果的 tool_call id;取消/早返回时据此给剩余的补合成结果,
+            # 保证 assistant 里每个 tool_use 都有配对 tool_result(否则下一轮 provider 报错)。
+            resulted_ids: set[str] = set()
 
-                tool = self._tools.get(call.name)
-                needs_approval = bool(tool and tool.requires_approval)
-                if needs_approval:
-                    self._emit(RunEvent(kind=events.APPROVAL_REQUIRED, task_id=task.id,
+            def _flush_pending_tool_results() -> None:
+                """给本轮 resp.tool_calls 里还没结果的工具补合成 tool_result 并入历史。"""
+                pending = [
+                    ToolResult(tool_call_id=c.id, output=INTERRUPTED_TOOL_RESULT,
+                               is_error=False)
+                    for c in resp.tool_calls if c.id not in resulted_ids
+                ]
+                if pending:
+                    messages.extend(self._llm.format_tool_results(tool_results + pending))
+                    tool_results.clear()  # 已随 pending 一起入历史,避免下方重复 extend
+
+            try:
+                for call in resp.tool_calls:
+                    if cancel is not None:
+                        cancel.raise_if_cancelled()
+                    tool_calls_made += 1
+                    self._emit(RunEvent(kind=events.TOOL_REQUESTED, task_id=task.id,
                                         tool_name=call.name, tool_input=call.arguments))
 
-                if needs_approval and not self._approval.request(call.name, call.arguments):
-                    output, is_error = DENIED_MESSAGE, False
-                    denied_any = True
-                    self._emit(RunEvent(kind=events.TOOL_DENIED, task_id=task.id,
-                                        tool_name=call.name))
-                else:
-                    t0 = time.monotonic()
-                    output, is_error = self._tools.execute(call.name, call.arguments)
-                    # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
-                    # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
-                    output = _truncate_tool_output(output)
-                    self._emit(RunEvent(
-                        kind=events.TOOL_COMPLETED, task_id=task.id,
-                        tool_name=call.name, tool_output=output, tool_error=is_error,
-                        elapsed_seconds=time.monotonic() - t0,
-                    ))
-                    # 工具执行出错 -> 任务失败,交给 Replanner 决定重试/追加补救
-                    if is_error:
-                        return TaskOutcome(
-                            status=FAILED,
-                            error=f"工具 {call.name} 执行失败: {output}",
-                            evidence=last_text.strip(),
-                            text=last_text.strip(),
-                            tool_calls_made=tool_calls_made,
-                        )
+                    tool = self._tools.get(call.name)
+                    needs_approval = bool(tool and tool.requires_approval)
+                    if needs_approval:
+                        self._emit(RunEvent(kind=events.APPROVAL_REQUIRED, task_id=task.id,
+                                            tool_name=call.name, tool_input=call.arguments))
 
-                tool_results.append(ToolResult(
-                    tool_call_id=call.id, output=output, is_error=is_error,
-                ))
+                    if needs_approval and not self._approval.request(call.name, call.arguments):
+                        output, is_error = DENIED_MESSAGE, False
+                        denied_any = True
+                        self._emit(RunEvent(kind=events.TOOL_DENIED, task_id=task.id,
+                                            tool_name=call.name))
+                    else:
+                        t0 = time.monotonic()
+                        output, is_error = self._tools.execute(call.name, call.arguments)
+                        # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
+                        # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
+                        output = _truncate_tool_output(output)
+                        self._emit(RunEvent(
+                            kind=events.TOOL_COMPLETED, task_id=task.id,
+                            tool_name=call.name, tool_output=output, tool_error=is_error,
+                            elapsed_seconds=time.monotonic() - t0,
+                        ))
+                        # 工具执行出错 -> 任务失败。先补齐 tool_result 配对,再返回,
+                        # 否则 assistant 的 tool_use 悬空,Replanner 重试时 provider 报错。
+                        if is_error:
+                            tool_results.append(ToolResult(
+                                tool_call_id=call.id, output=output, is_error=is_error,
+                            ))
+                            resulted_ids.add(call.id)
+                            _flush_pending_tool_results()
+                            return TaskOutcome(
+                                status=FAILED,
+                                error=f"工具 {call.name} 执行失败: {output}",
+                                evidence=last_text.strip(),
+                                text=last_text.strip(),
+                                tool_calls_made=tool_calls_made,
+                            )
+
+                    tool_results.append(ToolResult(
+                        tool_call_id=call.id, output=output, is_error=is_error,
+                    ))
+                    resulted_ids.add(call.id)
+            except Cancelled:
+                # 取消:给剩余未执行工具补合成结果,保证配对完整,历史可继续(供 steering)。
+                _flush_pending_tool_results()
+                raise
 
             messages.extend(self._llm.format_tool_results(tool_results))
 

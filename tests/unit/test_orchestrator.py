@@ -9,7 +9,7 @@ import json
 
 from app.agent import events
 from app.agent.approval import AutoApprove, DenyAll
-from app.agent.cancel import CancelToken
+from app.agent.cancel import CancelToken, Cancelled
 from app.agent.events import RunEvent
 from app.agent.executor import Executor
 from app.agent.orchestrator import Orchestrator
@@ -412,3 +412,90 @@ def test_orchestrator_respects_max_steps():
     # 没跑成功,且发了 run_failed
     assert not orch.all_completed()
     assert any(e.kind == events.RUN_FAILED for e in log)
+
+
+# ── 取消/出错后 tool_use 必须配对(否则下一轮 provider 报错)──────────────────
+
+
+def _tool_use_ids(messages: list[dict]) -> set[str]:
+    """收集 messages 里所有 tool_use 块的 id。
+
+    兼容两种形态:① 真实 adapter 把 block 包在 {"role","content":[...]} 里;
+    ② FakeRouter 的 provider_payload 是扁平 block(block 直接当 message)。
+    """
+    ids = set()
+    for m in messages:
+        if isinstance(m, dict) and m.get("type") == "tool_use":  # 扁平 block
+            ids.add(m.get("id"))
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    ids.add(b.get("id"))
+    return ids
+
+
+def _tool_result_ids(messages: list[dict]) -> set[str]:
+    """收集 messages 里所有 tool_result 块的 tool_use_id。"""
+    ids = set()
+    for m in messages:
+        if isinstance(m, dict) and m.get("type") == "tool_result":  # 扁平 block
+            ids.add(m.get("tool_use_id"))
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    ids.add(b.get("tool_use_id"))
+    return ids
+
+
+def _assert_tools_paired(messages: list[dict]) -> None:
+    """断言每个 tool_use 都有配对的 tool_result(无悬空 tool_call)。"""
+    uses = _tool_use_ids(messages)
+    results = _tool_result_ids(messages)
+    assert uses == results, f"悬空 tool_use: {uses - results}, 多余 result: {results - uses}"
+
+
+def _multi_tool_resp(*calls: tuple[str, str, dict]) -> ModelResponse:
+    """构造一条含多个 tool_call 的响应(id, name, args)。"""
+    from app.models.protocol import ToolCall
+    tool_calls = [ToolCall(id=cid, name=name, arguments=args) for cid, name, args in calls]
+    payload = [{"type": "tool_use", "id": cid, "name": name, "input": args}
+               for cid, name, args in calls]
+    return ModelResponse(text="", tool_calls=tool_calls,
+                         usage={"input_tokens": 5, "output_tokens": 1},
+                         provider_payload=payload)
+
+
+def test_executor_cancel_mid_tool_loop_pairs_tool_use():
+    """tool 循环中途取消:已 extend 的 tool_use 必须全部补上配对 tool_result。"""
+    # 一条响应含 2 个工具调用;在第一个 TOOL_REQUESTED 时取消 → 第二个来不及执行
+    router = FakeRouter([_multi_tool_resp(("c1", "echo", {"msg": "a"}),
+                                          ("c2", "echo", {"msg": "b"}))])
+    token = CancelToken()
+
+    def on_event(ev: RunEvent):
+        if ev.kind == events.TOOL_REQUESTED and ev.tool_name == "echo":
+            token.cancel()  # 第一个工具请求时就取消
+
+    ex = Executor(router, _registry(_echo_tool()), on_event=on_event)
+    messages: list[dict] = []
+    try:
+        ex.run_task(Task("t1", "两个工具"), messages, system="", max_steps=4, cancel=token)
+    except Cancelled:
+        pass
+    # 关键:取消后历史里每个 tool_use 都有配对 tool_result(c1 真实/c2 合成)
+    _assert_tools_paired(messages)
+
+
+def test_executor_tool_error_pairs_tool_use():
+    """工具出错早返回:同一轮里其它 tool_use 也要补配对,不留悬空。"""
+    # 第一个工具炸,第二个 echo 来不及执行 → 都要有 tool_result
+    router = FakeRouter([_multi_tool_resp(("c1", "explode", {}),
+                                          ("c2", "echo", {"msg": "b"}))])
+    ex = Executor(router, _registry(_explode_tool(), _echo_tool()))
+    messages: list[dict] = []
+    out = ex.run_task(Task("t1", "炸+回显"), messages, system="", max_steps=4)
+    assert out.status == FAILED
+    _assert_tools_paired(messages)
+
