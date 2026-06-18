@@ -1041,10 +1041,19 @@ class _EscWatcher:
     def __init__(self, on_esc):
         self._on_esc = on_esc
         self._stop = threading.Event()
+        self._paused = threading.Event()  # 置位时后台线程不读 stdin(让前台菜单独占)
         self._thread = None
         self._fd = None
         self._saved = None
         self._enabled = self._can_enable()
+
+    def pause(self) -> None:
+        """暂停读 stdin(前台 prompt_toolkit 菜单需要独占时调,见 input_arbiter)。"""
+        self._paused.set()
+
+    def resume(self) -> None:
+        """恢复读 stdin。"""
+        self._paused.clear()
 
     @staticmethod
     def _can_enable() -> bool:
@@ -1067,6 +1076,9 @@ class _EscWatcher:
         except (termios.error, ValueError, OSError):
             self._enabled = False  # 拿不到终端属性就放弃,降级到仅 Ctrl-C
             return self
+        # 注册为当前后台 reader,供菜单等前台 UI 临时暂停(独占 stdin)
+        from app.util.input_arbiter import set_background_reader
+        set_background_reader(self)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return self
@@ -1075,6 +1087,9 @@ class _EscWatcher:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=0.5)
+        if self._enabled:
+            from app.util.input_arbiter import clear_background_reader
+            clear_background_reader(self)
         if self._enabled and self._saved is not None and self._fd is not None:
             import termios
             try:
@@ -1086,11 +1101,15 @@ class _EscWatcher:
         import select
         fired = False
         while not self._stop.is_set():
+            if self._paused.is_set():
+                # 暂停期间不碰 stdin(前台菜单在用),睡一小会儿再看
+                time.sleep(0.05)
+                continue
             try:
                 r, _, _ = select.select([self._fd], [], [], 0.1)
             except (ValueError, OSError):
                 break  # fd 被关闭(主线程在退出),停
-            if not r:
+            if not r or self._paused.is_set():
                 continue
             try:
                 data = os.read(self._fd, 64)

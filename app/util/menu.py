@@ -142,7 +142,11 @@ def select_menu(
         full_screen=False,
         erase_when_done=True,  # 关闭后擦掉菜单本身,只留用户后续输出
     )
-    app.run()
+    # 独占 stdin:暂停后台 Esc 监听线程,否则它会抢走菜单的按键字节,
+    # 导致"选 1 / Enter 要按很多次才生效"。
+    from app.util.input_arbiter import foreground_stdin
+    with foreground_stdin():
+        app.run()
 
     if state["cancelled"]:
         return None
