@@ -551,6 +551,40 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         print(f"  ✓ 已压缩旧历史(~{before} → ~{after} tokens)", flush=True)
     elif kind == run_events.CONTEXT_COMPACTION_FAILED:
         print(f"  ⚠ 上下文压缩跳过:{ev.text}", flush=True)
+    # ── Loop Engineering 事件 ──
+    elif kind == run_events.LOOP_STARTED:
+        p = ev.payload or {}
+        print(f"  ✻ Loop 开始: {ev.text}", flush=True)
+        budgets = p.get("budgets", {})
+        print(f"    预算: {budgets.get('max_iterations')}轮 / "
+              f"{budgets.get('max_tool_calls')}次工具 / "
+              f"{budgets.get('max_runtime_minutes')}分钟", flush=True)
+    elif kind == run_events.LOOP_ITERATION_STARTED:
+        print(f"  → Iteration {ev.payload.get('iteration')}", flush=True)
+    elif kind == run_events.WORKTREE_PREPARED:
+        print(f"  ✓ {ev.text}", flush=True)
+    elif kind == run_events.VERIFICATION_STARTED:
+        print(f"  ✻ {ev.text}", flush=True)
+    elif kind == run_events.VERIFICATION_COMPLETED:
+        p = ev.payload or {}
+        status = p.get("status", "")
+        emoji = "✓" if status == "pass" else "✗"
+        print(f"  {emoji} {ev.text}", flush=True)
+        checks = p.get("checks", [])
+        if checks and status != "pass":
+            for c in checks[:3]:  # 只打前 3 个,避免刷屏
+                print(f"    · [{c.get('status')}] {c.get('name')}: {c.get('summary', '')[:80]}", flush=True)
+    elif kind == run_events.REPAIR_PLANNED:
+        print(f"  ⚙ {ev.text}", flush=True)
+    elif kind == run_events.LOOP_COMPLETED:
+        print(f"\n  ✓ {ev.text}", flush=True)
+        p = ev.payload or {}
+        if p.get("diff_summary"):
+            print(f"    改动: {p['diff_summary'][:200]}", flush=True)
+    elif kind == run_events.LOOP_BLOCKED:
+        print(f"\n  ⊘ {ev.text}", flush=True)
+    elif kind == run_events.LOOP_BUDGET_EXHAUSTED:
+        print(f"\n  ⏱ {ev.text}", flush=True)
 
 
 def _handle_context_command(session: AgentSession, line: str) -> str:
@@ -847,6 +881,49 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     )
     # 把 mcp_manager 挂到 router 上,main() 退出时统一关闭
     router.mcp_manager = mcp_manager
+
+    # ── Loop Engineering 命令处理器 ──────────────────────────────────────────
+    # 提供 /goal 和 /loop 命令。需要访问当前 session 的 Orchestrator、workspace_root、
+    # 以及一个执行 loop.run() 的回调(带 Ctrl-C 取消处理)。
+    from app.agent.loop_commands import LoopCommandHandler
+
+    def _run_loop_with_cancel(loop) -> str:
+        """执行 loop.run(),带 Ctrl-C 协作式取消(复用 _chat_with_cancel 的模式)。"""
+        from app.agent.cancel import CancelToken
+        import signal
+        import threading
+
+        token = CancelToken()
+        can_trap = threading.current_thread() is threading.main_thread()
+        prev_handler = None
+
+        def _on_sigint(signum, frame):
+            if not token.cancelled:
+                token.cancel()
+                print(f"\n  ⏹ 已请求中断;将在当前步骤后停止。", flush=True)
+            else:
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                raise KeyboardInterrupt
+
+        if can_trap:
+            try:
+                prev_handler = signal.signal(signal.SIGINT, _on_sigint)
+            except ValueError:
+                can_trap = False
+
+        try:
+            return loop.run(cancel=token)
+        finally:
+            if can_trap and prev_handler is not None:
+                signal.signal(signal.SIGINT, prev_handler)
+
+    router.loop_handler = LoopCommandHandler(
+        storage=storage,
+        get_session=lambda: router.current,
+        run_loop_fn=_run_loop_with_cancel,
+        workspace_root=ws,
+    )
+
     # 启动:有未归档历史 session 就恢复最近一个,否则新建(避免每次启动堆积空会话)
     start_agent = default_profile_id if default_profile_id in agent_profiles else None
     sid, resumed = router.resume_or_new(agent_id=start_agent)
@@ -920,6 +997,8 @@ _SLASH_COMMANDS = {
     "/resume": "继续上一轮未完成/失败的任务",
     "/session": "管理多 Agent 会话",
     "/context": "查看上下文预算 / 手动压缩 / 摘要",
+    "/goal": "定义 Loop Engineering 目标",
+    "/loop": "启动/查看/停止 Loop",
 }
 # /session 子命令 → 说明
 _SESSION_SUBCOMMANDS = {
@@ -937,6 +1016,17 @@ _CONTEXT_SUBCOMMANDS = {
     "summary": "查看当前生效的压缩摘要",
     "disable-auto-compact": "禁用本会话的自动压缩",
     "enable-auto-compact": "重新启用本会话的自动压缩",
+}
+# /goal 子命令 → 说明
+_GOAL_SUBCOMMANDS = {
+    "new": "创建新 GoalSpec",
+    "show": "显示当前或指定 goal",
+}
+# /loop 子命令 → 说明
+_LOOP_SUBCOMMANDS = {
+    "start": "启动 Loop",
+    "status": "显示 Loop 状态",
+    "stop": "停止 Loop (Ctrl-C)",
 }
 
 
@@ -968,14 +1058,32 @@ class _SlashCompleter(Completer):
                     yield Completion(cmd, start_position=-len(word), display_meta=desc)
             return
 
-        if parts[0] not in ("/session", "/context"):
-            return  # 只有 /session 和 /context 有更深层补全
+        if parts[0] not in ("/session", "/context", "/goal", "/loop"):
+            return  # 只有这几个有更深层补全
 
         # ── 第二级:/context 子命令 ──
         if parts[0] == "/context":
             if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
                 prefix = parts[1] if len(parts) == 2 else ""
                 for sub, desc in _CONTEXT_SUBCOMMANDS.items():
+                    if sub.startswith(prefix):
+                        yield Completion(sub, start_position=-len(prefix), display_meta=desc)
+            return
+
+        # ── 第二级:/goal 子命令 ──
+        if parts[0] == "/goal":
+            if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
+                prefix = parts[1] if len(parts) == 2 else ""
+                for sub, desc in _GOAL_SUBCOMMANDS.items():
+                    if sub.startswith(prefix):
+                        yield Completion(sub, start_position=-len(prefix), display_meta=desc)
+            return
+
+        # ── 第二级:/loop 子命令 ──
+        if parts[0] == "/loop":
+            if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
+                prefix = parts[1] if len(parts) == 2 else ""
+                for sub, desc in _LOOP_SUBCOMMANDS.items():
                     if sub.startswith(prefix):
                         yield Completion(sub, start_position=-len(prefix), display_meta=desc)
             return
@@ -1229,6 +1337,20 @@ def _repl(router: SessionRouter) -> int:
 
         if line == "/context" or line.startswith("/context "):
             print(_handle_context_command(session, line))
+            continue
+
+        # /goal 和 /loop 命令:Loop Engineering 模式(§7.6)
+        if line.startswith("/goal") or line.startswith("/loop"):
+            loop_handler = getattr(router, "loop_handler", None)
+            if loop_handler is None:
+                print("Loop 功能尚未初始化。")
+                continue
+            if line.startswith("/goal"):
+                out = loop_handler.handle_goal_command(line)
+            else:
+                out = loop_handler.handle_loop_command(line)
+            if out:
+                print(out)
             continue
 
         # /resume:继续上一轮未完成的任务(失败任务重置为 pending 重试)。

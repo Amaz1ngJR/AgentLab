@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -21,11 +23,19 @@ from app.config.schemas import LLMConfig, ModelProfile
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 
+# 临时覆盖 workspace_root() 的根目录(线程/协程局部)。Loop 模式在隔离 worktree 内
+# 执行任务时,用 use_workspace_root() 把文件/shell 工具的根目录临时指向 worktree,
+# 退出时自动还原。默认 None 表示不覆盖,走 WORKSPACE_ROOT env / 项目根的原有逻辑。
+_workspace_override: ContextVar[Optional[Path]] = ContextVar(
+    "workspace_override", default=None
+)
+
 
 def workspace_root() -> Path:
     """返回 Agent 文件工具被允许操作的根目录(绝对路径)。
 
     优先级:
+      0. use_workspace_root() 设置的临时覆盖(Loop worktree 隔离)
       1. WORKSPACE_ROOT 环境变量(由 .env 注入或显式 export)
       2. 项目根目录 —— 为开发期默认行为
 
@@ -33,10 +43,29 @@ def workspace_root() -> Path:
       文件工具(read_file / write_file / list_dir)在执行前调用此函数,
       把用户传入的路径限制在返回的根目录内,越界请求会被拒绝。
     """
+    override = _workspace_override.get()
+    if override is not None:
+        return override
     raw = os.getenv("WORKSPACE_ROOT")
     if raw and raw.strip():
         return Path(raw.strip()).expanduser().resolve()
     return PROJECT_ROOT
+
+
+@contextmanager
+def use_workspace_root(path: str | Path) -> Iterator[Path]:
+    """在 with 块内把 workspace_root() 临时指向 path,退出后还原。
+
+    用于 Loop 模式:LoopRunner 进入一轮 worktree 内执行时包一层,文件/shell 工具
+    便都落在 worktree 里,主工作区不被未验证改动污染。基于 ContextVar,线程安全、
+    可重入(嵌套覆盖退出后恢复上一层),不会污染全局 env。
+    """
+    resolved = Path(path).expanduser().resolve()
+    token = _workspace_override.set(resolved)
+    try:
+        yield resolved
+    finally:
+        _workspace_override.reset(token)
 
 
 def _env(name: str) -> Optional[str]:

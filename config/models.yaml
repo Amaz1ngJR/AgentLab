@@ -66,10 +66,10 @@ models:
   # 协议同 OpenAI Chat Completions，走 openai_compatible adapter，无需改代码。
   # 凭据：把 API Key 放进 .env 的 SILICONFLOW_API_KEY，不要写在这里。
   # 模型 ID 用硅基流动控制台里的完整名（带组织前缀），可用 SILICONFLOW_MODEL 覆盖。
-  #   例：deepseek-ai/DeepSeek-V3 / Qwen/Qwen2.5-72B-Instruct / deepseek-ai/DeepSeek-R1
+  #   例：deepseek-ai/DeepSeek-V3 / Qwen/Qwen2.5-72B-Instruct / deepseek-ai/DeepSeek-R1 Qwen/Qwen3-8B
   siliconflow:
-    provider: openai_compatible
-    model: ${SILICONFLOW_MODEL:-Qwen/Qwen3-8B}
+    provider: openai_compatible 
+    model: ${SILICONFLOW_MODEL:-nex-agi/Nex-N2-Pro}
     base_url: https://api.siliconflow.cn/v1
     api_key_env: SILICONFLOW_API_KEY
     capabilities: [chat, tools]

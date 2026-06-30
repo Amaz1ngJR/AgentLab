@@ -45,6 +45,7 @@ from app.agent.orchestrator import Orchestrator
 from app.agent.planner import Planner
 from app.agent.tasks import TaskStore
 from app.agent.verifier import Verifier, VerificationResult
+from app.config.loader import use_workspace_root
 from app.workspace.worktree import WorktreeInfo, WorktreeManager
 
 
@@ -89,6 +90,9 @@ class LoopRunner:
         self.worktree: WorktreeInfo | None = None
         self.verification_results: list[VerificationResult] = []
         self.started_at: float | None = None
+        # 下一轮要执行的指令。第一轮是 None(用 objective 构建初始指令);
+        # 验证失败后 _diagnose_and_repair 会填入修复指令,下一轮带 resume=True 执行。
+        self._next_instruction: str | None = None
 
     def run(self, cancel: CancelToken | None = None) -> str:
         """运行 Loop，返回最终状态消息。
@@ -140,6 +144,9 @@ class LoopRunner:
 
                 # 开始新 iteration
                 self.current_iteration += 1
+                self.budget_used.iterations = self.current_iteration
+                if self.started_at:
+                    self.budget_used.runtime_seconds = time.time() - self.started_at
                 self.status = "executing"
                 self.on_event(RunEvent(
                     kind=LOOP_ITERATION_STARTED,
@@ -186,6 +193,8 @@ class LoopRunner:
             worktree_id=worktree_id,
             require_clean_base=False,  # 允许原工作区有改动
         )
+        # 验证器也要在 worktree 内跑命令/查文件,否则会去主工作区验证(看不到改动)。
+        self.verifier.workspace_root = self.worktree.path
 
         self.on_event(RunEvent(
             kind=WORKTREE_PREPARED,
@@ -198,24 +207,68 @@ class LoopRunner:
             },
         ))
 
+    def _build_initial_instruction(self) -> str:
+        """把 GoalSpec 拼成给 Orchestrator 的首轮执行指令。"""
+        lines = [self.goal.objective, ""]
+        if self.goal.success_criteria:
+            lines.append("成功标准(必须全部满足):")
+            lines.extend(f"  - {c}" for c in self.goal.success_criteria)
+        constraints = self.goal.constraints or {}
+        if constraints:
+            lines.append("")
+            lines.append("约束:")
+            for key, vals in constraints.items():
+                if vals:
+                    lines.append(f"  - {key}: {', '.join(vals)}")
+        return "\n".join(lines)
+
     def _execute_iteration(self, cancel: CancelToken) -> str:
-        """执行一轮任务。
+        """执行一轮任务,委托给 Orchestrator。
+
+        - 第一轮:用 objective + success_criteria 构建初始指令,resume=False。
+        - 修复轮:用 _diagnose_and_repair 填好的修复指令,resume=True(保留已有任务,
+          失败任务重置为 pending 继续推进)。
+        - 若有 worktree,用 use_workspace_root 把文件/shell 工具的根目录切到 worktree,
+          确保改动落在隔离区。
+        - 累计真实工具调用数到预算;按 Orchestrator.last_run_status 判 blocked/cancelled。
 
         Returns:
             "ok" / "blocked" / "cancelled"
         """
-        # 委托给 Orchestrator 执行任务
-        # 这里简化处理：假设 orchestrator 已经绑定到正确的工作区
-        # 实际实现需要根据 self.worktree 切换 cwd
+        if self._next_instruction is None:
+            instruction = self._build_initial_instruction()
+            resume = False
+        else:
+            instruction = self._next_instruction
+            resume = True
+        self._next_instruction = None  # 用过即清,下一轮默认重新走验证驱动
 
-        # TODO: 调用 orchestrator.run() 并处理结果
-        # 暂时模拟执行
-        time.sleep(0.1)  # 模拟执行
-        self.budget_used.tool_calls += 5  # 模拟工具调用
+        def _do_run() -> str:
+            return self.orchestrator.run(instruction, cancel=cancel, resume=resume)
 
-        if cancel.cancelled:
+        try:
+            if self.worktree is not None:
+                with use_workspace_root(self.worktree.path):
+                    _do_run()
+            else:
+                _do_run()
+        except Exception as exc:
+            # 执行阶段异常不直接崩 Loop:记一次,交给验证判定(通常验证会失败 → 修复)
+            self.status = "executing"
+            self.budget_used.tool_calls += getattr(
+                self.orchestrator, "last_run_tool_calls", 0)
+            return "ok"
+
+        # 累计真实工具调用数(替掉原来写死的 +5)
+        self.budget_used.tool_calls += getattr(
+            self.orchestrator, "last_run_tool_calls", 0)
+
+        run_status = getattr(self.orchestrator, "last_run_status", "")
+        if cancel.cancelled or run_status == "cancelled":
             return "cancelled"
-
+        if run_status == "blocked":
+            return "blocked"
+        # completed / failed 都进入验证:验证才是 Loop 是否达成目标的唯一裁判。
         return "ok"
 
     def _verify(self) -> VerificationResult:
@@ -225,11 +278,12 @@ class LoopRunner:
             text=f"开始验证 (第 {self.current_iteration} 轮)",
         ))
 
-        # 转换 GoalSpec.verification_plan 为 VerificationCheck
+        # GoalSpec.verification_plan 已是 VerificationCheck 列表;若是从存储恢复的
+        # dict(向后兼容),就地转成 VerificationCheck。
         from app.agent.goals import VerificationCheck
         checks = [
-            VerificationCheck(**check_dict)
-            for check_dict in self.goal.verification_plan
+            c if isinstance(c, VerificationCheck) else VerificationCheck(**c)
+            for c in self.goal.verification_plan
         ]
 
         # 运行验证
@@ -250,21 +304,43 @@ class LoopRunner:
         return result
 
     def _diagnose_and_repair(self, verification: VerificationResult) -> None:
-        """诊断失败原因并规划修复。"""
+        """诊断失败原因,把修复指令排进下一轮。
+
+        把验证失败的具体检查项 + 失败摘要拼成修复指令,存进 _next_instruction。
+        下一轮 _execute_iteration 会用 resume=True 调 Orchestrator —— 保留已有任务、
+        把上一轮 failed 的任务重置为 pending,并在其上追加这条修复计划继续推进。
+        """
         self.status = "repairing"
 
-        # 简化版：直接告诉 Replanner "验证失败，需要修复"
-        # 实际实现需要根据 verification.failure_category 生成详细诊断
-        repair_hint = verification.next_hint or "验证失败，需要修复"
+        # 收集失败/阻塞的检查项,组成诊断说明
+        failed_checks = [
+            c for c in verification.checks
+            if c.status in ("fail", "blocked", "uncertain")
+        ]
+        detail_lines = []
+        for c in failed_checks:
+            line = f"  - [{c.status}] {c.name}: {c.summary}"
+            if c.error:
+                line += f"\n    错误: {c.error[:300]}"
+            detail_lines.append(line)
+        detail = "\n".join(detail_lines) or (verification.next_hint or "验证未通过")
+
+        repair_instruction = (
+            f"上一轮改动未通过验证(失败分类: {verification.failure_category or '未知'})。\n"
+            f"验证失败详情:\n{detail}\n\n"
+            f"请诊断根因并修复,使下列成功标准全部满足:\n"
+            + "\n".join(f"  - {c}" for c in self.goal.success_criteria)
+        )
+        self._next_instruction = repair_instruction
 
         self.on_event(RunEvent(
             kind=REPAIR_PLANNED,
-            text=f"规划修复: {repair_hint}",
-            payload={"failure_category": verification.failure_category},
+            text=f"规划修复: {verification.next_hint or '验证失败'}",
+            payload={
+                "failure_category": verification.failure_category,
+                "failed_checks": [c.name for c in failed_checks],
+            },
         ))
-
-        # TODO: 调用 Replanner 追加修复任务
-        # 这里简化处理：下一轮 iteration 会重新执行
 
     def _is_budget_exhausted(self) -> bool:
         """检查预算是否耗尽。"""

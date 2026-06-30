@@ -99,12 +99,14 @@ class Executor:
         approval: Optional[ApprovalPolicy] = None,
         on_event: Optional[Callable[[RunEvent], None]] = None,
         progress: Optional[ProgressFn] = None,
+        context_manager: Optional[Any] = None,
     ):
         self._llm = llm
         self._tools = tools
         self._approval: ApprovalPolicy = approval or AutoApprove()
         self._emit = on_event or (lambda e: None)
         self._progress: ProgressFn = progress or (lambda label: nullcontext())
+        self._ctx = context_manager  # 任务内压缩用
 
     def run_task(
         self,
@@ -248,6 +250,24 @@ class Executor:
                 raise
 
             messages.extend(self._llm.format_tool_results(tool_results))
+
+            # ── 任务内压缩检查点 ──────────────────────────────────────────────
+            # tool_result 刚入历史,tool_use/tool_result 对已闭合,这是安全的压缩点。
+            # 单个任务若跑满 max_steps(读大文件 / 传大 payload),上下文会在任务内
+            # 撑大;只在任务边界压缩的话,任务结束前可能已撑爆窗口。这里每轮工具
+            # 执行后检查一次,及时压缩,堵住"单任务长循环撑爆窗口"的缺口。
+            if self._ctx is not None:
+                try:
+                    est = self._ctx.estimate(messages, system=system)
+                    if self._ctx.budget.status_for(est) == "compact":
+                        # 真需要压缩才显示 spinner(与 orchestrator._maybe_compact 对齐)
+                        with self._progress("compacting") as handle:
+                            on_progress = getattr(handle, "update", None)
+                            self._ctx.maybe_compact(
+                                messages, system=system, on_progress=on_progress,
+                            )
+                except Exception:
+                    pass  # 压缩失败不能中断任务主路径
 
             # 审批被拒:本任务阻塞,等用户介入,不继续往下试
             if denied_any:

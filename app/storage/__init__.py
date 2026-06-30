@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from app.storage.loop_store import init_loop_tables
 from app.util.redact import redact
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -128,6 +129,15 @@ class Storage:
         self._con.row_factory = sqlite3.Row
         self._con.executescript(_SCHEMA)
         self._con.commit()
+        # Loop Engineering 相关表(goal_specs/loop_runs/loop_iterations/
+        # verification_results/worktrees/subagent_runs)。与上面的核心表共用同一连接,
+        # 放在单独模块里建,避免主 _SCHEMA 越来越长。无 loop 功能时这些表只是空着。
+        init_loop_tables(self._con)
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """暴露底层连接,供 loop_store 等模块复用同一个 SQLite 连接。"""
+        return self._con
 
     def close(self) -> None:
         self._con.close()

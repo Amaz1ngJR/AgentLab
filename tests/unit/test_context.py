@@ -23,6 +23,7 @@ from app.agent.context_budget import (
 from app.agent.context_compaction import (
     ContextCompressor,
     ContextSummary,
+    _extract_json,
     _is_tool_result_message,
     _is_valid_summary,
     _safe_split_point,
@@ -213,6 +214,50 @@ def test_valid_summary_requires_fields():
     assert not _is_valid_summary({"handoff_note": "x"})  # 缺 user_goal
     assert not _is_valid_summary(None)
     assert not _is_valid_summary("not a dict")
+
+
+def test_extract_json_plain():
+    """纯 JSON 字符串直接解析。"""
+    obj = {"user_goal": "x", "handoff_note": "y"}
+    assert _extract_json(json.dumps(obj)) == obj
+
+
+def test_extract_json_fenced_no_nested():
+    """markdown 围栏包裹、无嵌套对象时正确抠出。"""
+    obj = {"user_goal": "x", "handoff_note": "y"}
+    text = f"```json\n{json.dumps(obj)}\n```"
+    assert _extract_json(text) == obj
+
+
+def test_extract_json_fenced_with_nested_objects():
+    """回归:嵌套对象 + markdown 围栏 —— 旧非贪婪正则在此处断在内层 '}'。
+
+    摘要里 tool_evidence 是 list[dict],模型若把整个 JSON 包进 ```json``` 围栏,
+    旧版 `\\{.*?\\}` 只能抠到内层 {"source":..., "finding":...},丢掉
+    user_goal/handoff_note,导致摘要被判为无效、压缩跳过。配平扫描修复此问题。
+    """
+    obj = _VALID_SUMMARY.copy()
+    # 确保 tool_evidence 里有嵌套 dict,这是触发旧 bug 的关键
+    assert isinstance(obj["tool_evidence"], list) and len(obj["tool_evidence"]) > 0
+    text = f"```json\n{json.dumps(obj, ensure_ascii=False)}\n```"
+    result = _extract_json(text)
+    assert result is not None, "配平扫描应能解析含嵌套对象的 JSON"
+    assert result.get("user_goal") == obj["user_goal"]
+    assert result.get("handoff_note") == obj["handoff_note"]
+
+
+def test_extract_json_prose_before_and_after():
+    """JSON 前后有散文也能正确抠出。"""
+    obj = {"user_goal": "目标", "handoff_note": "交接"}
+    text = f"这是我的分析结果：\n{json.dumps(obj)}\n以上。"
+    assert _extract_json(text) == obj
+
+
+def test_extract_json_returns_none_for_invalid():
+    """纯文本和空字符串都返回 None。"""
+    assert _extract_json("") is None
+    assert _extract_json("no braces here") is None
+    assert _extract_json("not { valid json }") is None
 
 
 # ── ContextCompressor ─────────────────────────────────────────────────────────

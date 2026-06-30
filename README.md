@@ -1,6 +1,6 @@
 # AgentLab
 
-运行在个人电脑上的本地 Agent 应用。支持对话、读写文件、搜索代码、执行命令、维护任务清单、操作浏览器、多 Agent 会话与长期记忆，可在本地模型（Ollama / Qwen 等）和云端模型（Claude / GPT）之间切换，只改配置不改代码。
+运行在个人电脑上的本地 Agent 应用。支持对话、读写文件、搜索代码、执行命令、交互式终端会话、维护任务清单、操作浏览器、多 Agent 会话与长期记忆，可在本地模型（Ollama / Qwen 等）和云端模型（Claude / GPT）之间切换，只改配置不改代码。
 
 ## 功能
 
@@ -8,11 +8,14 @@
 - **文件操作**：read_file / write_file / list_dir，受 `WORKSPACE_ROOT` 限制
 - **代码搜索**：`code_search` 支持 text / regex / file / symbol 四种模式，优先用 ripgrep，无 rg 时 Python fallback；遵守 `.gitignore`、命中行密钥脱敏
 - **Shell 命令**：跨平台 shell 工具（Mac/Linux 用 bash，Windows 用 PowerShell），cwd 锁定 workspace
+- **交互式终端**：`terminal_open` / `terminal_send` / `terminal_close` / `terminal_list` 维持 PTY 会话，适合远程登录、REPL、交互式安装器等需要持续对话的程序
 - **浏览器控制**：通过 Playwright MCP 打开网页、截图、读 DOM、点击、输入（默认禁用，需显式启用）
 - **多 Agent / 会话**：`/session` 命令族在一个进程里创建、切换、归档多个 Agent 会话；会话消息存 SQLite，可恢复
 - **长期记忆**：按 AgentProfile 的 `memory_policy` 检索历史记忆注入上下文，`read_write` 策略会话结束写摘要
+- **上下文压缩**：接近模型窗口上限时自动压缩可压缩历史，原始消息保留在 SQLite，`/context` 命令族查看与手动控制
 - **任务面板**：模型用 todo_write 维护多步任务清单，CLI 实时显示进度（`✓ done` / `❯ in_progress` / `○ pending`）
 - **方向键审批**：写操作 / shell 命令 / 浏览器动作前弹出菜单 `允许这次 / 总是允许 / 拒绝`，↑↓ 选择 + Enter
+- **可中断执行**：执行中按 Esc 或 Ctrl-C 停下，可直接输入新指令调整方向；`/resume` 继续上一轮未完成任务
 - **模型切换**：`--profile` 或 `.env` 切换本地 / 云端，不改代码；本地端点不通时给出可执行修复指引
 - **进度可见**：LLM 调用期间 `✻ thinking… (3.2s · ↓ 42 tokens)` 实时刷新；每轮末尾打印耗时与 token
 
@@ -71,8 +74,8 @@ model    : claude-sonnet-4-6
 profile  : cloud_claude
 能力     : chat, tools
 workspace: /Users/you/AgentLab
-工具     : read_file / write_file / list_dir / shell / todo_write
-输入 /reset 清空会话; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.
+工具     : read_file / write_file / list_dir / shell / terminal_* (交互式会话) / todo_write
+输入 /reset 清空会话; /resume 继续未完成任务; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.
 
 ▸ 帮我重构 cli.py 里的 spinner 逻辑
 
@@ -123,6 +126,11 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 | 命令 | 作用 |
 |---|---|
 | `/reset` | 清空当前会话的消息和任务 |
+| `/resume [目标]` | 继续上一轮未完成的任务（失败任务重置为 pending） |
+| `/context` | 显示上下文预算 + recent window + 压缩摘要状态 |
+| `/context compact` | 立即压缩当前会话的可压缩历史 |
+| `/context summary` | 查看当前生效的压缩摘要 |
+| `/context disable-auto-compact` / `enable-auto-compact` | 关闭 / 开启本会话自动压缩 |
 | `/session` | 显示当前 session 信息 |
 | `/session list` | 列出所有活跃 session |
 | `/session agents` | 列出 `config/agents.yaml` 里可用的 Agent |
@@ -210,9 +218,9 @@ WORKSPACE_ROOT=/Users/you/some-project
 |---|---|---|
 | `cloud_claude` | Anthropic Claude Sonnet | `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY` |
 | `cloud_claude_opus` | Anthropic Claude Opus | 同上 |
-| `cloud_openai` | OpenAI Responses API（GPT 系列） | `OPENAI_API_KEY` |
+| `gpt_official` | OpenAI 官方 GPT（Responses API） | `OPENAI_API_KEY`（可选 `OPENAI_MODEL` 覆盖型号） |
+| `siliconflow` | 硅基流动 SiliconFlow（OpenAI 兼容云端） | `SILICONFLOW_API_KEY`（可选 `SILICONFLOW_MODEL` 覆盖型号） |
 | `local_qwen` | 本机 Ollama + Qwen2.5-Coder 7B | 无（需先 `ollama pull`） |
-| `local_qwen14b` | 本机 Ollama + Qwen2.5-Coder 14B | 无 |
 | `local_deepseek` | 本机 Ollama + DeepSeek-R1 7B | 无（不带工具能力） |
 | `lan_qwen` | 局域网 GPU 主机 Ollama | 无（修改 profile 里的 `base_url`） |
 
@@ -243,16 +251,20 @@ AgentLab/
 │   ├── cli.py              # CLI 入口 + spinner + 任务面板 + SessionRouter 接入
 │   ├── config/             # 配置加载（profile + .env）
 │   ├── models/             # Anthropic / OpenAI Responses / OpenAI-compatible 三种 adapter
-│   ├── agent/              # AgentSession 工具循环 + 审批 + TaskStore + profiles + session_router
-│   ├── tools/builtin/      # files / code_search / shell / todo_write 内置工具
+│   ├── agent/              # AgentSession 工具循环 + 编排(planner/executor/replanner)
+│   │                       #   + 审批 + 取消 + 上下文压缩 + TaskStore + session_router
+│   ├── tools/builtin/      # files / code_search / shell / interactive(终端) / todo_write
 │   ├── mcp/                # MCP Client：config / manager(sync↔async 桥) / adapter
 │   ├── storage/            # SQLite：sessions / messages / memories / tool_executions
 │   ├── memory/             # 长期记忆策略 + 记忆注入
+│   ├── skills/             # Skill 目录加载与注入
+│   ├── workspace/          # workspace 根目录解析与路径校验
 │   └── util/               # 方向键菜单 + 凭据脱敏
 ├── config/
 │   ├── models.yaml                  # 模型 profile 注册表
 │   ├── agents.example.yaml          # 多 Agent 定义模板
 │   └── mcp_servers.example.yaml     # MCP server 模板（Playwright）
+├── skills/                 # 内置 Skill（code-review / confluence-update 等）
 ├── scripts/
 │   ├── install_local_model.sh   # macOS / Linux 一键安装 Ollama + 模型
 │   ├── install_local_model.ps1  # Windows 同上
@@ -261,7 +273,7 @@ AgentLab/
 │   ├── technical_architecture.md  # 系统设计方案
 │   ├── local_model_guide.md       # 本地模型落地指南
 │   └── process.md                 # 开发进度与下一步计划
-├── tests/unit/             # 离线单元测试（174 个）
+├── tests/unit/             # 离线单元测试
 └── .env.example
 ```
 

@@ -62,8 +62,12 @@ class Orchestrator:
         self._planner = planner or Planner(llm)
         self._replanner = Replanner(self.store)
         self._progress: ProgressFn = progress or (lambda label: nullcontext())
-        self._executor = Executor(llm, tools, self._approval,
-                                  on_event=self._forward, progress=self._progress)
+        self._executor = Executor(
+            llm, tools, self._approval,
+            on_event=self._forward,
+            progress=self._progress,
+            context_manager=context_manager,  # 任务内压缩钩子
+        )
         self._emit = on_event or (lambda e: None)
         # 跨任务、跨 run 共享的对话历史(后做的任务能看到先做任务的上下文)。
         # 允许外部传入一个已存在的 list(AgentSession 把自己的 messages 交进来共享)。
@@ -76,6 +80,8 @@ class Orchestrator:
         self.last_run_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self.last_actual_model: Optional[str] = None
         self.last_run_status: str = ""  # completed / blocked / failed / cancelled
+        # 本轮 run() 累计的真实工具调用次数(供 Loop 模式累加进预算)。每次 run() 重置。
+        self.last_run_tool_calls: int = 0
 
     def _namespace_tasks(self, tasks: list) -> list:
         """给一批新计划的任务 id 加 run 前缀,并同步重映射其 dependencies。
@@ -112,6 +118,13 @@ class Orchestrator:
         """
         if self._ctx is None:
             return
+        # 先预检状态:只在需要压缩时才显示 spinner,避免每个稳定点都闪 "compacting (0.0s)"
+        # 的误导。context_manager 会在真正压缩时发 COMPACTION_STARTED/COMPLETED 事件,
+        # UI 那边会打印压缩进度,这里就不需要无条件套 spinner 了。
+        est = self._ctx.estimate(self.messages, system=self._system)
+        status = self._ctx.budget.status_for(est)
+        if status != "compact":
+            return  # 预算还够,不需要压缩
         try:
             with self._progress("compacting") as handle:
                 on_progress = getattr(handle, "update", None)
@@ -132,6 +145,7 @@ class Orchestrator:
         self._run_seq += 1
         self.last_run_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_run_status = ""
+        self.last_run_tool_calls = 0
         if not resume:
             # 非 resume 模式:清空旧任务,只展示本轮计划
             self.store.clear()
@@ -192,6 +206,7 @@ class Orchestrator:
                     usage_acc=self.last_run_usage, on_actual_model=_record_model,
                 )
                 steps_left -= max(1, outcome.tool_calls_made)
+                self.last_run_tool_calls += outcome.tool_calls_made
 
                 patch = self._replanner.apply(task, outcome)
                 self._emit_task_update(task.id, patch.new_status, patch.note)

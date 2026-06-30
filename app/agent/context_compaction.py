@@ -187,18 +187,62 @@ def _safe_split_point(
     return max(0, split)
 
 
+def _find_balanced_json(text: str, start: int) -> Optional[str]:
+    """从 text[start] 处的 '{' 起,做括号配平扫描,返回完整的 JSON 对象子串。
+
+    正确处理嵌套对象/数组,并跳过字符串字面量里的花括号(以及转义)。配不平
+    (花括号没闭合)返回 None。这是比 `\\{.*?\\}` 正则更可靠的抠取方式 —— 后者
+    非贪婪会停在第一个 '}',贪婪又可能多吞;配平扫描才能精确切出整个对象。
+    """
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
 def _extract_json(text: str) -> Optional[dict]:
-    """从模型输出抠出第一个 JSON 对象(容忍 markdown 围栏 / 前后散文)。"""
+    """从模型输出抠出第一个 JSON 对象(容忍 markdown 围栏 / 前后散文 / 嵌套结构)。
+
+    用括号配平扫描而非非贪婪正则:模型若把含嵌套对象(如 tool_evidence)的摘要包进
+    ```json``` 围栏,`\\{.*?\\}` 会停在第一个内层 '}' 抠出残缺片段,导致必填字段丢失、
+    摘要被误判为非法。配平扫描从第一个 '{' 切到与之匹配的 '}',不受嵌套影响。
+    """
     if not text:
         return None
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    candidate = fenced.group(1) if fenced else None
-    if candidate is None:
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start : end + 1]
-    if candidate is None:
+    # 优先在 markdown 围栏内找(围栏存在时,JSON 通常完整地落在里面)
+    fenced = re.search(r"```(?:json)?\s*", text)
+    search_from = fenced.end() if fenced else 0
+    start = text.find("{", search_from)
+    if start == -1 and search_from != 0:
+        start = text.find("{")  # 围栏后没找到,退回全文找
+    if start == -1:
         return None
+    candidate = _find_balanced_json(text, start)
+    if candidate is None:
+        # 配平失败(JSON 被截断等):退回"首 { 到末 }"的粗略切法兜底
+        end = text.rfind("}")
+        if end > start:
+            candidate = text[start : end + 1]
+        else:
+            return None
     try:
         obj = json.loads(candidate)
         return obj if isinstance(obj, dict) else None
