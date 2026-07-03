@@ -154,6 +154,14 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
     top_p = _env_float("LLM_TOP_P") or params.get("top_p")
     context_size = _env_int("LLM_CONTEXT_SIZE") or params.get("context_size")
 
+    # 深度思考开关：profile.params.enable_thinking 默认值，LLM_ENABLE_THINKING 可覆盖。
+    # 仅 Qwen3 / DeepSeek-R1 等支持 reasoning_content 的模型需要;其他模型留 False。
+    env_thinking = _env("LLM_ENABLE_THINKING")
+    if env_thinking is not None:
+        enable_thinking = env_thinking.lower() in ("1", "true", "yes", "on")
+    else:
+        enable_thinking = bool(params.get("enable_thinking", False))
+
     return LLMConfig(
         provider=profile.provider,
         model=profile.model,
@@ -165,6 +173,7 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
         context_size=context_size,
         timeout_seconds=float(_env("LLM_TIMEOUT_SECONDS") or "120"),
         stream=_env_bool("LLM_STREAM", default=False),
+        enable_thinking=enable_thinking,
         profile_name=active_profile,
         capabilities=list(profile.capabilities),
     )

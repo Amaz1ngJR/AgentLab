@@ -27,6 +27,7 @@ from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
     TextDeltaCallback,
+    ThinkingDeltaCallback,
     ToolCall,
     ToolResult,
 )
@@ -86,6 +87,7 @@ class OpenAIAdapter:
         max_tokens: int = 4096,
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
+        on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
     ) -> ModelResponse:
         """带工具调用的完整对话,供 Agent 循环使用。"""
         params = self._base_params(messages, temperature, system)

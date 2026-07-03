@@ -76,6 +76,23 @@ models:
     params:
       temperature: 0.2
 
+  # ── 阿里云百炼 DashScope（OpenAI 兼容）────────────────────────────────────────
+  # 协议同 OpenAI Chat Completions，走 openai_compatible adapter，无需改代码。
+  # 凭据：把 API Key 放进 .env 的 DASHSCOPE_API_KEY，不要写在这里。
+  # base_url 用百炼控制台给出的 compatible-mode 端点（每个部署的子域名不同）。
+  # 模型 ID 可用 DASHSCOPE_MODEL 覆盖（如 qwen3.7-max / qwen-max / qwen-plus）。
+  # enable_thinking: 深度思考模型在作答前会先流式输出推理过程（reasoning_content），
+  #   CLI 会用暗色实时展示；可用 LLM_ENABLE_THINKING=false 临时关闭。
+  aliyun_qwen:
+    provider: openai_compatible
+    model: ${DASHSCOPE_MODEL:-qwen3.7-max}
+    base_url: https://llm-65vyj4p0lgbyd0vp.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+    capabilities: [chat, tools]
+    params:
+      temperature: 0.2
+      enable_thinking: true
+
   # ── OpenAI 官方 GPT 模型（GPT-3.5 （gpt-3.5-turbo）/ GPT-5 （gpt-5））────────────────────────────────────
   gpt_official:
     provider: openai

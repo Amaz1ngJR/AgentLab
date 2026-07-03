@@ -51,6 +51,7 @@ class FakeRouter:
         max_tokens=4096,
         on_progress=None,
         on_text_delta=None,
+        on_thinking_delta=None,
     ) -> ModelResponse:
         # 拷贝 messages 快照,避免被后续修改污染
         self.calls.append([dict(m) for m in messages])
@@ -221,7 +222,8 @@ def test_progress_and_text_callbacks_invoked():
     class TextStreamingFake(FakeRouter):
         def create_message(self, messages, tools=None, system=None,
                            temperature=None, max_tokens=4096,
-                           on_progress=None, on_text_delta=None):
+                           on_progress=None, on_text_delta=None,
+                           on_thinking_delta=None):
             if on_text_delta:
                 on_text_delta("hel")
                 on_text_delta("lo")

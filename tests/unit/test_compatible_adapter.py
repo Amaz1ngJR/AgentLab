@@ -5,7 +5,7 @@ from app.models.compatible_adapter import OpenAICompatibleAdapter
 from app.config.schemas import LLMConfig
 
 
-def _cfg():
+def _cfg(enable_thinking: bool = False):
     return LLMConfig(
         provider="openai_compatible",
         model="qwen2.5-coder:7b-instruct",
@@ -17,10 +17,11 @@ def _cfg():
         context_size=None,
         timeout_seconds=30,
         stream=False,
+        enable_thinking=enable_thinking,
     )
 
 
-def _chunk(*, content=None, tool_calls=None, finish_reason=None, usage=None):
+def _chunk(*, content=None, tool_calls=None, finish_reason=None, usage=None, reasoning=None):
     """构造单个流式 chunk。"""
     chunk = MagicMock()
     if usage is not None:
@@ -30,7 +31,7 @@ def _chunk(*, content=None, tool_calls=None, finish_reason=None, usage=None):
     else:
         chunk.usage = None
 
-    if content is None and tool_calls is None and finish_reason is None:
+    if content is None and tool_calls is None and finish_reason is None and reasoning is None:
         chunk.choices = []
         return chunk
 
@@ -39,6 +40,9 @@ def _chunk(*, content=None, tool_calls=None, finish_reason=None, usage=None):
     delta = MagicMock()
     delta.content = content
     delta.tool_calls = tool_calls
+    # MagicMock 默认对任意属性返回真值,会让 adapter 误以为有推理内容;
+    # 显式置为传入值(默认 None),只有想测思考流时才给字符串。
+    delta.reasoning_content = reasoning
     choice.delta = delta
     chunk.choices = [choice]
     return chunk
@@ -175,6 +179,61 @@ def test_streaming_callbacks_are_invoked():
     final = progress_updates[-1]
     assert final["input_tokens"] == 20
     assert final["output_tokens"] == 8
+
+
+def _stream_thinking(reasoning: str, answer: str, prompt_tokens=12, completion_tokens=6):
+    """模拟深度思考模型:先吐 reasoning_content,再吐正式 content。"""
+    chunks = [_chunk(reasoning=ch) for ch in reasoning]
+    chunks += [_chunk(content=ch) for ch in answer]
+    chunks.append(_chunk(finish_reason="stop"))
+    chunks.append(_chunk(usage=(prompt_tokens, completion_tokens)))
+    return iter(chunks)
+
+
+def test_thinking_stream_separates_reasoning_from_answer():
+    """enable_thinking 时:reasoning_content 走 on_thinking_delta + resp.reasoning,
+    正式答案走 on_text_delta + resp.text,两者不串味,且推理不进对话历史。"""
+    thinking_chunks: list[str] = []
+    text_chunks: list[str] = []
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _stream_thinking("想一下", "答案")
+
+        adapter = OpenAICompatibleAdapter(_cfg(enable_thinking=True))
+        resp = adapter.create_message(
+            messages=[{"role": "user", "content": "1+1"}],
+            on_text_delta=text_chunks.append,
+            on_thinking_delta=thinking_chunks.append,
+        )
+
+    # 推理与答案分别归位
+    assert "".join(thinking_chunks) == "想一下"
+    assert resp.reasoning == "想一下"
+    assert "".join(text_chunks) == "答案"
+    assert resp.text == "答案"
+    # 推理过程不能混进 provider_payload(对话历史只回放最终答案)
+    assert resp.provider_payload[0]["content"] == "答案"
+    assert "想一下" not in resp.provider_payload[0]["content"]
+    # enable_thinking 应通过 extra_body 透传给服务端
+    kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert kwargs.get("extra_body") == {"enable_thinking": True}
+
+
+def test_enable_thinking_off_omits_extra_body():
+    """默认(enable_thinking=False)不带 extra_body,避免给不认识它的端点塞参数。"""
+    with patch("openai.OpenAI") as MockOpenAI:
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _stream_text("hi")
+
+        adapter = OpenAICompatibleAdapter(_cfg(enable_thinking=False))
+        resp = adapter.create_message(messages=[{"role": "user", "content": "hi"}])
+
+    assert resp.reasoning == ""
+    kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert "extra_body" not in kwargs
 
 
 # ── 兜底:本地小模型把工具调用当文本吐出来,从正文捞回 ─────────────────────────

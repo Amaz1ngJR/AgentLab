@@ -8,6 +8,7 @@ from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
     TextDeltaCallback,
+    ThinkingDeltaCallback,
     ToolResult,
 )
 
@@ -42,6 +43,7 @@ class ModelRouter:
         max_tokens: int = 4096,
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
+        on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
     ) -> ModelResponse:
         return self._adapter.create_message(
             messages,
@@ -51,6 +53,7 @@ class ModelRouter:
             max_tokens=max_tokens,
             on_progress=on_progress,
             on_text_delta=on_text_delta,
+            on_thinking_delta=on_thinking_delta,
         )
 
     def format_tool_results(self, results: list[ToolResult]) -> list[dict]:

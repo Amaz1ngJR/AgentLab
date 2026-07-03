@@ -18,6 +18,7 @@ from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
     TextDeltaCallback,
+    ThinkingDeltaCallback,
     ToolCall,
     ToolResult,
 )
@@ -65,6 +66,7 @@ class OpenAICompatibleAdapter:
         max_tokens: int = 4096,
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
+        on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
     ) -> ModelResponse:
         # OpenAI-compatible 接口把 system 放在 messages 里（role=system）
         all_messages = list(messages)
@@ -79,6 +81,12 @@ class OpenAICompatibleAdapter:
             params["tools"] = [_to_openai_tool(t) for t in tools]
             params["tool_choice"] = "auto"
 
+        # 深度思考模型(Qwen3 / DeepSeek-R1 等)需要显式开启,服务端才会在流里
+        # 额外吐出 delta.reasoning_content。通过 extra_body 透传,非思考模型不带此参,
+        # 避免给 Ollama / 硅基流动等端点塞它们不认识的字段。
+        if getattr(self._cfg, "enable_thinking", False):
+            params["extra_body"] = {"enable_thinking": True}
+
         # 输入 token 估算（在真值到达前用），约 3 字符一个 token
         in_tokens_est = max(1, sum(len(str(m.get("content", ""))) for m in all_messages) // 3)
         in_tokens = in_tokens_est
@@ -92,6 +100,7 @@ class OpenAICompatibleAdapter:
         emit_progress()
 
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []  # 深度思考模型的推理过程(reasoning_content)
         # tool_calls 流式分片到达：index -> {"id", "name", "args_str"}
         tool_calls_buf: dict[int, dict[str, str]] = {}
         finish_reason: Optional[str] = None
@@ -109,6 +118,14 @@ class OpenAICompatibleAdapter:
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
                 if delta is not None:
+                    # 推理增量:思考模型在正式 content 之前先吐 reasoning_content。
+                    # 只用于实时展示,不计入 out_tokens 估算(usage 已包含它),
+                    # 也不进入 text_parts / 对话历史。
+                    reasoning_chunk = getattr(delta, "reasoning_content", None)
+                    if reasoning_chunk:
+                        reasoning_parts.append(reasoning_chunk)
+                        if on_thinking_delta:
+                            on_thinking_delta(reasoning_chunk)
                     if getattr(delta, "content", None):
                         chunk_text = delta.content
                         text_parts.append(chunk_text)
@@ -201,6 +218,7 @@ class OpenAICompatibleAdapter:
             provider_payload=[payload],
             finish_reason=finish_reason,
             actual_model=actual_model,
+            reasoning="".join(reasoning_parts),
         )
 
     @staticmethod

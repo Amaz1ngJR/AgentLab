@@ -68,7 +68,12 @@ def _term_width(default: int = 80) -> int:
 
 
 def _display_width(text: str) -> int:
-    """终端显示宽度：东亚宽字符算 2，其他算 1。"""
+    """终端显示宽度：东亚宽字符算 2，其他算 1。
+
+    先剥掉 ANSI 转义(dim 思考流 / 任务面板高亮都带颜色码),否则会把不可见的
+    控制字符算进宽度,导致 footer 擦除时上移行数算错、出现重影。
+    """
+    text = _strip_ansi(text)
     width = 0
     for ch in text:
         if unicodedata.east_asian_width(ch) in ("W", "F"):
@@ -227,6 +232,7 @@ class _Spinner:
         self._lock = threading.Lock()
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self._any_text = False         # 整个 turn 是否出现过正文(决定退出收尾)
+        self._any_thinking = False     # 是否出现过思考流(用于在思考→正文/摘要间分隔)
         self._line_buf = ""            # 当前还没换行的正文尾行(擦除/重画 footer 时要复原)
         self._tasks_committed = False  # 任务面板每步只提交一次
         self._frame_idx = 0
@@ -249,7 +255,10 @@ class _Spinner:
                     sys.stdout.write("\n")
                 sys.stdout.write("\n")
             else:
-                # 纯 tool_use / 无文本:保留任务面板 + 一行摘要
+                # 纯 tool_use / 无文本:保留任务面板 + 一行摘要。
+                # 若只流过思考(没有正文),先换行收掉暗色尾行再打摘要。
+                if self._any_thinking and self._line_buf:
+                    sys.stdout.write("\n")
                 sys.stdout.write(f"  ✻ {self.label} ({self._fmt_status()})\n")
             sys.stdout.flush()
 
@@ -267,6 +276,13 @@ class _Spinner:
         with self._lock:
             self._erase_footer()
             self._commit_tasks()
+            # 思考流→正文的过渡:思考是暗色,正文是常色。换行收掉思考尾行 +
+            # 空一行分隔,避免正文紧贴在灰字后面。只在首次出现正文时做一次。
+            if self._any_thinking and not self._any_text:
+                if self._line_buf:
+                    sys.stdout.write("\n")
+                sys.stdout.write("\n")
+                self._line_buf = ""
             self._any_text = True
             sys.stdout.write(delta)
             # 维护"当前未换行尾行":有换行则取最后一段,否则累加到现有尾行
@@ -274,6 +290,32 @@ class _Spinner:
                 self._line_buf = delta.rsplit("\n", 1)[1]
             else:
                 self._line_buf += delta
+            self._draw_footer()
+            sys.stdout.flush()
+
+    def on_thinking(self, delta: str) -> None:
+        """流式打印思考(推理)过程,用暗色与正式答案区分。
+
+        复用 on_text 的"擦 footer → append → 重画 footer"机制,但把每段增量包进
+        dim 颜色码。_line_buf 里存的是带色码的字符串;footer 擦除靠 _display_width
+        (已剥 ANSI)算宽度,所以色码不会让上移行数算错。
+        """
+        if not delta:
+            return
+        with self._lock:
+            self._erase_footer()
+            self._commit_tasks()
+            if not self._any_thinking:
+                # 思考段起一个暗色标题,提示这是推理而非最终答案
+                sys.stdout.write(f"{_ANSI_DIM}💭 思考\n{_ANSI_RESET}")
+                self._any_thinking = True
+            styled = f"{_ANSI_DIM}{delta}{_ANSI_RESET}"
+            sys.stdout.write(styled)
+            if "\n" in delta:
+                tail = delta.rsplit("\n", 1)[1]
+                self._line_buf = f"{_ANSI_DIM}{tail}{_ANSI_RESET}" if tail else ""
+            else:
+                self._line_buf += styled
             self._draw_footer()
             sys.stdout.flush()
 
@@ -386,6 +428,7 @@ class _PlainProgress:
         self._t0 = 0.0
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self._text_started = False
+        self._thinking_started = False
 
     def __enter__(self) -> "_PlainProgress":
         self._t0 = time.monotonic()
@@ -396,7 +439,7 @@ class _PlainProgress:
         elapsed = time.monotonic() - self._t0
         out_t = self._metrics["output_tokens"]
         suffix = f" · ↓ {_fmt_tokens(out_t)}" if out_t else ""
-        if self._text_started:
+        if self._text_started or self._thinking_started:
             sys.stdout.write("\n\n")
             sys.stdout.flush()
         print(f"  ✻ {self.label} ({_fmt_duration(elapsed)}{suffix})", flush=True)
@@ -407,12 +450,22 @@ class _PlainProgress:
             "output_tokens": int(metrics.get("output_tokens", 0) or 0),
         }
 
+    def on_thinking(self, delta: str) -> None:
+        if not delta:
+            return
+        if not self._thinking_started:
+            self._thinking_started = True
+            sys.stdout.write(f"\n{_ANSI_DIM}💭 思考\n")
+        sys.stdout.write(f"{_ANSI_DIM}{delta}{_ANSI_RESET}")
+        sys.stdout.flush()
+
     def on_text(self, delta: str) -> None:
         if not delta:
             return
         if not self._text_started:
             self._text_started = True
-            sys.stdout.write("\n")
+            # 思考流后接正文:先空一行把灰字推开
+            sys.stdout.write("\n\n" if self._thinking_started else "\n")
         sys.stdout.write(delta)
         sys.stdout.flush()
 
@@ -456,16 +509,224 @@ def _fmt(data: dict) -> str:
         return repr(data)
 
 
+def _resolve_ws_path(path_str: str):
+    """复用工具侧的 workspace 解析拿真实磁盘路径;失败退回 expanduser。"""
+    try:
+        from app.tools.builtin.files import _resolve_within_workspace
+        return _resolve_within_workspace(path_str)
+    except Exception:
+        from pathlib import Path
+        return Path(path_str).expanduser()
+
+
+def _render_pre_approval_diff(path_str: str, old_content: str, new_content: str,
+                              is_new: bool) -> None:
+    """审批前渲染彩色 diff + 拉 VS Code diff。old/new 已知,不需执行工具。"""
+    from app.util import diff as _diff
+
+    if old_content == new_content:
+        return
+    is_delete = bool(old_content) and not new_content
+    added, removed = _diff.diff_stats(old_content, new_content)
+    width = min(_term_width(), 120)
+    print(flush=True)
+    print(_diff.render_header(path_str, is_new, added, removed, is_delete=is_delete),
+          flush=True)
+    body = _diff.render_color_diff(old_content, new_content, width=width)
+    if body:
+        print(body, flush=True)
+    print(flush=True)
+    # 记住句柄:用户允许/拒绝后关掉这个 diff tab(见 _close_active_vscode_diff)
+    _register_vscode_diff(_diff.launch_vscode_diff(old_content, new_content, path_str))
+
+
+# 当前打开着的 VS Code diff 句柄(edit_file/write_file 审批期间)。
+# 用户做出选择后由 _close_active_vscode_diff() terminate 掉,关闭 diff tab。
+_ACTIVE_VSCODE_DIFFS: list = []
+
+
+def _register_vscode_diff(handle) -> None:
+    if handle is not None:
+        _ACTIVE_VSCODE_DIFFS.append(handle)
+
+
+def _close_active_vscode_diff() -> None:
+    """关闭审批期间打开的所有 VS Code diff tab(允许/拒绝后调用)。"""
+    from app.util import diff as _diff
+    while _ACTIVE_VSCODE_DIFFS:
+        _diff.close_vscode_diff(_ACTIVE_VSCODE_DIFFS.pop())
+
+
+def _render_write_file(tool_input: dict) -> None:
+    """把 write_file 的改动渲染成彩色 diff 打到终端(在审批菜单之前调用)。
+
+    读旧内容(文件不存在则视为新建),和 tool_input.content 做行级 diff。
+    此刻磁盘上还是旧内容,新内容在 tool_input 里,所以同时具备旧/新两份。
+    任何异常都吞掉,退化为不打 diff —— diff 是锦上添花,不该打断工具流程。
+    """
+    try:
+        path_str = tool_input.get("path", "")
+        new_content = tool_input.get("content", "") or ""
+        if not path_str:
+            return
+        path = _resolve_ws_path(path_str)
+        is_new = not path.exists()
+        old_content = "" if is_new else path.read_text(encoding="utf-8", errors="replace")
+        _render_pre_approval_diff(path_str, old_content, new_content, is_new)
+    except Exception:
+        return
+
+
+def _render_edit_file(tool_input: dict) -> None:
+    """把 edit_file 的局部替换渲染成彩色 diff(审批前调用)。
+
+    在内存里模拟 _edit_file 的替换逻辑(old_str→new_str,空 old_str=末尾追加),
+    算出替换后的完整内容,与旧内容做 diff。不真正写盘。old_str 不唯一 / 找不到
+    时不显示 diff(交给工具执行时报错给模型)。
+    """
+    try:
+        path_str = tool_input.get("path", "")
+        if not path_str:
+            return
+        path = _resolve_ws_path(path_str)
+        if not path.exists() or not path.is_file():
+            return
+        old_content = path.read_text(encoding="utf-8", errors="replace")
+        old_str = tool_input.get("old_str", "")
+        new_str = tool_input.get("new_str", "")
+        if old_str == "":
+            new_content = old_content + new_str
+        else:
+            if old_content.count(old_str) != 1:
+                return  # 不唯一 / 未命中:执行时会报错,这里不猜
+            new_content = old_content.replace(old_str, new_str, 1)
+        _render_pre_approval_diff(path_str, old_content, new_content, is_new=False)
+    except Exception:
+        return
+
+
+# shell 命令改文件的"执行前快照"。
+# _SHELL_TREE_BEFORE:执行前整棵 workspace 的文件内容快照(不依赖解析命令,
+#   任何写文件方式 —— 重定向 / sed / python -c / heredoc —— 落盘后都能比对出来)。
+#   仓库过大时为 None,退化到窄路径 _SHELL_TARGETS(靠命令解析)。
+_SHELL_TREE_BEFORE: dict[str, str] | None = None
+_SHELL_TARGETS: dict[str, str] = {}
+
+
+def _snapshot_shell_targets(tool_input: dict) -> None:
+    """shell 执行前:抓拍 workspace 快照;仓库过大时退化为解析命令目标。"""
+    global _SHELL_TREE_BEFORE
+    from app.util import diff as _diff
+
+    _SHELL_TREE_BEFORE = None
+    _SHELL_TARGETS.clear()
+    try:
+        from app.config.loader import workspace_root
+        root = workspace_root()
+        # 首选:整棵树快照(与命令写法无关)
+        _SHELL_TREE_BEFORE = _diff.snapshot_tree(root)
+        if _SHELL_TREE_BEFORE is not None:
+            return
+        # 退化:仓库太大,只快照命令里能解析出的写入目标
+        command = tool_input.get("command", "") or ""
+        from pathlib import Path
+        for t in _diff.shell_write_targets(command):
+            p = Path(t)
+            if not p.is_absolute():
+                p = root / p  # shell 的 cwd 是 workspace_root
+            _SHELL_TARGETS[str(p)] = _diff.read_text_safe(p)
+    except Exception:
+        _SHELL_TREE_BEFORE = None
+        _SHELL_TARGETS.clear()
+
+
+def _emit_file_diff(path_str, old, new, is_new, width) -> None:
+    """打印单个文件的头 + 彩色 diff,并(可选)拉 VS Code diff。"""
+    from app.util import diff as _diff
+
+    is_delete = bool(old) and not new
+    added, removed = _diff.diff_stats(old, new)
+    print(flush=True)
+    print(_diff.render_header(path_str, is_new, added, removed, is_delete=is_delete),
+          flush=True)
+    body = _diff.render_color_diff(old, new, width=width)
+    if body:
+        print(body, flush=True)
+    print(flush=True)
+    _diff.launch_vscode_diff(old, new, path_str)
+
+
+def _render_shell_diff() -> None:
+    """shell 执行后:比对执行前快照,把真正落盘的改动打成彩色 diff。"""
+    import os as _os
+
+    from app.util import diff as _diff
+
+    _MAX_FILES_SHOWN = 10  # 一条命令改动过多文件时,只详列前 N 个
+    try:
+        width = min(_term_width(), 120)
+        change_count = 0
+        if _SHELL_TREE_BEFORE is not None:
+            # 全量快照路径:再拍一次,diff 出所有变化的文件
+            from app.config.loader import workspace_root
+            after = _diff.snapshot_tree(workspace_root())
+            changes = _diff.diff_snapshots(_SHELL_TREE_BEFORE, after)
+            change_count = len(changes)
+            for path_str, old, new, is_new in changes[:_MAX_FILES_SHOWN]:
+                _emit_file_diff(path_str, old, new, is_new, width)
+            extra = len(changes) - _MAX_FILES_SHOWN
+            if extra > 0:
+                print(f"  … 另有 {extra} 个文件改动(未详列)", flush=True)
+        elif _SHELL_TARGETS:
+            # 窄路径:只比对解析出的目标
+            for path_str, old in _SHELL_TARGETS.items():
+                new = _diff.read_text_safe(path_str)
+                if new == old:
+                    continue
+                is_new = (old == "") and _os.path.exists(path_str)
+                _emit_file_diff(path_str, old, new, is_new, width)
+                change_count += 1
+        # 命令跑了但没改任何文件:明确告知(避免用户疑惑"diff 去哪了")
+        if change_count == 0 and (_SHELL_TREE_BEFORE is not None or _SHELL_TARGETS):
+            print(f"  {_ANSI_DIM}(本次命令未改动任何文件){_ANSI_RESET}", flush=True)
+    except Exception:
+        pass
+    finally:
+        _reset_shell_snapshot()
+
+
+def _reset_shell_snapshot() -> None:
+    global _SHELL_TREE_BEFORE
+    _SHELL_TREE_BEFORE = None
+    _SHELL_TARGETS.clear()
+
+
 def _print_event(ev: TurnEvent) -> None:
     if ev.kind == "tool_call":
-        print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
+        if ev.tool_name == "write_file":
+            _render_write_file(ev.tool_input or {})
+        elif ev.tool_name == "edit_file":
+            _render_edit_file(ev.tool_input or {})
+        elif ev.tool_name == "shell":
+            _snapshot_shell_targets(ev.tool_input or {})
+            print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
+        else:
+            print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
     elif ev.kind == "tool_result":
         preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
         tag = "ERR" if ev.tool_error else "ok"
         t = f" ({ev.elapsed_seconds * 1000:.0f}ms)" if ev.elapsed_seconds < 1 else f" ({ev.elapsed_seconds:.1f}s)"
         print(f"    [{tag}]{t} {preview}", flush=True)
+        if ev.tool_name == "shell" and not ev.tool_error:
+            _render_shell_diff()
+        # write_file/edit_file 允许后关闭 VS Code diff
+        if ev.tool_name in ("write_file", "edit_file") and not ev.tool_error:
+            _close_active_vscode_diff()
     elif ev.kind == "tool_denied":
         print(f"    [denied] 已拒绝 {ev.tool_name}", flush=True)
+        # write_file/edit_file 拒绝后也关闭 VS Code diff
+        if ev.tool_name in ("write_file", "edit_file"):
+            _close_active_vscode_diff()
     elif ev.kind == "text":
         print(f"\n{ev.text}\n", flush=True)
 
@@ -490,15 +751,31 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         if ev.text:
             print(f"\n{ev.text}\n", flush=True)
     elif kind == run_events.TOOL_REQUESTED:
-        print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
+        if ev.tool_name == "write_file":
+            _render_write_file(ev.tool_input or {})
+        elif ev.tool_name == "edit_file":
+            _render_edit_file(ev.tool_input or {})
+        elif ev.tool_name == "shell":
+            _snapshot_shell_targets(ev.tool_input or {})
+            print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
+        else:
+            print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
     elif kind == run_events.TOOL_COMPLETED:
         preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
         tag = "ERR" if ev.tool_error else "ok"
         t = (f" ({ev.elapsed_seconds * 1000:.0f}ms)" if ev.elapsed_seconds < 1
              else f" ({ev.elapsed_seconds:.1f}s)")
         print(f"    [{tag}]{t} {preview}", flush=True)
+        if ev.tool_name == "shell" and not ev.tool_error:
+            _render_shell_diff()
+        # write_file/edit_file 允许后关闭 VS Code diff(与 Claude Code 对齐)
+        if ev.tool_name in ("write_file", "edit_file") and not ev.tool_error:
+            _close_active_vscode_diff()
     elif kind == run_events.TOOL_DENIED:
         print(f"    [denied] 已拒绝 {ev.tool_name}", flush=True)
+        # write_file/edit_file 拒绝后也关闭 VS Code diff
+        if ev.tool_name in ("write_file", "edit_file"):
+            _close_active_vscode_diff()
     elif kind == run_events.PLAN_CREATED:
         tasks = ev.payload.get("tasks", [])
         if len(tasks) > 1:  # 单任务计划不值得打面板,省噪音

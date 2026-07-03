@@ -14,6 +14,14 @@ ProgressCallback = Callable[[dict[str, int]], None]
 TextDeltaCallback = Callable[[str], None]
 """文本增量回调，参数为本次新增的文本片段"""
 
+ThinkingDeltaCallback = Callable[[str], None]
+"""思考(推理)增量回调，参数为本次新增的思考文本片段。
+
+深度思考模型(如 Qwen3 系列、DeepSeek-R1)在正式作答前会先输出一段
+推理过程(OpenAI 兼容协议里走 delta.reasoning_content)。这段内容只用于
+实时展示,不进入对话历史(provider_payload),也不算最终答案。
+"""
+
 
 @dataclass
 class ToolCall:
@@ -46,6 +54,8 @@ class ModelResponse:
     """adapter 向 Runtime 返回的统一响应结构。
 
     text             - 模型输出的纯文本（可能为空，例如本轮只返回了工具调用）
+    reasoning        - 深度思考模型的推理过程文本（仅用于展示/记录，不回放进
+                       对话历史，也不是最终答案）；非思考模型恒为空字符串
     tool_calls       - 模型请求执行的工具列表；为空表示模型已给出最终答案
     usage            - token 用量 {"input_tokens": int, "output_tokens": int}
     provider_payload - provider 原生 content blocks（dict 列表），
@@ -63,3 +73,4 @@ class ModelResponse:
     provider_payload: Any
     finish_reason: str | None = None
     actual_model: str | None = None
+    reasoning: str = ""

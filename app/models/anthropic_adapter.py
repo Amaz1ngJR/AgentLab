@@ -12,6 +12,7 @@ from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
     TextDeltaCallback,
+    ThinkingDeltaCallback,
     ToolCall,
     ToolResult,
 )
@@ -78,6 +79,7 @@ class AnthropicAdapter:
         max_tokens: int = 4096,
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
+        on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
     ) -> ModelResponse:
         system_from_msgs, converted = self._split_system(messages)
         system_text = system or system_from_msgs

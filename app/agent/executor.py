@@ -138,6 +138,7 @@ class Executor:
             with self._progress("thinking") as handle:
                 on_progress = getattr(handle, "update", None)
                 raw_on_text = getattr(handle, "on_text", None)
+                raw_on_thinking = getattr(handle, "on_thinking", None)
 
                 def on_text_delta(delta: str) -> None:
                     nonlocal text_streamed
@@ -151,6 +152,7 @@ class Executor:
                     system=system,
                     on_progress=on_progress,
                     on_text_delta=on_text_delta if raw_on_text else None,
+                    on_thinking_delta=raw_on_thinking,
                 )
 
             if usage_acc is not None and getattr(resp, "usage", None):
@@ -221,7 +223,8 @@ class Executor:
                         output = _truncate_tool_output(output)
                         self._emit(RunEvent(
                             kind=events.TOOL_COMPLETED, task_id=task.id,
-                            tool_name=call.name, tool_output=output, tool_error=is_error,
+                            tool_name=call.name, tool_input=call.arguments,
+                            tool_output=output, tool_error=is_error,
                             elapsed_seconds=time.monotonic() - t0,
                         ))
                         # 工具执行出错 -> 任务失败。先补齐 tool_result 配对,再返回,

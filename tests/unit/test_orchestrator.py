@@ -44,7 +44,8 @@ class FakeRouter:
         return "fake"
 
     def create_message(self, messages, tools=None, system=None, temperature=None,
-                       max_tokens=4096, on_progress=None, on_text_delta=None):
+                       max_tokens=4096, on_progress=None, on_text_delta=None,
+                       on_thinking_delta=None):
         self.calls.append([dict(m) for m in messages])
         if not self._responses:
             return ModelResponse(text="(no more responses)", tool_calls=[],

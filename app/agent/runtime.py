@@ -25,6 +25,13 @@ DEFAULT_SYSTEM_PROMPT = """你是 AgentLab,一个本地编码助手。
   搜正则用 regex,找文件用 file,找定义用 symbol。拿到命中再用 read_file 精读。
 - 不要重复你上一条已经说过的话。如果发现自己在重复,改为调用工具或给出最终结论。
 
+【改文件必读】
+- 改/删几行、改配置:用 edit_file(old_str→new_str),不要 write_file 覆盖整文件,
+  更不要用 shell 重定向 / sed -i / python -c 改文件。edit_file 会在审批前展示
+  彩色 diff,用户能看清改了什么再确认。
+- 新建文件才用 write_file。追加内容用 edit_file(old_str="", new_str=要追加的内容)。
+- shell 工具只用于查看(ls / grep / git status)、安装依赖、跑测试。禁止用它改文件。
+
 【常规约定】
 - 用户用中文对话时,回复也用中文。
 - 写代码时简洁优先,不要过度解释。
@@ -225,6 +232,7 @@ class AgentSession:
                 with self._progress("thinking") as handle:
                     on_progress = getattr(handle, "update", None)
                     raw_on_text = getattr(handle, "on_text", None)
+                    raw_on_thinking = getattr(handle, "on_thinking", None)
 
                     def on_text_delta(delta: str) -> None:
                         nonlocal text_streamed
@@ -238,6 +246,7 @@ class AgentSession:
                         system=self.system_prompt,
                         on_progress=on_progress,
                         on_text_delta=on_text_delta if raw_on_text else None,
+                        on_thinking_delta=raw_on_thinking,
                     )
 
                 for k in ("input_tokens", "output_tokens"):
@@ -283,6 +292,7 @@ class AgentSession:
                         self._on_event(TurnEvent(
                             kind="tool_result",
                             tool_name=call.name,
+                            tool_input=call.arguments,
                             tool_output=output,
                             tool_error=is_error,
                             elapsed_seconds=time.monotonic() - t0,
