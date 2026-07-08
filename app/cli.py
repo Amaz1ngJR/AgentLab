@@ -1013,7 +1013,21 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     from app.config.loader import workspace_root
     ws = workspace_root()
     print(f"workspace: {ws}")
-    print("工具     : read_file / write_file / list_dir / shell / terminal_* (交互式会话) / todo_write")
+
+    # 动态生成工具列表
+    from app.tools.builtin import default_tools
+    builtin_tools = default_tools()
+    tool_names = [t.name for t in builtin_tools]
+    # 把 terminal_* 归纳显示
+    tool_display = []
+    for name in tool_names:
+        if name.startswith('terminal_'):
+            if 'terminal_* (交互式会话)' not in tool_display:
+                tool_display.append('terminal_* (交互式会话)')
+        else:
+            tool_display.append(name)
+
+    print(f"工具     : {' / '.join(tool_display)}")
     print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
     print("输入 /reset 清空会话; /resume 继续未完成任务; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
     print("执行中按 Esc 或 Ctrl-C 可中断,停下后直接输入新指令即可调整方向。\n")

@@ -5,3 +5,8 @@ pyyaml>=6.0
 prompt_toolkit>=3.0
 pathspec>=0.12
 mcp>=1.0
+
+# Web search (optional, for web_search tool)
+duckduckgo-search>=6.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0

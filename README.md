@@ -7,6 +7,7 @@
 - **对话**：多轮上下文对话；流式输出文本逐字展示，token 实时增长
 - **文件操作**：read_file / write_file / list_dir，受 `WORKSPACE_ROOT` 限制
 - **代码搜索**：`code_search` 支持 text / regex / file / symbol 四种模式，优先用 ripgrep，无 rg 时 Python fallback；遵守 `.gitignore`、命中行密钥脱敏
+- **Web 搜索**：`web_search` 在互联网上搜索信息，返回标题、链接和摘要；使用 DuckDuckGo（注重隐私，无需 API key）
 - **Shell 命令**：跨平台 shell 工具（Mac/Linux 用 bash，Windows 用 PowerShell），cwd 锁定 workspace
 - **交互式终端**：`terminal_open` / `terminal_send` / `terminal_close` / `terminal_list` 维持 PTY 会话，适合远程登录、REPL、交互式安装器等需要持续对话的程序
 - **浏览器控制**：通过 Playwright MCP 打开网页、截图、读 DOM、点击、输入（默认禁用，需显式启用）
@@ -30,7 +31,14 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-浏览器控制还需要 Node/npx（首次启动会自动 `npx` 下载 Playwright）。
+**可选依赖**（根据需要安装，跨平台通用）：
+
+```bash
+# Web 搜索功能（web_search 工具）
+pip install duckduckgo-search requests beautifulsoup4
+```
+
+浏览器控制还需要 Node.js/npx（首次启动会自动 `npx` 下载 Playwright，Windows/macOS 均支持）。
 
 ## 快速开始
 
@@ -74,7 +82,7 @@ model    : claude-sonnet-4-6
 profile  : cloud_claude
 能力     : chat, tools
 workspace: /Users/you/AgentLab
-工具     : read_file / write_file / list_dir / shell / terminal_* (交互式会话) / todo_write
+工具     : read_file / write_file / list_dir / shell / web_search / terminal_* (交互式会话) / todo_write
 输入 /reset 清空会话; /resume 继续未完成任务; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.
 
 ▸ 帮我重构 cli.py 里的 spinner 逻辑
