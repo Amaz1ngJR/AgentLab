@@ -177,8 +177,29 @@ class SessionRouter:
             sess.last_run_status = ""
 
     def close_all(self) -> None:
-        for s in self._sessions.values():
-            s.close()
+        """关闭所有 session + 共享资源(MCP server),退出前调用。
+
+        read_write 记忆策略的 session 会在此时写入会话摘要(§6.2)。
+        """
+        from app.config.loader import workspace_root
+        ws = str(workspace_root())
+
+        for sid, sess in self._sessions.items():
+            # read_write 策略的会话结束时写摘要到 memories
+            mem_policy = getattr(sess, "mem_policy", None)
+            agent_profile = getattr(sess, "agent_profile", None)
+            if mem_policy and agent_profile and hasattr(mem_policy, "save"):
+                try:
+                    mem_policy.save(
+                        agent_id=agent_profile.agent_id,
+                        session_id=sid,
+                        messages=sess.messages,
+                        workspace=ws,
+                    )
+                except Exception:
+                    # 写摘要失败不应阻断退出,静默吞掉
+                    pass
+            sess.close()
         self._sessions.clear()
         # 关闭全局共享资源(MCP server 进程等)
         if self.mcp_manager is not None:

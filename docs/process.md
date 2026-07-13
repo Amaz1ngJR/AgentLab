@@ -13,7 +13,7 @@
 
 ## 1. 当前一句话状态
 
-AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）、`Planner + Executor + Replanner` 编排路径（带依赖 TaskStore + 结构化 `RunEvent`，已接入 CLI 主路径，支持 Ctrl-C 协作式取消与任务状态持久化恢复）、上下文预算与自动压缩（`ContextBudget` + `ContextCompressor` + 结构化摘要 + `/context` 命令族，编排稳定点超阈值自动压缩、可审计）。
+AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/web 搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）、`Planner + Executor + Replanner` 编排路径（带依赖 TaskStore + 结构化 `RunEvent`，已接入 CLI 主路径，支持 Ctrl-C 协作式取消与任务状态持久化恢复）、上下文预算与自动压缩（`ContextBudget` + `ContextCompressor` + 结构化摘要 + `/context` 命令族，编排稳定点超阈值自动压缩、可审计）。
 
 当前编排相当于 PRD 的 **Task 模式**（Planner→Executor→Replanner，目标是把任务跑完）。PRD 新增的 **Loop 模式（Loop Engineering，§7.6）** 核心组件已落地、待集成：`GoalSpec` + 校验、`Verifier`（command/file_assertion）、`LoopRunner` 状态机框架、`WorktreeManager` 隔离工作区、`loop_store`（6 表）、Loop RunEvent、`/goal` `/loop` 命令框架均已实现并测试（见 3.11）；尚未打通的是 LoopRunner 与 Orchestrator 的深度集成、CLI 主循环接入、Verifier 扩展（browser/api/human）、`Learner` / `Project Knowledge` / 子 Agent / 后台 Loop。
 
@@ -47,6 +47,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 - `read_file / write_file / list_dir`（受 `WORKSPACE_ROOT` 限制）、`shell`（跨平台、cwd 锁定 workspace）、`todo_write`（CLI 任务面板 `✓/❯/○`）。
 - `code_search`（`app/tools/builtin/code_search.py`）：text/regex/file/symbol 四种模式，优先 `rg --json`，无 rg 时 Python fallback；遵守 `.gitignore`、命中行密钥脱敏。
+- `web_search`（`app/tools/builtin/web_search.py`）：互联网搜索工具，返回结构化结果（标题/URL/摘要）。优先用 `duckduckgo_search` 库，失败时退化为 requests + BeautifulSoup 解析 DuckDuckGo HTML；结果脱敏、超时保护、输出 32KB 硬截断；只读免审批；依赖（`duckduckgo-search` / `requests` / `beautifulsoup4`）未安装时优雅降级返回安装提示。完全跨平台（无路径操作/subprocess/POSIX 特定功能）。22 个单元测试（16 passed + 6 skipped，跳过项为可选依赖未装）。
 - 交互式终端会话（`app/tools/builtin/interactive.py`）：`PtySession` 在伪终端里起子进程，`read-until-idle` 通用驱动（不依赖提示符/哨兵）；`terminal_open / terminal_send / terminal_close / terminal_list` 四个工具按会话注入；用于远程登录（`zsh -ic 'vsm <device>'`、ssh）、REPL、交互式安装器等 `shell` 搞不定的有状态会话。子进程随 AgentSession 关闭而清理。
 
 ### 3.3 MCP Client 层（stdio）+ Playwright 浏览器控制
@@ -83,7 +84,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **343 个 unit tests**（全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager）、code_search、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage（含 tasks/runs/context_summaries 持久化）、memory、session_router（含任务快照恢复）、CLI 斜杠补全、Skill loader/catalog、Loop Engineering（GoalSpec 校验 / Verifier command+file / WorktreeManager）。
+- **444 个 unit tests**（其中 6 个在可选依赖未装时 skip，全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager）、code_search、web_search（参数校验/后端选择/错误处理/输出限制/集成）、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage（含 tasks/runs/context_summaries 持久化）、memory、session_router（含任务快照恢复 + CLI session 增强：prompt 显示 / 退出写摘要）、CLI 斜杠补全、Skill loader/catalog、Loop Engineering（GoalSpec 校验 / Verifier command+file / WorktreeManager）。
 
 ### 3.8 Planner / Executor / Replanner 编排与结构化 RunEvent
 
@@ -142,14 +143,14 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |
 | 任务面板 / TaskStore | 任务状态唯一源:依赖/claim/blocked/failed/evidence/history/snapshot/restore;`todo_write` 走简单三态;CLI 面板渲染(含 blocked/failed 字形) | `app/agent/tasks.py`, `app/tools/builtin/todo.py` |
 | 审批 | 自动 / 交互（方向键）/ 拒绝；仍是 `requires_approval` 布尔模型 | `app/agent/approval.py`, `app/util/menu.py` |
-| 内置工具 | `read_file / write_file / list_dir / code_search / shell / todo_write`；`terminal_*` 交互式终端会话 | `app/tools/builtin/` |
+| 内置工具 | `read_file / write_file / edit_file / list_dir / code_search / web_search / shell / todo_write`；`terminal_*` 交互式终端会话 | `app/tools/builtin/` |
 | MCP | stdio Manager、工具发现、sync/async 桥、同名不覆盖、auto_approve 白名单 | `app/mcp/` |
 | 浏览器控制 | Playwright MCP：打开/snapshot/点击/输入；named profile；数据边界提示 | `config/mcp_servers.example.yaml`, `app/cli.py` |
 | 存储 | SQLite：sessions/messages/memories/tool_executions/runs/tasks；settings 表与 Web 复用待做 | `app/storage/` |
 | 安全基础 | workspace 越界拒绝、脱敏、MCP env allowlist、敏感目录不入库 | `app/util/redact.py`, `.gitignore` |
 | 取消 | Ctrl-C 协作式取消(CancelToken):首次置位、当前步骤后停止,连按强制中断 | `app/agent/cancel.py`, `app/cli.py` |
 | 上下文压缩 | ContextBudget + ContextCompressor + 结构化摘要;编排稳定点超 85% 自动压缩、可审计;`/context` 命令族 | `app/agent/context.py`, `context_budget.py`, `context_compaction.py` |
-| 测试 | 343 个 unit tests | `tests/unit/` |
+| 测试 | 444 个 unit tests（web_search 的 6 个在可选依赖未装时自动 skip） | `tests/unit/` |
 
 ---
 
@@ -194,6 +195,7 @@ AgentLab/
       builtin/
         files.py                   # read_file / write_file / list_dir
         code_search.py             # 高频代码搜索
+        web_search.py              # 互联网搜索(DuckDuckGo + HTML fallback,可选依赖优雅降级)
         shell.py                   # 跨平台 shell
         interactive.py             # 交互式终端会话(PTY)：PtySession + manager + terminal_* 工具(Windows 优雅降级)
         todo.py                    # todo_write
@@ -223,7 +225,7 @@ AgentLab/
   docs/
     technical_architecture.md      # PRD 和总体技术方案
     process.md                     # 当前进展和接下来工作
-  tests/unit/                      # 343 个 unit tests
+  tests/unit/                      # 444 个 unit tests
 ```
 
 尚未出现但 PRD 已规划的目录/模块：`app/agent/learner.py`、`app/agent/subagents.py`、`app/workspace/knowledge.py`、`app/workspace/scheduler.py`、`app/control/`、`app/tui/`、`app/server.py`、`app/web/`。（Loop 核心 `goals.py` / `verifier.py` / `loop_runner.py` / `loop_store.py` / `app/workspace/worktree.py` 已落地，见 3.11。）
@@ -249,14 +251,16 @@ AgentLab/
 
 ### 6.2 多 Agent、Session 与长期记忆
 
-当前状态：核心功能已完成（见 3.4）。剩下的是非阻塞优化。
+当前状态：核心功能已完成（见 3.4）。**CLI prompt 显示 session_id·agent 名称** 和 **read_write 退出写摘要** 已实现（见下方）。
 
-接下来要做：
+已完成（本次提交）：
+- ✅ CLI prompt 动态显示 `[session_id·agent_name] ▸`（app/cli.py）
+- ✅ `read_write` 记忆策略的"会话结束写摘要"接入 CLI 退出钩子：`SessionRouter.close_all()` 调用 `mem_policy.save()`（app/agent/session_router.py）
+- ✅ `/session list` 显示每个会话的消息数（已完成，commit `948774f`）
 
-- CLI banner / prompt 提示符显示当前 session_id 和 agent 名称。
-- `read_write` 记忆策略的"会话结束写摘要"接入 CLI 退出钩子（store/policy 已实现，CLI 退出时尚未调用 `mem_policy.save`）。
-- `memories` 升级为向量检索（当前 LIKE 全文匹配，够 MVP）。
-- `/session list` 显示每个会话的消息数，方便辨认空会话。
+接下来要做（非阻塞优化）：
+
+- `memories` 升级为向量检索（当前 LIKE 全文匹配，够 MVP；需新增依赖或复用 Ollama embedding，待评估方案）。
 
 ### 6.3 模型层
 
@@ -273,16 +277,22 @@ AgentLab/
 
 ### 6.4 工具与审批
 
-当前状态：`Tool` 只有 `requires_approval` 布尔字段；内置工具齐全；MCP 工具走 auto_approve 白名单。
+当前状态：`Tool` 只有 `requires_approval` 布尔字段；内置工具齐全（含 `web_search`，见 3.2）；MCP 工具走 auto_approve 白名单。
 
 接下来要做：
 
-- 将 `Tool` 升级为 `ToolDescriptor`，补 `risk / target_type / scope / origin / host / requires_observation / audit_redactor`。
+- 将 `Tool` 升级为 `ToolDescriptor`，补 `risk / target_type / scope / origin / host / requires_observation / audit_redactor`。`web_search` 属 `network` 只读风险，应在此分级里明确标注。
 - 审批升级为分级策略：`read / observe / network / write / browser_control / desktop_control / remote_execute / execute / destructive`。
 - 支持会话级授权（绑定 tool/origin/host/workspace）；删除、支付、发布、上传等动作不能被普通授权绕过。
 - 内置工具、MCP 工具、浏览器动作、远程动作统一进入审计摘要。
 
 验收标准：同一审批策略可同时判断 `write_file`、`shell`、`browser_click`、MCP tool 和 remote command。
+
+**web_search 相关增强（非阻塞）**：
+
+- `web_search` 目前只返回搜索结果摘要（标题/URL/摘要），不抓完整正文。需要读网页全文（如知乎/博客文章）时得靠 Playwright 浏览器工具（`browser_navigate` + `browser_snapshot`）。可考虑新增独立的 `web_fetch` 工具：给定 URL 抓正文并转 Markdown（requests + readability/trafilatura），比浏览器 DOM 点击更轻量、更适合"读一篇文章"的场景。
+- `duckduckgo-search` 库偶发限流/验证码，当前已有 HTML fallback；后续可补 Bing/Google（需 API key）作为可选后端，用 profile 或 env 选择。
+- 把搜索查询与结果 URL 纳入 `tool_executions` 审计（当前只脱敏不落审计）。
 
 ### 6.5 MCP
 

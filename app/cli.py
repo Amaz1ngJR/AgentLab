@@ -1141,7 +1141,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
         # 用 partial 把 panel_state 绑定到 _print_run_event,供 on_run_event 用
         from functools import partial
         print_run_event_with_state = partial(_print_run_event, panel_state=panel_state)
-        return AgentSession(
+        sess = AgentSession(
             llm=llm,
             tools=reg,
             approval=AutoApprove() if auto_approve else InteractivePolicy(),
@@ -1163,6 +1163,11 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
             on_run_event=print_run_event_with_state,
             context_manager=ctx_manager,
         )
+        # 附加 agent_profile 供 CLI prompt 显示用(非 AgentSession 核心属性)
+        sess.agent_profile = agent_profile
+        # 附加 mem_policy 供退出时写摘要(§6.2,read_write 策略会话结束写入)
+        sess.mem_policy = mem_policy
+        return sess
 
     router = SessionRouter(
         storage=storage,
@@ -1590,10 +1595,20 @@ def _repl(router: SessionRouter) -> int:
         completer=_SlashCompleter(router),
         complete_while_typing=True,   # 边打边弹,不用按 Tab
     )
-    prompt_fragments = FormattedText([("class:prompt", "▸ ")])
 
     while True:
         _print_input_separator()
+        # 动态构建 prompt:显示 [session_id·agent_name]
+        if router.current_id and router.current:
+            sess = router.current
+            # 从 session 里拿 agent_profile (如果有的话)
+            agent_name = getattr(sess, "agent_profile", None)
+            agent_name = agent_name.name if agent_name else "?"
+            prompt_text = f"[{router.current_id[:6]}·{agent_name}] ▸ "
+        else:
+            prompt_text = "▸ "
+        prompt_fragments = FormattedText([("class:prompt", prompt_text)])
+
         try:
             line = pt_session.prompt(prompt_fragments, style=_PROMPT_STYLE).strip()
         except KeyboardInterrupt:
