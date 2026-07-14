@@ -1,4 +1,4 @@
-"""测试 CLI session 增强功能：prompt 显示 + 退出写摘要 (§6.2)。"""
+"""测试 CLI session 增强功能：prompt 显示标题 + 退出写摘要 (§6.2)。"""
 from __future__ import annotations
 
 from pathlib import Path

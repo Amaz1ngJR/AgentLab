@@ -1598,13 +1598,16 @@ def _repl(router: SessionRouter) -> int:
 
     while True:
         _print_input_separator()
-        # 动态构建 prompt:显示 [session_id·agent_name]
+        # 动态构建 prompt:显示 [session_id·标题]
         if router.current_id and router.current:
-            sess = router.current
-            # 从 session 里拿 agent_profile (如果有的话)
-            agent_name = getattr(sess, "agent_profile", None)
-            agent_name = agent_name.name if agent_name else "?"
-            prompt_text = f"[{router.current_id[:6]}·{agent_name}] ▸ "
+            sess_id = router.current_id
+            # 从 storage 获取 session 标题
+            sess_row = storage.get_session(sess_id)
+            title = sess_row["title"] if sess_row else "?"
+            # 标题可能很长，截断到合理长度
+            if len(title) > 30:
+                title = title[:27] + "..."
+            prompt_text = f"[{sess_id[:6]}·{title}] ▸ "
         else:
             prompt_text = "▸ "
         prompt_fragments = FormattedText([("class:prompt", prompt_text)])
