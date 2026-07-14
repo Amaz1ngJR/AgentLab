@@ -63,13 +63,62 @@ def _truncate_tool_output(output: str, max_chars: int = TOOL_OUTPUT_MAX_CHARS) -
         f"{tail}"
     )
 
+
+def _looks_like_action_task(task_content: str) -> bool:
+    """判断任务描述是否明显需要工具操作（而不是纯思考/总结）。
+
+    用于空转检测：如果任务看起来需要工具但模型没调用，给予提示。
+    """
+    content_lower = task_content.lower()
+    # 包含这些关键词的任务通常需要工具操作
+    action_keywords = [
+        "读", "read", "查看", "打开", "文件",
+        "写", "write", "修改", "编辑", "edit", "改",
+        "执行", "运行", "run", "shell", "命令",
+        "搜索", "search", "查找", "grep", "find",
+        "创建", "create", "新建", "删除", "delete",
+        "测试", "test", "验证", "check",
+    ]
+    # 包含这些关键词的任务通常是纯思考，不需要工具
+    thinking_keywords = [
+        "分析", "总结", "解释", "说明", "描述",
+        "思考", "判断", "评估", "建议",
+    ]
+    has_action = any(kw in content_lower for kw in action_keywords)
+    only_thinking = all(kw not in content_lower for kw in action_keywords) and \
+                    any(kw in content_lower for kw in thinking_keywords)
+    return has_action and not only_thinking
+
+
+def _looks_like_completion_message(text: str) -> bool:
+    """判断模型输出是否像"任务已完成/无需操作"的消息。
+
+    用于空转检测的例外：有些任务检查后发现不需要操作，模型直接说明即可。
+    """
+    if not text:
+        return False
+    text_lower = text.lower()
+    completion_patterns = [
+        "已完成", "完成", "done", "finished", "completed",
+        "无需", "不需要", "no need", "not needed", "unnecessary",
+        "已经", "already",
+        "成功", "successfully", "success",
+    ]
+    return any(pattern in text_lower for pattern in completion_patterns)
+
 # progress 工厂签名:接收 label,返回一个上下文管理器(可带 .update / .on_text)
 ProgressFn = Callable[[str], ContextManager[Any]]
 
 # 注入到 messages 的任务指令模板:告诉模型"现在只聚焦这一个子任务"
 _TASK_DIRECTIVE = (
-    "【当前子任务】{content}\n"
-    "请只聚焦完成这一个子任务。完成后用一句话说明结果即可,不要展开成最终总结。"
+    "【当前子任务】{content}\n\n"
+    "重要提示:\n"
+    "- 必须立即调用相关工具完成这个子任务，不要只描述计划或分析。\n"
+    "- 如果任务涉及文件操作，立即调用 read_file/write_file/edit_file。\n"
+    "- 如果任务涉及命令执行，立即调用 shell。\n"
+    "- 如果任务涉及代码搜索，立即调用 code_search。\n"
+    "- 完成后用一句话说明结果即可，不要展开成最终总结。\n"
+    "- 禁止只输出文字说明而不调用工具。"
 )
 
 
@@ -172,6 +221,27 @@ class Executor:
 
             # 没有工具调用 = 模型认为这个子任务已经做完
             if not resp.tool_calls:
+                # 空转检测：第一轮就没调用工具，且任务描述明显需要工具操作时，给予提示
+                # 但如果模型给出的文本说明了不需要操作（如"已完成"、"无需修改"等），则接受
+                if tool_calls_made == 0 and _looks_like_action_task(task.content) and \
+                   not _looks_like_completion_message(last_text):
+                    # 这是第一轮，任务看起来需要工具操作，模型只输出了文字且不像完成消息
+                    # 给模型一次纠正机会，明确提示必须调用工具
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "注意：你只输出了文字说明，但没有调用任何工具。\n"
+                            "请立即调用相关工具完成任务，而不是只描述要做什么。\n"
+                            "例如：\n"
+                            "- 需要读文件 → 调用 read_file\n"
+                            "- 需要写文件 → 调用 write_file 或 edit_file\n"
+                            "- 需要执行命令 → 调用 shell\n"
+                            "- 需要搜索代码 → 调用 code_search\n\n"
+                            "现在请立即调用工具完成任务。"
+                        )
+                    })
+                    continue  # 给模型一次重新响应的机会
+                # 否则认为任务确实完成了
                 return TaskOutcome(
                     status=COMPLETED,
                     evidence=last_text.strip(),
