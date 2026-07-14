@@ -10,3 +10,8 @@ mcp>=1.0
 duckduckgo-search>=6.0.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
+
+# Web fetch (optional, for web_fetch tool — 正文抽取，按优先级取任一即可)
+# trafilatura 效果最好；没装则回退 beautifulsoup4（已在上方）纯文本抽取
+trafilatura>=1.6.0
+markdownify>=0.11.0
