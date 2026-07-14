@@ -1601,8 +1601,8 @@ def _repl(router: SessionRouter) -> int:
         # 动态构建 prompt:显示 [session_id·标题]
         if router.current_id and router.current:
             sess_id = router.current_id
-            # 从 storage 获取 session 标题
-            sess_row = storage.get_session(sess_id)
+            # 从 router._storage 获取 session 标题
+            sess_row = router._storage.get_session(sess_id)
             title = sess_row["title"] if sess_row else "?"
             # 标题可能很长，截断到合理长度
             if len(title) > 30:
