@@ -48,6 +48,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `read_file / write_file / list_dir`（受 `WORKSPACE_ROOT` 限制）、`shell`（跨平台、cwd 锁定 workspace）、`todo_write`（CLI 任务面板 `✓/❯/○`）。
 - `code_search`（`app/tools/builtin/code_search.py`）：text/regex/file/symbol 四种模式，优先 `rg --json`，无 rg 时 Python fallback；遵守 `.gitignore`、命中行密钥脱敏。
 - `web_search`（`app/tools/builtin/web_search.py`）：互联网搜索工具，返回结构化结果（标题/URL/摘要）。优先用 `duckduckgo_search` 库，失败时退化为 requests + BeautifulSoup 解析 DuckDuckGo HTML；结果脱敏、超时保护、输出 32KB 硬截断；只读免审批；依赖（`duckduckgo-search` / `requests` / `beautifulsoup4`）未安装时优雅降级返回安装提示。完全跨平台（无路径操作/subprocess/POSIX 特定功能）。22 个单元测试（16 passed + 6 skipped，跳过项为可选依赖未装）。
+- `web_fetch`（`app/tools/builtin/web_fetch.py`）：给定 URL 抓取网页正文并转 Markdown。HTTP GET 抓 HTML → 正文抽取（trafilatura 最优 → readability → BeautifulSoup 兜底）→ Markdown 转换；只允许 http/https（SSRF 基本防护，拒绝 file://）；响应体 5MB 上限 + 正文 20K 字符截断；只读免审批；依赖未装时优雅降级（BeautifulSoup 纯文本兜底）。22 个单元测试全通过。补足 web_search「只给摘要」的缺口，解决「读知乎文章失败」类问题。
 - 交互式终端会话（`app/tools/builtin/interactive.py`）：`PtySession` 在伪终端里起子进程，`read-until-idle` 通用驱动（不依赖提示符/哨兵）；`terminal_open / terminal_send / terminal_close / terminal_list` 四个工具按会话注入；用于远程登录（`zsh -ic 'vsm <device>'`、ssh）、REPL、交互式安装器等 `shell` 搞不定的有状态会话。子进程随 AgentSession 关闭而清理。
 
 ### 3.3 MCP Client 层（stdio）+ Playwright 浏览器控制
@@ -84,7 +85,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **444 个 unit tests**（其中 6 个在可选依赖未装时 skip，全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager）、code_search、web_search（参数校验/后端选择/错误处理/输出限制/集成）、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage（含 tasks/runs/context_summaries 持久化）、memory、session_router（含任务快照恢复 + CLI session 增强：prompt 显示 / 退出写摘要）、CLI 斜杠补全、Skill loader/catalog、Loop Engineering（GoalSpec 校验 / Verifier command+file / WorktreeManager）。
+- **466 个 unit tests**（其中 6 个在可选依赖未装时 skip，全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager）、code_search、web_search（参数校验/后端选择/错误处理/输出限制/集成）、web_fetch（URL 校验/SSRF 防护/正文抽取/截断/脱敏/优雅降级）、shell、交互式终端会话、审批、menu、spinner、workspace path、redact、AgentProfile、storage（含 tasks/runs/context_summaries 持久化）、memory、session_router（含任务快照恢复 + CLI session 增强：prompt 显示 / 退出写摘要）、CLI 斜杠补全、Skill loader/catalog、Loop Engineering（GoalSpec 校验 / Verifier command+file / WorktreeManager）。
 
 ### 3.8 Planner / Executor / Replanner 编排与结构化 RunEvent
 
@@ -143,14 +144,14 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |
 | 任务面板 / TaskStore | 任务状态唯一源:依赖/claim/blocked/failed/evidence/history/snapshot/restore;`todo_write` 走简单三态;CLI 面板渲染(含 blocked/failed 字形) | `app/agent/tasks.py`, `app/tools/builtin/todo.py` |
 | 审批 | 自动 / 交互（方向键）/ 拒绝；仍是 `requires_approval` 布尔模型 | `app/agent/approval.py`, `app/util/menu.py` |
-| 内置工具 | `read_file / write_file / edit_file / list_dir / code_search / web_search / shell / todo_write`；`terminal_*` 交互式终端会话 | `app/tools/builtin/` |
+| 内置工具 | `read_file / write_file / edit_file / list_dir / code_search / web_search / web_fetch / shell / todo_write`；`terminal_*` 交互式终端会话 | `app/tools/builtin/` |
 | MCP | stdio Manager、工具发现、sync/async 桥、同名不覆盖、auto_approve 白名单 | `app/mcp/` |
 | 浏览器控制 | Playwright MCP：打开/snapshot/点击/输入；named profile；数据边界提示 | `config/mcp_servers.example.yaml`, `app/cli.py` |
 | 存储 | SQLite：sessions/messages/memories/tool_executions/runs/tasks；settings 表与 Web 复用待做 | `app/storage/` |
 | 安全基础 | workspace 越界拒绝、脱敏、MCP env allowlist、敏感目录不入库 | `app/util/redact.py`, `.gitignore` |
 | 取消 | Ctrl-C 协作式取消(CancelToken):首次置位、当前步骤后停止,连按强制中断 | `app/agent/cancel.py`, `app/cli.py` |
 | 上下文压缩 | ContextBudget + ContextCompressor + 结构化摘要;编排稳定点超 85% 自动压缩、可审计;`/context` 命令族 | `app/agent/context.py`, `context_budget.py`, `context_compaction.py` |
-| 测试 | 444 个 unit tests（web_search 的 6 个在可选依赖未装时自动 skip） | `tests/unit/` |
+| 测试 | 466 个 unit tests（web_search 的 6 个在可选依赖未装时自动 skip） | `tests/unit/` |
 
 ---
 
@@ -256,10 +257,10 @@ AgentLab/
 
 ### 6.2 多 Agent、Session 与长期记忆
 
-当前状态：核心功能已完成（见 3.4）。**CLI prompt 显示 session_id·agent 名称** 和 **read_write 退出写摘要** 已实现（见下方）。
+当前状态：核心功能已完成（见 3.4）。**CLI prompt 显示 session_id·标题** 和 **read_write 退出写摘要** 已实现（见下方）。
 
 已完成（本次提交）：
-- ✅ CLI prompt 动态显示 `[session_id·agent_name] ▸`（app/cli.py）
+- ✅ CLI prompt 动态显示 `[session_id·标题] ▸`（app/cli.py，从 storage 读取 session title，标题超过 30 字符时截断）
 - ✅ `read_write` 记忆策略的"会话结束写摘要"接入 CLI 退出钩子：`SessionRouter.close_all()` 调用 `mem_policy.save()`（app/agent/session_router.py）
 - ✅ `/session list` 显示每个会话的消息数（已完成，commit `948774f`）
 
@@ -282,7 +283,15 @@ AgentLab/
 
 ### 6.4 工具与审批
 
-当前状态：`Tool` 只有 `requires_approval` 布尔字段；内置工具齐全（含 `web_search`，见 3.2）；MCP 工具走 auto_approve 白名单。
+当前状态：`Tool` 只有 `requires_approval` 布尔字段；内置工具齐全（含 `web_search` 和 `web_fetch`，见 3.2）；MCP 工具走 auto_approve 白名单。
+
+**web_fetch 已实现**（commit 即将提交）：
+- 给定 URL 抓取网页正文并转 Markdown（requests + trafilatura/readability/BeautifulSoup）
+- 比浏览器 DOM 点击更轻量，适合「读一篇文章」场景
+- SSRF 基本防护（只允许 http/https）、5MB 响应上限、20K 字符截断
+- 依赖未装时优雅降级（BeautifulSoup 纯文本兜底）
+- 22 个单元测试全通过
+- 解决「读知乎文章失败」等 web_search 只给摘要的缺口
 
 接下来要做：
 
@@ -295,7 +304,6 @@ AgentLab/
 
 **web_search 相关增强（非阻塞）**：
 
-- `web_search` 目前只返回搜索结果摘要（标题/URL/摘要），不抓完整正文。需要读网页全文（如知乎/博客文章）时得靠 Playwright 浏览器工具（`browser_navigate` + `browser_snapshot`）。可考虑新增独立的 `web_fetch` 工具：给定 URL 抓正文并转 Markdown（requests + readability/trafilatura），比浏览器 DOM 点击更轻量、更适合"读一篇文章"的场景。
 - `duckduckgo-search` 库偶发限流/验证码，当前已有 HTML fallback；后续可补 Bing/Google（需 API key）作为可选后端，用 profile 或 env 选择。
 - 把搜索查询与结果 URL 纳入 `tool_executions` 审计（当前只脱敏不落审计）。
 
