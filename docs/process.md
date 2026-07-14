@@ -240,6 +240,11 @@ AgentLab/
 
 当前状态：编排核心(见 3.8)与 CLI 接入 + 任务持久化(见 3.9)均已完成，对应 PRD 的 **Task 模式**。CLI 默认 `AgentSession(orchestrate=True)`,一轮对话走 规划→按依赖执行→失败重规划;`RunEvent` 经 `_print_run_event` 渲染到 spinner、任务面板(含 blocked/failed 字形)与工具行;Ctrl-C 触发 `CancelToken` 协作式取消;TaskStore 快照落 SQLite `runs/tasks`,`/session switch` 与重启后可恢复任务状态。PRD 新增的 **Loop 模式**（GoalSpec/LoopRunner/Verifier/Learner）在此之上，单列 6.14。
 
+**「只说不做」问题已修复**（commit `2caddfa`）：
+- 强化 Planner system prompt：明确要求只输出 JSON，任务 content 必须包含具体工具调用，避免「确认」「检查」等空泛任务
+- 强化 Executor 任务指令：明确要求「必须立即调用工具」，列举具体场景，禁止只输出文字
+- 新增空转检测：第一轮不调用工具时给模型纠正提示，智能识别合法完成消息（「已完成」「无需操作」）避免误伤
+
 接下来要做(均为非阻塞增强):
 
 - `approval_required` 目前靠 Executor 内同步调 `ApprovalPolicy`(方向键菜单已生效);后续可把审批也做成异步 RunEvent,便于 Web UI/TUI 统一弹窗。
