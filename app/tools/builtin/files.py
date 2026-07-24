@@ -6,7 +6,7 @@
 
 安全说明:
   - 路径会被 expanduser + resolve 展开成绝对路径,支持 ~ 写法
-  - 所有操作都被限制在 workspace_root() 返回的目录内,越界请求会被拒绝
+  - workspace 内只读操作免审批;路径越界时必须通过独立的 outside_workspace 审批
   - read_file 单次最多读 200KB,防止把超大文件全塞进模型上下文
   - write_file / edit_file 标记了 requires_approval=True,执行前会弹出人工确认;
     CLI 在确认前会展示彩色 diff。改文件优先用 edit_file(局部替换)而非 shell。
@@ -16,32 +16,69 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.config.loader import workspace_root
-from app.tools.registry import Tool
+from app.tools.registry import Tool, is_approval_granted
 
 # 单次读取上限:200KB。超出部分截断并附提示,避免撑爆模型上下文窗口。
 MAX_READ_BYTES = 200_000
 
 
 class WorkspacePathError(Exception):
-    """路径越出 workspace 范围。被工具捕获,转成给模型的错误字符串。"""
+    """路径越出 workspace 且没有对应审批。"""
 
 
-def _resolve_within_workspace(path_str: str) -> Path:
-    """把路径展开成绝对路径,并校验是否在 workspace 之下。
-
-    越界时抛 WorkspacePathError;调用方捕获后返回错误字符串给模型。
-    """
+def _resolve_path(path_str: str) -> Path:
+    """相对路径基于 workspace 展开，绝对路径保持其原始目标。"""
     root = workspace_root()
     raw = Path(path_str).expanduser()
-    # 相对路径必须基于 workspace 解析。Loop 模式只通过 ContextVar 切换
-    # workspace_root,不会修改进程 CWD;若直接 Path.resolve(),会错误地落到主工作区。
-    target = (raw if raw.is_absolute() else root / raw).resolve()
+    return (raw if raw.is_absolute() else root / raw).resolve()
+
+
+def _is_outside_workspace(target: Path) -> bool:
+    root = workspace_root()
     try:
         target.relative_to(root)
+        return False
     except ValueError:
+        return True
+
+
+def _outside_workspace_approval(
+    tool_name: str,
+    args: dict,
+    *,
+    path_key: str = "path",
+    default: str = ".",
+) -> str | None:
+    """路径越界时返回独立审批动作名，供 Tool 动态判定。"""
+    raw = args.get(path_key, default)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        target = _resolve_path(raw)
+    except (OSError, RuntimeError):
+        return None
+    if _is_outside_workspace(target):
+        return f"{tool_name}_outside_workspace"
+    return None
+
+
+def _resolve_within_workspace(
+    path_str: str,
+    outside_approval: str | None = None,
+) -> Path:
+    """解析路径；越界时要求 ToolRegistry 授予对应审批动作。
+
+    保留原函数名以兼容 CLI diff 和既有调用。未传 outside_approval 的调用仍是
+    严格 workspace 解析，适合审批前预览等不应读取外部文件的场景。
+    """
+    root = workspace_root()
+    target = _resolve_path(path_str)
+    if _is_outside_workspace(target):
+        if outside_approval and is_approval_granted(outside_approval):
+            return target
         raise WorkspacePathError(
             f"path '{target}' is outside workspace '{root}'. "
-            f"set WORKSPACE_ROOT in .env if you need to access this path."
+            f"approval '{outside_approval or 'outside_workspace'}' is required."
         )
     return target
 
@@ -49,7 +86,10 @@ def _resolve_within_workspace(path_str: str) -> Path:
 def _read_file(args: dict) -> str:
     """读取文本文件内容。超过 200KB 时截断并附说明。"""
     try:
-        path = _resolve_within_workspace(args["path"])
+        path = _resolve_within_workspace(
+            args["path"],
+            "read_file_outside_workspace",
+        )
     except WorkspacePathError as exc:
         return f"refused: {exc}"
     if not path.exists():
@@ -67,7 +107,10 @@ def _read_file(args: dict) -> str:
 def _write_file(args: dict) -> str:
     """把内容写入文件。父目录不存在时自动创建。已有文件会被覆盖。"""
     try:
-        path = _resolve_within_workspace(args["path"])
+        path = _resolve_within_workspace(
+            args["path"],
+            "write_file_outside_workspace",
+        )
     except WorkspacePathError as exc:
         return f"refused: {exc}"
     content = args.get("content", "")
@@ -93,7 +136,10 @@ def _edit_file(args: dict) -> str:
       - 文件不存在时报错(新建请用 write_file)。
     """
     try:
-        path = _resolve_within_workspace(args["path"])
+        path = _resolve_within_workspace(
+            args["path"],
+            "edit_file_outside_workspace",
+        )
     except WorkspacePathError as exc:
         return f"refused: {exc}"
     if not path.exists():
@@ -129,7 +175,10 @@ def _edit_file(args: dict) -> str:
 def _list_dir(args: dict) -> str:
     """列出目录下的所有条目。目录名末尾带 / 以便区分文件和目录。"""
     try:
-        path = _resolve_within_workspace(args.get("path", "."))
+        path = _resolve_within_workspace(
+            args.get("path", "."),
+            "list_dir_outside_workspace",
+        )
     except WorkspacePathError as exc:
         return f"refused: {exc}"
     if not path.exists():
@@ -152,7 +201,7 @@ def _list_dir(args: dict) -> str:
 READ_FILE = Tool(
     name="read_file",
     description="读取本地文本文件的内容。返回 UTF-8 文本,超过 200KB 会截断。"
-                "路径必须在 workspace 内,否则会被拒绝。",
+                "workspace 内免审批,读取外部路径前必须获得用户审批。",
     input_schema={
         "type": "object",
         "properties": {
@@ -162,12 +211,13 @@ READ_FILE = Tool(
     },
     executor=_read_file,
     requires_approval=False,  # 只读,不需要确认
+    approval_resolver=lambda args: _outside_workspace_approval("read_file", args),
 )
 
 WRITE_FILE = Tool(
     name="write_file",
     description="把内容写入本地文件。会覆盖已有文件,会自动创建父目录。"
-                "路径必须在 workspace 内,否则会被拒绝。",
+                "写入始终审批;外部路径使用独立的越界审批。",
     input_schema={
         "type": "object",
         "properties": {
@@ -178,12 +228,13 @@ WRITE_FILE = Tool(
     },
     executor=_write_file,
     requires_approval=True,   # 写操作,执行前弹出 y/a/n 确认
+    approval_resolver=lambda args: _outside_workspace_approval("write_file", args),
 )
 
 LIST_DIR = Tool(
     name="list_dir",
     description="列出目录下的所有条目,目录名带 / 后缀。不传 path 时列当前目录。"
-                "路径必须在 workspace 内,否则会被拒绝。",
+                "workspace 内免审批,列出外部目录前必须获得用户审批。",
     input_schema={
         "type": "object",
         "properties": {
@@ -193,6 +244,10 @@ LIST_DIR = Tool(
     },
     executor=_list_dir,
     requires_approval=False,  # 只读,不需要确认
+    approval_resolver=lambda args: _outside_workspace_approval(
+        "list_dir",
+        args,
+    ),
 )
 
 EDIT_FILE = Tool(
@@ -201,7 +256,7 @@ EDIT_FILE = Tool(
                 "优先用它(而不是 write_file 覆盖整文件,更不要用 shell 改文件)。"
                 "规则:old_str 必须在文件里唯一出现;old_str 传空串表示在末尾追加"
                 "new_str;new_str 传空串表示删除 old_str 这段。文件不存在时请改用"
-                "write_file。路径必须在 workspace 内。",
+                "write_file。编辑始终审批;外部路径使用独立的越界审批。",
     input_schema={
         "type": "object",
         "properties": {
@@ -216,6 +271,7 @@ EDIT_FILE = Tool(
     },
     executor=_edit_file,
     requires_approval=True,   # 写操作,执行前弹确认(审批前会显示 diff)
+    approval_resolver=lambda args: _outside_workspace_approval("edit_file", args),
 )
 
 

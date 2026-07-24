@@ -41,12 +41,12 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - 模型层：Anthropic Messages、OpenAI Responses、OpenAI-compatible 三种 adapter；内部协议统一 `ModelResponse / ToolCall / ToolResult`；OpenAI-compatible 具备 JSON tool call fallback；实际模型 ID 规范化 + 代理静默映射提示。
 - Runtime：同步多轮"模型 → 工具 → 模型"循环；工具审批、工具错误回灌、流式文本回调、`max_steps` 限制。
 - 审批：`AutoApprove / InteractivePolicy(方向键菜单) / DenyAll`。
-- 安全基础：workspace 越界拒绝、错误/工具输出脱敏（`redact`）、MCP env allowlist。
+- 安全基础：workspace 内按风险执行、越界使用不可持久化的独立审批动作、错误/工具输出脱敏（`redact`）、MCP env allowlist。
 
 ### 3.2 内置工具
 
-- `read_file / write_file / list_dir`（受 `WORKSPACE_ROOT` 限制）、`shell`（跨平台、cwd 锁定 workspace）、`todo_write`（CLI 任务面板 `✓/❯/○`）。
-- `code_search`（`app/tools/builtin/code_search.py`）：text/regex/file/symbol 四种模式，优先 `rg --json`，无 rg 时 Python fallback；遵守 `.gitignore`、命中行密钥脱敏。
+- `read_file / write_file / list_dir`：workspace 是默认信任边界；workspace 内只读免审批，写入按原风险审批，越界改用独立且不可记忆的审批动作。`shell` 默认 cwd 为 workspace、每次审批，指定外部 cwd 时使用独立越界审批。`todo_write` 提供 CLI 任务面板 `✓/❯/○`。
+- `code_search`（`app/tools/builtin/code_search.py`）：text/regex/file/symbol 四种模式，优先 `rg --json`，无 rg 时 Python fallback；遵守 `.gitignore`、命中行密钥脱敏；workspace 内只读免审批，外部搜索逐次审批。
 - `web_search`（`app/tools/builtin/web_search.py`）：互联网搜索工具，返回结构化结果（标题/URL/摘要）。优先用 `duckduckgo_search` 库，失败时退化为 requests + BeautifulSoup 解析 DuckDuckGo HTML；结果脱敏、超时保护、输出 32KB 硬截断；只读免审批；依赖（`duckduckgo-search` / `requests` / `beautifulsoup4`）未安装时优雅降级返回安装提示。完全跨平台（无路径操作/subprocess/POSIX 特定功能）。22 个单元测试（16 passed + 6 skipped，跳过项为可选依赖未装）。
 - `web_fetch`（`app/tools/builtin/web_fetch.py`）：给定 URL 抓取网页正文并转 Markdown。HTTP GET 抓 HTML → 正文抽取（trafilatura 最优 → readability → BeautifulSoup 兜底）→ Markdown 转换；只允许公网 http/https，拒绝 URL 凭据、本机/私网/链路本地/保留地址和解析到非公网 IP 的域名；关闭自动重定向并逐跳重新校验，阻断重定向 SSRF；响应体 5MB 上限 + 正文 20K 字符截断；只读免审批；依赖未装时优雅降级。30 个单元测试全通过。
 - 交互式终端会话（`app/tools/builtin/interactive.py`）：`PtySession` 在伪终端里起子进程，`read-until-idle` 通用驱动（不依赖提示符/哨兵）；`terminal_open / terminal_send / terminal_close / terminal_list` 四个工具按会话注入；用于远程登录（`zsh -ic 'vsm <device>'`、ssh）、REPL、交互式安装器等 `shell` 搞不定的有状态会话。子进程随 AgentSession 关闭而清理。
@@ -80,6 +80,9 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 - `config/models.yaml`（模型 profile 注册表）+ `config/agents.example.yaml`（多 Agent 模板）+ `config/mcp_servers.example.yaml`（MCP 模板）。
 - 约定：`*.example.yaml` 入库作模板，去掉 `.example` 的真实配置 gitignore 不入库；`data/agentlab.db`、`data/browser-profiles/`、`.playwright-mcp/` 均不入库。
+- `pyproject.toml` 提供可编辑安装和 `agentlab` console script；CLI
+  `-w / --workspace` 支持从任意目录选择 Agent 工具边界，显式参数优先于
+  `WORKSPACE_ROOT`，`python -m app` 开发入口保持兼容。
 
 ### 3.6 Skill Loader
 
@@ -91,7 +94,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **488 个 unit tests**（其中 6 个在可选依赖未装时 skip，全离线），覆盖：runtime（含编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager，含 Windows `npx.cmd`、最小运行环境和 cwd）、code_search、web_search、web_fetch（公网地址校验、DNS/重定向 SSRF、正文抽取、截断、脱敏）、shell、交互式终端会话、审批、workspace path、存储、记忆、session_router、CLI、Skill loader/catalog、Loop Engineering（真实多轮编排、Verifier 审批、worktree 相对路径/未跟踪文件/审批提交与合并边界、执行异常终止）。
+- **499 个 unit tests**（其中 6 个在可选依赖未装时 skip，全离线），覆盖：runtime（含动态审批、编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager，含 Windows `npx.cmd`、最小运行环境和 cwd）、CLI 全局入口与 workspace 参数、code_search（含外部目录审批）、web_search、web_fetch（公网地址校验、DNS/重定向 SSRF、正文抽取、截断、脱敏）、shell（含外部 cwd 审批）、交互式终端会话、审批、workspace path、存储、记忆、session_router、Skill loader/catalog、Loop Engineering（真实多轮编排、Verifier 审批、worktree 相对路径/未跟踪文件/审批提交与合并边界、执行异常终止）。
 - `.github/workflows/mcp-cross-platform.yml` 在 Windows、Linux、macOS
   runner 安装 Node.js 后真实验证 `npx` 解析，并运行 MCP 专项测试。
 
@@ -151,12 +154,12 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 长期记忆 | none/read/read_write 三策略 + 注入；LIKE 检索（未做向量） | `app/memory/` |
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |
 | 任务面板 / TaskStore | 任务状态唯一源:依赖/claim/blocked/failed/evidence/history/snapshot/restore;`todo_write` 走简单三态;CLI 面板渲染(含 blocked/failed 字形) | `app/agent/tasks.py`, `app/tools/builtin/todo.py` |
-| 审批 | 自动 / 交互（方向键）/ 拒绝；仍是 `requires_approval` 布尔模型 | `app/agent/approval.py`, `app/util/menu.py` |
+| 审批 | 自动 / 交互（方向键）/ 拒绝；`requires_approval` + `approval_resolver` 支持按参数动态审批，workspace 越界动作不可持久化授权 | `app/agent/approval.py`, `app/tools/registry.py`, `app/util/menu.py` |
 | 内置工具 | `read_file / write_file / edit_file / list_dir / code_search / web_search / web_fetch / shell / todo_write`；`terminal_*` 交互式终端会话 | `app/tools/builtin/` |
 | MCP | stdio Manager、工具发现、sync/async 桥、同名不覆盖、auto_approve 白名单 | `app/mcp/` |
 | 浏览器控制 | Playwright MCP：打开/snapshot/点击/输入；named profile；数据边界提示 | `config/mcp_servers.example.yaml`, `app/cli.py` |
 | 存储 | SQLite：sessions/messages/memories/tool_executions/runs/tasks；settings 表与 Web 复用待做 | `app/storage/` |
-| 安全基础 | workspace 越界拒绝、脱敏、MCP env allowlist、敏感目录不入库 | `app/util/redact.py`, `.gitignore` |
+| 安全基础 | workspace 默认信任边界、越界强审批、审批上下文防模型伪造、脱敏、MCP env allowlist、敏感目录不入库 | `app/tools/registry.py`, `app/util/redact.py`, `.gitignore` |
 | 取消 | Ctrl-C 协作式取消(CancelToken):首次置位、当前步骤后停止,连按强制中断 | `app/agent/cancel.py`, `app/cli.py` |
 | 上下文压缩 | ContextBudget + ContextCompressor + 结构化摘要;编排稳定点超 85% 自动压缩、可审计;`/context` 命令族 | `app/agent/context.py`, `context_budget.py`, `context_compaction.py` |
 | 测试 | 483 个 unit tests（web_search 的 6 个在可选依赖未装时自动 skip） | `tests/unit/` |
@@ -200,7 +203,7 @@ AgentLab/
     workspace/                     # [Loop] 工作区隔离与项目知识
       worktree.py                  # WorktreeManager:git worktree 创建/diff/dirty/删除/合并建议
     tools/
-      registry.py                  # Tool 注册表（仍是 requires_approval 布尔模型）
+      registry.py                  # Tool 注册表：静态 requires_approval + 参数级 approval_resolver
       builtin/
         files.py                   # read_file / write_file / list_dir
         code_search.py             # 高频代码搜索
@@ -291,7 +294,11 @@ AgentLab/
 
 ### 6.4 工具与审批
 
-当前状态：`Tool` 只有 `requires_approval` 布尔字段；内置工具齐全（含 `web_search` 和 `web_fetch`，见 3.2）；MCP 工具走 auto_approve 白名单。
+当前状态：`Tool` 支持静态 `requires_approval` 和参数级
+`approval_resolver`；文件、代码搜索与 Shell cwd 已按 workspace 是否越界动态
+选择审批动作，越界动作不可持久化授权。内置工具齐全（含 `web_search` 和
+`web_fetch`，见 3.2）；MCP 工具走 auto_approve 白名单。尚缺完整风险元数据和
+统一审计。
 
 **web_fetch 已实现**：
 - 给定 URL 抓取网页正文并转 Markdown（requests + trafilatura/readability/BeautifulSoup）
@@ -397,7 +404,7 @@ AgentLab/
 
 ### 6.11 安全、可观测性与测试
 
-当前状态：已有 workspace 限制、脱敏、MCP env allowlist、审批基础；测试以 unit 为主，集成测试目录存在但未成主路径。
+当前状态：已有 workspace 默认边界与越界动态审批、脱敏、MCP env allowlist、审批基础；测试以 unit 为主，集成测试目录存在但未成主路径。
 
 接下来要做：
 
@@ -482,20 +489,26 @@ PRD 模式分层（§7.6.1）：Prompt 模式（单轮）→ Task 模式（Plann
 ```bash
 conda activate agentlab
 
-# 收集测试。当前 488 个 unit tests。
+# 首次安装，注册可从任意目录调用的 agentlab 命令。
+python -m pip install -e .
+
+# 收集测试。当前 491 个 unit tests。
 python -m pytest tests/unit --collect-only -q
 
 # 运行全部 unit tests。
 python -m pytest tests/unit -q
 
-# 交互模式。
-python -m app
+# 从任意目录进入交互模式，当前目录作为 Agent workspace。
+agentlab --workspace .
 
 # 单次 prompt。
-python -m app --profile cloud_claude -p "list_dir 看下 config/ 目录"
+agentlab --workspace . --profile cloud_claude -p "list_dir 看下当前目录"
 
 # 本地模型。需要先启动 Ollama 并下载模型。
-python -m app --profile local_qwen -p "list_dir 看下当前目录"
+agentlab --workspace . --profile local_qwen -p "list_dir 看下当前目录"
+
+# 源码目录内仍可使用开发入口。
+python -m app
 ```
 
 多 Agent / 会话：
@@ -538,7 +551,7 @@ python -m app --profile cloud_claude -p "打开 https://example.com 并告诉我
 ## 9. 接手注意事项
 
 - 先读 PRD 的目标设计，再读本文件判断当前代码缺口。
-- 做实现优先保持现有模式：Python dataclass、pytest unit test、fake provider/fake manager、workspace 限制、脱敏。
+- 做实现优先保持现有模式：Python dataclass、pytest unit test、fake provider/fake manager、workspace 默认边界与越界审批、脱敏。
 - 查代码优先用 `rg` 或内置 `code_search`，不要让模型通过 shell 拼复杂 grep/find。
 - 修改 PRD 时只改目标设计；修改进度、完成情况、下一步计划时只改本文件，**完成项归到第 3 节而不是在下一步表里标记**。
 - 高风险能力的顺序应是：先结构化描述和审计，再接真实执行能力。

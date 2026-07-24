@@ -1,6 +1,7 @@
 """AgentLab CLI —— 程序入口和用户界面。
 
 用法:
+    agentlab --workspace .                     # 安装后从任意目录启动
     python -m app                              # 交互式对话
     python -m app -p "帮我看 README.md"        # 单次 prompt 后退出
     python -m app -y                           # 自动放行所有工具调用
@@ -22,6 +23,7 @@ import threading
 import time
 import unicodedata
 from contextlib import contextmanager
+from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
@@ -510,13 +512,12 @@ def _fmt(data: dict) -> str:
 
 
 def _resolve_ws_path(path_str: str):
-    """复用工具侧的 workspace 解析拿真实磁盘路径;失败退回 expanduser。"""
+    """审批前只解析 workspace 内路径，禁止预览阶段读取外部文件。"""
     try:
         from app.tools.builtin.files import _resolve_within_workspace
         return _resolve_within_workspace(path_str)
     except Exception:
-        from pathlib import Path
-        return Path(path_str).expanduser()
+        return None
 
 
 def _render_pre_approval_diff(path_str: str, old_content: str, new_content: str,
@@ -570,6 +571,8 @@ def _render_write_file(tool_input: dict) -> None:
         if not path_str:
             return
         path = _resolve_ws_path(path_str)
+        if path is None:
+            return
         is_new = not path.exists()
         old_content = "" if is_new else path.read_text(encoding="utf-8", errors="replace")
         _render_pre_approval_diff(path_str, old_content, new_content, is_new)
@@ -589,6 +592,8 @@ def _render_edit_file(tool_input: dict) -> None:
         if not path_str:
             return
         path = _resolve_ws_path(path_str)
+        if path is None:
+            return
         if not path.exists() or not path.is_file():
             return
         old_content = path.read_text(encoding="utf-8", errors="replace")
@@ -1695,12 +1700,33 @@ def _repl(router: SessionRouter) -> int:
         _print_stats(session)
 
 
+def _workspace_directory(value: str) -> Path:
+    """解析并校验 CLI workspace 参数。"""
+    try:
+        path = Path(value).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise argparse.ArgumentTypeError(f"workspace 不可访问: {exc}") from exc
+    if not path.is_dir():
+        raise argparse.ArgumentTypeError(f"workspace 不是目录: {path}")
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agentlab")
     parser.add_argument("-p", "--prompt", help="一次性 prompt，执行完即退出")
     parser.add_argument("-y", "--yes", action="store_true", help="自动放行所有工具调用")
     parser.add_argument("--profile", help="使用 config/models.yaml 中的指定 profile")
+    parser.add_argument(
+        "-w",
+        "--workspace",
+        type=_workspace_directory,
+        help="Agent 可操作的工作区目录；相对路径按当前终端目录解析",
+    )
     args = parser.parse_args(argv)
+
+    # 显式 CLI 参数优先于项目 .env。load_dotenv(override=False) 会保留该值。
+    if args.workspace is not None:
+        os.environ["WORKSPACE_ROOT"] = str(args.workspace)
 
     try:
         router = _build_session(auto_approve=args.yes, profile=args.profile)

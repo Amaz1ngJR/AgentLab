@@ -124,6 +124,28 @@ def _danger_tool() -> Tool:
     )
 
 
+class RecordingApproval:
+    def __init__(self, allowed: bool = True):
+        self.allowed = allowed
+        self.calls = []
+
+    def request(self, tool_name, tool_input):
+        self.calls.append((tool_name, tool_input))
+        return self.allowed
+
+
+def _dynamic_tool() -> Tool:
+    return Tool(
+        name="dynamic",
+        description="conditionally needs approval",
+        input_schema={"type": "object", "properties": {"outside": {"type": "boolean"}}},
+        executor=lambda args: "dynamic executed",
+        approval_resolver=lambda args: (
+            "dynamic_outside_workspace" if args.get("outside") else None
+        ),
+    )
+
+
 def _explode_tool() -> Tool:
     def boom(args):
         raise RuntimeError("intentional failure")
@@ -179,6 +201,27 @@ def test_approval_denied_skips_execution():
     last_msg = second_call[-1]
     # 拒绝消息被作为 tool_result 喂回模型
     assert last_msg["content"][0]["content"] == DENIED_MESSAGE
+
+
+def test_dynamic_approval_action_is_requested_and_granted():
+    router = FakeRouter([
+        _resp_tool("call_dynamic", "dynamic", {"outside": True}),
+        _resp_text("done"),
+    ])
+    approval = RecordingApproval()
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_dynamic_tool()),
+        approval=approval,
+    )
+
+    assert session.chat("use outside path") == "done"
+    assert approval.calls == [
+        ("dynamic_outside_workspace", {"outside": True}),
+    ]
+    tool_result = router.calls[1][-1]["content"][0]
+    assert tool_result["content"] == "dynamic executed"
+    assert tool_result["is_error"] is False
 
 
 def test_tool_execution_error_is_reported():

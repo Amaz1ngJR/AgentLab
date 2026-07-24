@@ -58,3 +58,33 @@ def test_interactive_header_includes_tool_context():
     assert any("/tmp/x.txt" in line for line in captured["header_lines"])
     # 三个选项,值分别是 yes / always / no
     assert [c[1] for c in captured["choices"]] == ["yes", "always", "no"]
+
+
+def test_outside_workspace_approval_cannot_be_remembered():
+    captured = {}
+
+    def fake_menu(choices, **_):
+        captured["choices"] = choices
+        return "yes"
+
+    with patch("app.util.menu.select_menu", side_effect=fake_menu):
+        assert InteractivePolicy().request(
+            "read_file_outside_workspace",
+            {"path": "/outside/file"},
+        )
+
+    assert [c[1] for c in captured["choices"]] == ["yes", "no"]
+
+
+def test_command_execution_approvals_cannot_be_remembered():
+    for action in ("shell", "terminal_open", "terminal_send"):
+        captured = {}
+
+        def fake_menu(choices, **_):
+            captured["choices"] = choices
+            return "yes"
+
+        with patch("app.util.menu.select_menu", side_effect=fake_menu):
+            assert InteractivePolicy().request(action, {"command": "pwd"})
+
+        assert [c[1] for c in captured["choices"]] == ["yes", "no"]

@@ -97,6 +97,17 @@ def _danger_tool() -> Tool:
     )
 
 
+def _dynamic_tool() -> Tool:
+    return Tool(
+        name="dynamic", description="conditional approval",
+        input_schema={"type": "object", "properties": {"outside": {"type": "boolean"}}},
+        executor=lambda a: "dynamic executed",
+        approval_resolver=lambda a: (
+            "dynamic_outside_workspace" if a.get("outside") else None
+        ),
+    )
+
+
 def _explode_tool() -> Tool:
     def boom(a):
         return None  # 不会被调用到(execute 捕获异常),这里用真实抛错版本
@@ -201,6 +212,27 @@ def test_executor_denied_marks_blocked():
     out = ex.run_task(Task("t1", "do danger"), [], system="", max_steps=4)
     assert out.status == BLOCKED
     assert "拒绝" in out.error
+
+
+def test_executor_dynamic_approval_denied_marks_blocked():
+    router = FakeRouter([
+        _resp_tool("c1", "dynamic", {"outside": True}),
+    ])
+    events_seen = []
+    ex = Executor(
+        router,
+        _registry(_dynamic_tool()),
+        approval=DenyAll(),
+        on_event=events_seen.append,
+    )
+
+    out = ex.run_task(Task("t1", "read outside"), [], system="", max_steps=4)
+
+    assert out.status == BLOCKED
+    approval_event = next(
+        event for event in events_seen if event.kind == events.APPROVAL_REQUIRED
+    )
+    assert approval_event.payload["approval_action"] == "dynamic_outside_workspace"
 
 
 def test_executor_step_budget_exhausted_fails():
@@ -499,4 +531,3 @@ def test_executor_tool_error_pairs_tool_use():
     out = ex.run_task(Task("t1", "炸+回显"), messages, system="", max_steps=4)
     assert out.status == FAILED
     _assert_tools_paired(messages)
-

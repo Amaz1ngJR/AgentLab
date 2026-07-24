@@ -5,10 +5,10 @@
 ## 功能
 
 - **对话**：多轮上下文对话；流式输出文本逐字展示，token 实时增长
-- **文件操作**：read_file / write_file / list_dir，受 `WORKSPACE_ROOT` 限制
+- **文件操作**：read_file / write_file / list_dir，workspace 内按风险执行，越界必须审批
 - **代码搜索**：`code_search` 支持 text / regex / file / symbol 四种模式，优先用 ripgrep，无 rg 时 Python fallback；遵守 `.gitignore`、命中行密钥脱敏
 - **Web 搜索**：`web_search` 在互联网上搜索信息，返回标题、链接和摘要；使用 DuckDuckGo（注重隐私，无需 API key）
-- **Shell 命令**：跨平台 shell 工具（Mac/Linux 用 bash，Windows 用 PowerShell），cwd 锁定 workspace
+- **Shell 命令**：跨平台 shell 工具（Mac/Linux 用 bash，Windows 用 PowerShell），默认 cwd 为 workspace，外部 cwd 需审批
 - **交互式终端**：`terminal_open` / `terminal_send` / `terminal_close` / `terminal_list` 维持 PTY 会话，适合远程登录、REPL、交互式安装器等需要持续对话的程序
 - **浏览器控制**：通过 Playwright MCP 打开网页、截图、读 DOM、点击、输入（默认禁用，需显式启用）
 - **多 Agent / 会话**：`/session` 命令族在一个进程里创建、切换、归档多个 Agent 会话；会话消息存 SQLite，可恢复
@@ -27,9 +27,12 @@
 ```bash
 conda create -n agentlab python=3.11   # 或自建 venv
 conda activate agentlab
-pip install -r requirements.txt
+pip install -e .
 cp .env.example .env
 ```
+
+`pip install -e .` 会安装依赖并注册全局 `agentlab` 命令；源码修改后无需重复安装。
+Windows PowerShell 使用 `Copy-Item .env.example .env` 复制环境变量模板。
 
 **可选依赖**（根据需要安装，跨平台通用）：
 
@@ -123,11 +126,20 @@ workspace: /Users/you/AgentLab
 ## 命令行参数
 
 ```bash
+agentlab --workspace .                 # 从任意目录启动，以当前目录为工作区
+agentlab -w /path/to/project           # 指定其他工作区
+agentlab -w . --profile local_qwen     # 指定工作区和模型 profile
+
 python -m app                          # 交互式 REPL
 python -m app -p "帮我看 README.md"    # 单次 prompt 后退出
 python -m app -y                       # 自动放行所有工具（跳过审批）
 python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 ```
+
+`agentlab` 可以在任意目录执行。模型、Agent、Skill 和 MCP 配置仍从 AgentLab
+源码目录加载；`--workspace` 是默认工作范围。工具可以请求访问其他目录，但
+每次越界都必须经过独立审批。
+`python -m app` 继续作为源码目录内的开发启动方式。
 
 ## REPL 内命令
 
@@ -226,7 +238,7 @@ ACTIVE_PROFILE=cloud_claude         # 必填,对应 config/models.yaml 中的 pr
 ANTHROPIC_AUTH_TOKEN=cr_xxxx
 ANTHROPIC_BASE_URL=https://your-proxy/api/
 
-# 限制 Agent 文件工具的访问范围(可选,默认项目根)
+# 设置 Agent 默认工作范围和免审批边界(可选,默认项目根)
 WORKSPACE_ROOT=/Users/you/some-project
 ```
 
@@ -254,8 +266,8 @@ WORKSPACE_ROOT=/Users/you/some-project
 
 ## 安全
 
-- **路径限制**：所有文件/搜索工具受 `WORKSPACE_ROOT` 约束，越界返回 `refused: ...` 给模型，不抛异常
-- **写操作审批**：`write_file` / `shell` / 浏览器点击输入等默认弹方向键菜单确认；`-y` 跳过
+- **路径审批**：workspace 是默认信任边界；文件读取、目录列举、代码搜索、写入和 Shell cwd 越界时使用独立审批，不能选择“本会话总是允许”；Shell 与交互式终端命令也必须逐次审批
+- **写操作审批**：`write_file` / `shell` / 浏览器点击输入等默认弹方向键菜单确认；`-y` 表示用户主动自动批准所有工具，包括 workspace 外访问
 - **凭据脱敏**：异常 traceback、工具输出、记忆写入前用正则脱敏 `Bearer xxx` / `sk-ant-xxx` / `cr_xxx` / `x-api-key=xxx` 等
 - **MCP 隔离**：新 MCP server 默认禁用；启用前 CLI 展示 server / transport / 工具列表；只透传 `PATH` 给子进程
 - **云端数据边界**：浏览器控制 + 云端模型时启动显著提示页面内容将离开本机
@@ -292,6 +304,7 @@ AgentLab/
 │   ├── local_model_guide.md       # 本地模型落地指南
 │   └── process.md                 # 开发进度与下一步计划
 ├── tests/unit/             # 离线单元测试
+├── pyproject.toml          # Python 打包配置和 agentlab 全局命令
 └── .env.example
 ```
 
@@ -299,6 +312,7 @@ AgentLab/
 
 ```bash
 conda activate agentlab
+pip install -e .
 python -m pytest tests/unit/ -v
 ```
 

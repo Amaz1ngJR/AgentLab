@@ -1536,6 +1536,10 @@ end
 | `destructive` | 删除、覆盖大量文件、修改系统设置 | 默认阻止，明确二次确认后才执行 |
 
 工具 registry 需要为内置工具和 MCP 工具使用同一套风险元数据。模型不能自行提升权限。
+workspace 是默认工作范围与信任边界，而不是绝对沙箱：workspace 内只读动作可
+自动允许；目标路径越界时必须切换为独立审批动作，批准后才执行。越界审批与
+普通工具审批使用不同 action，且不得提供会话级“总是允许”，避免普通授权被
+扩展成任意文件系统访问。
 
 ### 7.9 能力层与电脑控制详细图
 
@@ -1627,7 +1631,9 @@ Http --> McpServer
 | `code_search` | 搜索文本、正则、symbol、文件名，返回位置和上下文 | 不修改文件，不执行命令 |
 | `shell` | 执行任意命令 | 不作为默认搜索入口 |
 
-`code_search` 必须是只读工具，风险等级为 `read`。它仍然必须受 workspace 限制，并遵守 ignore 规则、结果条数、输出大小和超时限制。
+`code_search` 必须是只读工具，风险等级为 `read`。workspace 内搜索可自动
+允许；搜索根目录越界时必须触发 `code_search_outside_workspace` 独立审批。
+无论目标范围如何，都必须遵守 ignore 规则、结果条数、输出大小和超时限制。
 
 #### 7.10.2 推荐工具接口
 
@@ -1635,8 +1641,8 @@ Http --> McpServer
 ToolDescriptor(
     name="code_search",
     risk="read",
-    target_type="workspace",
-    description="在 workspace 内搜索代码文本、正则、文件名或 symbol，返回文件路径、行号和上下文片段。",
+    target_type="filesystem",
+    description="搜索代码文本、正则、文件名或 symbol；workspace 外搜索需要逐次审批。",
     input_schema={
         "type": "object",
         "properties": {
@@ -1651,7 +1657,7 @@ ToolDescriptor(
             },
             "path": {
                 "type": "string",
-                "description": "可选子目录，必须在 workspace 内",
+                "description": "可选搜索目录；workspace 外目录需要逐次审批",
                 "default": "."
             },
             "glob": {
@@ -1717,7 +1723,7 @@ ToolDescriptor(
 
 约束：
 
-- `path` 使用相对 workspace 的 POSIX 风格路径，跨平台展示稳定。
+- workspace 内命中使用相对 workspace 的 POSIX 风格路径；外部命中返回绝对路径。
 - `line` / `column` 从 1 开始，便于 UI 跳转。
 - `context` 行数受 `context_lines` 限制。
 - 结果超过 `max_results` 或输出大小上限时设置 `truncated=true`。
@@ -1729,7 +1735,8 @@ ToolDescriptor(
 
 1. 优先调用 `ripgrep`，因为它快、遵守 ignore 规则、跨平台可安装。
 2. `rg` 不存在时，使用 Python fallback 扫描文本文件。
-3. 所有路径通过 workspace resolver 校验，禁止越界搜索。
+3. 所有路径通过 workspace resolver 校验；越界时由 Runtime 请求独立审批，
+   ToolRegistry 仅在获批调用的执行上下文中临时放行。
 4. 搜索进程设置 timeout，输出流式读取或硬截断，避免卡住 Runtime。
 
 后续可选增量索引：
@@ -1742,15 +1749,16 @@ ToolDescriptor(
 
 安全要求：
 
-- 只读，不需要逐次审批。
-- 不能搜索 workspace 外路径。
+- workspace 内只读搜索不需要逐次审批。
+- workspace 外搜索必须逐次审批，不能加入会话级永久授权。
+- 审批结果由 Runtime 传给 ToolRegistry 的受控执行上下文，模型参数不能伪造。
 - 默认不返回隐藏密钥文件内容；匹配到 `.env`、私钥、token 文件时只返回路径和命中行号，内容脱敏或要求额外确认。
 - 当模型为云端 provider 时，搜索结果会进入上下文，应对疑似密钥进行脱敏。
 
 测试要求：
 
 - text/regex/file/symbol 四种模式。
-- workspace 越界拒绝。
+- 未审批的 workspace 越界请求必须拒绝；用户拒绝后不执行，用户批准后允许搜索。
 - `.gitignore` 和默认忽略目录生效。
 - `rg` 可用与不可用 fallback 路径。
 - max_results、context_lines、timeout、二进制文件跳过。
@@ -2607,12 +2615,19 @@ Loop Engineering 入口：
 启动体验目标：
 
 ```bash
-# 终端模式
-python -m app chat --profile local_qwen
+# 首次安装或源码开发
+python -m pip install -e /path/to/AgentLab
+
+# 从任意目录启动；workspace 决定文件、搜索和命令工具的边界
+agentlab --workspace . --profile local_qwen
 
 # 本地 Web 模式，仅监听本机
-python -m app serve --host 127.0.0.1 --port 8765
+agentlab serve --workspace . --host 127.0.0.1 --port 8765
 ```
+
+`pyproject.toml` 必须注册 `agentlab` console script。`--workspace` 接受绝对或
+相对目录，相对路径以调用者当前目录为基准；CLI 参数优先于环境变量和应用配置。
+`python -m app` 作为源码开发入口继续保留。
 
 ### 11.3 是否做桌面客户端
 
@@ -2650,7 +2665,8 @@ python -m app serve --host 127.0.0.1 --port 8765
 默认值应保守：
 
 - Web 服务监听 `127.0.0.1`。
-- 仅允许访问用户选择的 workspace；越界读取也提示确认。
+- workspace 是默认工作范围；越界读取、列目录、搜索、写入和外部 cwd 执行
+  必须逐次提示确认，拒绝时不执行。
 - 文件写操作每次询问；执行命令与网络 MCP 默认禁用，启用后仍需确认。
 - 浏览器控制默认使用隔离 profile；真实登录态、上传、下载、提交表单都需要显式确认。
 - 桌面控制和远程设备控制默认禁用；启用后仍不允许模型绕过审批直接连续操作。
@@ -2694,7 +2710,7 @@ python -m app serve --host 127.0.0.1 --port 8765
 | 子 Agent 测试 | 权限隔离、结果汇总、验证 Agent 只读、不能降低 GoalSpec |
 | Project Knowledge 测试 | README/AGENTS/SKILL 解析、来源标注、与实际代码冲突时优先实际代码 |
 | Learner 测试 | memory candidate、skill update proposal、anti-pattern 生成与敏感信息过滤 |
-| 代码搜索测试 | text/regex/file/symbol 搜索、ignore 规则、越界拒绝、fallback、脱敏和截断 |
+| 代码搜索测试 | text/regex/file/symbol 搜索、ignore 规则、越界拒绝/批准、fallback、脱敏和截断 |
 | MCP 集成测试 | 测试 server 的 `list_tools` / `call_tool`、连接错误、审批；Windows 验证 `npx.cmd` 解析、最小运行环境和进程树清理 |
 | 浏览器控制测试 | Playwright 打开本地测试页面、点击、输入、截图、下载路径限制 |
 | 远程控制测试 | fake SSH client 覆盖 host key、workspace、timeout、输出截断、审批拒绝 |

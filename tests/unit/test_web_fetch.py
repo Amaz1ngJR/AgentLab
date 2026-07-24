@@ -171,8 +171,15 @@ class TestBeautifulSoupExtraction:
         assert result is None
 
     def test_extract_content_falls_through_to_bs4(self):
-        # trafilatura/readability 未装时，应该落到 beautifulsoup
-        title, content, extractor = _extract_content(SAMPLE_HTML, "https://example.com")
+        # 显式模拟高优先级可选依赖不可用，避免测试结果依赖本机安装状态。
+        with (
+            patch("app.tools.builtin.web_fetch._extract_trafilatura", return_value=None),
+            patch("app.tools.builtin.web_fetch._extract_readability", return_value=None),
+        ):
+            title, content, extractor = _extract_content(
+                SAMPLE_HTML,
+                "https://example.com",
+            )
         assert extractor == "beautifulsoup"
         assert "WebRTC" in content
 
@@ -193,7 +200,11 @@ class TestFetchAndExtract:
         return resp
 
     def test_successful_fetch_returns_json(self):
-        with patch("requests.get", return_value=self._mock_response(SAMPLE_HTML)):
+        with (
+            patch("requests.get", return_value=self._mock_response(SAMPLE_HTML)),
+            patch("app.tools.builtin.web_fetch._extract_trafilatura", return_value=None),
+            patch("app.tools.builtin.web_fetch._extract_readability", return_value=None),
+        ):
             result = _web_fetch({"url": "https://example.com/article"})
 
         parsed = json.loads(result)

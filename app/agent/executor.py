@@ -275,19 +275,30 @@ class Executor:
                                         tool_name=call.name, tool_input=call.arguments))
 
                     tool = self._tools.get(call.name)
-                    needs_approval = bool(tool and tool.requires_approval)
+                    approval_action = (
+                        tool.approval_action(call.arguments) if tool else None
+                    )
+                    needs_approval = approval_action is not None
                     if needs_approval:
                         self._emit(RunEvent(kind=events.APPROVAL_REQUIRED, task_id=task.id,
-                                            tool_name=call.name, tool_input=call.arguments))
+                                            tool_name=call.name, tool_input=call.arguments,
+                                            payload={"approval_action": approval_action}))
 
-                    if needs_approval and not self._approval.request(call.name, call.arguments):
+                    if needs_approval and not self._approval.request(
+                        approval_action,
+                        call.arguments,
+                    ):
                         output, is_error = DENIED_MESSAGE, False
                         denied_any = True
                         self._emit(RunEvent(kind=events.TOOL_DENIED, task_id=task.id,
                                             tool_name=call.name))
                     else:
                         t0 = time.monotonic()
-                        output, is_error = self._tools.execute(call.name, call.arguments)
+                        output, is_error = self._tools.execute(
+                            call.name,
+                            call.arguments,
+                            approved_action=approval_action,
+                        )
                         # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
                         # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
                         output = _truncate_tool_output(output)

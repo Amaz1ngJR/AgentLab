@@ -5,7 +5,7 @@
 
 安全约束:
   - requires_approval=True,每次执行前用户必须显式同意(默认行为;-y 模式跳过)
-  - cwd 锁定在 workspace_root(),命令的相对路径都基于 workspace
+  - cwd 默认是 workspace;指定外部 cwd 时使用独立的越界审批
   - timeout 默认 30s,超时后子进程被杀掉
   - 输出截断到 8KB,避免巨型日志撑爆模型上下文
 
@@ -25,7 +25,11 @@ from __future__ import annotations
 import platform
 import subprocess
 
-from app.config.loader import workspace_root
+from app.tools.builtin.files import (
+    WorkspacePathError,
+    _outside_workspace_approval,
+    _resolve_within_workspace,
+)
 from app.tools.registry import Tool
 
 # 单次输出上限:8KB。超出截断并附说明,避免让模型上下文吞下兆级 log。
@@ -61,7 +65,17 @@ def _run_shell(args: dict) -> str:
     except (TypeError, ValueError):
         timeout = DEFAULT_TIMEOUT
 
-    cwd = workspace_root()
+    try:
+        cwd = _resolve_within_workspace(
+            args.get("cwd", "."),
+            "shell_outside_workspace",
+        )
+    except WorkspacePathError as exc:
+        return f"refused: {exc}"
+    if not cwd.exists():
+        return f"working directory not found: {cwd}"
+    if not cwd.is_dir():
+        return f"not a working directory: {cwd}"
     argv = _build_argv(command)
 
     try:
@@ -105,7 +119,8 @@ def _run_shell(args: dict) -> str:
 SHELL = Tool(
     name="shell",
     description=(
-        "在 workspace 目录下执行 shell 命令(macOS/Linux 用 bash,Windows 用 PowerShell)。"
+        "执行 shell 命令(macOS/Linux 用 bash,Windows 用 PowerShell)。"
+        "cwd 默认是 workspace;外部 cwd 需要独立审批。"
         "返回 stdout / stderr / exit code。超过 8KB 的输出会被截断。"
         "默认超时 30 秒,可通过 timeout 字段指定更长(单位秒)。"
         "适用:跑测试、看 git 状态、构建项目、列文件等。"
@@ -122,11 +137,21 @@ SHELL = Tool(
                 "description": f"超时秒数,默认 {DEFAULT_TIMEOUT}",
                 "default": DEFAULT_TIMEOUT,
             },
+            "cwd": {
+                "type": "string",
+                "description": "可选工作目录;相对路径基于 workspace,外部目录需要审批",
+                "default": ".",
+            },
         },
         "required": ["command"],
     },
     executor=_run_shell,
     requires_approval=True,  # shell 命令属于高风险操作,默认强制审批
+    approval_resolver=lambda args: _outside_workspace_approval(
+        "shell",
+        args,
+        path_key="cwd",
+    ),
 )
 
 

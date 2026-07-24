@@ -10,6 +10,7 @@ from app.tools.builtin.shell import (
     _build_argv,
     _run_shell,
 )
+from app.tools.registry import ToolRegistry
 
 
 def _make_completed(stdout: str = "", stderr: str = "", returncode: int = 0):
@@ -79,6 +80,36 @@ def test_run_shell_custom_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", fake_run)
     _run_shell({"command": "sleep 5", "timeout": 60})
     assert captured["timeout"] == 60
+
+
+def test_shell_outside_cwd_requires_separate_approval(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
+    registry = ToolRegistry()
+    registry.register(SHELL)
+    args = {"command": "pwd", "cwd": str(outside)}
+
+    denied, is_error = registry.execute(
+        "shell",
+        args,
+        approved_action="shell",
+    )
+    assert is_error is True
+    assert denied == "approval required: shell_outside_workspace"
+
+    with patch("subprocess.run", return_value=_make_completed()) as run:
+        output, is_error = registry.execute(
+            "shell",
+            args,
+            approved_action="shell_outside_workspace",
+        )
+
+    assert is_error is False
+    assert "[exit code: 0]" in output
+    assert run.call_args.kwargs["cwd"] == str(outside.resolve())
 
 
 def test_run_shell_timeout_returns_error(monkeypatch, tmp_path):

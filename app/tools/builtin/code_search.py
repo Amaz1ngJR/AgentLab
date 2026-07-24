@@ -14,12 +14,11 @@
 实现策略(见 §7.7.5):
   1. 优先调 ripgrep(rg):快、自动遵守 .gitignore、跨平台
   2. 无 rg 时退化为 Python 扫描
-  3. 所有路径经 workspace resolver 校验,禁止越界
+  3. 所有路径经 workspace resolver 校验,越界搜索必须先审批
   4. 搜索设 timeout,结果数 / 输出大小硬截断,避免卡住或撑爆上下文
 
 安全(见 §7.7.6):
-  - 只读,风险等级 read,不需要逐次审批
-  - 不能搜 workspace 外路径
+  - workspace 内只读搜索免审批;workspace 外搜索使用独立审批动作
   - 命中行经 redact() 脱敏,疑似密钥(sk-xxx / Bearer xxx 等)不会原样回灌给(云端)模型
 """
 from __future__ import annotations
@@ -31,7 +30,11 @@ from pathlib import Path
 from typing import Optional
 
 from app.config.loader import workspace_root
-from app.tools.builtin.files import WorkspacePathError
+from app.tools.builtin.files import (
+    WorkspacePathError,
+    _outside_workspace_approval,
+    _resolve_within_workspace,
+)
 from app.tools.registry import Tool
 from app.util.redact import redact
 
@@ -56,23 +59,16 @@ def _find_ripgrep() -> Optional[str]:
 
 
 def _resolve_search_root(path_str: str) -> Path:
-    """把 path 参数解析成 workspace 内的搜索根目录。越界抛 WorkspacePathError。
+    """解析搜索根目录；workspace 外路径必须已获得 code_search 越界审批。
 
     与 files.py 不同:相对路径基于 workspace 根解析,而不是进程 CWD。这样
     默认 path='.' 总是指 workspace 根,不受 Agent 进程实际工作目录影响。
     """
     raw = (path_str or ".").strip()
-    p = Path(raw).expanduser()
-    root = workspace_root()
-    target = (p if p.is_absolute() else root / p).resolve()
-    try:
-        target.relative_to(root)
-    except ValueError:
-        raise WorkspacePathError(
-            f"path '{target}' is outside workspace '{root}'. "
-            f"set WORKSPACE_ROOT in .env if you need to access this path."
-        )
-    return target
+    return _resolve_within_workspace(
+        raw,
+        "code_search_outside_workspace",
+    )
 
 
 def _build_symbol_pattern(query: str) -> str:
@@ -446,7 +442,8 @@ def _code_search(args: dict) -> str:
 CODE_SEARCH = Tool(
     name="code_search",
     description=(
-        "在 workspace 内搜索代码,返回文件相对路径、行号、列号和上下文片段。"
+        "搜索代码并返回文件路径、行号、列号和上下文片段。workspace 内免审批,"
+        "搜索外部目录前必须获得用户审批。"
         "比用 shell 拼 grep/find 更安全可控,应作为搜代码的首选。"
         "四种模式:text(普通文本,默认)、regex(正则)、file(文件名/路径)、"
         "symbol(函数/类/变量定义)。只读,自动遵守 .gitignore,跳过 node_modules 等大目录。"
@@ -467,7 +464,7 @@ CODE_SEARCH = Tool(
             },
             "path": {
                 "type": "string",
-                "description": "可选子目录,必须在 workspace 内,默认当前目录 '.'",
+                "description": "可选搜索目录;外部目录需要审批,默认 workspace 根目录 '.'",
                 "default": ".",
             },
             "glob": {
@@ -490,6 +487,10 @@ CODE_SEARCH = Tool(
     },
     executor=_code_search,
     requires_approval=False,  # 只读,风险等级 read,不需审批
+    approval_resolver=lambda args: _outside_workspace_approval(
+        "code_search",
+        args,
+    ),
 )
 
 

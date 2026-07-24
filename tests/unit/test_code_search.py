@@ -18,6 +18,7 @@ from app.tools.builtin.code_search import (
     _build_symbol_pattern,
     _code_search,
 )
+from app.tools.registry import ToolRegistry
 
 
 def _force_python_backend(monkeypatch):
@@ -112,6 +113,30 @@ def test_workspace_out_of_bounds_refused(monkeypatch, tmp_path):
     out = _code_search({"query": "x", "path": "/etc"})
     assert out.startswith("refused:")
     assert "outside workspace" in out
+
+
+def test_workspace_out_of_bounds_allowed_after_approval(monkeypatch, tmp_path):
+    _force_python_backend(monkeypatch)
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "external.py").write_text("def approved_symbol():\n    pass\n")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
+    args = {"query": "approved_symbol", "path": str(outside)}
+    registry = ToolRegistry()
+    registry.register(CODE_SEARCH)
+
+    output, is_error = registry.execute(
+        "code_search",
+        args,
+        approved_action="code_search_outside_workspace",
+    )
+
+    assert is_error is False
+    parsed = json.loads(output)
+    assert parsed["count"] == 1
+    assert parsed["matches"][0]["path"].endswith("external.py")
 
 
 def test_empty_query_refused():

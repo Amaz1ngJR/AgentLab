@@ -279,13 +279,23 @@ class AgentSession:
                     ))
 
                     tool = self.tools.get(call.name)
-                    if tool and tool.requires_approval and not self.approval.request(call.name, call.arguments):
+                    approval_action = (
+                        tool.approval_action(call.arguments) if tool else None
+                    )
+                    if approval_action and not self.approval.request(
+                        approval_action,
+                        call.arguments,
+                    ):
                         output = DENIED_MESSAGE
                         is_error = False
                         self._on_event(TurnEvent(kind="tool_denied", tool_name=call.name))
                     else:
                         t0 = time.monotonic()
-                        output, is_error = self.tools.execute(call.name, call.arguments)
+                        output, is_error = self.tools.execute(
+                            call.name,
+                            call.arguments,
+                            approved_action=approval_action,
+                        )
                         # 进入历史前截断超大输出(与编排路径一致,见 executor)。
                         from app.agent.executor import _truncate_tool_output
                         output = _truncate_tool_output(output)

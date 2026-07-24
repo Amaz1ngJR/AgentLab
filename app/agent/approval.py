@@ -81,14 +81,20 @@ class InteractivePolicy:
 
     # 工具参数预览的最大字符数,过长会截断
     _PREVIEW_MAX = 240
+    # workspace 越界和任意命令执行必须逐次确认，不能被会话白名单吞掉。
+    _NON_PERSISTENT_ACTIONS = {"shell", "terminal_open", "terminal_send"}
 
     def __init__(self) -> None:
         # 本会话的白名单:选过"总是允许"的工具名存在这里,下次直接放行
         self._always: set[str] = set()
 
     def request(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
+        can_persist = (
+            tool_name not in self._NON_PERSISTENT_ACTIONS
+            and not tool_name.endswith("_outside_workspace")
+        )
         # 已在白名单中,直接放行,不再询问
-        if tool_name in self._always:
+        if can_persist and tool_name in self._always:
             return True
 
         # 延迟导入避免 prompt_toolkit 在 AutoApprove 场景下也被加载
@@ -107,19 +113,20 @@ class InteractivePolicy:
             f"参数: {args_str}",
         ]
 
+        choices = [("允许这次", "yes")]
+        if can_persist:
+            choices.append((f"本会话总是允许 {tool_name}", "always"))
+        choices.append(("拒绝", "no"))
+
         result = select_menu(
-            choices=[
-                ("允许这次", "yes"),
-                (f"本会话总是允许 {tool_name}", "always"),
-                ("拒绝", "no"),
-            ],
+            choices=choices,
             header_lines=header_lines,
             title="是否允许执行?",
         )
 
         if result == "yes":
             return True
-        if result == "always":
+        if result == "always" and can_persist:
             self._always.add(tool_name)  # 加入白名单
             return True
         # "no" 或 None(取消) 都视为拒绝
