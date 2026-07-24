@@ -779,15 +779,10 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
     elif kind == run_events.PLAN_CREATED:
         tasks = ev.payload.get("tasks", [])
         if len(tasks) > 1:  # 单任务计划不值得打面板,省噪音
-            task_lines = _format_task_lines(tasks)
-            # 去重:打印后更新 panel_state,避免紧接着的 spinner _commit_tasks
-            # 又把同一个面板打一遍(PLAN_CREATED 后第一个任务的 spinner 会重绘)。
-            if panel_state is not None:
-                panel_state["last"] = "\n".join(task_lines)
+            # 只打印计划摘要，不打整个任务面板，让第一个 spinner 负责打印
+            # 这样避免了 PLAN_CREATED 后紧接着第一个任务开始时重复打印
             print(f"\n  ✻ 计划:{len(tasks)} 个子任务", flush=True)
-            for line in task_lines:
-                print(line, flush=True)
-            print(flush=True)
+            # 不更新 panel_state，让 spinner 的第一次 _commit_tasks 正常打印
     elif kind == run_events.RUN_COMPLETED:
         tasks = ev.payload.get("tasks", [])
         if len(tasks) > 1:
@@ -858,6 +853,8 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         p = ev.payload or {}
         if p.get("diff_summary"):
             print(f"    改动: {p['diff_summary'][:200]}", flush=True)
+    elif kind == run_events.LOOP_FAILED:
+        print(f"\n  ✗ {ev.text}", flush=True)
     elif kind == run_events.LOOP_BLOCKED:
         print(f"\n  ⊘ {ev.text}", flush=True)
     elif kind == run_events.LOOP_BUDGET_EXHAUSTED:
