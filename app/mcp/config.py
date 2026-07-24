@@ -9,7 +9,7 @@
   - 配置文件只保存环境变量名,不保存真实 token(本 MVP 只做 stdio,token 暂未用上)
   - stdio 命令以数组保存并直接启动,禁止经 shell 字符串展开
   - 新 server 默认 enabled=false,启用前 CLI 会展示 server 与工具
-  - env_allowlist 限制透传给子进程的环境变量,默认只给 PATH,避免泄漏密钥
+  - 运行时只自动透传非敏感系统变量;其它变量必须进入 env_allowlist
 """
 from __future__ import annotations
 
@@ -31,7 +31,8 @@ class MCPServerConfig:
     transport     - 目前只支持 "stdio"
     command       - stdio 启动可执行,例如 "npx"
     args          - 启动参数数组,例如 ["-y", "@playwright/mcp@latest", "--headless"]
-    env_allowlist - 允许透传给子进程的环境变量名;默认只 PATH
+    cwd           - 子进程工作目录;相对路径按项目根目录解析
+    env_allowlist - 除运行必需系统变量外,允许额外透传的环境变量名
     enabled       - 是否启用;新 server 默认 false
     risk          - server 级风险标签(用于展示与未来分级审批),默认 "browser_control"
     auto_approve  - 该 server 下免审批的工具名白名单(只读观察类),其余默认需审批
@@ -40,6 +41,7 @@ class MCPServerConfig:
     transport: str = "stdio"
     command: Optional[str] = None
     args: list[str] = field(default_factory=list)
+    cwd: Optional[str] = None
     env_allowlist: list[str] = field(default_factory=lambda: ["PATH"])
     enabled: bool = False
     risk: str = "browser_control"
@@ -64,6 +66,7 @@ def load_mcp_servers(path: Optional[Path] = None) -> list[MCPServerConfig]:
             transport=body.get("transport", "stdio"),
             command=body.get("command"),
             args=list(body.get("args") or []),
+            cwd=body.get("cwd"),
             env_allowlist=list(body.get("env_allowlist") or ["PATH"]),
             enabled=bool(body.get("enabled", False)),
             risk=body.get("risk", "browser_control"),

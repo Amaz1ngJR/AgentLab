@@ -323,6 +323,8 @@ LanMode -[hidden]right- CloudMode
 1. 文件路径全部使用 `pathlib.Path`，不在业务逻辑拼接 `/` 或 `\`。
 2. 内置工具使用 Python API 执行文件操作；Shell 工具区分 `powershell` 与 `zsh`/`bash` profile。
 3. stdio MCP Server 的启动命令采用参数数组，不依赖 shell 展开与管道语法。
+   Windows 下启动器必须解析 `npx.cmd` / `.exe` / `.bat`，不得要求用户维护
+   单独的 Windows MCP 配置。
 4. 用户数据目录使用平台规范目录，例如 macOS 的 Application Support 与 Windows 的 LocalAppData；开发模式可保留项目内 `.agentlab/`。
 5. FastAPI 默认只监听 `127.0.0.1`，局域网开放必须由用户显式配置。
 6. 本地模型文件由 Ollama/LM Studio 管理；AgentLab 只存模型 profile，不复制权重文件。
@@ -1969,6 +1971,7 @@ servers:
     transport: stdio
     command: python
     args: ["-m", "my_git_mcp_server"]
+    cwd: "."
     env_allowlist: ["PATH"]
     enabled: false
     risk: read
@@ -1985,6 +1988,11 @@ servers:
 
 - 配置文件只保存环境变量名称，不保存真实 token。
 - stdio 命令以数组方式保存并直接启动，禁止默认通过 shell 执行字符串。
+- `cwd` 相对路径以 AgentLab 项目根目录为基准，避免启动终端目录改变
+  Playwright profile、下载目录或本地 MCP Server 的工作目录。
+- Windows 自动解析 npm shim（例如 `npx` → `npx.cmd`），并向子进程提供
+  `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`USERPROFILE`、`APPDATA`
+  等运行必需的非敏感变量；其它变量仍必须进入 `env_allowlist`。
 - 任一新 MCP Server 第一次启用前，UI/CLI 展示 server 名称、transport 和可能暴露的数据。
 - 从 MCP 发现的每一个工具都映射到统一 `ToolDescriptor`，并继承或提高 server 风险等级。
 
@@ -2687,7 +2695,7 @@ python -m app serve --host 127.0.0.1 --port 8765
 | Project Knowledge 测试 | README/AGENTS/SKILL 解析、来源标注、与实际代码冲突时优先实际代码 |
 | Learner 测试 | memory candidate、skill update proposal、anti-pattern 生成与敏感信息过滤 |
 | 代码搜索测试 | text/regex/file/symbol 搜索、ignore 规则、越界拒绝、fallback、脱敏和截断 |
-| MCP 集成测试 | 测试 server 的 `list_tools` / `call_tool`、连接错误、审批 |
+| MCP 集成测试 | 测试 server 的 `list_tools` / `call_tool`、连接错误、审批；Windows 验证 `npx.cmd` 解析、最小运行环境和进程树清理 |
 | 浏览器控制测试 | Playwright 打开本地测试页面、点击、输入、截图、下载路径限制 |
 | 远程控制测试 | fake SSH client 覆盖 host key、workspace、timeout、输出截断、审批拒绝 |
 | 桌面控制测试 | adapter mock 覆盖截图、坐标动作、取消和权限不足提示 |

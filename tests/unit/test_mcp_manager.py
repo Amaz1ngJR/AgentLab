@@ -6,13 +6,21 @@
      验证 call_tool 能把调用投递进 loop 并同步拿回结果,以及超时处理。
 """
 import asyncio
+import os
 import time
 import types
+from pathlib import Path
 
 import pytest
 
 from app.mcp.config import MCPServerConfig
-from app.mcp.manager import MCPManager, _content_to_text
+from app.mcp.manager import (
+    MCPManager,
+    _build_stdio_env,
+    _content_to_text,
+    _resolve_stdio_command,
+    _resolve_stdio_cwd,
+)
 
 
 # ── _content_to_text ─────────────────────────────────────────────────────────
@@ -56,6 +64,76 @@ def test_secret_redacted_in_result():
     text, _ = _content_to_text(r)
     assert "sk-abcdefghij" not in text
     assert "sk-***" in text
+
+
+# ── stdio 跨平台启动 ──────────────────────────────────────────────────────────
+
+def test_windows_resolves_npx_cmd(monkeypatch):
+    seen = []
+
+    def fake_which(command):
+        seen.append(command)
+        if command == "npx.cmd":
+            return r"C:\Program Files\nodejs\npx.cmd"
+        return None
+
+    monkeypatch.setattr("app.mcp.manager.shutil.which", fake_which)
+
+    resolved = _resolve_stdio_command("npx", system="Windows")
+
+    assert resolved == r"C:\Program Files\nodejs\npx.cmd"
+    assert seen[:2] == ["npx", "npx.cmd"]
+
+
+def test_windows_keeps_explicit_executable_extension(monkeypatch):
+    monkeypatch.setattr(
+        "app.mcp.manager.shutil.which",
+        lambda command: command if command == "custom.cmd" else None,
+    )
+
+    assert _resolve_stdio_command("custom.cmd", system="Windows") == "custom.cmd"
+
+
+def test_missing_npx_has_windows_install_hint(monkeypatch):
+    monkeypatch.setattr("app.mcp.manager.shutil.which", lambda command: None)
+
+    with pytest.raises(FileNotFoundError, match="Node.js LTS"):
+        _resolve_stdio_command("npx", system="Windows")
+
+
+def test_windows_stdio_env_includes_runtime_paths_and_allowlist(monkeypatch):
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            "PATH": r"C:\Windows\System32",
+            "SYSTEMROOT": r"C:\Windows",
+            "COMSPEC": r"C:\Windows\System32\cmd.exe",
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+            "TEMP": r"C:\Temp",
+            "USERPROFILE": r"C:\Users\tester",
+            "APPDATA": r"C:\Users\tester\AppData\Roaming",
+            "LOCALAPPDATA": r"C:\Users\tester\AppData\Local",
+            "MCP_TEST_TOKEN": "allowed",
+            "UNLISTED_SECRET": "must-not-leak",
+        },
+    )
+    server = MCPServerConfig(name="playwright", env_allowlist=["MCP_TEST_TOKEN"])
+
+    env = _build_stdio_env(server, system="Windows")
+
+    assert env["SYSTEMROOT"] == r"C:\Windows"
+    assert env["PATHEXT"] == ".COM;.EXE;.BAT;.CMD"
+    assert env["LOCALAPPDATA"].endswith(r"AppData\Local")
+    assert env["MCP_TEST_TOKEN"] == "allowed"
+    assert "UNLISTED_SECRET" not in env
+
+
+def test_stdio_cwd_is_anchored_to_project_root():
+    resolved = Path(_resolve_stdio_cwd("data/browser-profiles/test"))
+
+    assert resolved.is_absolute()
+    assert resolved.parts[-3:] == ("data", "browser-profiles", "test")
 
 
 # ── sync↔async 桥 ────────────────────────────────────────────────────────────

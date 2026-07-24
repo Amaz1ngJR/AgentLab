@@ -26,12 +26,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
+from app.agent.approval import ApprovalPolicy
 from app.agent.cancel import CancelToken
 from app.agent.events import (
     GOAL_DEFINED,
     LOOP_BLOCKED,
     LOOP_BUDGET_EXHAUSTED,
     LOOP_COMPLETED,
+    LOOP_FAILED,
     LOOP_ITERATION_STARTED,
     LOOP_STARTED,
     REPAIR_PLANNED,
@@ -67,6 +69,7 @@ class LoopRunner:
         orchestrator: Orchestrator,
         verifier: Verifier,
         worktree_manager: WorktreeManager | None = None,
+        approval: ApprovalPolicy | None = None,
         on_event: Callable[[RunEvent], None] | None = None,
     ):
         """
@@ -75,12 +78,14 @@ class LoopRunner:
             orchestrator: 复用的 Task 层编排器
             verifier: 验证器
             worktree_manager: Worktree 管理器（workspace_mode=git_worktree 时需要）
+            approval: worktree 提交等高风险收尾动作的审批策略
             on_event: 事件回调
         """
         self.goal = goal
         self.orchestrator = orchestrator
         self.verifier = verifier
         self.worktree_manager = worktree_manager
+        self.approval = approval
         self.on_event = on_event or (lambda e: None)
 
         self.loop_id = f"loop-{uuid.uuid4().hex[:8]}"
@@ -93,6 +98,7 @@ class LoopRunner:
         # 下一轮要执行的指令。第一轮是 None(用 objective 构建初始指令);
         # 验证失败后 _diagnose_and_repair 会填入修复指令,下一轮带 resume=True 执行。
         self._next_instruction: str | None = None
+        self._last_execution_error: str | None = None
 
     def run(self, cancel: CancelToken | None = None) -> str:
         """运行 Loop，返回最终状态消息。
@@ -160,6 +166,10 @@ class LoopRunner:
                     return self._finish_blocked("审批被拒或权限不足")
                 elif exec_result == "cancelled":
                     return self._finish_cancelled()
+                elif exec_result == "failed":
+                    return self._finish_failed(
+                        self._last_execution_error or "执行阶段发生未知异常"
+                    )
 
                 # 验证
                 self.status = "verifying"
@@ -180,8 +190,7 @@ class LoopRunner:
             return self._finish_cancelled()
 
         except Exception as exc:
-            self.status = "failed"
-            return f"Loop 异常终止: {exc}"
+            return self._finish_failed(f"{type(exc).__name__}: {exc}")
 
     def _prepare_worktree(self) -> None:
         """准备 worktree 隔离工作区。"""
@@ -233,7 +242,7 @@ class LoopRunner:
         - 累计真实工具调用数到预算;按 Orchestrator.last_run_status 判 blocked/cancelled。
 
         Returns:
-            "ok" / "blocked" / "cancelled"
+            "ok" / "blocked" / "cancelled" / "failed"
         """
         if self._next_instruction is None:
             instruction = self._build_initial_instruction()
@@ -253,11 +262,12 @@ class LoopRunner:
             else:
                 _do_run()
         except Exception as exc:
-            # 执行阶段异常不直接崩 Loop:记一次,交给验证判定(通常验证会失败 → 修复)
-            self.status = "executing"
+            # 执行器异常不能继续交给普通 verifier。否则已有文件/旧测试可能碰巧
+            # 通过，导致 Loop 把“执行崩溃”误报为“目标达成”。
+            self._last_execution_error = f"{type(exc).__name__}: {exc}"
             self.budget_used.tool_calls += getattr(
                 self.orchestrator, "last_run_tool_calls", 0)
-            return "ok"
+            return "failed"
 
         # 累计真实工具调用数(替掉原来写死的 +5)
         self.budget_used.tool_calls += getattr(
@@ -364,8 +374,32 @@ class LoopRunner:
 
         # 生成 diff summary（如果有 worktree）
         diff_summary = ""
+        commit_sha = ""
+        commit_error = ""
         if self.worktree and self.worktree_manager:
             diff_summary = self.worktree_manager.get_diff_summary(self.worktree)
+            if self.worktree_manager.check_dirty(self.worktree):
+                approval_args = {
+                    "summary": diff_summary[:1000],
+                    "worktree": str(self.worktree.path),
+                    "branch": f"worktree/{self.worktree.worktree_id}",
+                }
+                try:
+                    approved = (
+                        self.approval is not None
+                        and self.approval.request("worktree_commit", approval_args)
+                    )
+                except Exception as exc:
+                    approved = False
+                    commit_error = f"无法请求 worktree 提交审批: {exc}"
+                if approved:
+                    try:
+                        commit_sha = self.worktree_manager.commit_all(
+                            self.worktree,
+                            f"AgentLab loop {self.goal.goal_id}: verified changes",
+                        )
+                    except Exception as exc:
+                        commit_error = str(exc)
 
         self.on_event(RunEvent(
             kind=LOOP_COMPLETED,
@@ -378,6 +412,8 @@ class LoopRunner:
                     "checks": len(verification.checks),
                 },
                 "diff_summary": diff_summary[:500],  # 截断
+                "commit_sha": commit_sha,
+                "commit_error": commit_error,
             },
         ))
 
@@ -385,9 +421,25 @@ class LoopRunner:
         if self.worktree:
             msg += f"\n\n改动已在隔离 worktree: {self.worktree.path}"
             if self.worktree_manager:
+                if commit_sha:
+                    msg += f"\n已生成验证提交: {commit_sha[:12]}"
+                elif commit_error:
+                    msg += f"\n自动提交失败，改动仍保留在 worktree: {commit_error}"
+                elif self.worktree_manager.check_dirty(self.worktree):
+                    msg += "\n用户未批准生成提交，改动仍保留在 worktree。"
                 merge_cmd = self.worktree_manager.merge_suggestion(self.worktree)
                 msg += f"\n\n{merge_cmd}"
         return msg
+
+    def _finish_failed(self, reason: str) -> str:
+        """Loop 因内部执行异常失败，禁止继续验证并误报成功。"""
+        self.status = "failed"
+        self.on_event(RunEvent(
+            kind=LOOP_FAILED,
+            text=f"Loop 执行失败: {reason}",
+            payload={"reason": reason},
+        ))
+        return f"Loop 执行失败: {reason}"
 
     def _finish_blocked(self, reason: str) -> str:
         """Loop 被阻塞。"""

@@ -31,8 +31,11 @@ def _resolve_within_workspace(path_str: str) -> Path:
 
     越界时抛 WorkspacePathError;调用方捕获后返回错误字符串给模型。
     """
-    target = Path(path_str).expanduser().resolve()
     root = workspace_root()
+    raw = Path(path_str).expanduser()
+    # 相对路径必须基于 workspace 解析。Loop 模式只通过 ContextVar 切换
+    # workspace_root,不会修改进程 CWD;若直接 Path.resolve(),会错误地落到主工作区。
+    target = (raw if raw.is_absolute() else root / raw).resolve()
     try:
         target.relative_to(root)
     except ValueError:

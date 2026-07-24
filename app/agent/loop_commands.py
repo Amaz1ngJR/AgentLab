@@ -239,7 +239,10 @@ class LoopCommandHandler:
 
         # Verifier:workspace_root 在 LoopRunner 准备 worktree 后会被覆盖
         from app.agent.verifier import Verifier
-        verifier = Verifier(workspace_root=str(self.workspace_root))
+        verifier = Verifier(
+            workspace_root=str(self.workspace_root),
+            approval=session.approval,
+        )
 
         # WorktreeManager:只在 git_worktree 模式下创建
         worktree_manager = None
@@ -260,6 +263,7 @@ class LoopCommandHandler:
             orchestrator=orchestrator,
             verifier=verifier,
             worktree_manager=worktree_manager,
+            approval=session.approval,
             on_event=session._on_run_event if hasattr(session, "_on_run_event") else None,
         )
         self.current_loop = loop

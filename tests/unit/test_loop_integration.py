@@ -14,14 +14,16 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.agent.cancel import CancelToken
+from app.agent.approval import AutoApprove, DenyAll
 from app.agent.goals import GoalSpec, VerificationCheck, GoalBudgets
 from app.agent.loop_runner import LoopRunner
 from app.agent.orchestrator import Orchestrator
 from app.agent.planner import Planner
 from app.agent.tasks import TaskStore
-from app.agent.verifier import Verifier
+from app.agent.verifier import CheckResult, VerificationResult, Verifier
 from app.models.protocol import ModelResponse, ToolCall
 from app.tools.registry import ToolRegistry
+from app.workspace.worktree import WorktreeInfo
 
 
 def _fake_llm():
@@ -33,7 +35,7 @@ def _fake_llm():
         {"id": "t1", "description": "写一个测试文件", "dependencies": []}
     ]
     """
-    llm.create_message.side_effect = [
+    responses = [
         # 第一次调用:规划阶段,返回计划 JSON
         ModelResponse(
             text=plan_json,
@@ -77,6 +79,9 @@ def _fake_llm():
             usage={"input_tokens": 200, "output_tokens": 20},
         ),
     ]
+    # Loop 的修复路径会多次调用同一个 Orchestrator；每轮都需要完整的
+    # plan -> tool_use -> end_turn 三段响应。
+    llm.create_message.side_effect = responses * 4
     return llm
 
 
@@ -313,6 +318,115 @@ def test_loop_runner_budget_exhausted():
     assert loop.status == "budget_exhausted"
     assert loop.current_iteration == 2  # 达到 max_iterations
     assert "预算耗尽" in result
+
+
+def test_loop_runner_execution_exception_cannot_be_verified_as_success():
+    """执行器崩溃时必须直接失败，不能继续用旧状态验证成成功。"""
+    orchestrator = MagicMock()
+    orchestrator.run.side_effect = RuntimeError("executor crashed")
+    orchestrator.last_run_tool_calls = 0
+    verifier = MagicMock()
+    verifier.verify.return_value = MagicMock(is_success=lambda: True)
+    goal = GoalSpec(
+        goal_id="test-execution-error",
+        objective="执行任务",
+        success_criteria=["任务成功执行"],
+        verification_plan=[
+            VerificationCheck(type="file_assertion", path="existing.txt", exists=True),
+        ],
+        budgets=GoalBudgets(max_iterations=2, max_runtime_minutes=10, max_tool_calls=10),
+        workspace_mode="direct",
+    )
+    loop = LoopRunner(
+        goal=goal,
+        orchestrator=orchestrator,
+        verifier=verifier,
+    )
+
+    result = loop.run()
+
+    assert loop.status == "failed"
+    assert "executor crashed" in result
+    verifier.verify.assert_not_called()
+
+
+def test_loop_success_commits_worktree_after_approval(tmp_path):
+    """验证通过后，只有审批放行才生成可合并提交。"""
+    manager = MagicMock()
+    manager.get_diff_summary.return_value = "工作区状态:\n?? result.txt"
+    manager.check_dirty.return_value = True
+    manager.commit_all.return_value = "a" * 40
+    manager.merge_suggestion.return_value = "git merge worktree/test"
+    goal = GoalSpec(
+        goal_id="test-commit",
+        objective="生成结果",
+        success_criteria=["结果存在"],
+        verification_plan=[
+            VerificationCheck(type="file_assertion", path="result.txt", exists=True),
+        ],
+        workspace_mode="git_worktree",
+    )
+    loop = LoopRunner(
+        goal=goal,
+        orchestrator=MagicMock(),
+        verifier=MagicMock(),
+        worktree_manager=manager,
+        approval=AutoApprove(),
+    )
+    loop.worktree = WorktreeInfo(
+        worktree_id="test",
+        path=tmp_path,
+        base_branch="main",
+        base_commit="0" * 40,
+    )
+    verification = VerificationResult(
+        status="pass",
+        checks=[CheckResult(name="file", status="pass")],
+    )
+
+    result = loop._finish_succeeded(verification)
+
+    manager.commit_all.assert_called_once()
+    assert "已生成验证提交" in result
+
+
+def test_loop_success_keeps_dirty_worktree_when_commit_denied(tmp_path):
+    """拒绝提交后保留改动，不能静默生成 commit。"""
+    manager = MagicMock()
+    manager.get_diff_summary.return_value = "工作区状态:\n?? result.txt"
+    manager.check_dirty.return_value = True
+    manager.merge_suggestion.return_value = "不能直接合并"
+    goal = GoalSpec(
+        goal_id="test-denied-commit",
+        objective="生成结果",
+        success_criteria=["结果存在"],
+        verification_plan=[
+            VerificationCheck(type="file_assertion", path="result.txt", exists=True),
+        ],
+        workspace_mode="git_worktree",
+    )
+    loop = LoopRunner(
+        goal=goal,
+        orchestrator=MagicMock(),
+        verifier=MagicMock(),
+        worktree_manager=manager,
+        approval=DenyAll(),
+    )
+    loop.worktree = WorktreeInfo(
+        worktree_id="test",
+        path=tmp_path,
+        base_branch="main",
+        base_commit="0" * 40,
+    )
+    verification = VerificationResult(
+        status="pass",
+        checks=[CheckResult(name="file", status="pass")],
+    )
+
+    result = loop._finish_succeeded(verification)
+
+    manager.commit_all.assert_not_called()
+    assert "用户未批准生成提交" in result
 
 
 def test_loop_runner_cancel():

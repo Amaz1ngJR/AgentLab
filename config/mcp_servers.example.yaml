@@ -6,7 +6,9 @@
 # 安全约定:
 #   - 新 server 默认 enabled: false。启用前 CLI 会展示 server 名、transport 和工具列表。
 #   - stdio 命令用 command + args 数组直接启动,不经 shell 字符串展开。
-#   - env_allowlist 限制透传给子进程的环境变量(默认只 PATH),避免把密钥泄漏给 MCP server。
+#   - AgentLab 自动透传跨平台运行必需的非敏感系统变量。其它变量只有列入
+#     env_allowlist 才会传给子进程,避免把密钥泄漏给 MCP server。
+#   - Windows 会自动把 command: npx 解析为 npx.cmd,不需要维护单独配置。
 #   - 真实 token / 密钥不写在这里;需要时用环境变量名引用(本 MVP 的 stdio server 暂未用到)。
 #
 # 审批:
@@ -42,6 +44,8 @@ servers:
       - "data/browser-profiles/example"   # 自取名字,目录已在 .gitignore
       # ── 想 headless 跑就取消下面一行注释(首次登录前必须 headed)──
       # - "--headless"
+    # 相对路径以 AgentLab 项目根目录为基准,保证从任意终端目录启动结果一致。
+    cwd: "."
     env_allowlist:
       - PATH
     enabled: false          # 默认禁用;确认要用浏览器控制再改 true

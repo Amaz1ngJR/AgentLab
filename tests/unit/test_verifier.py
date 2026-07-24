@@ -1,9 +1,11 @@
 """Verifier 单元测试。"""
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from app.agent.approval import AutoApprove, DenyAll
 from app.agent.goals import VerificationCheck
 from app.agent.verifier import CheckResult, VerificationResult, Verifier
 
@@ -15,9 +17,13 @@ def temp_workspace():
         yield Path(tmpdir)
 
 
+def _approved_verifier(workspace: Path) -> Verifier:
+    return Verifier(workspace_root=str(workspace), approval=AutoApprove())
+
+
 def test_verifier_command_pass(temp_workspace):
     """命令 exit code 0 应通过。"""
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     check = VerificationCheck(type="command", command="echo hello")
     result = verifier.verify([check])
     assert result.is_success()
@@ -26,7 +32,7 @@ def test_verifier_command_pass(temp_workspace):
 
 def test_verifier_command_fail(temp_workspace):
     """命令 exit code 非 0 应失败。"""
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     check = VerificationCheck(type="command", command="exit 1")
     result = verifier.verify([check])
     assert not result.is_success()
@@ -36,7 +42,7 @@ def test_verifier_command_fail(temp_workspace):
 
 def test_verifier_command_expected_nonzero(temp_workspace):
     """可以期望非 0 的 exit code。"""
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     check = VerificationCheck(
         type="command",
         command="exit 2",
@@ -48,10 +54,10 @@ def test_verifier_command_expected_nonzero(temp_workspace):
 
 def test_verifier_command_timeout(temp_workspace):
     """命令超时应失败。"""
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     check = VerificationCheck(
         type="command",
-        command="sleep 10",
+        command=f'"{sys.executable}" -c "import time; time.sleep(10)"',
         timeout=1,
     )
     result = verifier.verify([check])
@@ -64,7 +70,7 @@ def test_verifier_file_exists_pass(temp_workspace):
     test_file = temp_workspace / "test.txt"
     test_file.write_text("hello")
 
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     check = VerificationCheck(
         type="file_assertion",
         path="test.txt",
@@ -76,7 +82,7 @@ def test_verifier_file_exists_pass(temp_workspace):
 
 def test_verifier_file_exists_fail(temp_workspace):
     """文件不存在检查失败。"""
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     check = VerificationCheck(
         type="file_assertion",
         path="nonexistent.txt",
@@ -89,7 +95,7 @@ def test_verifier_file_exists_fail(temp_workspace):
 
 def test_verifier_file_not_exists_pass(temp_workspace):
     """文件不应存在检查通过。"""
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     check = VerificationCheck(
         type="file_assertion",
         path="should_not_exist.txt",
@@ -163,7 +169,7 @@ def test_verifier_multiple_checks_all_pass(temp_workspace):
     """多个检查都通过。"""
     (temp_workspace / "test.txt").write_text("ok")
 
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     checks = [
         VerificationCheck(type="command", command="echo test"),
         VerificationCheck(type="file_assertion", path="test.txt", exists=True),
@@ -175,7 +181,7 @@ def test_verifier_multiple_checks_all_pass(temp_workspace):
 
 def test_verifier_multiple_checks_one_fail(temp_workspace):
     """多个检查中一个失败则整体失败。"""
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     checks = [
         VerificationCheck(type="command", command="echo test"),
         VerificationCheck(type="file_assertion", path="missing.txt", exists=True),
@@ -187,13 +193,34 @@ def test_verifier_multiple_checks_one_fail(temp_workspace):
 
 def test_verifier_blocked_takes_priority(temp_workspace):
     """blocked 优先级高于 fail。"""
-    verifier = Verifier(workspace_root=str(temp_workspace))
+    verifier = _approved_verifier(temp_workspace)
     checks = [
         VerificationCheck(type="command", command="exit 1"),  # fail
         VerificationCheck(type="human", description="需人工确认"),  # blocked
     ]
     result = verifier.verify(checks)
     assert result.status == "blocked"
+
+
+def test_verifier_command_without_policy_is_blocked(temp_workspace):
+    verifier = Verifier(workspace_root=str(temp_workspace))
+    result = verifier.verify([
+        VerificationCheck(type="command", command="echo should-not-run"),
+    ])
+    assert result.status == "blocked"
+    assert result.checks[0].error == "approval_policy_missing"
+
+
+def test_verifier_command_denied_is_blocked(temp_workspace):
+    verifier = Verifier(
+        workspace_root=str(temp_workspace),
+        approval=DenyAll(),
+    )
+    result = verifier.verify([
+        VerificationCheck(type="command", command="echo should-not-run"),
+    ])
+    assert result.status == "blocked"
+    assert result.checks[0].error == "approval_denied"
 
 
 def test_verifier_empty_checks():

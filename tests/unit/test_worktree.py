@@ -102,6 +102,33 @@ def test_worktree_get_diff_summary(git_repo):
     assert "改动统计" in diff or "文件列表" in diff
 
 
+def test_worktree_diff_summary_includes_untracked_files(git_repo):
+    """Agent 新建但尚未 add 的文件也必须出现在交付摘要中。"""
+    manager = WorktreeManager(repo_root=git_repo)
+    worktree = manager.create("test-goal-untracked")
+    (worktree.path / "new_file.txt").write_text("hello")
+
+    diff = manager.get_diff_summary(worktree)
+
+    assert "new_file.txt" in diff
+    assert "??" in diff
+    assert "无改动" not in diff
+
+
+def test_worktree_commit_all_makes_branch_mergeable(git_repo):
+    """经审批调用 commit_all 后，分支应包含可合并提交。"""
+    manager = WorktreeManager(repo_root=git_repo)
+    worktree = manager.create("test-goal-commit")
+    (worktree.path / "new_file.txt").write_text("hello")
+
+    commit_sha = manager.commit_all(worktree, "verified changes")
+
+    assert len(commit_sha) == 40
+    assert not manager.check_dirty(worktree)
+    assert manager.has_commits(worktree)
+    assert "git merge" in manager.merge_suggestion(worktree)
+
+
 def test_worktree_check_dirty(git_repo):
     """检查 worktree 是否 dirty。"""
     manager = WorktreeManager(repo_root=git_repo)
@@ -152,9 +179,23 @@ def test_worktree_merge_suggestion(git_repo):
     """生成合并建议。"""
     manager = WorktreeManager(repo_root=git_repo)
     worktree = manager.create("test-goal-9")
+    (worktree.path / "result.txt").write_text("verified")
+    manager.commit_all(worktree, "verified changes")
 
     suggestion = manager.merge_suggestion(worktree)
     assert "git checkout" in suggestion
     assert "git merge" in suggestion
     assert worktree.base_branch in suggestion
     assert f"worktree/{worktree.worktree_id}" in suggestion
+
+
+def test_worktree_merge_suggestion_rejects_dirty_worktree(git_repo):
+    """未提交改动不能被描述为可直接 merge。"""
+    manager = WorktreeManager(repo_root=git_repo)
+    worktree = manager.create("test-goal-dirty-merge")
+    (worktree.path / "result.txt").write_text("verified")
+
+    suggestion = manager.merge_suggestion(worktree)
+
+    assert "不能直接合并" in suggestion
+    assert "git merge worktree/" not in suggestion

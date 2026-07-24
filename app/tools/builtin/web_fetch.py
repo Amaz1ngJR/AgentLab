@@ -15,17 +15,20 @@
 
 安全:
   - 只读 network 风险,不需逐次审批(同 web_search)。
-  - 只允许 http/https,拒绝 file:// 等本地/内网协议绕过(SSRF 基本防护)。
+  - 只允许公网 http/https；解析 DNS 并拒绝本机/私网/链路本地/保留地址。
+  - 关闭自动重定向,每一跳重新校验目标,阻断重定向 SSRF。
   - 抓取内容与 URL 经 redact() 脱敏后再返回。
   - 超时 + 响应体大小上限,避免阻塞或拉爆内存。
   - 依赖未装时返回明确的安装提示,不抛异常。
 """
 from __future__ import annotations
 
+import ipaddress
 import json
+import socket
 import time
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from app.tools.registry import Tool
 from app.util.redact import redact
@@ -34,6 +37,8 @@ from app.util.redact import redact
 DEFAULT_TIMEOUT = 15              # HTTP 请求超时(秒)
 MAX_CONTENT_CHARS = 20_000        # 抽出正文的字符上限(超出截断)
 MAX_RESPONSE_BYTES = 5_000_000    # HTTP 响应体字节上限(5MB,超出拒绝,防大文件)
+MAX_REDIRECTS = 5                 # 手动跟随重定向，每一跳都重新做 SSRF 校验
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -45,6 +50,56 @@ def _truncate(text: str, limit: int = MAX_CONTENT_CHARS) -> tuple[str, bool]:
     if len(text) <= limit:
         return text, False
     return text[:limit], True
+
+
+def _validate_public_http_url(url: str) -> Optional[str]:
+    """校验 URL 只能指向公网 HTTP(S) 地址；安全时返回 None。"""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return f"only http/https urls are allowed (got '{parsed.scheme or 'none'}')"
+        if not parsed.netloc or not parsed.hostname:
+            return f"invalid url '{url}'"
+        if parsed.username is not None or parsed.password is not None:
+            return "credentials in URL are not allowed"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        return f"invalid url: {exc}"
+
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return f"local address is not allowed: {host}"
+
+    try:
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
+        addresses = [literal]
+    except ValueError:
+        try:
+            resolved = socket.getaddrinfo(
+                host, port, type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            return f"hostname resolution failed for '{host}': {exc}"
+        addresses = []
+        for item in resolved:
+            try:
+                addresses.append(ipaddress.ip_address(item[4][0].split("%", 1)[0]))
+            except (ValueError, IndexError):
+                return f"hostname '{host}' resolved to an invalid address"
+
+    if not addresses:
+        return f"hostname '{host}' did not resolve to an address"
+    for address in addresses:
+        if (
+            not address.is_global
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+        ):
+            return f"private or non-public address is not allowed: {address}"
+    return None
 
 
 def _fetch_html(url: str, timeout: int) -> tuple[str, str, Optional[str]]:
@@ -59,36 +114,84 @@ def _fetch_html(url: str, timeout: int) -> tuple[str, str, Optional[str]]:
         return "", url, "requests not installed. Install with: pip install requests"
 
     headers = {"User-Agent": DEFAULT_UA, "Accept": "text/html,application/xhtml+xml"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
-        resp.raise_for_status()
+    current_url = url
 
-        # 非 HTML 内容(pdf/图片/二进制)不适合抽正文,直接拒绝
-        ctype = resp.headers.get("Content-Type", "").lower()
-        if ctype and "html" not in ctype and "xml" not in ctype and "text" not in ctype:
-            return "", resp.url, f"unsupported content-type: {ctype} (web_fetch only reads HTML pages)"
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        validation_error = _validate_public_http_url(current_url)
+        if validation_error:
+            return "", current_url, f"refused: {validation_error}"
 
-        # 逐块读,超过上限就停(防超大响应体撑爆内存)
-        chunks: list[bytes] = []
-        total = 0
-        for chunk in resp.iter_content(chunk_size=65536):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > MAX_RESPONSE_BYTES:
-                return "", resp.url, f"response too large (> {MAX_RESPONSE_BYTES} bytes)"
-            chunks.append(chunk)
-
-        raw = b"".join(chunks)
-        # 优先用 requests 猜的编码,兜底 utf-8
-        encoding = resp.encoding or "utf-8"
+        resp = None
         try:
-            html = raw.decode(encoding, errors="replace")
-        except (LookupError, TypeError):
-            html = raw.decode("utf-8", errors="replace")
-        return html, resp.url, None
-    except Exception as exc:
-        return "", url, f"fetch failed: {type(exc).__name__}: {exc}"
+            # 自动重定向必须关闭：Location 的下一跳需要先经过同一套 SSRF 校验。
+            resp = requests.get(
+                current_url,
+                headers=headers,
+                timeout=timeout,
+                stream=True,
+                allow_redirects=False,
+            )
+            status_code = getattr(resp, "status_code", 200)
+            if isinstance(status_code, int) and status_code in REDIRECT_STATUSES:
+                location = resp.headers.get("Location")
+                if not location:
+                    return "", current_url, "redirect response missing Location header"
+                if redirect_count >= MAX_REDIRECTS:
+                    return "", current_url, f"too many redirects (> {MAX_REDIRECTS})"
+                current_url = urljoin(current_url, location)
+                continue
+
+            resp.raise_for_status()
+            final_url = getattr(resp, "url", current_url) or current_url
+
+            # 非 HTML 内容(pdf/图片/二进制)不适合抽正文,直接拒绝
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if ctype and "html" not in ctype and "xml" not in ctype and "text" not in ctype:
+                return "", final_url, (
+                    f"unsupported content-type: {ctype} "
+                    "(web_fetch only reads HTML pages)"
+                )
+
+            declared_size = resp.headers.get("Content-Length")
+            if declared_size:
+                try:
+                    if int(declared_size) > MAX_RESPONSE_BYTES:
+                        return "", final_url, (
+                            f"response too large (> {MAX_RESPONSE_BYTES} bytes)"
+                        )
+                except ValueError:
+                    pass
+
+            # 逐块读,超过上限就停(防超大响应体撑爆内存)
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_RESPONSE_BYTES:
+                    return "", final_url, (
+                        f"response too large (> {MAX_RESPONSE_BYTES} bytes)"
+                    )
+                chunks.append(chunk)
+
+            raw = b"".join(chunks)
+            # 优先用 requests 猜的编码,兜底 utf-8
+            encoding = resp.encoding or "utf-8"
+            try:
+                html = raw.decode(encoding, errors="replace")
+            except (LookupError, TypeError):
+                html = raw.decode("utf-8", errors="replace")
+            return html, final_url, None
+        except Exception as exc:
+            return "", current_url, f"fetch failed: {type(exc).__name__}: {exc}"
+        finally:
+            if resp is not None:
+                close = getattr(resp, "close", None)
+                if callable(close):
+                    close()
+
+    return "", current_url, f"too many redirects (> {MAX_REDIRECTS})"
 
 
 def _extract_trafilatura(html: str, url: str) -> Optional[tuple[str, str]]:
@@ -220,6 +323,8 @@ def _web_fetch(args: dict) -> str:
     start_time = time.time()
     html, final_url, error = _fetch_html(url, timeout)
     if error:
+        if error.startswith("refused:"):
+            return error
         return f"error: {error}"
 
     title, content, extractor = _extract_content(html, final_url)

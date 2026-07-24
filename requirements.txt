@@ -4,7 +4,8 @@ python-dotenv>=1.0.0
 pyyaml>=6.0
 prompt_toolkit>=3.0
 pathspec>=0.12
-mcp>=1.0
+# 1.27.2 includes Windows executable resolution and process-tree cleanup.
+mcp>=1.27.2
 
 # Web search (optional, for web_search tool)
 duckduckgo-search>=6.0.0

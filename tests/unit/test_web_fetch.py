@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -47,6 +48,17 @@ SAMPLE_HTML = """
 """
 
 
+@pytest.fixture(autouse=True)
+def public_dns(monkeypatch):
+    """单测默认把示例域名解析到公网测试地址，避免依赖真实 DNS。"""
+    monkeypatch.setattr(
+        "app.tools.builtin.web_fetch.socket.getaddrinfo",
+        lambda host, port, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+        ],
+    )
+
+
 class TestWebFetchTool:
     """工具注册与 schema。"""
 
@@ -90,6 +102,37 @@ class TestUrlValidation:
     def test_missing_netloc_refused(self):
         result = _web_fetch({"url": "http://"})
         assert "refused" in result
+
+    @pytest.mark.parametrize("url", [
+        "http://127.0.0.1/admin",
+        "http://10.0.0.1/internal",
+        "http://169.254.169.254/latest/meta-data",
+        "http://[::1]/admin",
+        "http://localhost/admin",
+    ])
+    def test_private_and_local_addresses_refused(self, url):
+        with patch("requests.get") as get:
+            result = _web_fetch({"url": url})
+        assert result.startswith("refused:")
+        get.assert_not_called()
+
+    def test_hostname_resolving_to_private_address_refused(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.tools.builtin.web_fetch.socket.getaddrinfo",
+            lambda host, port, **kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.10", port)),
+            ],
+        )
+        with patch("requests.get") as get:
+            result = _web_fetch({"url": "https://internal.example/page"})
+        assert result.startswith("refused:")
+        get.assert_not_called()
+
+    def test_url_credentials_refused(self):
+        with patch("requests.get") as get:
+            result = _web_fetch({"url": "https://user:pass@example.com/page"})
+        assert result.startswith("refused:")
+        get.assert_not_called()
 
 
 class TestTruncate:
@@ -144,6 +187,7 @@ class TestFetchAndExtract:
         resp.raise_for_status = MagicMock()
         resp.headers = {"Content-Type": content_type}
         resp.url = url
+        resp.status_code = 200
         resp.encoding = "utf-8"
         resp.iter_content = MagicMock(return_value=[html.encode("utf-8")])
         return resp
@@ -159,6 +203,19 @@ class TestFetchAndExtract:
         assert parsed["extractor"] == "beautifulsoup"
         assert "chars" in parsed
         assert "elapsed_seconds" in parsed
+
+    def test_redirect_to_private_address_refused(self):
+        redirect = MagicMock()
+        redirect.status_code = 302
+        redirect.headers = {"Location": "http://127.0.0.1/admin"}
+        redirect.url = "https://example.com/redirect"
+
+        with patch("requests.get", return_value=redirect) as get:
+            result = _web_fetch({"url": "https://example.com/redirect"})
+
+        assert result.startswith("refused:")
+        get.assert_called_once()
+        assert get.call_args.kwargs["allow_redirects"] is False
 
     def test_non_html_content_type_rejected(self):
         with patch("requests.get",
@@ -180,6 +237,7 @@ class TestFetchAndExtract:
         resp.raise_for_status = MagicMock()
         resp.headers = {"Content-Type": "text/html"}
         resp.url = "https://example.com"
+        resp.status_code = 200
         resp.encoding = "utf-8"
         resp.iter_content = MagicMock(return_value=[big_chunk])
         with patch("requests.get", return_value=resp):
@@ -248,6 +306,7 @@ class TestRedaction:
         resp.raise_for_status = MagicMock()
         resp.headers = {"Content-Type": "text/html"}
         resp.url = "https://example.com"
+        resp.status_code = 200
         resp.encoding = "utf-8"
         resp.iter_content = MagicMock(return_value=[html.encode("utf-8")])
 

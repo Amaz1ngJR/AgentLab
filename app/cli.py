@@ -1090,9 +1090,11 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     # Skill 只影响上下文（注入工作流说明），不授予工具权限。
     skill_catalog = SkillCatalog.from_dir()
     if skill_catalog.all():
+        enabled = skill_catalog.enabled_skills()
+        enabled_names = ', '.join(s.skill_id for s in enabled) if enabled else '无'
         print(f"Skill    : 发现 {len(skill_catalog.all())} 个 "
               f"({', '.join(s.skill_id for s in skill_catalog.all())});"
-              f" 默认启用 {len(skill_catalog.enabled_skills())} 个")
+              f" 默认启用 {len(enabled)} 个 ({enabled_names})")
 
     def _session_factory(agent_profile, session_id: str) -> AgentSession:
         """按 AgentProfile 构建一个隔离的 AgentSession:独立工具表 + 任务清单 + 记忆注入。"""

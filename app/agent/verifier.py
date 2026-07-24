@@ -25,7 +25,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from app.agent.approval import ApprovalPolicy
 from app.agent.goals import VerificationCheck
+from app.tools.builtin.shell import _build_argv
 
 
 @dataclass
@@ -56,8 +58,13 @@ class VerificationResult:
 class Verifier:
     """验证器：用证据判断目标是否达成。"""
 
-    def __init__(self, workspace_root: str | None = None):
+    def __init__(
+        self,
+        workspace_root: str | None = None,
+        approval: ApprovalPolicy | None = None,
+    ):
         self.workspace_root = Path(workspace_root) if workspace_root else Path.cwd()
+        self.approval = approval
 
     def verify(self, checks: list[VerificationCheck]) -> VerificationResult:
         """执行验证计划，返回统一结果。
@@ -157,14 +164,45 @@ class Verifier:
         timeout = check.timeout or 30
         expected = check.expected_exit_code
 
-        # 执行命令（简化版，后续可集成到 shell 工具）
+        approval_args = {
+            "command": check.command,
+            "timeout": timeout,
+            "cwd": str(self.workspace_root),
+            "purpose": "loop_verification",
+        }
+        if self.approval is None:
+            return CheckResult(
+                name=name,
+                status="blocked",
+                summary="缺少验证命令审批策略，已拒绝执行",
+                error="approval_policy_missing",
+            )
+        try:
+            approved = self.approval.request("verifier_command", approval_args)
+        except Exception as exc:
+            return CheckResult(
+                name=name,
+                status="blocked",
+                summary=f"验证命令审批失败: {exc}",
+                error=str(exc),
+            )
+        if not approved:
+            return CheckResult(
+                name=name,
+                status="blocked",
+                summary="用户拒绝执行验证命令",
+                error="approval_denied",
+            )
+
+        # 与内置 shell 工具复用相同的跨平台解释器选择：macOS/Linux 用 bash，
+        # Windows 用 PowerShell；使用 argv 执行，避免 subprocess shell=True。
         try:
             result = subprocess.run(
-                check.command,
-                shell=True,
+                _build_argv(check.command),
                 cwd=str(self.workspace_root),
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:

@@ -20,6 +20,7 @@ def test_parses_server(tmp_path):
         "    transport: stdio\n"
         "    command: npx\n"
         "    args: ['-y', '@playwright/mcp@latest']\n"
+        "    cwd: .\n"
         "    enabled: true\n"
         "    risk: browser_control\n"
         "    auto_approve: ['browser_snapshot']\n",
@@ -31,6 +32,7 @@ def test_parses_server(tmp_path):
     assert s.name == "playwright"
     assert s.command == "npx"
     assert s.args == ["-y", "@playwright/mcp@latest"]
+    assert s.cwd == "."
     assert s.enabled is True
     assert s.auto_approve == ["browser_snapshot"]
 
@@ -41,6 +43,7 @@ def test_defaults(tmp_path):
     s = load_mcp_servers(cfg)[0]
     assert s.transport == "stdio"        # 默认 stdio
     assert s.enabled is False            # 新 server 默认禁用
+    assert s.cwd is None
     assert s.env_allowlist == ["PATH"]   # 默认只透传 PATH
     assert s.auto_approve == []
 

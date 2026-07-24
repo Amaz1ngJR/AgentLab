@@ -22,7 +22,7 @@
 
 ## 安装
 
-需要 **Python 3.11+**（MCP 功能依赖；纯对话/文件/shell 用 3.9+ 也可，但推荐 3.11）。
+需要 **Python 3.11+**。
 
 ```bash
 conda create -n agentlab python=3.11   # 或自建 venv
@@ -38,7 +38,9 @@ cp .env.example .env
 pip install duckduckgo-search requests beautifulsoup4
 ```
 
-浏览器控制还需要 Node.js/npx（首次启动会自动 `npx` 下载 Playwright，Windows/macOS 均支持）。
+浏览器控制还需要 Node.js LTS / npx（首次启动会自动下载 Playwright MCP
+和浏览器内核）。Windows 会自动解析 `npx.cmd`，macOS、Linux 和 Windows
+共用同一份 MCP 配置。
 
 ## 快速开始
 
@@ -185,12 +187,20 @@ agents:
 默认关闭。启用后模型可打开网页、截图、读 DOM、点击、输入。
 
 ```bash
-# 1. 复制模板
+# macOS / Linux
 cp config/mcp_servers.example.yaml config/mcp_servers.yaml
-# 2. 把其中 playwright 的 enabled 改成 true
-# 3. 启动(首次 npx 会下载 @playwright/mcp 和浏览器内核)
 python -m app
 ```
+
+```powershell
+# Windows PowerShell
+Copy-Item config\mcp_servers.example.yaml config\mcp_servers.yaml
+python -m app
+```
+
+启动前把 `config/mcp_servers.yaml` 中的 `playwright.enabled` 改成 `true`。
+可以先运行 `node --version` 和 `npx --version` 检查 Node.js 是否已加入
+`PATH`；首次启动会下载 `@playwright/mcp` 和浏览器内核。
 
 工作流：模型先 `browser_navigate` 打开页面 → `browser_snapshot` 拿元素 ref → 用 ref 做 `browser_click` / `browser_type`。点击/输入默认每次需审批，`browser_snapshot` 等只读工具免审批。
 

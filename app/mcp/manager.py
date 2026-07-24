@@ -15,21 +15,117 @@
     (cancel scope 限制只针对上下文的进入/退出,不针对方法调用)。
 
 安全:
-  - 子进程 env 只透传 server.env_allowlist(默认 PATH),避免把密钥泄漏给 MCP server。
+  - 子进程 env 只包含跨平台运行所需的非敏感系统变量,以及
+    server.env_allowlist 显式允许的变量,避免把密钥泄漏给 MCP server。
   - 工具输出经 redact() 脱敏后才回灌给(可能是云端的)模型。
 """
 from __future__ import annotations
 
 import asyncio
 import os
+import platform
+import shutil
 import sys
 import threading
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
-from app.mcp.config import MCPServerConfig
+from app.mcp.config import MCPServerConfig, PROJECT_ROOT
 from app.util.redact import format_exception, redact
+
+
+_COMMON_RUNTIME_ENV_VARS = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    "USERNAME",
+)
+
+# CreateProcess、Node.js/npm 和 Playwright 在 Windows 上依赖这些路径变量。
+# 它们只包含本机路径/系统配置,不包含 API key 或业务凭据。
+_WINDOWS_RUNTIME_ENV_VARS = (
+    "APPDATA",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "WINDIR",
+)
+
+_WINDOWS_EXECUTABLE_EXTENSIONS = (".cmd", ".exe", ".bat", ".com")
+
+
+def _resolve_stdio_command(command: str | None, system: str | None = None) -> str:
+    """把 MCP stdio 命令解析为可直接启动的可执行文件。
+
+    Windows 的 npm shim 通常是 ``npx.cmd``。MCP stdio 禁止使用 shell=True,
+    所以必须在启动前显式解析扩展名;同一份 ``command: npx`` 配置因此可在三个
+    平台复用。
+    """
+    raw = (command or "").strip()
+    if not raw:
+        raise ValueError("MCP stdio server 缺少 command")
+
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    candidates = [expanded]
+    if (system or platform.system()) == "Windows":
+        lower = expanded.lower()
+        if not lower.endswith(_WINDOWS_EXECUTABLE_EXTENSIONS):
+            candidates.extend(f"{expanded}{ext}" for ext in _WINDOWS_EXECUTABLE_EXTENSIONS)
+
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    hint = ""
+    if raw.lower() in {"npx", "npx.cmd"}:
+        hint = " 请安装 Node.js LTS，并重新打开终端以刷新 PATH。"
+    raise FileNotFoundError(f"找不到 MCP 启动命令 '{raw}'。{hint}".rstrip())
+
+
+def _build_stdio_env(
+    server: MCPServerConfig,
+    system: str | None = None,
+) -> dict[str, str]:
+    """构造最小、可跨平台运行的 MCP 子进程环境。"""
+    keys = list(_COMMON_RUNTIME_ENV_VARS)
+    if (system or platform.system()) == "Windows":
+        keys.extend(_WINDOWS_RUNTIME_ENV_VARS)
+    keys.extend(server.env_allowlist)
+
+    env: dict[str, str] = {}
+    for key in dict.fromkeys(keys):
+        value = os.environ.get(key)
+        if value is None or value.startswith("()"):
+            continue
+        env[key] = value
+    return env
+
+
+def _resolve_stdio_cwd(cwd: str | None) -> str | None:
+    """将配置中的相对 cwd 固定到项目根目录,避免受启动终端目录影响。"""
+    if not cwd:
+        return None
+    path = Path(os.path.expandvars(os.path.expanduser(cwd)))
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return str(path.resolve())
 
 
 @dataclass
@@ -136,8 +232,14 @@ class MCPManager:
         from mcp.client.stdio import stdio_client
 
         try:
-            env = {k: os.environ[k] for k in server.env_allowlist if k in os.environ}
-            params = StdioServerParameters(command=server.command, args=server.args, env=env)
+            command = _resolve_stdio_command(server.command)
+            env = _build_stdio_env(server)
+            params = StdioServerParameters(
+                command=command,
+                args=server.args,
+                env=env,
+                cwd=_resolve_stdio_cwd(server.cwd),
+            )
             async with AsyncExitStack() as stack:
                 read, write = await stack.enter_async_context(stdio_client(params))
                 session = await stack.enter_async_context(ClientSession(read, write))

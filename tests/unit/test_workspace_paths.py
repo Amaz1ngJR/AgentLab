@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from app.config.loader import use_workspace_root
 from app.tools.builtin.files import (
     _list_dir,
     _read_file,
@@ -17,6 +18,18 @@ def test_resolve_within_workspace(monkeypatch, tmp_path):
     target = tmp_path / "sub" / "file.txt"
     resolved = _resolve_within_workspace(str(target))
     assert resolved == target.resolve()
+
+
+def test_relative_path_is_based_on_workspace_override(monkeypatch, tmp_path):
+    """Loop 切换 workspace 后，相对路径不能继续按主进程 CWD 解析。"""
+    monkeypatch.chdir(tmp_path.parent)
+    with use_workspace_root(tmp_path):
+        out = _write_file({"path": "nested/hello.txt", "content": "hi"})
+        resolved = _resolve_within_workspace("nested/hello.txt")
+
+    assert out.startswith("wrote 2 chars")
+    assert resolved == (tmp_path / "nested" / "hello.txt").resolve()
+    assert (tmp_path / "nested" / "hello.txt").read_text() == "hi"
 
 
 def test_resolve_outside_workspace_raises(monkeypatch, tmp_path):

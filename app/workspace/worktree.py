@@ -149,19 +149,61 @@ class WorktreeManager:
             )
             stat = stat_result.stdout.strip()
 
-            # 文件列表
-            files_result = self._run_git(
+            # status 同时覆盖已跟踪、已暂存和未跟踪文件；单纯 git diff 会漏掉
+            # Agent 新建但尚未 git add 的文件。
+            status_result = self._run_git(
                 "-C", str(worktree.path),
-                "diff", "--name-status", worktree.base_commit,
+                "status", "--short",
             )
-            files = files_result.stdout.strip()
+            status = status_result.stdout.strip()
 
-            if not stat and not files:
+            if not stat and not status:
                 return "无改动"
 
-            return f"改动统计:\n{stat}\n\n文件列表:\n{files}"
+            stat_text = stat or "(仅包含未跟踪文件，暂无 diff 统计)"
+            return f"改动统计:\n{stat_text}\n\n工作区状态:\n{status}"
         except subprocess.CalledProcessError as exc:
             return f"获取 diff 失败: {exc.stderr}"
+
+    def has_commits(self, worktree: WorktreeInfo) -> bool:
+        """返回 worktree 分支是否包含 base_commit 之后的新提交。"""
+        result = self._run_git(
+            "-C", str(worktree.path),
+            "rev-list", "--count", f"{worktree.base_commit}..HEAD",
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        try:
+            return int(result.stdout.strip() or "0") > 0
+        except ValueError:
+            return False
+
+    def commit_all(self, worktree: WorktreeInfo, message: str) -> str:
+        """把 worktree 中全部改动提交，返回 commit SHA。
+
+        调用方必须在执行前完成用户审批。本方法不会操作主工作区或自动合并。
+        """
+        if not worktree.path.exists():
+            raise ValueError(f"Worktree 不存在: {worktree.path}")
+        if not self.check_dirty(worktree):
+            if self.has_commits(worktree):
+                result = self._run_git("-C", str(worktree.path), "rev-parse", "HEAD")
+                return result.stdout.strip()
+            raise ValueError("Worktree 没有可提交的改动")
+
+        try:
+            self._run_git("-C", str(worktree.path), "add", "-A")
+            self._run_git(
+                "-C", str(worktree.path),
+                "-c", "user.name=AgentLab",
+                "-c", "user.email=agentlab@localhost",
+                "commit", "-m", message,
+            )
+            result = self._run_git("-C", str(worktree.path), "rev-parse", "HEAD")
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"提交 worktree 改动失败: {exc.stderr}") from exc
 
     def check_dirty(self, worktree: WorktreeInfo) -> bool:
         """检查 worktree 是否有未提交改动。"""
@@ -221,6 +263,14 @@ class WorktreeManager:
             合并命令建议
         """
         branch_name = f"worktree/{worktree.worktree_id}"
+        if self.check_dirty(worktree):
+            return (
+                "验证已通过，但 worktree 仍有未提交改动，不能直接合并。\n"
+                f"请先检查并提交: git -C {worktree.path} status --short\n"
+                "提交完成后再执行合并。"
+            )
+        if not self.has_commits(worktree):
+            return "验证已通过，但 worktree 分支没有新提交，无需执行 git merge。"
         return (
             f"验证通过！建议合并步骤：\n"
             f"1. 切换到目标分支: git checkout {worktree.base_branch}\n"
