@@ -268,6 +268,7 @@ WORKSPACE_ROOT=/Users/you/some-project
 
 - **路径审批**：workspace 是默认信任边界；文件读取、目录列举、代码搜索、写入和 Shell cwd 越界时使用独立审批，不能选择“本会话总是允许”；Shell 与交互式终端命令也必须逐次审批
 - **写操作审批**：`write_file` / `shell` / 浏览器点击输入等默认弹方向键菜单确认；`-y` 表示用户主动自动批准所有工具，包括 workspace 外访问
+- **分级风险与审计**：内置工具和 MCP 工具统一使用 ToolDescriptor 九级风险；执行成功、失败、拒绝和审批缺失都会把风险、目标、来源及脱敏摘要写入 SQLite `tool_executions`
 - **凭据脱敏**：异常 traceback、工具输出、记忆写入前用正则脱敏 `Bearer xxx` / `sk-ant-xxx` / `cr_xxx` / `x-api-key=xxx` 等
 - **MCP 隔离**：新 MCP server 默认禁用；启用前 CLI 展示 server / transport / 工具列表；只透传 `PATH` 给子进程
 - **云端数据边界**：浏览器控制 + 云端模型时启动显著提示页面内容将离开本机

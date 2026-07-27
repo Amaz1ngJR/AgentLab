@@ -1104,7 +1104,26 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
     def _session_factory(agent_profile, session_id: str) -> AgentSession:
         """按 AgentProfile 构建一个隔离的 AgentSession:独立工具表 + 任务清单 + 记忆注入。"""
         task_store = TaskStore()
-        reg = ToolRegistry()
+
+        def _persist_tool_audit(event) -> None:
+            storage.log_tool_execution(
+                session_id=session_id,
+                tool_name=event.tool_name,
+                args_summary=event.args_summary,
+                result_summary=event.result_summary,
+                is_error=event.is_error,
+                elapsed_seconds=event.elapsed_seconds,
+                risk=event.risk,
+                target_type=event.target_type,
+                scope=event.scope,
+                origin=event.origin,
+                host=event.host,
+                approval_action=event.approval_action or "",
+                outcome=event.outcome,
+                requires_observation=event.requires_observation,
+            )
+
+        reg = ToolRegistry(audit_sink=_persist_tool_audit)
         for t in default_tools():
             reg.register(t)
         reg.register(make_todo_write_tool(task_store))

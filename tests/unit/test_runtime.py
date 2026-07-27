@@ -203,6 +203,23 @@ def test_approval_denied_skips_execution():
     assert last_msg["content"][0]["content"] == DENIED_MESSAGE
 
 
+def test_approval_denial_is_written_to_registry_audit():
+    router = FakeRouter([
+        _resp_tool("call_x", "danger", {}),
+        _resp_text("stopped"),
+    ])
+    audit_events = []
+    registry = ToolRegistry(audit_sink=audit_events.append)
+    registry.register(_danger_tool())
+    session = AgentSession(llm=router, tools=registry, approval=DenyAll())
+
+    assert session.chat("do dangerous thing") == "stopped"
+    assert len(audit_events) == 1
+    assert audit_events[0].tool_name == "danger"
+    assert audit_events[0].outcome == "denied"
+    assert audit_events[0].approval_action == "danger"
+
+
 def test_dynamic_approval_action_is_requested_and_granted():
     router = FakeRouter([
         _resp_tool("call_dynamic", "dynamic", {"outside": True}),

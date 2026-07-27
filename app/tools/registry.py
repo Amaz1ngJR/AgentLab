@@ -1,22 +1,59 @@
-"""工具注册表 —— 管理 Agent 可以调用的所有工具。
+"""工具注册表 —— 管理 Agent 可以调用的所有能力。
 
 使用场景:
   程序启动时把所有工具注册进来,Agent 循环通过 registry.schemas() 把工具描述
   发给模型,模型决定调哪个,Agent 再通过 registry.execute() 实际执行。
 
-工具的关键属性:
-  input_schema      - 告诉模型这个工具接受哪些参数(JSON Schema 格式)
-  requires_approval - True 表示执行前必须人工确认(写文件、执行命令等危险操作)
-  approval_resolver - 根据参数返回动态审批动作;例如只在路径越出 workspace 时审批
+所有内置工具、MCP 工具和后续电脑控制动作都使用 ToolDescriptor。除了模型可见
+schema,Descriptor 还携带 risk / target / scope / origin 等安全元数据,供审批和
+审计使用。旧代码仍可导入 Tool,它是 ToolDescriptor 的兼容别名。
 """
 from __future__ import annotations
 
+import json
+import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from app.util.redact import redact
+
 
 ApprovalResolver = Callable[[dict[str, Any]], Optional[str]]
+AuditRedactor = Callable[[dict[str, Any], str], tuple[str, str]]
+ToolAuditSink = Callable[["ToolAuditEvent"], None]
+
+TOOL_RISKS = frozenset({
+    "read",
+    "observe",
+    "network",
+    "write",
+    "browser_control",
+    "desktop_control",
+    "remote_execute",
+    "execute",
+    "destructive",
+})
+
+# 未显式覆盖 requires_approval 时按风险决定。read 是本地无副作用读取;
+# observe/network 需要按目标确认;其余会改变环境或执行代码,默认逐次审批。
+_APPROVAL_REQUIRED_RISKS = TOOL_RISKS - {"read"}
+
+
+class ToolExecutionError(Exception):
+    """executor 可抛出的预期工具错误,消息会原样回传给模型。"""
+
+
+def _clip(text: str, limit: int = 500) -> str:
+    return text[:limit] + "…" if len(text) > limit else text
+
+
+def _json_summary(value: Any) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=repr)
+    except (TypeError, ValueError):
+        text = repr(value)
+    return redact(_clip(text))
 
 # 审批结果不能放进模型可控的 args。Runtime 在 ToolRegistry.execute() 调用时
 # 传入已批准 action，Registry 用 ContextVar 只在当前 executor 调用期间授予。
@@ -32,25 +69,54 @@ def is_approval_granted(action: str) -> bool:
 
 
 @dataclass
-class Tool:
-    """一个可被模型调用的工具。
+class ToolAuditEvent:
+    """一次工具执行或拒绝的结构化审计事件。"""
 
-    name              - 工具名称,模型用这个名字请求调用,例如 "read_file"
-    description       - 工具功能描述,模型根据这段文字决定要不要用它
-    input_schema      - 参数定义(JSON Schema),告诉模型该传哪些字段
-    executor          - 实际执行函数,接收参数字典,返回结果字符串
-    requires_approval - 是否需要人工确认才能执行。
-                        只读操作(read_file / list_dir)设为 False,
-                        写操作(write_file)或危险操作(shell 命令)设为 True。
-    approval_resolver - 可选动态审批判定。返回审批动作名表示本次需要审批,
-                        返回 None 表示沿用 requires_approval。
+    tool_name: str
+    risk: str
+    target_type: str
+    scope: str
+    origin: str
+    host: Optional[str]
+    requires_observation: bool
+    approval_action: Optional[str]
+    outcome: str
+    args_summary: str
+    result_summary: str
+    is_error: bool
+    elapsed_seconds: float
+
+
+@dataclass
+class ToolDescriptor:
+    """一个可被模型调用、可审批、可审计的能力描述。
+
+    requires_approval 是兼容覆盖项。设为 None 时根据 risk 使用默认策略;
+    旧工具可继续显式传 True/False。approval_resolver 可按参数提高审批要求,
+    例如 workspace 外路径返回独立且不可持久化的 action。
     """
+
     name: str
     description: str
     input_schema: dict[str, Any]
     executor: Callable[[dict[str, Any]], str]
-    requires_approval: bool = False
+    # 保持旧 Tool 构造器的第 5/6 个位置参数顺序,兼容外部扩展。
+    requires_approval: Optional[bool] = None
     approval_resolver: Optional[ApprovalResolver] = None
+    risk: str = "read"
+    target_type: str = "runtime"
+    scope: str = "session"
+    origin: str = "builtin"
+    host: Optional[str] = None
+    requires_observation: bool = False
+    audit_redactor: Optional[AuditRedactor] = None
+
+    def __post_init__(self) -> None:
+        if self.risk not in TOOL_RISKS:
+            allowed = ", ".join(sorted(TOOL_RISKS))
+            raise ValueError(
+                f"unknown tool risk '{self.risk}' for {self.name}; expected one of: {allowed}"
+            )
 
     def approval_action(self, args: dict[str, Any]) -> Optional[str]:
         """返回本次调用需要批准的动作名,无需审批则返回 None。"""
@@ -58,7 +124,27 @@ class Tool:
             dynamic = self.approval_resolver(args or {})
             if dynamic:
                 return dynamic
-        return self.name if self.requires_approval else None
+        needs_approval = (
+            self.requires_approval
+            if self.requires_approval is not None
+            else self.risk in _APPROVAL_REQUIRED_RISKS
+        )
+        return self.name if needs_approval else None
+
+    def audit_summary(
+        self,
+        args: dict[str, Any],
+        result: str,
+    ) -> tuple[str, str]:
+        """生成脱敏、有界的参数和结果摘要。"""
+        if self.audit_redactor is not None:
+            try:
+                args_summary, result_summary = self.audit_redactor(args or {}, result)
+                return redact(_clip(str(args_summary))), redact(_clip(str(result_summary)))
+            except Exception:
+                # 审计回调不能影响工具主流程,失败时退回通用脱敏摘要。
+                pass
+        return _json_summary(args or {}), redact(_clip(str(result)))
 
     def to_schema(self) -> dict[str, Any]:
         """生成发给模型的工具描述字典(Anthropic 原生格式)。"""
@@ -67,6 +153,9 @@ class Tool:
             "description": self.description,
             "input_schema": self.input_schema,
         }
+
+
+Tool = ToolDescriptor
 
 
 class ToolRegistry:
@@ -78,25 +167,82 @@ class ToolRegistry:
       3. 模型返回工具调用请求后,调用 execute() 实际运行
     """
 
-    def __init__(self) -> None:
+    def __init__(self, audit_sink: Optional[ToolAuditSink] = None) -> None:
         # 用字典存储,key 是工具名,方便按名称 O(1) 查找
-        self._tools: dict[str, Tool] = {}
+        self._tools: dict[str, ToolDescriptor] = {}
+        self._audit_sink = audit_sink
 
-    def register(self, tool: Tool) -> None:
+    def register(self, tool: ToolDescriptor) -> None:
         """注册一个工具。同名工具会覆盖旧的。"""
         self._tools[tool.name] = tool
 
-    def get(self, name: str) -> Tool | None:
+    def get(self, name: str) -> ToolDescriptor | None:
         """按名称查找工具。未注册时返回 None。"""
         return self._tools.get(name)
 
-    def all(self) -> list[Tool]:
+    def all(self) -> list[ToolDescriptor]:
         """返回所有已注册的工具列表。"""
         return list(self._tools.values())
 
     def schemas(self) -> list[dict[str, Any]]:
         """返回所有工具的描述字典列表,直接传给模型的 tools 参数。"""
         return [t.to_schema() for t in self._tools.values()]
+
+    def record_denied(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        approval_action: Optional[str],
+    ) -> None:
+        """记录上层 ApprovalPolicy 拒绝的调用。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            return
+        self._emit_audit(
+            tool,
+            args,
+            "User denied execution",
+            approval_action=approval_action,
+            outcome="denied",
+            is_error=False,
+            elapsed_seconds=0.0,
+        )
+
+    def _emit_audit(
+        self,
+        tool: ToolDescriptor,
+        args: dict[str, Any],
+        result: str,
+        *,
+        approval_action: Optional[str],
+        outcome: str,
+        is_error: bool,
+        elapsed_seconds: float,
+    ) -> None:
+        if self._audit_sink is None:
+            return
+        args_summary, result_summary = tool.audit_summary(args, result)
+        event = ToolAuditEvent(
+            tool_name=tool.name,
+            risk=tool.risk,
+            target_type=tool.target_type,
+            scope=tool.scope,
+            origin=tool.origin,
+            host=tool.host,
+            requires_observation=tool.requires_observation,
+            approval_action=approval_action,
+            outcome=outcome,
+            args_summary=args_summary,
+            result_summary=result_summary,
+            is_error=is_error,
+            elapsed_seconds=elapsed_seconds,
+        )
+        try:
+            self._audit_sink(event)
+        except Exception:
+            # 审计存储故障不能把已经完成的用户操作变成工具失败。
+            pass
 
     def execute(
         self,
@@ -113,17 +259,43 @@ class ToolRegistry:
         approved_action 只能由 Runtime/Executor 在 ApprovalPolicy 放行后传入。
         Registry 会再次核对工具本次实际需要的动作，阻止绕过上层审批直接执行。
         """
+        started = time.monotonic()
         tool = self._tools.get(name)
         if tool is None:
             return f"unknown tool: {name}", True
         required_action = tool.approval_action(args or {})
         if required_action is not None and approved_action != required_action:
-            return f"approval required: {required_action}", True
+            result = f"approval required: {required_action}"
+            self._emit_audit(
+                tool,
+                args or {},
+                result,
+                approval_action=required_action,
+                outcome="approval_required",
+                is_error=True,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            return result, True
 
         token = _approved_action.set(approved_action)
         try:
-            return tool.executor(args or {}), False
+            result = tool.executor(args or {})
+            is_error = False
+        except ToolExecutionError as exc:
+            result = str(exc)
+            is_error = True
         except Exception as exc:
-            return f"{type(exc).__name__}: {exc}", True
+            result = f"{type(exc).__name__}: {exc}"
+            is_error = True
         finally:
             _approved_action.reset(token)
+        self._emit_audit(
+            tool,
+            args or {},
+            result,
+            approval_action=required_action,
+            outcome="error" if is_error else "completed",
+            is_error=is_error,
+            elapsed_seconds=time.monotonic() - started,
+        )
+        return result, is_error

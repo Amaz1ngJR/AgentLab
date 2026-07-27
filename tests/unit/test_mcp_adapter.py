@@ -1,7 +1,10 @@
 """离线测试:MCP 工具适配器 —— 用 fake manager,不连真 server。"""
+import pytest
+
 from app.mcp.adapter import build_mcp_tools
 from app.mcp.config import MCPServerConfig
 from app.mcp.manager import MCPToolInfo
+from app.tools.registry import ToolExecutionError, ToolRegistry
 
 
 class FakeManager:
@@ -49,6 +52,25 @@ def test_auto_approve_whitelist():
     assert tools["browser_click"].requires_approval is True      # 其余需审批
 
 
+def test_inherits_server_risk_and_origin_metadata():
+    mgr = FakeManager([_info("browser_snapshot"), _info("browser_click")])
+    cfg = MCPServerConfig(
+        name="playwright",
+        risk="browser_control",
+        auto_approve=["browser_snapshot"],
+    )
+    tools = {t.name: t for t in build_mcp_tools(mgr, [cfg])}
+
+    snapshot = tools["browser_snapshot"]
+    assert snapshot.risk == "browser_control"
+    assert snapshot.target_type == "browser"
+    assert snapshot.scope == "mcp_server:playwright"
+    assert snapshot.origin == "mcp"
+    assert snapshot.host == "playwright"
+    assert snapshot.requires_observation is False
+    assert tools["browser_click"].requires_observation is True
+
+
 def test_executor_forwards_to_manager():
     mgr = FakeManager([_info("browser_navigate")])
     tool = build_mcp_tools(mgr, [MCPServerConfig(name="playwright")])[0]
@@ -62,9 +84,18 @@ def test_executor_marks_mcp_error():
     mgr = FakeManager([_info("browser_click")])
     tool = build_mcp_tools(mgr, [MCPServerConfig(name="playwright")])[0]
     mgr.next_result = ("element not found", True)
-    out = tool.executor({"ref": "x"})
+    with pytest.raises(ToolExecutionError, match="element not found"):
+        tool.executor({"ref": "x"})
+
+    registry = ToolRegistry()
+    registry.register(tool)
+    out, is_error = registry.execute(
+        tool.name,
+        {"ref": "x"},
+        approved_action=tool.approval_action({"ref": "x"}),
+    )
+    assert is_error is True
     assert out.startswith("[mcp error]")
-    assert "element not found" in out
 
 
 def test_duplicate_tool_name_across_servers_skipped():

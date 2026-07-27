@@ -350,6 +350,29 @@ def _web_fetch(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+def _web_fetch_audit_summary(args: dict, result: str) -> tuple[str, str]:
+    safe_args = {
+        key: args.get(key)
+        for key in ("url", "max_chars", "timeout")
+        if key in args
+    }
+    try:
+        body = json.loads(result)
+        result_summary = json.dumps(
+            {
+                "url": body.get("url", ""),
+                "title": body.get("title", ""),
+                "extractor": body.get("extractor", ""),
+                "chars": body.get("chars", 0),
+                "truncated": body.get("truncated", False),
+            },
+            ensure_ascii=False,
+        )
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        result_summary = result
+    return json.dumps(safe_args, ensure_ascii=False), result_summary
+
+
 WEB_FETCH = Tool(
     name="web_fetch",
     description=(
@@ -379,6 +402,11 @@ WEB_FETCH = Tool(
         "required": ["url"],
     },
     executor=_web_fetch,
+    risk="network",
+    target_type="internet",
+    scope="public_web",
+    origin="builtin",
+    audit_redactor=_web_fetch_audit_summary,
     requires_approval=False,  # 只读 network 风险,不需审批
 )
 

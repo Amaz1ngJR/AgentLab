@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
 from app.agent import events
-from app.agent.approval import ApprovalPolicy, AutoApprove
+from app.agent.approval import ApprovalPolicy, AutoApprove, request_tool_approval
 from app.agent.cancel import CancelToken, Cancelled
 from app.agent.events import RunEvent
 from app.agent.tasks import BLOCKED, COMPLETED, FAILED, Task
@@ -284,12 +284,23 @@ class Executor:
                                             tool_name=call.name, tool_input=call.arguments,
                                             payload={"approval_action": approval_action}))
 
-                    if needs_approval and not self._approval.request(
-                        approval_action,
-                        call.arguments,
+                    if (
+                        needs_approval
+                        and tool is not None
+                        and not request_tool_approval(
+                            self._approval,
+                            tool,
+                            approval_action,
+                            call.arguments,
+                        )
                     ):
                         output, is_error = DENIED_MESSAGE, False
                         denied_any = True
+                        self._tools.record_denied(
+                            call.name,
+                            call.arguments,
+                            approval_action=approval_action,
+                        )
                         self._emit(RunEvent(kind=events.TOOL_DENIED, task_id=task.id,
                                             tool_name=call.name))
                     else:

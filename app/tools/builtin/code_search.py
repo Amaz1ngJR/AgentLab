@@ -439,6 +439,27 @@ def _code_search(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+def _code_search_audit_summary(args: dict, result: str) -> tuple[str, str]:
+    safe_args = {
+        key: args.get(key)
+        for key in ("query", "mode", "path", "glob", "max_results")
+        if key in args
+    }
+    try:
+        body = json.loads(result)
+        result_summary = json.dumps(
+            {
+                "count": body.get("count", 0),
+                "truncated": body.get("truncated", False),
+                "backend": (body.get("summary") or {}).get("backend", ""),
+            },
+            ensure_ascii=False,
+        )
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        result_summary = result
+    return json.dumps(safe_args, ensure_ascii=False), result_summary
+
+
 CODE_SEARCH = Tool(
     name="code_search",
     description=(
@@ -486,6 +507,11 @@ CODE_SEARCH = Tool(
         "required": ["query"],
     },
     executor=_code_search,
+    risk="read",
+    target_type="filesystem",
+    scope="workspace_or_approved_external",
+    origin="builtin",
+    audit_redactor=_code_search_audit_summary,
     requires_approval=False,  # 只读,风险等级 read,不需审批
     approval_resolver=lambda args: _outside_workspace_approval(
         "code_search",

@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
-from app.agent.approval import ApprovalPolicy, AutoApprove
+from app.agent.approval import ApprovalPolicy, AutoApprove, request_tool_approval
 from app.agent.cancel import CancelToken
 from app.agent.events import RunEvent
 from app.agent.tasks import TaskStore
@@ -282,12 +282,23 @@ class AgentSession:
                     approval_action = (
                         tool.approval_action(call.arguments) if tool else None
                     )
-                    if approval_action and not self.approval.request(
-                        approval_action,
-                        call.arguments,
+                    if (
+                        approval_action
+                        and tool is not None
+                        and not request_tool_approval(
+                            self.approval,
+                            tool,
+                            approval_action,
+                            call.arguments,
+                        )
                     ):
                         output = DENIED_MESSAGE
                         is_error = False
+                        self.tools.record_denied(
+                            call.name,
+                            call.arguments,
+                            approval_action=approval_action,
+                        )
                         self._on_event(TurnEvent(kind="tool_denied", tool_name=call.name))
                     else:
                         t0 = time.monotonic()

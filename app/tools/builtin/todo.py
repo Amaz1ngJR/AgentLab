@@ -87,5 +87,9 @@ def make_todo_write_tool(store: TaskStore) -> Tool:
             "required": ["tasks"],
         },
         executor=_todo_write,
+        risk="read",
+        target_type="task_store",
+        scope="session",
+        origin="builtin",
         requires_approval=False,  # 只更新内存状态,不操作环境
     )

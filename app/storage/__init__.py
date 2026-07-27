@@ -65,6 +65,14 @@ CREATE TABLE IF NOT EXISTS tool_executions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  TEXT NOT NULL,
     tool_name   TEXT NOT NULL,
+    risk        TEXT NOT NULL DEFAULT '',
+    target_type TEXT NOT NULL DEFAULT '',
+    scope       TEXT NOT NULL DEFAULT '',
+    origin      TEXT NOT NULL DEFAULT '',
+    host        TEXT,
+    approval_action TEXT NOT NULL DEFAULT '',
+    outcome     TEXT NOT NULL DEFAULT 'completed',
+    requires_observation INTEGER NOT NULL DEFAULT 0,
     args_summary TEXT NOT NULL DEFAULT '',
     result_summary TEXT NOT NULL DEFAULT '',
     is_error    INTEGER NOT NULL DEFAULT 0,
@@ -110,6 +118,17 @@ CREATE TABLE IF NOT EXISTS context_summaries (
 );
 """
 
+_TOOL_EXECUTION_MIGRATIONS = {
+    "risk": "TEXT NOT NULL DEFAULT ''",
+    "target_type": "TEXT NOT NULL DEFAULT ''",
+    "scope": "TEXT NOT NULL DEFAULT ''",
+    "origin": "TEXT NOT NULL DEFAULT ''",
+    "host": "TEXT",
+    "approval_action": "TEXT NOT NULL DEFAULT ''",
+    "outcome": "TEXT NOT NULL DEFAULT 'completed'",
+    "requires_observation": "INTEGER NOT NULL DEFAULT 0",
+}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -128,6 +147,7 @@ class Storage:
         self._con = sqlite3.connect(str(self._path), check_same_thread=False)
         self._con.row_factory = sqlite3.Row
         self._con.executescript(_SCHEMA)
+        self._migrate_tool_executions()
         self._con.commit()
         # Loop Engineering 相关表(goal_specs/loop_runs/loop_iterations/
         # verification_results/worktrees/subagent_runs)。与上面的核心表共用同一连接,
@@ -141,6 +161,18 @@ class Storage:
 
     def close(self) -> None:
         self._con.close()
+
+    def _migrate_tool_executions(self) -> None:
+        """为已有数据库补 ToolDescriptor 审计列。"""
+        existing = {
+            row["name"]
+            for row in self._con.execute("PRAGMA table_info(tool_executions)").fetchall()
+        }
+        for name, declaration in _TOOL_EXECUTION_MIGRATIONS.items():
+            if name not in existing:
+                self._con.execute(
+                    f"ALTER TABLE tool_executions ADD COLUMN {name} {declaration}"
+                )
 
     @contextmanager
     def _tx(self):
@@ -310,18 +342,37 @@ class Storage:
     def log_tool_execution(self, session_id: str, tool_name: str,
                            args_summary: str, result_summary: str,
                            is_error: bool = False,
-                           elapsed_seconds: Optional[float] = None) -> None:
+                           elapsed_seconds: Optional[float] = None, *,
+                           risk: str = "",
+                           target_type: str = "",
+                           scope: str = "",
+                           origin: str = "",
+                           host: Optional[str] = None,
+                           approval_action: str = "",
+                           outcome: Optional[str] = None,
+                           requires_observation: bool = False) -> None:
+        final_outcome = outcome or ("error" if is_error else "completed")
         with self._tx() as con:
             con.execute(
                 """INSERT INTO tool_executions
-                   (session_id,tool_name,args_summary,result_summary,
-                    is_error,elapsed_seconds,created_at)
-                   VALUES(?,?,?,?,?,?,?)""",
-                (session_id, tool_name,
+                   (session_id,tool_name,risk,target_type,scope,origin,host,
+                    approval_action,outcome,requires_observation,args_summary,
+                    result_summary,is_error,elapsed_seconds,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (session_id, tool_name, risk, target_type, scope, origin, host,
+                 approval_action, final_outcome, int(requires_observation),
                  redact(_truncate(args_summary)),
                  redact(_truncate(result_summary)),
                  int(is_error), elapsed_seconds, _now()),
             )
+
+    def list_tool_executions(self, session_id: str) -> list[dict]:
+        """按执行顺序返回某会话的工具审计记录。"""
+        rows = self._con.execute(
+            "SELECT * FROM tool_executions WHERE session_id=? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     # ── tasks(TaskStore 持久化,支持退出重启恢复任务状态)──────────────────────
 

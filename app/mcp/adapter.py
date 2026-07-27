@@ -1,7 +1,7 @@
-"""MCP 工具适配器 —— 把发现的 MCP 工具包装成内置 Tool,接入现有 ToolRegistry。
+"""MCP 工具适配器 —— 把发现的 MCP 工具包装成 ToolDescriptor。
 
 设计要点(technical_architecture.md §9.2):
-  - 每个 MCP 工具映射成统一的 ToolDescriptor(这里复用现有 Tool dataclass)。
+  - 每个 MCP 工具映射成统一的 ToolDescriptor,继承 server risk/origin/host。
   - 同名工具不覆盖内置:内置 read_file/write_file/list_dir/code_search/shell/todo_write
     是基础能力,MCP 不能顶替(§ "待接入 MCP 清单" 原则)。同名则跳过并警告。
   - 审批:MCP 工具默认 requires_approval=True(动作经浏览器/外部进程执行,风险高);
@@ -14,7 +14,7 @@ from typing import Optional
 
 from app.mcp.config import MCPServerConfig
 from app.mcp.manager import MCPManager, MCPToolInfo
-from app.tools.registry import Tool
+from app.tools.registry import Tool, ToolExecutionError
 
 # 调用 MCP 工具的默认超时(秒)。浏览器导航/等待可能偏慢,给得比本地工具宽。
 DEFAULT_CALL_TIMEOUT = 60.0
@@ -24,11 +24,10 @@ def _make_executor(manager: MCPManager, server: str, tool_name: str):
     """生成同步 executor 闭包:把 (args) 转发给 manager.call_tool。"""
     def _execute(args: dict) -> str:
         text, is_error = manager.call_tool(server, tool_name, args, timeout=DEFAULT_CALL_TIMEOUT)
-        # registry.execute 用 (text, is_error) 中的 text;is_error 通过抛异常体现。
-        # 这里 MCP 错误已是文本,直接把错误信息当结果返回(前缀标明),
-        # 让模型看到失败原因而不是中断循环。
+        # MCP 协议错误抛成预期工具错误,Registry 会把 is_error 标为 True,
+        # 同时将消息回灌模型并写入统一审计。
         if is_error:
-            return f"[mcp error] {text}"
+            raise ToolExecutionError(f"[mcp error] {text}")
         return text
     return _execute
 
@@ -45,6 +44,7 @@ def build_mcp_tools(
     reserved = reserved_names or set()
     # server name -> auto_approve 白名单,用于决定每个工具是否免审批
     auto_by_server = {s.name: set(s.auto_approve) for s in server_configs}
+    config_by_server = {s.name: s for s in server_configs}
 
     tools: list[Tool] = []
     seen: set[str] = set()
@@ -60,11 +60,24 @@ def build_mcp_tools(
         seen.add(info.name)
 
         auto = info.name in auto_by_server.get(info.server, set())
+        server = config_by_server.get(info.server)
+        risk = server.risk if server is not None else "destructive"
+        is_browser = info.name.startswith("browser_")
+        is_observation = any(
+            token in info.name
+            for token in ("snapshot", "screenshot", "console_messages", "network_requests")
+        )
         tools.append(Tool(
             name=info.name,
             description=info.description or f"(MCP tool from {info.server})",
             input_schema=info.input_schema or {"type": "object", "properties": {}},
             executor=_make_executor(manager, info.server, info.name),
+            risk=risk,
+            target_type="browser" if is_browser else "mcp_server",
+            scope=f"mcp_server:{info.server}",
+            origin="mcp",
+            host=info.server,
+            requires_observation=is_browser and not is_observation,
             requires_approval=not auto,  # 白名单内免审批,其余需审批
         ))
     return tools

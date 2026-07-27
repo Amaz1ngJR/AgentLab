@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from app.config.loader import workspace_root
@@ -198,6 +199,22 @@ def _list_dir(args: dict) -> str:
 # input_schema 是 JSON Schema 格式,模型根据它知道该传哪些参数。
 # description 是给模型看的自然语言说明,写清楚功能和限制。
 
+
+def _read_audit_summary(args: dict, result: str) -> tuple[str, str]:
+    return (
+        json.dumps({"path": args.get("path", "")}, ensure_ascii=False),
+        f"returned_chars={len(result)}",
+    )
+
+
+def _write_audit_summary(args: dict, result: str) -> tuple[str, str]:
+    summary = {"path": args.get("path", "")}
+    for key in ("content", "old_str", "new_str"):
+        if key in args:
+            summary[f"{key}_chars"] = len(str(args.get(key, "")))
+    return json.dumps(summary, ensure_ascii=False), result
+
+
 READ_FILE = Tool(
     name="read_file",
     description="读取本地文本文件的内容。返回 UTF-8 文本,超过 200KB 会截断。"
@@ -210,6 +227,11 @@ READ_FILE = Tool(
         "required": ["path"],
     },
     executor=_read_file,
+    risk="read",
+    target_type="filesystem",
+    scope="workspace_or_approved_external",
+    origin="builtin",
+    audit_redactor=_read_audit_summary,
     requires_approval=False,  # 只读,不需要确认
     approval_resolver=lambda args: _outside_workspace_approval("read_file", args),
 )
@@ -227,6 +249,11 @@ WRITE_FILE = Tool(
         "required": ["path", "content"],
     },
     executor=_write_file,
+    risk="write",
+    target_type="filesystem",
+    scope="workspace_or_approved_external",
+    origin="builtin",
+    audit_redactor=_write_audit_summary,
     requires_approval=True,   # 写操作,执行前弹出 y/a/n 确认
     approval_resolver=lambda args: _outside_workspace_approval("write_file", args),
 )
@@ -243,6 +270,11 @@ LIST_DIR = Tool(
         "required": [],  # path 是可选参数
     },
     executor=_list_dir,
+    risk="read",
+    target_type="filesystem",
+    scope="workspace_or_approved_external",
+    origin="builtin",
+    audit_redactor=_read_audit_summary,
     requires_approval=False,  # 只读,不需要确认
     approval_resolver=lambda args: _outside_workspace_approval(
         "list_dir",
@@ -270,6 +302,11 @@ EDIT_FILE = Tool(
         "required": ["path", "old_str", "new_str"],
     },
     executor=_edit_file,
+    risk="write",
+    target_type="filesystem",
+    scope="workspace_or_approved_external",
+    origin="builtin",
+    audit_redactor=_write_audit_summary,
     requires_approval=True,   # 写操作,执行前弹确认(审批前会显示 diff)
     approval_resolver=lambda args: _outside_workspace_approval("edit_file", args),
 )

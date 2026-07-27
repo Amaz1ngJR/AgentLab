@@ -1,7 +1,13 @@
 """离线测试：审批策略。不需要网络或模型。"""
 from unittest.mock import patch
 
-from app.agent.approval import AutoApprove, DenyAll, InteractivePolicy
+from app.agent.approval import (
+    AutoApprove,
+    DenyAll,
+    InteractivePolicy,
+    request_tool_approval,
+)
+from app.tools.registry import ToolDescriptor
 
 
 def test_auto_approve():
@@ -88,3 +94,58 @@ def test_command_execution_approvals_cannot_be_remembered():
             assert InteractivePolicy().request(action, {"command": "pwd"})
 
         assert [c[1] for c in captured["choices"]] == ["yes", "no"]
+
+
+def test_structured_approval_shows_risk_and_target():
+    captured = {}
+    tool = ToolDescriptor(
+        name="browser_click",
+        description="click",
+        input_schema={"type": "object", "properties": {}},
+        executor=lambda _: "ok",
+        risk="browser_control",
+        target_type="browser",
+        scope="mcp_server:playwright",
+        origin="mcp",
+        host="playwright",
+    )
+
+    def fake_menu(choices, header_lines, **_):
+        captured["choices"] = choices
+        captured["header_lines"] = header_lines
+        return "yes"
+
+    with patch("app.util.menu.select_menu", side_effect=fake_menu):
+        assert request_tool_approval(
+            InteractivePolicy(),
+            tool,
+            "browser_click",
+            {"ref": "x"},
+        )
+
+    assert [c[1] for c in captured["choices"]] == ["yes", "no"]
+    assert "风险: browser_control" in captured["header_lines"]
+    assert "目标: browser / mcp_server:playwright / playwright" in captured["header_lines"]
+    assert "来源: mcp" in captured["header_lines"]
+
+
+def test_request_tool_approval_keeps_legacy_policy_compatible():
+    class LegacyPolicy:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, action, args):
+            self.calls.append((action, args))
+            return True
+
+    policy = LegacyPolicy()
+    tool = ToolDescriptor(
+        name="write_file",
+        description="write",
+        input_schema={"type": "object", "properties": {}},
+        executor=lambda _: "ok",
+        risk="write",
+    )
+
+    assert request_tool_approval(policy, tool, "write_file", {"path": "x"})
+    assert policy.calls == [("write_file", {"path": "x"})]

@@ -1,5 +1,6 @@
 """离线测试：Storage SQLite 层。"""
 import json
+import sqlite3
 from app.storage import Storage
 
 
@@ -91,8 +92,62 @@ def test_memory_secret_redacted(tmp_path):
 def test_tool_execution_logged(tmp_path):
     s = _store(tmp_path)
     s.create_session("s1", "default", "cloud_claude")
-    s.log_tool_execution("s1", "read_file", '{"path":"x"}', "content", elapsed_seconds=0.1)
-    # 只验证不报错，审计写入成功
+    s.log_tool_execution(
+        "s1",
+        "read_file",
+        '{"path":"x"}',
+        "content",
+        elapsed_seconds=0.1,
+        risk="read",
+        target_type="filesystem",
+        scope="workspace",
+        origin="builtin",
+        approval_action="",
+        outcome="completed",
+    )
+    rows = s.list_tool_executions("s1")
+    assert len(rows) == 1
+    assert rows[0]["tool_name"] == "read_file"
+    assert rows[0]["risk"] == "read"
+    assert rows[0]["target_type"] == "filesystem"
+    assert rows[0]["scope"] == "workspace"
+    assert rows[0]["origin"] == "builtin"
+    assert rows[0]["outcome"] == "completed"
+
+
+def test_tool_execution_schema_migrates_existing_database(tmp_path):
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute(
+        """CREATE TABLE tool_executions (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           session_id TEXT NOT NULL,
+           tool_name TEXT NOT NULL,
+           args_summary TEXT NOT NULL DEFAULT '',
+           result_summary TEXT NOT NULL DEFAULT '',
+           is_error INTEGER NOT NULL DEFAULT 0,
+           elapsed_seconds REAL,
+           created_at TEXT NOT NULL
+        )"""
+    )
+    con.commit()
+    con.close()
+
+    store = Storage(path)
+    columns = {
+        row["name"]
+        for row in store.conn.execute("PRAGMA table_info(tool_executions)").fetchall()
+    }
+    assert {
+        "risk",
+        "target_type",
+        "scope",
+        "origin",
+        "host",
+        "approval_action",
+        "outcome",
+        "requires_observation",
+    }.issubset(columns)
 
 
 def test_upsert_agent_profile(tmp_path):

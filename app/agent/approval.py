@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from app.tools.registry import ToolDescriptor
 
 
 class ApprovalPolicy(Protocol):
@@ -29,6 +32,23 @@ class ApprovalPolicy(Protocol):
         返回 True 表示允许执行,False 表示拒绝。
         """
         ...
+
+
+def request_tool_approval(
+    policy: ApprovalPolicy,
+    tool: "ToolDescriptor",
+    action: str,
+    tool_input: dict[str, Any],
+) -> bool:
+    """用结构化工具元数据请求审批,并兼容旧 ApprovalPolicy。
+
+    新策略可实现 request_tool();现有测试策略和第三方策略只实现 request() 也能
+    继续工作。模型参数保持原样,风险元数据不会混进 executor 的 args。
+    """
+    extended = getattr(policy, "request_tool", None)
+    if callable(extended):
+        return bool(extended(tool, action, tool_input))
+    return bool(policy.request(action, tool_input))
 
 
 class AutoApprove:
@@ -83,15 +103,42 @@ class InteractivePolicy:
     _PREVIEW_MAX = 240
     # workspace 越界和任意命令执行必须逐次确认，不能被会话白名单吞掉。
     _NON_PERSISTENT_ACTIONS = {"shell", "terminal_open", "terminal_send"}
+    _NON_PERSISTENT_RISKS = {
+        "browser_control",
+        "desktop_control",
+        "remote_execute",
+        "execute",
+        "destructive",
+    }
 
     def __init__(self) -> None:
         # 本会话的白名单:选过"总是允许"的工具名存在这里,下次直接放行
         self._always: set[str] = set()
 
     def request(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
+        return self._request(tool_name, tool_input)
+
+    def request_tool(
+        self,
+        tool: "ToolDescriptor",
+        action: str,
+        tool_input: dict[str, Any],
+    ) -> bool:
+        """带 risk/target/origin 元数据的工具审批入口。"""
+        return self._request(action, tool_input, tool=tool)
+
+    def _request(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        *,
+        tool: "ToolDescriptor | None" = None,
+    ) -> bool:
+        risk = getattr(tool, "risk", None)
         can_persist = (
             tool_name not in self._NON_PERSISTENT_ACTIONS
             and not tool_name.endswith("_outside_workspace")
+            and risk not in self._NON_PERSISTENT_RISKS
         )
         # 已在白名单中,直接放行,不再询问
         if can_persist and tool_name in self._always:
@@ -112,6 +159,15 @@ class InteractivePolicy:
             f"工具: {tool_name}",
             f"参数: {args_str}",
         ]
+        if tool is not None:
+            target = f"{tool.target_type} / {tool.scope}"
+            if tool.host:
+                target += f" / {tool.host}"
+            header_lines.extend([
+                f"风险: {tool.risk}",
+                f"目标: {target}",
+                f"来源: {tool.origin}",
+            ])
 
         choices = [("允许这次", "yes")]
         if can_persist:

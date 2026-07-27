@@ -332,6 +332,11 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             "required": ["command"],
         },
         executor=_open,
+        risk="execute",
+        target_type="terminal_session",
+        scope="session",
+        origin="builtin",
+        requires_observation=True,
         requires_approval=True,
     )
 
@@ -372,6 +377,11 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             "required": ["session_id", "input"],
         },
         executor=_send,
+        risk="execute",
+        target_type="terminal_session",
+        scope="session",
+        origin="builtin",
+        requires_observation=True,
         requires_approval=True,
     )
 
@@ -389,6 +399,10 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             "required": ["session_id"],
         },
         executor=_close,
+        risk="execute",
+        target_type="terminal_session",
+        scope="session",
+        origin="builtin",
         requires_approval=False,  # 关闭是收尾动作,无需审批
     )
 
@@ -397,6 +411,10 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         description="列出当前所有活跃的交互式会话(session_id、存活状态、启动命令)。",
         input_schema={"type": "object", "properties": {}},
         executor=_list,
+        risk="observe",
+        target_type="terminal_session",
+        scope="session",
+        origin="builtin",
         requires_approval=False,
     )
 

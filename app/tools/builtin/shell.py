@@ -146,6 +146,10 @@ SHELL = Tool(
         "required": ["command"],
     },
     executor=_run_shell,
+    risk="execute",
+    target_type="process",
+    scope="workspace_or_approved_external",
+    origin="builtin",
     requires_approval=True,  # shell 命令属于高风险操作,默认强制审批
     approval_resolver=lambda args: _outside_workspace_approval(
         "shell",

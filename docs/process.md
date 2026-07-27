@@ -13,21 +13,21 @@
 
 ## 1. 当前一句话状态
 
-AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、方向键审批、内置文件/代码搜索/web 搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）、`Planner + Executor + Replanner` 编排路径（带依赖 TaskStore + 结构化 `RunEvent`，已接入 CLI 主路径，支持 Ctrl-C 协作式取消与任务状态持久化恢复）、上下文预算与自动压缩（`ContextBudget` + `ContextCompressor` + 结构化摘要 + `/context` 命令族，编排稳定点超阈值自动压缩、可审计）。
+AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、ToolDescriptor 九级风险与统一工具审计、方向键审批、内置文件/代码搜索/web 搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）、`Planner + Executor + Replanner` 编排路径（带依赖 TaskStore + 结构化 `RunEvent`，已接入 CLI 主路径，支持 Ctrl-C 协作式取消与任务状态持久化恢复）、上下文预算与自动压缩（`ContextBudget` + `ContextCompressor` + 结构化摘要 + `/context` 命令族，编排稳定点超阈值自动压缩、可审计）。
 
 **Loop 模式（Loop Engineering，§7.6）的基础闭环已接通**：`/goal new` 定义目标和验证命令，`/loop start` 创建隔离 worktree，调用 `Orchestrator` 执行 Planner→Executor→Replanner，随后进入 Verifier 验证；失败时生成修复指令继续迭代，成功时展示完整 worktree 状态，并在用户审批后生成可合并提交。command Verifier 复用同一审批策略和跨平台 shell 解释器；执行器异常会直接终止 Loop，不能再被旧文件或旧测试误判为成功。尚缺 browser/api/human Verifier、Loop 运行证据完整持久化、`Learner` / Project Knowledge、子 Agent 和后台 Loop。
 
-距离 PRD 的核心缺口：Loop Engineering 的高级验证、学习与协作能力尚未完成；没有统一风险等级 `ToolDescriptor` 与分级审批，没有自建 Computer Control Gateway，没有终端 TUI，没有 Web UI。
+距离 PRD 的核心缺口：Loop Engineering 的高级验证、学习与协作能力尚未完成；CLI 尚未抽出可供多前端复用的 Runtime Service 与异步 Approval Broker；没有自建 Computer Control Gateway、FastAPI Server、终端 TUI 和 Web UI。
 
 ---
 
 ## 2. 当前需要做的事情（最多 5 项）
 
-1. **完善 Loop Engineering 证据闭环**（PRD §7.6，基础闭环见 3.11）：把 loop run / iteration / verification / worktree / commit 证据完整写入 `loop_store`，并实现 browser/api/human Verifier 与 `/loop evidence`、`/loop diff`。
-2. 把 `Tool` 升级为统一 `ToolDescriptor`，审批从布尔值改为分级策略（read/write/execute/browser_control/...）（见 6.4）。
-3. 建立 `ComputerControlGateway`，把 Playwright MCP 浏览器能力纳入统一观察、动作、审批、审计链路（见 6.6）。
-4. 新增终端 TUI（`app/tui/`）：顶部大号 **Amaz1ng** 欢迎栏 + 会话/任务/审批/对话分区，复用同一 Runtime 事件（见 6.12）。
-5. FastAPI Web UI + SSE 事件，与 CLI 共用同一 Runtime service（见 6.10）。
+1. **抽出 Runtime Service 与 Approval Broker**：把 Session 创建、消息执行、取消、审批、事件订阅和资源关闭从 CLI 拆成公共服务；CLI 先迁移到该服务（见 6.1、6.10）。
+2. **完善 Loop Engineering 证据闭环**（PRD §7.6，基础闭环见 3.11）：把 loop run / iteration / verification / worktree / commit 证据完整写入 `loop_store`，实现 api/human Verifier 与 `/loop evidence`、`/loop diff`（见 6.14）。
+3. **建立 ComputerControlGateway**：先包装 Playwright MCP，让 snapshot/click/type 进入统一 Observation、风险判断、审批和审计，并接入 browser Verifier（见 6.6、6.7）。
+4. **实现 FastAPI Server MVP**：提供 session/message/approval/cancel API 与 SSE 事件，增加 `agentlab serve`；先完成 API 和简单管理页，再扩展完整 Web UI（见 6.10）。
+5. **补跨平台集成验证**：在 Windows/Linux/macOS CI 覆盖 CLI 安装、Runtime Service、Server、MCP/Playwright 和审批审计主链路（见 6.11）。
 
 ---
 
@@ -94,7 +94,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **499 个 unit tests**（其中 6 个在可选依赖未装时 skip，全离线），覆盖：runtime（含动态审批、编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、MCP（config/adapter/manager，含 Windows `npx.cmd`、最小运行环境和 cwd）、CLI 全局入口与 workspace 参数、code_search（含外部目录审批）、web_search、web_fetch（公网地址校验、DNS/重定向 SSRF、正文抽取、截断、脱敏）、shell（含外部 cwd 审批）、交互式终端会话、审批、workspace path、存储、记忆、session_router、Skill loader/catalog、Loop Engineering（真实多轮编排、Verifier 审批、worktree 相对路径/未跟踪文件/审批提交与合并边界、执行异常终止）。
+- **515 个 unit tests**（全离线），覆盖：runtime（含动态审批、编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、ToolDescriptor/九级风险/结构化审批/统一审计/旧数据库迁移、MCP（config/adapter/manager，含 Windows `npx.cmd`、最小运行环境和 cwd）、CLI 全局入口与 workspace 参数、code_search（含外部目录审批）、web_search、web_fetch（公网地址校验、DNS/重定向 SSRF、正文抽取、截断、脱敏）、shell（含外部 cwd 审批）、交互式终端会话、workspace path、存储、记忆、session_router、Skill loader/catalog、Loop Engineering（真实多轮编排、Verifier 审批、worktree 相对路径/未跟踪文件/审批提交与合并边界、执行异常终止）。
 - `.github/workflows/mcp-cross-platform.yml` 在 Windows、Linux、macOS
   runner 安装 Node.js 后真实验证 `npx` 解析，并运行 MCP 专项测试。
 
@@ -138,6 +138,15 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - **Loop RunEvent** (`app/agent/events.py`)：14 个 Loop 生命周期事件，新增明确的 `loop_failed`。
 - **Loop CLI 命令** (`app/agent/loop_commands.py`)：已接入 CLI 主循环；`/goal new <目标> :: <验证命令>` 创建并持久化 GoalSpec，`/loop start/status/stop` 驱动当前 session 的 Orchestrator、Verifier 和 WorktreeManager。
 
+### 3.12 ToolDescriptor、分级审批与统一工具审计
+
+- `app/tools/registry.py`：正式引入 `ToolDescriptor`，统一描述 `risk / target_type / scope / origin / host / requires_observation / audit_redactor`；`Tool` 保留为兼容别名，现有 Skill、测试和扩展无需一次性迁移。
+- 九级风险分类已落地：`read / observe / network / write / browser_control / desktop_control / remote_execute / execute / destructive`。工具未显式覆盖 `requires_approval` 时由风险等级决定默认审批；workspace 越界仍由参数级 `approval_resolver` 提升为独立审批动作。
+- `InteractivePolicy` 已能展示风险、目标、来源和 host；browser/desktop/remote/execute/destructive、shell/terminal 以及 workspace 越界动作不可使用“本会话总是允许”。旧 `ApprovalPolicy.request(action,args)` 通过兼容适配继续可用。
+- 内置文件、代码搜索、Web、Shell、Todo、交互式终端和 MCP 工具均声明风险与目标元数据。MCP 工具继承 Server risk，并标注 `origin=mcp`、server host 和 browser observation 要求。
+- `ToolRegistry` 对 completed/error/denied/approval_required 统一产出 `ToolAuditEvent`；CLI 为每个 Session 注入审计 sink，写入 SQLite `tool_executions`。表已补风险、目标、来源、host、审批动作、结果状态和 observation 字段，并可自动迁移旧数据库。
+- 文件内容、代码搜索结果和网页正文使用工具级 `audit_redactor` 只记录有界摘要；MCP 协议错误不再伪装成功，而是作为工具错误回灌模型并进入审计。
+
 ---
 
 ## 4. 当前能力快照
@@ -154,15 +163,15 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 长期记忆 | none/read/read_write 三策略 + 注入；LIKE 检索（未做向量） | `app/memory/` |
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |
 | 任务面板 / TaskStore | 任务状态唯一源:依赖/claim/blocked/failed/evidence/history/snapshot/restore;`todo_write` 走简单三态;CLI 面板渲染(含 blocked/failed 字形) | `app/agent/tasks.py`, `app/tools/builtin/todo.py` |
-| 审批 | 自动 / 交互（方向键）/ 拒绝；`requires_approval` + `approval_resolver` 支持按参数动态审批，workspace 越界动作不可持久化授权 | `app/agent/approval.py`, `app/tools/registry.py`, `app/util/menu.py` |
+| 审批 | `ToolDescriptor` 九级风险 + 参数级 `approval_resolver`；交互审批展示风险/目标/来源，高风险与 workspace 越界动作不可持久化授权；旧 Policy 兼容 | `app/agent/approval.py`, `app/tools/registry.py`, `app/util/menu.py` |
 | 内置工具 | `read_file / write_file / edit_file / list_dir / code_search / web_search / web_fetch / shell / todo_write`；`terminal_*` 交互式终端会话 | `app/tools/builtin/` |
-| MCP | stdio Manager、工具发现、sync/async 桥、同名不覆盖、auto_approve 白名单 | `app/mcp/` |
+| MCP | stdio Manager、工具发现、sync/async 桥、同名不覆盖、auto_approve 白名单；映射 ToolDescriptor 并继承 Server 风险，调用进入统一审计 | `app/mcp/` |
 | 浏览器控制 | Playwright MCP：打开/snapshot/点击/输入；named profile；数据边界提示 | `config/mcp_servers.example.yaml`, `app/cli.py` |
-| 存储 | SQLite：sessions/messages/memories/tool_executions/runs/tasks；settings 表与 Web 复用待做 | `app/storage/` |
+| 存储 | SQLite：sessions/messages/memories/tool_executions/runs/tasks/context_summaries + Loop 表；工具审计含风险/目标/来源/审批/结果；settings 表待做 | `app/storage/` |
 | 安全基础 | workspace 默认信任边界、越界强审批、审批上下文防模型伪造、脱敏、MCP env allowlist、敏感目录不入库 | `app/tools/registry.py`, `app/util/redact.py`, `.gitignore` |
 | 取消 | Ctrl-C 协作式取消(CancelToken):首次置位、当前步骤后停止,连按强制中断 | `app/agent/cancel.py`, `app/cli.py` |
 | 上下文压缩 | ContextBudget + ContextCompressor + 结构化摘要;编排稳定点超 85% 自动压缩、可审计;`/context` 命令族 | `app/agent/context.py`, `context_budget.py`, `context_compaction.py` |
-| 测试 | 483 个 unit tests（web_search 的 6 个在可选依赖未装时自动 skip） | `tests/unit/` |
+| 测试 | 完整离线 unit tests 通过（数量见 3.7）；三平台 MCP 专项 CI 已配置 | `tests/unit/`, `.github/workflows/mcp-cross-platform.yml` |
 
 ---
 
@@ -199,11 +208,11 @@ AgentLab/
       goals.py                     # [Loop] GoalSpec + 校验(objective/success_criteria/verifier/预算)
       verifier.py                  # [Loop] Verifier:command/file_assertion + VerificationResult
       loop_runner.py               # [Loop] LoopRunner 状态机框架(执行→验证→诊断→修复)
-      loop_commands.py             # [Loop] LoopCommandHandler:/goal /loop 命令处理(待接 CLI)
+      loop_commands.py             # [Loop] LoopCommandHandler:/goal /loop 命令处理(已接 CLI)
     workspace/                     # [Loop] 工作区隔离与项目知识
       worktree.py                  # WorktreeManager:git worktree 创建/diff/dirty/删除/合并建议
     tools/
-      registry.py                  # Tool 注册表：静态 requires_approval + 参数级 approval_resolver
+      registry.py                  # ToolDescriptor、九级风险、动态审批、统一 ToolAuditEvent
       builtin/
         files.py                   # read_file / write_file / list_dir
         code_search.py             # 高频代码搜索
@@ -237,7 +246,7 @@ AgentLab/
   docs/
     technical_architecture.md      # PRD 和总体技术方案
     process.md                     # 当前进展和接下来工作
-  tests/unit/                      # 444 个 unit tests
+  tests/unit/                      # unit tests（当前数量见 3.7，避免多处数字漂移）
 ```
 
 尚未出现但 PRD 已规划的目录/模块：`app/agent/learner.py`、`app/agent/subagents.py`、`app/workspace/knowledge.py`、`app/workspace/scheduler.py`、`app/control/`、`app/tui/`、`app/server.py`、`app/web/`。（Loop 核心 `goals.py` / `verifier.py` / `loop_runner.py` / `loop_store.py` / `app/workspace/worktree.py` 已落地，见 3.11。）
@@ -257,9 +266,10 @@ AgentLab/
 - 强化 Executor 任务指令：明确要求「必须立即调用工具」，列举具体场景，禁止只输出文字
 - 新增空转检测：第一轮不调用工具时给模型纠正提示，智能识别合法完成消息（「已完成」「无需操作」）避免误伤
 
-接下来要做(均为非阻塞增强):
+接下来要做：
 
-- `approval_required` 目前靠 Executor 内同步调 `ApprovalPolicy`(方向键菜单已生效);后续可把审批也做成异步 RunEvent,便于 Web UI/TUI 统一弹窗。
+- **P0：抽出 Runtime Service**，统一提供 create/switch session、send message、cancel、subscribe events、approve/deny 和 close；CLI 先改为调用 Service，不能让 Web/TUI 直接依赖 `_build_session` 或复制 `_session_factory`。
+- 在 Runtime Service 内新增异步 `ApprovalBroker`：Executor 发结构化 ApprovalRequest 后暂停当前 run，由 CLI/Web/TUI 提交 decision；保留同步 Policy adapter 兼容现有 CLI 和测试。
 - Replanner 当前是启发式;后续可选"让模型看 outcome 产出 plan patch"的 LLM 重规划。
 - `runs / tasks` 已落库,但还没有 CLI/Web 查看入口(如 `/runs`、任务历史回看)。
 - 编排路径会把"子任务指令"作为 user 消息写进历史,多轮后上下文偏长。PRD §7.3 的上下文压缩(见 6.13)会在 token 接近窗口上限时自动压缩旧历史兜底,任务不会因超限中断;"用独立通道传子任务指令、根本不进对话历史"是可选的源头优化,优先级下调。
@@ -268,12 +278,9 @@ AgentLab/
 
 ### 6.2 多 Agent、Session 与长期记忆
 
-当前状态：核心功能已完成（见 3.4）。**CLI prompt 显示 session_id·标题** 和 **read_write 退出写摘要** 已实现（见下方）。
-
-已完成（本次提交）：
-- ✅ CLI prompt 动态显示 `[session_id·标题] ▸`（app/cli.py，从 storage 读取 session title，标题超过 30 字符时截断）
-- ✅ `read_write` 记忆策略的"会话结束写摘要"接入 CLI 退出钩子：`SessionRouter.close_all()` 调用 `mem_policy.save()`（app/agent/session_router.py）
-- ✅ `/session list` 显示每个会话的消息数（已完成，commit `948774f`）
+当前状态：核心功能已完成（见 3.4）。CLI prompt 显示
+`[session_id·标题] ▸`，`/session list` 显示消息数；`read_write` 策略在
+`SessionRouter.close_all()` 中生成会话摘要并写入长期记忆。
 
 接下来要做（非阻塞优化）：
 
@@ -294,45 +301,43 @@ AgentLab/
 
 ### 6.4 工具与审批
 
-当前状态：`Tool` 支持静态 `requires_approval` 和参数级
-`approval_resolver`；文件、代码搜索与 Shell cwd 已按 workspace 是否越界动态
-选择审批动作，越界动作不可持久化授权。内置工具齐全（含 `web_search` 和
-`web_fetch`，见 3.2）；MCP 工具走 auto_approve 白名单。尚缺完整风险元数据和
-统一审计。
-
-**web_fetch 已实现**：
-- 给定 URL 抓取网页正文并转 Markdown（requests + trafilatura/readability/BeautifulSoup）
-- 比浏览器 DOM 点击更轻量，适合「读一篇文章」场景
-- SSRF 防护：只允许公网 http/https，解析全部 DNS 地址，拒绝本机/私网/链路本地/保留地址；关闭自动重定向并逐跳校验
-- 依赖未装时优雅降级（BeautifulSoup 纯文本兜底）
-- 30 个单元测试全通过
-- 解决「读知乎文章失败」等 web_search 只给摘要的缺口
+当前状态：统一 `ToolDescriptor`、九级风险、参数级 `approval_resolver`、
+结构化交互审批和 `ToolAuditEvent` 已完成（见 3.12）。workspace 越界和高风险
+动作不可持久化授权；内置工具与 MCP 均声明风险/目标/来源元数据，并由 CLI
+Session 统一写入 `tool_executions`。`web_search` / `web_fetch` 标为
+`network`，当前通过显式只读策略免逐次审批。
 
 接下来要做：
 
-- 将 `Tool` 升级为 `ToolDescriptor`，补 `risk / target_type / scope / origin / host / requires_observation / audit_redactor`。`web_search` 属 `network` 只读风险，应在此分级里明确标注。
-- 审批升级为分级策略：`read / observe / network / write / browser_control / desktop_control / remote_execute / execute / destructive`。
-- 支持会话级授权（绑定 tool/origin/host/workspace）；删除、支付、发布、上传等动作不能被普通授权绕过。
-- 内置工具、MCP 工具、浏览器动作、远程动作统一进入审计摘要。
+- 在 Runtime Service 的 Approval Broker 中实现结构化会话授权，授权键绑定
+  `tool + risk + origin + host + scope`，不能只按 action 字符串记忆。
+- 增加敏感动作分类器：删除、支付、发布、上传、授权、部署等动作提升为
+  `destructive` 或二次确认，普通 browser/write 授权不能绕过。
+- 增加审计查询与回放接口，按 session/run/tool/risk/outcome 过滤，并让 Loop
+  evidence 引用具体 `tool_executions.id`。
+- 为更多工具补专用 `audit_redactor`；参数和结果只存必要摘要，不落正文、凭据、
+  cookie 或终端密码输入。
 
-验收标准：同一审批策略可同时判断 `write_file`、`shell`、`browser_click`、MCP tool 和 remote command。
+验收标准：同一审批策略可同时判断 `write_file`、`shell`、`browser_click`、MCP
+tool 和 remote command；基础 Descriptor 与内置/MCP 审计已满足，browser/remote
+待 ControlGateway 接入。
 
 **web_search 相关增强（非阻塞）**：
 
 - `duckduckgo-search` 库偶发限流/验证码，当前已有 HTML fallback；后续可补 Bing/Google（需 API key）作为可选后端，用 profile 或 env 选择。
-- 把搜索查询与结果 URL 纳入 `tool_executions` 审计（当前只脱敏不落审计）。
+- 搜索查询已进入 `tool_executions`；若后续需要保存结果 URL，应只保存命中域名或受控数量的 URL 摘要。
 
 ### 6.5 MCP
 
 当前状态：stdio Client 可用，Playwright 已接入；Windows 的 npm shim
 解析、必需环境变量、稳定 cwd 和 MCP SDK 进程树清理已接入，并有三平台
-专项 CI（见 3.3）。
+专项 CI。MCP 工具已映射为 ToolDescriptor，继承 Server risk/origin/host，
+调用成功、协议错误和审批结果进入统一工具审计（见 3.3、3.12）。
 
 接下来要做：
 
 - 增加 Streamable HTTP transport。
-- MCP 工具映射到新版 `ToolDescriptor`，继承 server risk，可按工具提高风险等级。
-- MCP 调用写入 `tool_executions` 审计表。
+- 支持在 Server 默认风险之上按工具配置提高风险等级，禁止工具自行降低风险。
 - 增加健康状态、断线重连、连接失败事件。
 
 验收标准：stdio 和 Streamable HTTP 两种 MCP 都能通过统一 ToolRegistry 调用，并被同一套审批和审计策略处理。
@@ -395,29 +400,37 @@ AgentLab/
 
 接下来要做：
 
+- 优先抽出 Runtime Service 与 Approval Broker，并让现有 CLI 通过该服务运行；这是 Server/TUI 的前置工作。
 - 补 `settings` 表；把 LoopRunner 的运行过程和证据真正写入现有 `loop_store` 表。
-- 抽出 Runtime service，让 CLI 与 Web UI 共用同一逻辑。
-- 新增 `app/server.py` 和 `app/web/`，提供本地 Web UI、SSE 事件、审批 API、Loop Dashboard / Loop API、Stop 按钮。
+- 新增 `app/server.py` 和 `app/web/`，先提供 health、sessions、messages、approvals、cancel、SSE 和 `agentlab serve`，默认只监听 `127.0.0.1`。
+- API 稳定后再增加本地 Web UI、Loop Dashboard、证据/diff 页面和 Stop 按钮。
 - 配置面板能查看 AgentProfile、模型 profile、Skill、MCP Server、Control Target 和工具风险等级。
 
-验收标准：退出重启后可 `/session list` 看到历史 session，并恢复消息、任务和记忆摘要（消息与记忆恢复已实现，任务恢复待 6.1）。
+验收标准：CLI 与 HTTP API 对同一 Session 使用同一 Runtime Service；`agentlab
+serve --workspace .` 可发送消息、订阅事件、处理审批和取消 run，退出重启后仍能
+恢复消息、任务、上下文摘要和工具审计。
 
 ### 6.11 安全、可观测性与测试
 
-当前状态：已有 workspace 默认边界与越界动态审批、脱敏、MCP env allowlist、审批基础；测试以 unit 为主，集成测试目录存在但未成主路径。
+当前状态：已有 workspace 默认边界与越界动态审批、ToolDescriptor 九级风险、
+结构化工具审计、工具级摘要脱敏、MCP env allowlist；测试以 unit 为主，MCP
+已有 Windows/Linux/macOS 专项 CI，但完整 Server/浏览器/远程集成链路尚未建立。
 
 接下来要做：
 
 - API Key 从 `.env` 迁移到 macOS/Windows Keyring，`.env` 只做开发兜底。
-- 所有 tool execution、approval、control action、model profile、actual model 进入审计事件。
+- 把独立 approval decision、control action、model profile、actual model 补进审计事件，并与现有 ToolAuditEvent/run 串成可回放链路。
 - 增加 provider fake、MCP test server、本地浏览器测试页、fake SSH target。
+- 扩展三平台 CI，覆盖 editable install、CLI smoke、Runtime Service、FastAPI Server 和 Playwright 主链路。
 - 高风险模块默认禁用，首次启用必须展示能力、数据边界和风险。
 
 验收标准：一次包含模型推理、工具调用、审批、浏览器 observation 的 run 可被完整回放为事件和审计记录。
 
 ### 6.12 终端 TUI
 
-当前状态：还没有 `app/tui/`；交互只有行式 CLI REPL（`app/cli.py`），没有全屏分区界面，也没有欢迎栏。
+当前状态：还没有 `app/tui/`；交互只有行式 CLI REPL（`app/cli.py`），没有全屏
+分区界面，也没有欢迎栏。优先级后移到 Runtime Service 和 FastAPI Server 之后，
+避免 TUI 复制 CLI 内部装配逻辑。
 
 接下来要做：
 
@@ -492,7 +505,7 @@ conda activate agentlab
 # 首次安装，注册可从任意目录调用的 agentlab 命令。
 python -m pip install -e .
 
-# 收集测试。当前 491 个 unit tests。
+# 收集测试。当前数量以 3.7 和 pytest 输出为准。
 python -m pytest tests/unit --collect-only -q
 
 # 运行全部 unit tests。

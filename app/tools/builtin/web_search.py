@@ -13,7 +13,7 @@
   5. 输出大小限制,避免撑爆上下文
 
 安全:
-  - 只读,风险等级 read,不需要逐次审批
+  - 只读 network 请求,内置公网搜索不需要逐次审批
   - 结果经过脱敏处理
   - 超时保护,避免阻塞
   - 输出大小硬截断
@@ -217,6 +217,28 @@ def _web_search(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+def _web_search_audit_summary(args: dict, result: str) -> tuple[str, str]:
+    safe_args = {
+        key: args.get(key)
+        for key in ("query", "max_results", "engine", "timeout")
+        if key in args
+    }
+    try:
+        body = json.loads(result)
+        result_summary = json.dumps(
+            {
+                "engine": body.get("engine", ""),
+                "count": body.get("count", 0),
+                "truncated": body.get("truncated", False),
+                "error": body.get("error", ""),
+            },
+            ensure_ascii=False,
+        )
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        result_summary = result
+    return json.dumps(safe_args, ensure_ascii=False), result_summary
+
+
 WEB_SEARCH = Tool(
     name="web_search",
     description=(
@@ -252,7 +274,12 @@ WEB_SEARCH = Tool(
         "required": ["query"],
     },
     executor=_web_search,
-    requires_approval=False,  # 只读,风险等级 read,不需审批
+    risk="network",
+    target_type="internet",
+    scope="public_web",
+    origin="builtin",
+    audit_redactor=_web_search_audit_summary,
+    requires_approval=False,  # 只读 network 请求,当前内置公网搜索免逐次审批
 )
 
 
