@@ -54,7 +54,7 @@ models:
 
   cloud_claude_opus:
     provider: anthropic
-    model: ${ANTHROPIC_MODEL:-claude-opus-4-8}
+    model: ${ANTHROPIC_MODEL:-claude-opus-5}
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     api_key_env: ANTHROPIC_API_KEY
     base_url_env: ANTHROPIC_BASE_URL

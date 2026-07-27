@@ -929,6 +929,138 @@ def _handle_context_command(session: AgentSession, line: str) -> str:
             "disable-auto-compact / enable-auto-compact").format(sub)
 
 
+def _handle_model_command(router: SessionRouter, line: str) -> str:
+    """处理 /model 命令族。
+
+      /model                  列出所有配置的模型
+      /model list             列出所有配置的模型
+      /model current          显示当前使用的模型详情
+      /model switch <profile> 切换到指定模型
+    """
+    from app.config.loader import load_profiles
+
+    parts = line.split(maxsplit=2)
+    sub = parts[1].strip() if len(parts) > 1 else "list"
+
+    # /model 或 /model list - 列出所有配置的模型
+    if sub == "" or sub == "list":
+        try:
+            profiles = load_profiles()
+            if not profiles:
+                return "未找到任何模型配置。请检查 config/models.yaml。"
+
+            # 获取当前激活的 profile
+            current_profile = None
+            if router.current and hasattr(router.current, 'llm'):
+                llm = router.current.llm
+                # 尝试从 llm 对象获取 profile_name
+                current_profile = getattr(llm, 'profile_name', None)
+                # 如果 llm 没有 profile_name，尝试从配置获取
+                if not current_profile:
+                    from app.config.loader import load_config
+                    try:
+                        cfg = load_config()
+                        current_profile = cfg.profile_name
+                    except Exception:
+                        pass
+
+            lines = ["可用模型配置:"]
+            lines.append("")
+
+            for name, profile in sorted(profiles.items()):
+                marker = "→ " if name == current_profile else "  "
+                caps = ", ".join(profile.capabilities) if profile.capabilities else "无"
+                lines.append(f"{marker}{name}")
+                lines.append(f"    provider: {profile.provider}")
+                lines.append(f"    model   : {profile.model}")
+                if profile.base_url:
+                    lines.append(f"    base_url: {profile.base_url}")
+                lines.append(f"    能力    : {caps}")
+                lines.append("")
+
+            if current_profile:
+                lines.append(f"当前使用: {current_profile} (标记为 →)")
+            else:
+                lines.append("当前未激活任何模型")
+
+            return "\n".join(lines)
+        except Exception as e:
+            return f"加载模型配置失败: {e}"
+
+    # /model current - 显示当前模型详情
+    elif sub == "current":
+        if not router.current:
+            return "当前无活跃 session。用 /session new 创建。"
+
+        session = router.current
+        if not hasattr(session, 'llm'):
+            return "当前 session 没有 LLM 配置。"
+
+        llm = session.llm
+        lines = ["当前模型配置:"]
+        lines.append("")
+        lines.append(f"  profile    : {getattr(llm, 'profile_name', '未知')}")
+        lines.append(f"  provider   : {getattr(llm, 'provider', '未知')}")
+        lines.append(f"  model      : {getattr(llm, 'model', '未知')}")
+
+        base_url = getattr(llm, 'base_url', None)
+        if base_url:
+            lines.append(f"  base_url   : {base_url}")
+
+        temperature = getattr(llm, 'temperature', None)
+        if temperature is not None:
+            lines.append(f"  temperature: {temperature}")
+
+        context_size = getattr(llm, 'context_size', None)
+        if context_size:
+            lines.append(f"  context    : {context_size} tokens")
+
+        # 显示使用统计
+        if hasattr(session, 'cumulative_usage'):
+            usage = session.cumulative_usage
+            lines.append("")
+            lines.append("本会话用量:")
+            lines.append(f"  input      : {usage.get('input_tokens', 0)} tokens")
+            lines.append(f"  output     : {usage.get('output_tokens', 0)} tokens")
+            lines.append(f"  时长       : {session.cumulative_seconds:.1f}s")
+
+        return "\n".join(lines)
+
+    # /model switch <profile> - 切换模型
+    elif sub == "switch":
+        if len(parts) < 3:
+            return "用法: /model switch <profile_name>\n使用 /model list 查看可用模型。"
+
+        target_profile = parts[2].strip()
+
+        try:
+            profiles = load_profiles()
+            if target_profile not in profiles:
+                available = ", ".join(sorted(profiles.keys()))
+                return f"未找到 profile '{target_profile}'。\n可用: {available}"
+
+            # 切换模型需要重建 session
+            # 这里我们通过设置环境变量并提示用户重启来实现
+            # 因为动态切换模型涉及重建整个 LLM 实例和 session
+            import os
+            os.environ["ACTIVE_PROFILE"] = target_profile
+
+            return (
+                f"已设置 ACTIVE_PROFILE={target_profile}\n"
+                f"\n"
+                f"模型切换将在新建 session 时生效。建议:\n"
+                f"  1. /session new      - 新建使用新模型的会话\n"
+                f"  2. 或重启 agentlab   - 全局切换到新模型\n"
+                f"\n"
+                f"注: 当前会话仍使用原有模型。"
+            )
+        except Exception as e:
+            return f"切换模型失败: {e}"
+
+    else:
+        return f"未知子命令: {sub}。可用: list / current / switch"
+
+
 def _check_local_endpoint(cfg) -> None:
     """启动时探测本地 / 局域网 Ollama 端点是否在响应。
 
@@ -1031,7 +1163,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
 
     print(f"工具     : {' / '.join(tool_display)}")
     print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
-    print("输入 /reset 清空会话; /resume 继续未完成任务; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
+    print("输入 /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
     print("执行中按 Esc 或 Ctrl-C 可中断,停下后直接输入新指令即可调整方向。\n")
 
     # ── MCP server 接入 ───────────────────────────────────────────────────────
@@ -1318,6 +1450,7 @@ _SLASH_COMMANDS = {
     "/context": "查看上下文预算 / 手动压缩 / 摘要",
     "/goal": "定义 Loop Engineering 目标",
     "/loop": "启动/查看/停止 Loop",
+    "/model": "查看和切换模型配置",
 }
 # /session 子命令 → 说明
 _SESSION_SUBCOMMANDS = {
@@ -1346,6 +1479,12 @@ _LOOP_SUBCOMMANDS = {
     "start": "启动 Loop",
     "status": "显示 Loop 状态",
     "stop": "停止 Loop (Ctrl-C)",
+}
+# /model 子命令 → 说明
+_MODEL_SUBCOMMANDS = {
+    "list": "列出所有配置的模型",
+    "current": "显示当前使用的模型详情",
+    "switch": "切换到指定模型",
 }
 
 
@@ -1377,7 +1516,7 @@ class _SlashCompleter(Completer):
                     yield Completion(cmd, start_position=-len(word), display_meta=desc)
             return
 
-        if parts[0] not in ("/session", "/context", "/goal", "/loop"):
+        if parts[0] not in ("/session", "/context", "/goal", "/loop", "/model"):
             return  # 只有这几个有更深层补全
 
         # ── 第二级:/context 子命令 ──
@@ -1405,6 +1544,28 @@ class _SlashCompleter(Completer):
                 for sub, desc in _LOOP_SUBCOMMANDS.items():
                     if sub.startswith(prefix):
                         yield Completion(sub, start_position=-len(prefix), display_meta=desc)
+            return
+
+        # ── 第二级:/model 子命令 ──
+        if parts[0] == "/model":
+            if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
+                prefix = parts[1] if len(parts) == 2 else ""
+                for sub, desc in _MODEL_SUBCOMMANDS.items():
+                    if sub.startswith(prefix):
+                        yield Completion(sub, start_position=-len(prefix), display_meta=desc)
+            # ── 第三级:/model switch <profile_name> 的参数 ──
+            elif len(parts) >= 2 and parts[1] == "switch":
+                from app.config.loader import load_profiles
+                arg_prefix = parts[2] if (len(parts) >= 3 and not text.endswith(" ")) else ""
+                try:
+                    profiles = load_profiles()
+                    for profile_name, profile in profiles.items():
+                        if profile_name.startswith(arg_prefix):
+                            desc = f"{profile.provider} / {profile.model}"
+                            yield Completion(profile_name, start_position=-len(arg_prefix),
+                                           display_meta=desc)
+                except Exception:
+                    pass
             return
 
         # ── 第二级:/session 子命令 ──
@@ -1669,6 +1830,11 @@ def _repl(router: SessionRouter) -> int:
 
         if line == "/context" or line.startswith("/context "):
             print(_handle_context_command(session, line))
+            continue
+
+        # /model 命令:查看和切换模型配置
+        if line == "/model" or line.startswith("/model "):
+            print(_handle_model_command(router, line))
             continue
 
         # /goal 和 /loop 命令:Loop Engineering 模式(§7.6)

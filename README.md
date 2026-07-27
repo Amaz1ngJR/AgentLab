@@ -17,7 +17,7 @@
 - **任务面板**：模型用 todo_write 维护多步任务清单，CLI 实时显示进度（`✓ done` / `❯ in_progress` / `○ pending`）
 - **方向键审批**：写操作 / shell 命令 / 浏览器动作前弹出菜单 `允许这次 / 总是允许 / 拒绝`，↑↓ 选择 + Enter
 - **可中断执行**：执行中按 Esc 或 Ctrl-C 停下，可直接输入新指令调整方向；`/resume` 继续上一轮未完成任务
-- **模型切换**：`--profile` 或 `.env` 切换本地 / 云端，不改代码；本地端点不通时给出可执行修复指引
+- **模型切换**：`--profile` 或 `.env` 切换本地 / 云端，不改代码；`/model` 命令族运行时查看和切换模型；本地端点不通时给出可执行修复指引
 - **进度可见**：LLM 调用期间 `✻ thinking… (3.2s · ↓ 42 tokens)` 实时刷新；每轮末尾打印耗时与 token
 
 ## 安装
@@ -149,6 +149,10 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 |---|---|
 | `/reset` | 清空当前会话的消息和任务 |
 | `/resume [目标]` | 继续上一轮未完成的任务（失败任务重置为 pending） |
+| `/model` | 列出所有配置的模型（同 `/model list`） |
+| `/model list` | 列出所有配置的模型，标记当前使用的模型 |
+| `/model current` | 显示当前模型的详细配置和使用统计 |
+| `/model switch <profile>` | 切换到指定模型（新建 session 时生效） |
 | `/context` | 显示上下文预算 + recent window + 压缩摘要状态 |
 | `/context compact` | 立即压缩当前会话的可压缩历史 |
 | `/context summary` | 查看当前生效的压缩摘要 |
@@ -164,6 +168,10 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 | `exit` / `quit` / Ctrl-D | 退出 |
 
 不同 session 的消息历史、任务清单互相隔离，切换时不串。
+
+**使用提示**：
+- 所有斜杠命令支持 Tab 自动补全；`/model switch` 会补全 `config/models.yaml` 里的 profile 名
+- `/model switch` 只改后续新建 session 的模型，当前会话不受影响；切完接 `/session new` 生效，或重启 `agentlab` 全局切换
 
 ## 多 Agent 与长期记忆
 
