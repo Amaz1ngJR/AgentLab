@@ -1875,6 +1875,10 @@ def _repl(router: SessionRouter) -> int:
             continue
 
         try:
+            repaired = _repair_dangling_tool_use(session)
+            if repaired:
+                print(f"  ⚠ 检测到 {repaired} 个悬空 tool_use，已自动修复（历史损坏可能由上次中断引起）。",
+                      file=sys.stderr)
             _chat_with_cancel(session, line)
         except Exception as exc:
             # 脱敏后输出,避免 Authorization / API key 等凭据泄漏到终端
@@ -1883,6 +1887,69 @@ def _repl(router: SessionRouter) -> int:
         # 每轮对话后把消息历史 + 任务快照存盘,支持下次 /session switch 恢复
         router.persist_current()
         _print_stats(session)
+
+
+def _repair_dangling_tool_use(session) -> int:
+    """检测并修复 messages 里悬空的 tool_use（没有配对 tool_result 的 assistant 消息）。
+
+    Anthropic / Bedrock 要求每个 tool_use 块后面紧跟 tool_result，否则报
+    TOOL_USE_RESULT_MISMATCH 500 错误。executor 的 except BaseException 兜底已
+    能阻止新损坏产生；这个函数处理已存在于 session.messages 里的历史损坏
+    （从 SQLite 恢复的旧会话、或极端情况下漏网的损坏）。
+
+    返回修复的悬空 tool_use 数量（0 表示无需修复）。
+    """
+    from app.agent.executor import INTERRUPTED_TOOL_RESULT
+
+    messages = getattr(session, "messages", None)
+    if not messages:
+        return 0
+
+    llm = getattr(session, "llm", None)
+    if llm is None:
+        return 0
+
+    repaired = 0
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") != "assistant":
+            i += 1
+            continue
+        # 收集本条 assistant 消息里所有 tool_use 的 id
+        content = msg.get("content", [])
+        tool_use_ids = []
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_use_ids.append(block["id"])
+        if not tool_use_ids:
+            i += 1
+            continue
+        # 检查紧跟的下一条消息是否是 tool_result
+        next_i = i + 1
+        if next_i < len(messages):
+            next_msg = messages[next_i]
+            next_content = next_msg.get("content", [])
+            if isinstance(next_content, list):
+                result_ids = {
+                    b.get("tool_use_id") for b in next_content
+                    if isinstance(b, dict) and b.get("type") == "tool_result"
+                }
+                if result_ids >= set(tool_use_ids):
+                    i += 1
+                    continue  # 配对完整
+        # 有悬空 tool_use，在其后插入合成 tool_result
+        from app.models.protocol import ToolResult
+        synthetic = [
+            ToolResult(tool_call_id=tid, output=INTERRUPTED_TOOL_RESULT, is_error=False)
+            for tid in tool_use_ids
+        ]
+        patch = llm.format_tool_results(synthetic)
+        messages[next_i:next_i] = patch
+        repaired += len(tool_use_ids)
+        i += 2  # 跳过刚插入的 tool_result
+    return repaired
 
 
 def _workspace_directory(value: str) -> Path:

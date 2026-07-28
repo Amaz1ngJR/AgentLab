@@ -271,59 +271,82 @@ class AgentSession:
                     return resp.text
 
                 tool_results: list[ToolResult] = []
-                for call in resp.tool_calls:
-                    self._on_event(TurnEvent(
-                        kind="tool_call",
-                        tool_name=call.name,
-                        tool_input=call.arguments,
-                    ))
+                resulted_ids: set[str] = set()
 
-                    tool = self.tools.get(call.name)
-                    approval_action = (
-                        tool.approval_action(call.arguments) if tool else None
-                    )
-                    if (
-                        approval_action
-                        and tool is not None
-                        and not request_tool_approval(
-                            self.approval,
-                            tool,
-                            approval_action,
-                            call.arguments,
+                def _flush_legacy() -> None:
+                    """给未执行的工具补合成 tool_result,防止 tool_use 悬空。"""
+                    from app.agent.executor import INTERRUPTED_TOOL_RESULT
+                    pending = [
+                        ToolResult(tool_call_id=c.id, output=INTERRUPTED_TOOL_RESULT,
+                                   is_error=False)
+                        for c in resp.tool_calls if c.id not in resulted_ids
+                    ]
+                    if pending:
+                        self.messages.extend(
+                            self.llm.format_tool_results(tool_results + pending)
                         )
-                    ):
-                        output = DENIED_MESSAGE
-                        is_error = False
-                        self.tools.record_denied(
-                            call.name,
-                            call.arguments,
-                            approval_action=approval_action,
-                        )
-                        self._on_event(TurnEvent(kind="tool_denied", tool_name=call.name))
-                    else:
-                        t0 = time.monotonic()
-                        output, is_error = self.tools.execute(
-                            call.name,
-                            call.arguments,
-                            approved_action=approval_action,
-                        )
-                        # 进入历史前截断超大输出(与编排路径一致,见 executor)。
-                        from app.agent.executor import _truncate_tool_output
-                        output = _truncate_tool_output(output)
+                        tool_results.clear()
+
+                try:
+                    for call in resp.tool_calls:
                         self._on_event(TurnEvent(
-                            kind="tool_result",
+                            kind="tool_call",
                             tool_name=call.name,
                             tool_input=call.arguments,
-                            tool_output=output,
-                            tool_error=is_error,
-                            elapsed_seconds=time.monotonic() - t0,
                         ))
 
-                    tool_results.append(ToolResult(
-                        tool_call_id=call.id,
-                        output=output,
-                        is_error=is_error,
-                    ))
+                        tool = self.tools.get(call.name)
+                        approval_action = (
+                            tool.approval_action(call.arguments) if tool else None
+                        )
+                        if (
+                            approval_action
+                            and tool is not None
+                            and not request_tool_approval(
+                                self.approval,
+                                tool,
+                                approval_action,
+                                call.arguments,
+                            )
+                        ):
+                            output = DENIED_MESSAGE
+                            is_error = False
+                            self.tools.record_denied(
+                                call.name,
+                                call.arguments,
+                                approval_action=approval_action,
+                            )
+                            self._on_event(TurnEvent(kind="tool_denied", tool_name=call.name))
+                        else:
+                            t0 = time.monotonic()
+                            output, is_error = self.tools.execute(
+                                call.name,
+                                call.arguments,
+                                approved_action=approval_action,
+                            )
+                            # 进入历史前截断超大输出(与编排路径一致,见 executor)。
+                            from app.agent.executor import _truncate_tool_output
+                            output = _truncate_tool_output(output)
+                            self._on_event(TurnEvent(
+                                kind="tool_result",
+                                tool_name=call.name,
+                                tool_input=call.arguments,
+                                tool_output=output,
+                                tool_error=is_error,
+                                elapsed_seconds=time.monotonic() - t0,
+                            ))
+
+                        tool_results.append(ToolResult(
+                            tool_call_id=call.id,
+                            output=output,
+                            is_error=is_error,
+                        ))
+                        resulted_ids.add(call.id)
+                except BaseException:
+                    # 任何异常(含 KeyboardInterrupt)都先补齐 tool_result 配对,
+                    # 防止 messages 留下悬空 tool_use 导致后续每轮 API 都报错。
+                    _flush_legacy()
+                    raise
 
                 # 工具结果的回传格式由 adapter 决定(Anthropic / OpenAI Chat /
                 # OpenAI Responses 三家不一样),Runtime 不关心

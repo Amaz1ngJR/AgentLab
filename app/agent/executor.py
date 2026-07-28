@@ -339,8 +339,13 @@ class Executor:
                         tool_call_id=call.id, output=output, is_error=is_error,
                     ))
                     resulted_ids.add(call.id)
-            except Cancelled:
-                # 取消:给剩余未执行工具补合成结果,保证配对完整,历史可继续(供 steering)。
+            except BaseException:
+                # Cancelled / KeyboardInterrupt / 任何其他异常:
+                # 必须给本轮所有未执行的工具补合成 tool_result,保证 tool_use/tool_result
+                # 配对完整。否则 messages 里留下悬空 tool_use,下一轮 API 调用会因
+                # TOOL_USE_RESULT_MISMATCH 报错,且每轮都会持续失败(内存损坏即成立,
+                # 无需持久化)。原先只捕获 Cancelled,双击 Ctrl-C(KeyboardInterrupt)
+                # 或工具/回调的意外异常会直接逃逸,导致高频复现。
                 _flush_pending_tool_results()
                 raise
 
