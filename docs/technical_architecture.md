@@ -12,11 +12,11 @@
 
 ### 1.1 产品目标
 
-AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS 或 Windows 上启动它，对话、读写授权范围内的文件、调用工具或 MCP Server，并按任务选择本地模型或云端模型。目标形态不是单纯聊天机器人，而是一个经用户授权后能观察和操作计算机环境的个人 Agent。
+AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS、Windows 上启动它，对话、读写授权范围内的文件、调用工具或 MCP Server，并按任务选择本地模型或云端模型。目标形态不是单纯聊天机器人，而是一个经用户授权后能观察和操作计算机环境的个人 Agent。
 
 必须达成的目标：
 
-1. 同一套 Python 代码可运行在 macOS 和 Windows。
+1. 同一套 Python 代码可运行在 macOS、Windows。
 2. 本地模型下载完成后，只修改配置即可切换模型，不修改 Agent 业务逻辑。
 3. 能配置并调用在线模型，例如 OpenAI GPT 与 Anthropic Claude。
 4. 能加载本地 Skill，并能连接可配置的 MCP Server。
@@ -31,6 +31,7 @@ AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS 或
 13. 能在用户授权下执行桌面级操作，例如截图、点击、键盘输入和启动应用，但默认关闭。
 14. 能远程登录受信设备，在远程 workspace 内执行命令、传输文件或启动远程浏览器/Agent Worker。
 15. 文件写入、命令执行、联网请求、网页提交、桌面控制、远程执行和外部 MCP 调用都必须经过权限控制与审计。
+16. 能通过受控互联网检索获取最新信息：模型只产生结构化检索请求，Runtime 负责搜索、抓取、来源排序、引用与审计；最终结论可追溯到具体 URL 和获取时间。
 
 ### 1.2 非目标
 
@@ -53,17 +54,18 @@ AgentLab 是运行在个人电脑上的 Agent 应用。用户可以在 macOS 或
 
 | 领域 | 首选方案 | 原因 |
 |---|---|---|
-| 主语言 | Python 3.11+ | macOS/Windows 开发与分发成本低；MCP 与 AI SDK 生态完整 |
+| 主语言 | Python 3.11+ | macOS/Windows/Linux 开发与分发成本低；MCP 与 AI SDK 生态完整 |
 | Agent Runtime | 项目自有轻量循环，保留替换编排器的接口 | 便于精确控制审批、事件、provider 差异 |
 | Loop Engineering | GoalSpec + LoopRunner + Verifier + Replanner + Learner | 从“给一次 Prompt”升级为“定义目标后循环执行、验证、修复、学习”，但仍受预算、权限和停止条件约束 |
 | 多 Agent / Session | AgentProfile + Session 绑定 + `/session` 命令 | 一个应用内运行多个不同职责 Agent，切换时不混淆上下文和权限 |
 | API 服务 | FastAPI + Uvicorn | 本地服务、流式事件和 OpenAPI 方便；Python 单栈 |
 | 终端 TUI | Textual / Rich 全屏终端界面，复用同一 Runtime 事件 | 在不离开终端的前提下提供分区布局、欢迎栏、会话/任务/审批面板，比纯行式 REPL 更直观 |
 | Web UI | FastAPI 静态页面 + Jinja2/HTMX 或轻量 TypeScript 页面 | 不要求用户先配置复杂桌面环境；可由 Python 一条命令启动 |
-| 本地推理首选 | Ollama | macOS 与 Windows 均便于安装；提供 OpenAI-compatible 接口和工具调用能力 |
+| 本地推理首选 | Ollama | macOS、Windows 与 Linux 均可部署；提供 OpenAI-compatible 接口和工具调用能力 |
 | 本地推理可选 | LM Studio、vLLM、llama.cpp server | 通过 adapter 隔离，不成为核心硬依赖 |
 | 云端模型 | OpenAI 原生 adapter、Anthropic 原生 adapter | 不丢失各厂商工具、流式和响应能力；不假设云端协议完全一致 |
 | MCP | 官方 MCP Python SDK；stdio + Streamable HTTP | 与协议标准保持一致，适配本地进程与远程服务 |
+| 互联网检索 | WebRetrievalService + 可替换 SearchProvider + 受控 Fetcher + CitationManager | 模型不直接持有网络权限；搜索、正文抓取、动态浏览器和引用职责分离，便于替换供应商和审计 |
 | 浏览器控制 | Playwright Python 作为首选 Browser Adapter | 跨 macOS/Windows/Linux，支持 Chromium/WebKit/Firefox，适合结构化网页自动化 |
 | 桌面控制 | PyAutoGUI/系统无障碍能力作为可选 Desktop Adapter | 覆盖非网页应用，但风险高、稳定性低，默认禁用并要求强审批 |
 | 远程设备控制 | SSH Runner + 可选远程 Agent Worker/MCP Server | SSH 适合命令执行和文件传输；复杂远程交互通过远程 Worker 暴露结构化工具 |
@@ -136,13 +138,15 @@ rectangle "L3 能力层" as L3 {
   [Tool Registry] as L3Tools
   [Skill Loader] as L3Skills
   [MCP Manager] as L3Mcp
+  [Web Retrieval / Citation] as L3Web
   [Computer Control Gateway] as L3Control
-  [Memory / Retrieval] as L3Memory
+  [Memory Retrieval] as L3Memory
   [Worktree / Project Knowledge] as L3Workspace
   L3Model -[hidden]right- L3Tools
   L3Tools -[hidden]right- L3Skills
   L3Skills -[hidden]right- L3Mcp
-  L3Mcp -[hidden]right- L3Control
+  L3Mcp -[hidden]right- L3Web
+  L3Web -[hidden]right- L3Control
   L3Control -[hidden]right- L3Memory
   L3Memory -[hidden]right- L3Workspace
 }
@@ -150,11 +154,13 @@ rectangle "L3 能力层" as L3 {
 rectangle "L4 适配器层" as L4 {
   [Provider Adapters] as L4Provider
   [Built-in Tool Adapters] as L4Tool
+  [Search / Fetch Adapters] as L4Web
   [MCP Transports] as L4Mcp
   [Browser / Desktop / SSH Adapters] as L4Control
   [Storage Adapter] as L4Storage
   L4Provider -[hidden]right- L4Tool
-  L4Tool -[hidden]right- L4Mcp
+  L4Tool -[hidden]right- L4Web
+  L4Web -[hidden]right- L4Mcp
   L4Mcp -[hidden]right- L4Control
   L4Control -[hidden]right- L4Storage
 }
@@ -162,11 +168,13 @@ rectangle "L4 适配器层" as L4 {
 rectangle "L5 外部资源层" as L5 {
   cloud "Local / Cloud Models" as L5Models
   folder "Workspace / Files" as L5Files
+  cloud "Public Web / Search APIs" as L5Web
   node "MCP Servers" as L5Mcp
   node "Browser / Desktop / Remote Hosts" as L5Control
   database "SQLite / Data Dir" as L5Db
   L5Models -[hidden]right- L5Files
-  L5Files -[hidden]right- L5Mcp
+  L5Files -[hidden]right- L5Web
+  L5Web -[hidden]right- L5Mcp
   L5Mcp -[hidden]right- L5Control
   L5Control -[hidden]right- L5Db
 }
@@ -222,19 +230,23 @@ rectangle "模型服务" as Models {
 rectangle "能力层" as Capabilities {
   [Skill Loader / Memory] as ContextCapability
   [Tool Registry / MCP Manager] as ToolCapability
+  [Web Retrieval / Citation] as WebRetrieval
   [Computer Control Gateway] as ControlGateway
   [Worktree / Project Knowledge] as WorkspaceCapability
   ContextCapability -[hidden]right- ToolCapability
-  ToolCapability -[hidden]right- ControlGateway
+  ToolCapability -[hidden]right- WebRetrieval
+  WebRetrieval -[hidden]right- ControlGateway
   ControlGateway -[hidden]right- WorkspaceCapability
 }
 
 rectangle "受控资源" as Resources {
   folder "Workspace / Data Dir" as FS
+  cloud "Public Web / Search Providers" as PublicWeb
   node "Browser / Desktop" as LocalComputer
   node "Remote Hosts / MCP Servers" as RemoteTargets
   database "SQLite\n会话 / 审计 / 设置" as DB
-  FS -[hidden]right- LocalComputer
+  FS -[hidden]right- PublicWeb
+  PublicWeb -[hidden]right- LocalComputer
   LocalComputer -[hidden]right- RemoteTargets
   RemoteTargets -[hidden]right- DB
 }
@@ -258,6 +270,7 @@ Capabilities -down-> Resources : 经过权限策略后访问
 | UI / API | 接收用户输入、展示流式事件与审批请求，不实现 Agent 决策 |
 | Agent Runtime | 维护一次任务的规划、执行、重规划、上下文、步数限制、取消与恢复 |
 | Capability Layer | 对 Skill、内置 Tool、MCP Tool、记忆进行统一管理 |
+| Internet Retrieval | 把模型的搜索意图转换为受控的搜索、抓取、来源排序、缓存和引用；模型不直接联网 |
 | Computer Control | 把浏览器、桌面、远程主机抽象为受控目标，统一做观察、动作、审批、审计和取消 |
 | Model Layer | 把不同供应商响应翻译成统一内部事件 |
 | Persistence | 保存会话、配置元数据、执行记录；不将 API Key 明文写入业务数据库 |
@@ -277,7 +290,7 @@ skinparam shadowing false
 left to right direction
 
 rectangle "A. 单机本地模式" as LocalMode {
-  node "macOS 或 Windows" as SingleHost {
+  node "macOS / Windows / Linux" as SingleHost {
     [AgentLab\nCLI / Web] as LocalAgent
     [本机 Ollama\n本地模型] as LocalModel
   }
@@ -285,17 +298,17 @@ rectangle "A. 单机本地模式" as LocalMode {
 }
 
 rectangle "B. 局域网 GPU 模式" as LanMode {
-  node "macOS 或 Windows\n客户端" as ClientHost {
+  node "macOS / Windows / Linux\n客户端" as ClientHost {
     [AgentLab\nCLI / Web] as LanAgent
   }
-  node "Windows GPU 主机" as GpuHost {
+  node "Windows / Linux GPU 主机" as GpuHost {
     [Ollama\n本地模型] as GpuModel
   }
   LanAgent -down-> GpuModel : LAN API\n仅可信网络
 }
 
 rectangle "C. 云端模型模式" as CloudMode {
-  node "macOS 或 Windows" as CloudHost {
+  node "macOS / Windows / Linux" as CloudHost {
     [AgentLab\nCLI / Web] as CloudAgent
   }
   cloud "OpenAI / Anthropic\n在线 API" as CloudModel
@@ -307,15 +320,15 @@ LanMode -[hidden]right- CloudMode
 @enduml
 ```
 
-三种模式通过模型 profile 选择，不表示三条连接会同时启用。需要离线与隐私时选 A；需要复用 Windows 显卡时选 B；需要在线模型能力时显式选择 C。
+三种模式通过模型 profile 选择，不表示三条连接会同时启用。需要离线与隐私时选 A；需要复用局域网 GPU 主机时选 B；需要在线模型能力时显式选择 C。
 
 ### 4.2 推荐运行模式
 
 | 模式 | Agent 运行位置 | 推理位置 | 用途 |
 |---|---|---|---|
-| 单机离线 | Mac 或 Windows | 本机 Ollama | 隐私数据、无网络环境、轻量任务 |
-| GPU 主机服务 | Mac 或 Windows | Windows GPU 电脑的 Ollama | 在多台个人设备间复用较快的本地推理 |
-| 云端增强 | Mac 或 Windows | OpenAI / Anthropic | 复杂编码、较强工具调用或长上下文任务 |
+| 单机离线 | macOS、Windows 或 Linux | 本机 Ollama | 隐私数据、无网络环境、轻量任务 |
+| GPU 主机服务 | macOS、Windows 或 Linux | Windows/Linux GPU 电脑的 Ollama | 在多台个人设备间复用较快的本地推理 |
+| 云端增强 | macOS、Windows 或 Linux | OpenAI / Anthropic | 复杂编码、较强工具调用或长上下文任务 |
 | 混合路由 | 本机 | 本地默认，手工切换云端 | 成本与能力折中，默认采用显式切换 |
 
 ### 4.3 跨平台工程约束
@@ -325,11 +338,11 @@ LanMode -[hidden]right- CloudMode
 3. stdio MCP Server 的启动命令采用参数数组，不依赖 shell 展开与管道语法。
    Windows 下启动器必须解析 `npx.cmd` / `.exe` / `.bat`，不得要求用户维护
    单独的 Windows MCP 配置。
-4. 用户数据目录使用平台规范目录，例如 macOS 的 Application Support 与 Windows 的 LocalAppData；开发模式可保留项目内 `.agentlab/`。
+4. 用户数据目录使用平台规范目录，例如 macOS 的 Application Support、Windows 的 LocalAppData 与 Linux 的 XDG data/config 目录；开发模式可保留项目内 `.agentlab/`。
 5. FastAPI 默认只监听 `127.0.0.1`，局域网开放必须由用户显式配置。
 6. 本地模型文件由 Ollama/LM Studio 管理；AgentLab 只存模型 profile，不复制权重文件。
 7. 浏览器自动化优先使用隔离浏览器上下文，不默认接管用户正在使用的主浏览器 profile。
-8. 桌面控制依赖系统权限：macOS 需要 Accessibility/Screen Recording，Windows 需要相应 UI 自动化权限；未授权时能力不可用。
+8. 桌面控制依赖系统权限：macOS 需要 Accessibility/Screen Recording，Windows 需要相应 UI 自动化权限，Linux 需要按 X11/Wayland/desktop portal 能力检测；未授权或平台不支持时能力不可用。
 9. 远程设备控制必须显式配置 host、workspace、认证方式和风险等级，不从模型输出中临时拼接未知远程目标。
 
 ---
@@ -349,6 +362,7 @@ AgentLab/
     agents.example.yaml             # AgentProfile 模板：角色、模型、工具、Skill、MCP、记忆策略
     models.yaml                     # 模型 profile：provider、model、base_url、能力标签、默认参数
     mcp_servers.example.yaml        # MCP Server 模板：transport、启动命令/URL、风险等级、启用状态
+    retrieval.example.yaml          # 互联网检索模板：provider、domain policy、缓存、限额和引用策略
     control.example.yaml            # 电脑控制模板：浏览器、桌面控制、远程主机和下载目录配置
     loop.example.yaml               # Loop Engineering 模板：默认预算、验证器、worktree、学习策略
 
@@ -411,8 +425,21 @@ AgentLab/
       builtin/                      # 应用内置工具
         files.py                    # 文件工具：read/write/list，受 workspace 约束
         code_search.py              # 代码搜索工具：按文本/正则/文件名快速定位代码位置，只读
+        web_search.py               # 互联网发现工具：调 WebRetrievalService 返回结构化来源，不自行管 provider
+        web_fetch.py                # 受控网页抓取工具：调 Fetcher 获取正文/元数据，不直接绕过网络策略
+        web_find.py                 # 在已抓取 document 中定位文本，返回可引用 span，不重复联网
         shell.py                    # 本机 shell 工具：cwd、timeout、输出截断、强审批
         todo.py                     # 会话任务清单工具；无外部副作用
+
+    retrieval/                      # 受控互联网检索；模型不直接访问网络或 provider SDK
+      models.py                     # SearchRequest/Result、FetchedDocument、SourceRef、Citation 等内部数据模型
+      service.py                    # WebRetrievalService：路由 search/fetch/find、取消、限额、事件和审计
+      providers.py                  # SearchProvider 协议与 provider registry/failover；密钥只从 Keyring/env 解析
+      fetcher.py                    # HTTP Fetcher：SSRF/DNS/重定向校验、大小/类型限制、正文抽取和内容 hash
+      ranking.py                    # 来源去重、时效性、一手来源优先和可选 rerank；不改写原始结果
+      citations.py                  # CitationManager：claim/source/span 映射、URL 标准化、可点击引用输出
+      cache.py                      # 按 normalized URL/content hash/TTL 缓存文档，支持 ETag/Last-Modified 与 force refresh
+      policy.py                     # domain allow/deny、私网策略、provider 选择、版权摘录和云端数据边界
 
     control/                        # Computer Control Gateway 与具体控制 adapter
       gateway.py                    # 统一入口：解析 target、校验 capability/risk、走审批和审计
@@ -460,6 +487,7 @@ AgentLab/
   data/                             # 本地运行数据目录；gitignore
     sqlite/                         # SQLite 数据库文件
     blobs/                          # 截图、大文本、下载文件、工具输出引用
+    retrieval-cache/                # 抓取文档与提取结果缓存；可清理，不作为长期记忆
     browser-profiles/               # 受控浏览器 profile；隔离/命名 profile 分开
     logs/                           # 本地日志和脱敏审计导出
 ```
@@ -1826,7 +1854,7 @@ class ControlSession:
 
 - 默认关闭，需要在配置中显式启用 `desktop_control.enabled=true`。
 - 每次动作前提供最近截图和动作描述，例如“将在坐标 (x, y) 单击”。
-- macOS 启用前检查 Accessibility 与 Screen Recording 权限；Windows 启用前检查 UI 自动化/屏幕捕获能力。
+- macOS 启用前检查 Accessibility 与 Screen Recording 权限；Windows 启用前检查 UI 自动化/屏幕捕获能力；Linux 需显式检测 X11/Wayland/desktop portal 及当前会话是否允许控制。
 - 不允许模型直接连续执行长动作序列。应采用“观察 -> 计划下一步 -> 审批 -> 单步动作 -> 再观察”的闭环。
 - 必须支持紧急停止：CLI 中 Ctrl-C/Web UI 中 Stop 按钮应取消 pending action，并尽量释放键盘/鼠标状态。
 
@@ -1905,6 +1933,258 @@ end
 ```
 
 这个流程要求所有电脑控制动作都先经过 `Control Gateway`，而不是由模型直接调用低层库。`Control Gateway` 负责把“模型想做什么”转换成“对哪个已授权目标执行哪个受限动作”。
+
+### 7.12 受控互联网检索与引用
+
+AgentLab 需要具备类似现代 Agent 平台的互联网研究能力，但必须明确：**模型本身不直接连接互联网**。模型只能产生结构化 tool call；网络权限、provider 密钥、HTTP 连接、浏览器登录态、超时、取消、缓存、来源评估和审计都属于本地 Runtime。
+
+#### 7.12.1 能力边界
+
+| 组件 | 职责 | 不允许的行为 |
+|---|---|---|
+| Model | 判断是否需要最新信息，生成 query，选择待读来源，基于证据组织回答 | 直接持有 API Key、创建任意 socket、绕过 ToolRegistry 访问网络 |
+| ToolRegistry / Policy | 将 `web_search/web_fetch/web_find` 暴露为 ToolDescriptor，执行 network 风险、provider/domain 授权和审计 | 因模型声称“必须联网”而自动扩大范围 |
+| WebRetrievalService | 统一调度搜索、抓取、去重、缓存、排序、引用和事件 | 在工具实现里固定某一搜索供应商 |
+| SearchProvider | 把统一 SearchRequest 翻译为具体 provider 请求，返回原始来源元数据 | 修改搜索结果正文、伪造发布时间或吞掉来源 URL |
+| Fetcher | 受控获取公网 HTML/文本/PDF，校验每次重定向并提取正文 | 访问本机/私网，绕过 TLS，绕过付费墙，携带浏览器 cookie |
+| ControlGateway | 处理 JavaScript、登录态、点击和表单等动态网页 | Fetcher 失败时未经提示就升级为带登录态浏览器 |
+| CitationManager | 维护 claim/source/document/span 关系，输出可点击引用 | 把搜索结果页或模型记忆伪装成原始来源 |
+
+`web_search` 用于发现来源，`web_fetch` 用于获取证据，`web_find` 用于在已缓存文档中定位可引用片段。搜索 snippet 只是索引线索，默认不得作为高置信结论的唯一证据。
+
+#### 7.12.2 组件图
+
+```plantuml
+@startuml
+title 受控互联网检索组件
+skinparam componentStyle rectangle
+skinparam linetype ortho
+skinparam shadowing false
+top to bottom direction
+
+rectangle "Agent Runtime" as Runtime
+rectangle "ToolRegistry" as Registry
+
+rectangle "Web Retrieval" as Retrieval {
+  [WebRetrievalService] as Service
+  [Policy / Budget / Cancel] as Policy
+  [Search Pipeline] as Search
+  [Fetch / Extract Pipeline] as Fetch
+  [Source Store / Cache] as Sources
+  [CitationManager] as Citation
+
+  Service -down-> Policy
+  Policy -down-> Search
+  Policy -down-> Fetch
+  Search -down-> Sources
+  Fetch -down-> Sources
+  Sources -down-> Citation
+}
+
+rectangle "Adapters" as Adapters {
+  [SearchProvider Registry] as Providers
+  [HTTP / PDF Extractors] as Extractors
+  [ControlGateway Browser Backend] as Browser
+}
+
+cloud "Search APIs" as SearchApi
+cloud "Public Web" as PublicWeb
+database "SQLite / Blob / Retrieval Cache" as Store
+
+Runtime -down-> Registry : structured tool call
+Registry -down-> Service : authorized request
+Search -right-> Providers
+Fetch -right-> Extractors
+Fetch -right-> Browser : explicit dynamic fallback
+Providers -down-> SearchApi
+Extractors -down-> PublicWeb
+Sources -down-> Store : metadata / content ref / audit
+@enduml
+```
+
+内置 `web_*` Tool 是 ToolRegistry 与 WebRetrievalService 之间的薄适配器，不得各自实现 DNS 校验、重定向、缓存或引用逻辑。SearchProvider、HTTP Extractor 和 Browser Backend 是可替换适配器，不进入 Agent Runtime 核心。
+
+#### 7.12.3 内部数据模型
+
+```python
+@dataclass
+class SearchRequest:
+    query: str
+    max_results: int = 10
+    domains: list[str] = field(default_factory=list)
+    exclude_domains: list[str] = field(default_factory=list)
+    recency_days: int | None = None
+    language: str | None = None
+    safe_search: str = "moderate"
+    force_refresh: bool = False
+
+@dataclass
+class SearchResult:
+    source_id: str
+    title: str
+    url: str
+    display_url: str
+    snippet: str
+    provider: str
+    published_at: str | None
+    retrieved_at: str
+    score: float | None
+
+@dataclass
+class FetchedDocument:
+    document_id: str
+    source_id: str | None
+    requested_url: str
+    canonical_url: str
+    title: str
+    content_type: str
+    extracted_text_ref: str
+    content_hash: str
+    fetched_at: str
+    published_at: str | None
+    extractor: str
+    cache_status: str
+    truncated: bool
+
+@dataclass
+class Citation:
+    citation_id: str
+    source_id: str
+    document_id: str
+    canonical_url: str
+    title: str
+    span_start: int | None
+    span_end: int | None
+    accessed_at: str
+```
+
+`source_id/document_id/citation_id` 必须在一次 run 中稳定，不能让模型自行生成。URL 标准化必须保留原始 requested URL 和最终 canonical URL，不因去除 tracking 参数而丢失审计事实。大文本只放 Blob/Cache，SQLite 保存元数据、hash 和引用关系。
+
+#### 7.12.4 工具接口
+
+| 工具 | 主要参数 | 返回 | 风险 |
+|---|---|---|---|
+| `web_search` | `query/max_results/domains/exclude_domains/recency_days/language/force_refresh` | 带 `source_id` 的结构化 SearchResult 列表 | `network` |
+| `web_fetch` | `url` 或 `source_id`、`max_chars`、`render_mode=static\|browser\|auto`、`force_refresh` | FetchedDocument 元数据 + 受限正文 + `document_id` | `network`；升级 browser 后按 `browser_control` |
+| `web_find` | `document_id/pattern/context_chars/max_matches` | 文档内匹配位置、上下文和 citation span | `read` |
+
+工具结果必须是有界 JSON，包含 `truncated/cache_status/provider/error` 等状态；不得将无上限网页正文或二进制内容直接塞入模型上下文。Runtime 根据 ContextBudget 只选入必要片段，其余使用 document/blob ref。
+
+#### 7.12.5 检索时序
+
+```plantuml
+@startuml
+title Agent 联网检索与引用时序
+actor 用户 as User
+participant "Agent Runtime" as Runtime
+participant "Model" as Model
+participant "ToolRegistry / Policy" as Registry
+participant "WebRetrievalService" as Retrieval
+participant "SearchProvider / Fetcher" as Network
+participant "CitationManager" as Citation
+database "Audit / Source Store" as Store
+
+User -> Runtime : 提出需要最新信息的问题
+Runtime -> Model : 问题 + 检索工具 schema + 预算
+Model --> Runtime : web_search(query, filters)
+Runtime -> Registry : authorize(network, provider/domain)
+Registry -> Retrieval : search(request)
+Retrieval -> Network : provider search
+Network --> Retrieval : result metadata + URLs
+Retrieval -> Store : 保存 query/source/audit
+Retrieval --> Runtime : SearchResult[source_id]
+Runtime -> Model : 来源列表
+Model --> Runtime : web_fetch(source_id)
+Runtime -> Registry : authorize(network, domain)
+Registry -> Retrieval : fetch(source_id)
+Retrieval -> Network : HTTP fetch + validate + extract
+Network --> Retrieval : document + metadata
+Retrieval -> Citation : register source/document/spans
+Citation -> Store : 保存 content ref + citation mapping
+Retrieval --> Runtime : FetchedDocument + citation ids
+Runtime -> Model : 受限证据片段
+Model --> Runtime : 结论 + source/citation references
+Runtime --> User : 回答 + 可点击引用
+@enduml
+```
+
+对于时效性问题，Runtime 需要把当前日期传入检索上下文，并区分“网页发布日期”和“事件实际发生日期”。重要结论应尽量由两个独立来源交叉验证；技术问题优先官方文档、标准、仓库和论文，不用二次转述替代可获取的一手来源。
+
+#### 7.12.6 来源、引用与内容规则
+
+1. 搜索结果页不是最终引用；引用直接指向原始页面、文档或论文。
+2. 引用放在其支持的结论附近，不在回答末尾堆一组无对应关系的 URL。
+3. 每个引用至少保留 title、canonical URL、publisher/domain、accessed_at；能获取时再保留 published_at。
+4. Search snippet 可用于选源，但未 fetch 正文时必须标注 `snippet_only=true`，不用于高风险事实判断。
+5. 模型不得伪造 citation id。Runtime 在输出前校验引用是否属于本 run，URL 是否与 Source Store 一致。
+6. 遵守来源使用条款与版权边界：默认摘要而非大段复制，逐字引用使用可配置的单来源上限，不提供绕过付费墙或访问控制的功能。
+7. 网页变更后旧引用仍对应原 content hash 和 fetched_at；用户要求“最新”时不得静默使用过期缓存。
+
+#### 7.12.7 网络安全和 Prompt Injection
+
+- 只允许 `http/https`，拒绝 URL 凭据、`file/data/javascript` scheme、本机、私网、链路本地、保留地址和非预期端口。
+- 首次 DNS 解析和每次重定向都重新校验全部 IP；实际连接地址必须与已校验结果一致，防止 DNS rebinding。
+- 强制 TLS 验证、connect/read/total timeout、重定向上限、响应体/解压后大小上限、MIME allowlist 和取消信号，防止悬挂请求与解压炸弹。
+- 私网文档、本地 API 和企业知识库不通过公网 Fetcher 例外放行；应配置为 MCP Server、ControlTarget 或独立的受信 connector。
+- 外部网页、PDF、snippet 和搜索结果统一标记为 `untrusted_external_content`，只能作为数据进入 tool result/evidence，不能拼接到 system prompt、Skill 或审批策略。
+- 网页中“忽略之前指令”“执行命令”“上传文件”等文本不产生权限。由页面内容诱导出的新工具调用仍必须通过原 ToolDescriptor、GoalSpec 和审批策略。
+- Fetcher 不携带浏览器 cookie、本地 Authorization header 或用户日常浏览器 profile。升级到 browser 时需生成新的 `browser_control` 动作与数据边界提示。
+- `shell` 中的 `curl/wget/PowerShell Invoke-WebRequest` 不属于受控检索链，不得被 Agent 当作 `web_search/web_fetch` 的默认替代；确需执行时按 `execute` 高风险展示命令和网络目标并逐次审批，其结果不自动获得 citation 资格。
+- 当会话使用云端模型时，搜索 query、snippet 和抓取正文将离开本机进入模型上下文；UI/CLI 必须持续可见地标识该数据边界。
+
+#### 7.12.8 Provider、缓存、事件与审计
+
+SearchProvider 使用统一协议，允许接入无密钥公网搜索、用户配置的商业搜索 API、企业 Search MCP 或本地搜索服务。核心不依赖任一 provider 的返回对象。Provider failover 只能在兼容的数据边界内发生，不能把本地/企业 query 静默转发到公网供应商。
+
+缓存键至少包含 normalized URL、provider、语言、内容类型和策略版本。时效性查询使用短 TTL 或 `force_refresh`；可用 ETag/Last-Modified 做条件请求。缓存可由用户清理，不自动写入长期记忆。
+
+Runtime Event Bus 至少包含：
+
+- `retrieval_search_started/completed/failed`
+- `retrieval_fetch_started/completed/blocked/failed`
+- `retrieval_cache_hit`
+- `retrieval_citation_created`
+
+审计至少保存：`run_id/session_id`、query 脱敏摘要、provider、domain、requested/canonical URL、source/document id、published/fetched time、content hash、extractor、cache status、审批结果、耗时、响应大小、错误和 citation ids。SQLite 不保存无上限正文，也不记录 cookie、Authorization header 或 provider 密钥。
+
+#### 7.12.9 配置模型
+
+```yaml
+# config/retrieval.yaml
+retrieval:
+  enabled: true
+  default_provider: duckduckgo
+  provider_failover: []             # 默认不静默切换数据边界
+  max_queries_per_run: 12
+  max_fetches_per_run: 20
+  max_response_bytes: 5000000
+  max_document_chars: 30000
+  default_cache_ttl_seconds: 3600
+  public_web_auto_approve: true      # 显式应用配置，不由模型修改
+  domain_allowlist: []
+  domain_denylist: []
+  quote_limit_per_source: 25          # 默认按单词计，可按来源策略收紧
+  providers:
+    duckduckgo:
+      type: duckduckgo
+      enabled: true
+    search_api:
+      type: generic_search_api
+      enabled: false
+      api_key_env: SEARCH_API_KEY
+```
+
+配置只保存密钥环境变量名，密钥值来自系统 Keyring 或开发环境 `.env`。公网 Fetcher 不提供“允许任意私网”开关；私网或本地目标必须通过具体 host 白名单的 MCP Server、ControlTarget 或独立 connector 接入。
+
+#### 7.12.10 验收标准
+
+1. 本地和云端模型都只通过同一组 `web_search/web_fetch/web_find` schema 发起检索，替换 SearchProvider 不修改 Runtime 或 prompt。
+2. 询问“最新版本/新闻/价格/时间表”时，Agent 能自主搜索、抓取原始来源，区分发布日期与事件日期，最终回答含可点击引用。
+3. 已知 URL 可直接 fetch；静态抓取失败时返回明确原因，只在策略允许且用户了解登录态/数据边界后才通过 ControlGateway 升级浏览器。
+4. 搜索结果、文档和 citation 可按 run 回放；每条 citation 能反查 canonical URL、content hash 和 fetched_at。
+5. SSRF、重定向 SSRF、DNS rebinding、URL 凭据、超大响应、解压炸弹、错误 MIME、超时与取消均有离线测试。
+6. 包含 prompt injection 的测试网页只能成为不可信 tool result，不能改写 system prompt、自动扩权或触发未授权动作。
+7. Provider 限流/失败时有结构化错误；failover 必须符合配置且不改变数据边界。Windows、Linux、macOS 使用同一配置通过 fake provider 和本地 HTTP 测试站集成验收。
 
 ---
 
@@ -2003,6 +2283,7 @@ servers:
   等运行必需的非敏感变量；其它变量仍必须进入 `env_allowlist`。
 - 任一新 MCP Server 第一次启用前，UI/CLI 展示 server 名称、transport 和可能暴露的数据。
 - 从 MCP 发现的每一个工具都映射到统一 `ToolDescriptor`，并继承或提高 server 风险等级。
+- Search/Docs MCP 若作为互联网或企业检索后端，应通过 SearchProvider adapter 归一为 `SearchResult/SourceRef/FetchedDocument`，继续使用 CitationManager 和同一审计链；不另建一套无来源校验的搜索结果格式。
 
 ### 9.3 MCP 数据流和信任边界
 
@@ -2177,6 +2458,9 @@ scheduler:
 | `tasks` | Planner/Executor/Replanner 管理的任务状态、依赖和证据 |
 | `memories` | 长期记忆：用户偏好、Agent 经验、项目事实、会话摘要 |
 | `tool_executions` | 工具、参数脱敏摘要、审批决定、执行结果摘要 |
+| `retrieval_sources` | 搜索 query/provider 与 source_id、title、URL、snippet 摘要、published/retrieved time |
+| `retrieval_documents` | document_id、canonical URL、content hash、extractor、cache status、正文 blob ref |
+| `citations` | run/claim/source/document/span 映射与 accessed_at，供回答和 Loop evidence 回放 |
 | `settings` | 非密钥用户设置与已启用能力 |
 
 隐私规则：
@@ -2185,6 +2469,8 @@ scheduler:
 - 含凭据的环境变量、请求 header 和工具输出中的疑似密钥必须在日志中遮蔽。
 - 上下文压缩摘要与原始消息一样受数据保留和脱敏策略约束；摘要不能包含被拒绝保存的密钥、cookie、验证码或支付信息。
 - Loop 相关记录必须保存验证证据引用和失败分类，但不得长期保存完整敏感页面、数据库结果或密钥类输出。
+- 互联网正文缓存与长期记忆分离；清理 retrieval cache 后引用元数据可保留，但必须明确标记正文 blob 已不可用。
+- query、URL 和 snippet 入库前脱敏；不保存 provider 密钥、Authorization header、cookie 或带 URL 凭据的原始请求。
 - Worktree path、base commit、diff summary 可以持久化；合并、删除、覆盖主分支等动作必须另有审批记录。
 - 切换到在线模型时，在会话头部明确展示“内容可能发送至云端”。
 
@@ -2346,6 +2632,37 @@ entity "control_observations" as observations {
   summary
 }
 
+entity "retrieval_sources" as sources {
+  * id
+  --
+  run_id
+  provider
+  title
+  canonical_url
+  published_at
+  retrieved_at
+}
+
+entity "retrieval_documents" as documents {
+  * id
+  --
+  source_id
+  content_hash
+  extractor
+  content_ref
+  fetched_at
+}
+
+entity "citations" as citations {
+  * id
+  --
+  run_id
+  source_id
+  document_id
+  span_start
+  span_end
+}
+
 entity "settings" as settings {
   * key
   --
@@ -2368,6 +2685,9 @@ runs ||--o{ messages
 runs ||--o{ tools
 runs ||--o{ observations
 runs ||--o{ tasks
+runs ||--o{ sources
+sources ||--o{ documents
+documents ||--o{ citations
 summaries ||--o{ messages : compacts
 @enduml
 ```
@@ -2405,6 +2725,9 @@ CLI、终端 TUI 和 Web UI 都消费 Runtime 产生的事件：
 | `context_compaction_started` | 展示正在压缩旧消息和已完成 run |
 | `context_compaction_completed` | 展示压缩前后 token、摘要范围和可查看入口 |
 | `context_compaction_failed` | 展示压缩失败原因，以及切换更大模型或手动裁剪的入口 |
+| `retrieval_search_started/completed/failed` | 展示 query 摘要、provider、来源数、耗时和错误 |
+| `retrieval_fetch_started/completed/blocked/failed` | 展示目标 domain、静态/浏览器路由、缓存状态和安全拦截原因 |
+| `retrieval_citation_created` | 展示本 run 新增的来源和可点击引用，不展示未脱敏正文 |
 | `tool_requested` | 显示模型想调用的工具 |
 | `approval_required` | 弹出确认或终端询问 |
 | `tool_completed` | 展示成功、失败和耗时 |
@@ -2587,6 +2910,11 @@ Loop Engineering 入口：
 | `GET /api/models` | 可选模型与连通状态 |
 | `GET /api/skills` | Skill 列表与启用状态 |
 | `GET /api/mcp/servers` | MCP Server 状态 |
+| `POST /api/retrieval/search` | 经同一 Policy/WebRetrievalService 执行手动搜索，不绕过审批和限额 |
+| `POST /api/retrieval/fetch` | 按 URL 或 source_id 受控抓取文档；浏览器升级需新的审批 |
+| `GET /api/retrieval/sources` | 按 run/session 查看 SearchResult、FetchedDocument 和 citation 元数据 |
+| `GET /api/retrieval/documents/{id}` | 查看受控文档摘要/片段；不直接返回无上限 blob |
+| `DELETE /api/retrieval/cache` | 经 `destructive` 确认后清理检索正文缓存，保留或删除元数据由数据保留策略决定 |
 | `GET /api/control/targets` | 浏览器、桌面、远程设备目标与启用状态 |
 | `GET /api/control/sessions/{id}/snapshot` | 查看浏览器/桌面/远程会话的最近观察结果 |
 | `POST /api/sessions` | 创建会话 |
@@ -2631,7 +2959,7 @@ agentlab serve --workspace . --host 127.0.0.1 --port 8765
 
 ### 11.3 是否做桌面客户端
 
-产品形态上优先采用浏览器 UI + Python 本地服务，满足 macOS 与 Windows 双平台；待 Runtime、权限和更新机制稳定后，再评估 Electron/Tauri 等桌面壳与安装包。
+产品形态上优先采用浏览器 UI + Python 本地服务，满足 macOS、Windows 与 Linux 三平台；待 Runtime、权限和更新机制稳定后，再评估 Electron/Tauri 等桌面壳与安装包。
 
 ---
 
@@ -2643,7 +2971,10 @@ agentlab serve --workspace . --host 127.0.0.1 --port 8765
 |---|---|
 | 模型调用危险工具 | 工具风险等级、明确审批、最大步骤、超时和可取消 |
 | Prompt injection 诱导读写敏感文件 | workspace 根目录约束；访问目录外内容额外审批 |
-| 网页内容诱导 Agent 越权操作 | 网页文本视为不可信输入；提交、支付、授权、删除等动作二次确认 |
+| 搜索结果/网页/PDF 诱导 Agent 越权 | 外部内容标记为 `untrusted_external_content`，只作为 tool result/evidence；不进 system/Skill；提交、支付、授权、上传、删除等动作二次确认 |
+| Web Fetcher 被用于 SSRF/DNS rebinding | 只允许公网 http/https；首次解析、每跳重定向和实际连接 IP 都校验；私网资源走独立受信 connector |
+| 搜索 query 被静默发给其他 provider | provider/failover 受 profile 和数据边界约束；密钥只在本地解析；本地/企业 query 不降级到公网 provider |
+| 模型伪造来源或引用 | citation id 由 Runtime 生成，输出前校验本 run 的 source/document/URL/content hash 映射 |
 | 浏览器登录态泄露 | 默认隔离 profile；使用真实登录态必须显式启用 named profile 并提示数据边界 |
 | 截图/DOM 发送到云端模型 | 首次观察页面或桌面前提示；日志脱敏；允许用户选择本地模型执行敏感任务 |
 | 桌面控制误点或键盘失控 | 默认禁用；观察-审批-单步动作闭环；提供 Stop/取消和超时 |
@@ -2668,6 +2999,8 @@ agentlab serve --workspace . --host 127.0.0.1 --port 8765
 - workspace 是默认工作范围；越界读取、列目录、搜索、写入和外部 cwd 执行
   必须逐次提示确认，拒绝时不执行。
 - 文件写操作每次询问；执行命令与网络 MCP 默认禁用，启用后仍需确认。
+- 公网只读搜索/抓取只能通过显式启用的 retrieval profile；未知 provider、新 domain、私网目标和浏览器升级按独立风险审批。
+- 搜索 snippet 不默认当作最终证据；引用必须经 Source Store 校验，时效性问题不静默复用过期缓存。
 - 浏览器控制默认使用隔离 profile；真实登录态、上传、下载、提交表单都需要显式确认。
 - 桌面控制和远程设备控制默认禁用；启用后仍不允许模型绕过审批直接连续操作。
 - 在线模型 profile 在界面中始终可辨识，不能静默从本地降级至云端。
@@ -2689,6 +3022,7 @@ agentlab serve --workspace . --host 127.0.0.1 --port 8765
 - 输入/输出 token（provider 返回时）、耗时和工具步数。
 - 工具调用名称、风险等级、审批结果和脱敏后的错误。
 - MCP server 连接状态与调用耗时。
+- 互联网检索的 query 脱敏摘要、provider、domain、source/document/citation ids、fetch/cache 状态、content hash、耗时和安全拦截原因。
 - 电脑控制目标、origin/host、动作类型、观察结果摘要、截图引用、审批决定和取消记录。
 - GoalSpec 的 objective、success criteria、预算、约束、workspace_mode 和修改历史。
 - LoopRun 的 iteration、状态、预算消耗、失败分类、修复计划和最终结论。
@@ -2711,13 +3045,15 @@ agentlab serve --workspace . --host 127.0.0.1 --port 8765
 | Project Knowledge 测试 | README/AGENTS/SKILL 解析、来源标注、与实际代码冲突时优先实际代码 |
 | Learner 测试 | memory candidate、skill update proposal、anti-pattern 生成与敏感信息过滤 |
 | 代码搜索测试 | text/regex/file/symbol 搜索、ignore 规则、越界拒绝/批准、fallback、脱敏和截断 |
+| 互联网检索测试 | fake SearchProvider、搜索/抓取/文内定位、来源去重、时效缓存、citation 校验、provider failover 数据边界 |
+| Web 安全测试 | SSRF、重定向 SSRF、DNS rebinding、URL 凭据、TLS/超时/取消、大小/MIME/解压限制、prompt injection 不能扩权 |
 | MCP 集成测试 | 测试 server 的 `list_tools` / `call_tool`、连接错误、审批；Windows 验证 `npx.cmd` 解析、最小运行环境和进程树清理 |
 | 浏览器控制测试 | Playwright 打开本地测试页面、点击、输入、截图、下载路径限制 |
 | 远程控制测试 | fake SSH client 覆盖 host key、workspace、timeout、输出截断、审批拒绝 |
 | 桌面控制测试 | adapter mock 覆盖截图、坐标动作、取消和权限不足提示 |
 | Provider 烟测 | Ollama 本地聊天与 tool call；OpenAI/Anthropic 以显式凭据可选运行 |
 | UI 测试 | 创建会话、流式输出、审批交互、provider 显示 |
-| 跨平台验收 | macOS 和 Windows 分别完成安装、CLI、Web、本地模型切换 |
+| 跨平台验收 | macOS、Windows 和 Linux 分别完成安装、CLI、Web、本地模型切换与互联网检索 fake-provider 链路 |
 
 不能只以“能聊天”作为本地模型可用标准；Agent 模式必须验证该 profile 的结构化工具调用是否可靠。
 

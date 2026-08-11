@@ -17,7 +17,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 **Loop 模式（Loop Engineering，§7.6）的基础闭环已接通**：`/goal new` 定义目标和验证命令，`/loop start` 创建隔离 worktree，调用 `Orchestrator` 执行 Planner→Executor→Replanner，随后进入 Verifier 验证；失败时生成修复指令继续迭代，成功时展示完整 worktree 状态，并在用户审批后生成可合并提交。command Verifier 复用同一审批策略和跨平台 shell 解释器；执行器异常会直接终止 Loop，不能再被旧文件或旧测试误判为成功。尚缺 browser/api/human Verifier、Loop 运行证据完整持久化、`Learner` / Project Knowledge、子 Agent 和后台 Loop。
 
-距离 PRD 的核心缺口：Loop Engineering 的高级验证、学习与协作能力尚未完成；CLI 尚未抽出可供多前端复用的 Runtime Service 与异步 Approval Broker；没有自建 Computer Control Gateway、FastAPI Server、终端 TUI 和 Web UI。
+距离 PRD 的核心缺口：Loop Engineering 的高级验证、学习与协作能力尚未完成；CLI 尚未抽出可供多前端复用的 Runtime Service 与异步 Approval Broker；没有自建 Computer Control Gateway、FastAPI Server、终端 TUI 和 Web UI。互联网能力目前仍是单工具形态，尚无统一 WebRetrievalService、Source Store 和 CitationManager。
 
 ---
 
@@ -27,7 +27,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 2. **完善 Loop Engineering 证据闭环**（PRD §7.6，基础闭环见 3.11）：把 loop run / iteration / verification / worktree / commit 证据完整写入 `loop_store`，实现 api/human Verifier 与 `/loop evidence`、`/loop diff`（见 6.14）。
 3. **建立 ComputerControlGateway**：先包装 Playwright MCP，让 snapshot/click/type 进入统一 Observation、风险判断、审批和审计，并接入 browser Verifier（见 6.6、6.7）。
 4. **实现 FastAPI Server MVP**：提供 session/message/approval/cancel API 与 SSE 事件，增加 `agentlab serve`；先完成 API 和简单管理页，再扩展完整 Web UI（见 6.10）。
-5. **补跨平台集成验证**：在 Windows/Linux/macOS CI 覆盖 CLI 安装、Runtime Service、Server、MCP/Playwright 和审批审计主链路（见 6.11）。
+5. **实现受控互联网检索骨架**：抽出 WebRetrievalService/SearchProvider，让现有 `web_search/web_fetch` 转为薄适配器，建立 source/document/citation 数据模型与 fake provider 测试（见 6.15）。
 
 ---
 
@@ -249,7 +249,7 @@ AgentLab/
   tests/unit/                      # unit tests（当前数量见 3.7，避免多处数字漂移）
 ```
 
-尚未出现但 PRD 已规划的目录/模块：`app/agent/learner.py`、`app/agent/subagents.py`、`app/workspace/knowledge.py`、`app/workspace/scheduler.py`、`app/control/`、`app/tui/`、`app/server.py`、`app/web/`。（Loop 核心 `goals.py` / `verifier.py` / `loop_runner.py` / `loop_store.py` / `app/workspace/worktree.py` 已落地，见 3.11。）
+尚未出现但 PRD 已规划的目录/模块：`app/agent/learner.py`、`app/agent/subagents.py`、`app/workspace/knowledge.py`、`app/workspace/scheduler.py`、`app/retrieval/`、`app/control/`、`app/tui/`、`app/server.py`、`app/web/`。（Loop 核心 `goals.py` / `verifier.py` / `loop_runner.py` / `loop_store.py` / `app/workspace/worktree.py` 已落地，见 3.11。）
 
 ---
 
@@ -322,10 +322,7 @@ Session 统一写入 `tool_executions`。`web_search` / `web_fetch` 标为
 tool 和 remote command；基础 Descriptor 与内置/MCP 审计已满足，browser/remote
 待 ControlGateway 接入。
 
-**web_search 相关增强（非阻塞）**：
-
-- `duckduckgo-search` 库偶发限流/验证码，当前已有 HTML fallback；后续可补 Bing/Google（需 API key）作为可选后端，用 profile 或 env 选择。
-- 搜索查询已进入 `tool_executions`；若后续需要保存结果 URL，应只保存命中域名或受控数量的 URL 摘要。
+互联网搜索的 provider、抓取、来源、引用和缓存路线统一放在 6.15，本节只维护 ToolDescriptor、审批和审计的通用边界。
 
 ### 6.5 MCP
 
@@ -476,6 +473,37 @@ PRD 模式分层（§7.6.1）：Prompt 模式（单轮）→ Task 模式（Plann
 
 验收标准：CLI 用 `/goal new` + `/loop start` 跑一个带 `command` verifier 的代码目标，能看到 GoalSpec 校验、worktree 准备、规划→执行→验证→（失败则）诊断修复再验证、预算耗尽/验证通过/用户停止分别落到对应状态与 RunEvent，证据和 diff 可在 `/loop evidence` `/loop diff` 回看，且主工作区不被未验证改动污染。
 
+### 6.15 受控互联网检索与引用
+
+当前状态：已有可用的 `web_search` 和 `web_fetch`（见 3.2），能通过 DuckDuckGo/
+HTML fallback 搜索公网，并在 SSRF、重定向和体积限制下抓取静态 HTML
+正文；两者已是 `network` ToolDescriptor 并进入工具审计。但实现仍直接绑在
+tool 内，没有统一 provider 协议、source/document id、正文缓存、引用校验、
+`web_find`、PDF 提取或受控浏览器升级。
+
+接下来要做（按依赖顺序）：
+
+1. **检索核心骨架**：新增 `app/retrieval/models.py` 与 `service.py`，定义
+   SearchRequest/Result、FetchedDocument、Citation 和 WebRetrievalService；现有
+   `web_search/web_fetch` 改为薄适配器，保持旧 tool schema 兼容。
+2. **Provider 与来源链**：抽出 SearchProvider 协议，先用现有 DuckDuckGo
+   实现 adapter，增加 fake provider；新增 retrieval_sources/documents/citations
+   存储与 CitationManager，让回答可回溯 URL、content hash 和 fetched_at。
+3. **文档与缓存**：新增 `web_find`、normalized URL/content hash/TTL 缓存、
+   ETag/Last-Modified、HTML/text/PDF 提取和 ContextBudget 片段选择；大文本放
+   blob/cache，不自动写长期记忆。
+4. **安全与动态降级**：在当前 SSRF 防护上补实际连接 IP 校验、DNS
+   rebinding、解压体积、MIME 和 prompt-injection fixture；静态抓取失败时只能
+   经 ControlGateway + 新 `browser_control` 审批升级，不携带日常浏览器 cookie。
+5. **事件、API 与三平台验收**：增加 retrieval_* RunEvent、来源/文档/缓存
+   API，并在 Windows/Linux/macOS CI 用 fake provider + 本地 HTTP 测试站覆盖搜索、
+   抓取、引用、取消、provider 失败和外部页面不能扩权。
+
+验收标准：模型只产生结构化检索 tool call，不直接持有网络或 provider
+密钥；Agent 能针对最新信息搜索并抓取原始来源，最终回答使用 Runtime
+校验过的可点击引用；SSRF、缓存时效、provider 边界、prompt injection 和
+浏览器升级均可测试、可取消、可审计。完整目标见 PRD §7.12。
+
 ---
 
 ## 7. MCP 接入路线
@@ -490,7 +518,7 @@ PRD 模式分层（§7.6.1）：Prompt 模式（单轮）→ Task 模式（Plann
 | P1 | IDE/LSP MCP | 未接入 | diagnostics、definition、references、symbol search，用于增强 `code_search` |
 | P2 | Database MCP | 未接入 | 默认只读 schema/query；写 SQL/DDL 默认禁用或强审批 |
 | P2 | Remote Host MCP | 未接入 | 与 SSH Runner 互补，只允许预配置 host 和 remote workspace |
-| P2 | Docs/Search MCP | 未接入 | 内部文档、API 文档、知识库检索；结果必须标注来源 |
+| P2 | Docs/Search MCP | 未接入 | 内部文档、API 文档、知识库检索；作为 SearchProvider/connector 接入 6.15 的 source/citation 链，不另建结果格式 |
 | P3 | Cloud/DevOps MCP | 未接入 | 只读观察先接入；部署、扩缩容、删除资源必须二次确认 |
 
 ---
