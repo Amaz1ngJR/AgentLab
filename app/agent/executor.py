@@ -284,17 +284,22 @@ class Executor:
                                             tool_name=call.name, tool_input=call.arguments,
                                             payload={"approval_action": approval_action}))
 
-                    if (
-                        needs_approval
-                        and tool is not None
-                        and not request_tool_approval(
+                    approval_result = None
+                    if needs_approval and tool is not None:
+                        approval_result = request_tool_approval(
                             self._approval,
                             tool,
                             approval_action,
                             call.arguments,
                         )
-                    ):
-                        output, is_error = DENIED_MESSAGE, False
+
+                    if approval_result and not approval_result.approved:
+                        # 用户拒绝或按 ESC 取消
+                        if approval_result.feedback:
+                            output = f"[denied] 用户拒绝并提供了修改建议:\n\n{approval_result.feedback}"
+                        else:
+                            output = DENIED_MESSAGE
+                        is_error = False
                         denied_any = True
                         self._tools.record_denied(
                             call.name,
@@ -303,6 +308,15 @@ class Executor:
                         )
                         self._emit(RunEvent(kind=events.TOOL_DENIED, task_id=task.id,
                                             tool_name=call.name))
+
+                        # 如果用户按 ESC 明确取消，立即中断
+                        if approval_result.cancelled:
+                            tool_results.append(ToolResult(
+                                tool_call_id=call.id, output=output, is_error=False,
+                            ))
+                            resulted_ids.add(call.id)
+                            _flush_pending_tool_results()
+                            raise KeyboardInterrupt("用户取消操作")
                     else:
                         t0 = time.monotonic()
                         output, is_error = self._tools.execute(

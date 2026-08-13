@@ -17,6 +17,14 @@ if TYPE_CHECKING:
     from app.tools.registry import ToolDescriptor
 
 
+class ApprovalResult:
+    """审批结果。"""
+    def __init__(self, approved: bool, feedback: str | None = None, cancelled: bool = False):
+        self.approved = approved
+        self.feedback = feedback  # 用户的修改建议
+        self.cancelled = cancelled  # 用户是否按了 ESC/Ctrl-C 明确取消
+
+
 class ApprovalPolicy(Protocol):
     """审批策略接口。
 
@@ -39,16 +47,24 @@ def request_tool_approval(
     tool: "ToolDescriptor",
     action: str,
     tool_input: dict[str, Any],
-) -> bool:
+) -> ApprovalResult:
     """用结构化工具元数据请求审批,并兼容旧 ApprovalPolicy。
 
     新策略可实现 request_tool();现有测试策略和第三方策略只实现 request() 也能
     继续工作。模型参数保持原样,风险元数据不会混进 executor 的 args。
+
+    返回 ApprovalResult，包含审批结果和可选的用户反馈。
     """
     extended = getattr(policy, "request_tool", None)
     if callable(extended):
-        return bool(extended(tool, action, tool_input))
-    return bool(policy.request(action, tool_input))
+        result = extended(tool, action, tool_input)
+        if isinstance(result, ApprovalResult):
+            return result
+        return ApprovalResult(approved=bool(result))
+
+    # 兼容旧接口
+    approved = bool(policy.request(action, tool_input))
+    return ApprovalResult(approved=approved)
 
 
 class AutoApprove:
@@ -62,6 +78,14 @@ class AutoApprove:
     def request(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
         return True
 
+    def request_tool(
+        self,
+        tool: "ToolDescriptor",
+        action: str,
+        tool_input: dict[str, Any],
+    ) -> ApprovalResult:
+        return ApprovalResult(approved=True)
+
 
 class DenyAll:
     """无条件拒绝。
@@ -73,6 +97,14 @@ class DenyAll:
 
     def request(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
         return False
+
+    def request_tool(
+        self,
+        tool: "ToolDescriptor",
+        action: str,
+        tool_input: dict[str, Any],
+    ) -> ApprovalResult:
+        return ApprovalResult(approved=False)
 
 
 class InteractivePolicy:
@@ -116,14 +148,15 @@ class InteractivePolicy:
         self._always: set[str] = set()
 
     def request(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
-        return self._request(tool_name, tool_input)
+        result = self._request(tool_name, tool_input)
+        return result.approved
 
     def request_tool(
         self,
         tool: "ToolDescriptor",
         action: str,
         tool_input: dict[str, Any],
-    ) -> bool:
+    ) -> ApprovalResult:
         """带 risk/target/origin 元数据的工具审批入口。"""
         return self._request(action, tool_input, tool=tool)
 
@@ -133,7 +166,7 @@ class InteractivePolicy:
         tool_input: dict[str, Any],
         *,
         tool: "ToolDescriptor | None" = None,
-    ) -> bool:
+    ) -> ApprovalResult:
         risk = getattr(tool, "risk", None)
         can_persist = (
             tool_name not in self._NON_PERSISTENT_ACTIONS
@@ -142,7 +175,7 @@ class InteractivePolicy:
         )
         # 已在白名单中,直接放行,不再询问
         if can_persist and tool_name in self._always:
-            return True
+            return ApprovalResult(approved=True)
 
         # 延迟导入避免 prompt_toolkit 在 AutoApprove 场景下也被加载
         from app.util.menu import select_menu
@@ -169,9 +202,10 @@ class InteractivePolicy:
                 f"来源: {tool.origin}",
             ])
 
-        choices = [("允许这次", "yes")]
+        choices = [("接受", "yes")]
         if can_persist:
             choices.append((f"本会话总是允许 {tool_name}", "always"))
+        choices.append(("修改建议", "modify"))
         choices.append(("拒绝", "no"))
 
         result = select_menu(
@@ -181,9 +215,20 @@ class InteractivePolicy:
         )
 
         if result == "yes":
-            return True
+            return ApprovalResult(approved=True)
         if result == "always" and can_persist:
             self._always.add(tool_name)  # 加入白名单
-            return True
-        # "no" 或 None(取消) 都视为拒绝
-        return False
+            return ApprovalResult(approved=True)
+        if result == "modify":
+            # 让用户输入修改建议
+            from app.util.menu import prompt_text
+            feedback = prompt_text("请输入修改建议 (告诉 Agent 应该怎么做):")
+            if feedback and feedback.strip():
+                return ApprovalResult(approved=False, feedback=feedback.strip())
+            # 用户取消输入，视为拒绝
+            return ApprovalResult(approved=False)
+        if result == "no":
+            # 明确选择"拒绝"：Agent 自行调整
+            return ApprovalResult(approved=False)
+        # None(ESC/Ctrl-C 取消)：用户想中断当前操作
+        return ApprovalResult(approved=False, cancelled=True)

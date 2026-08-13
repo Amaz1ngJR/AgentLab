@@ -175,3 +175,40 @@ def _select_menu_fallback(
     if 0 <= idx < len(choices):
         return choices[idx][1]
     return None
+
+
+def prompt_text(message: str) -> Optional[str]:
+    """显示文本输入提示，返回用户输入的文本；用户取消时返回 None。
+
+    参数:
+      message - 提示文本
+
+    在非 TTY 环境下退化为 input()。
+    """
+    if not sys.stdout.isatty() or not sys.stdin.isatty():
+        try:
+            return input(f"{message} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+    from prompt_toolkit import prompt as pt_prompt
+    from prompt_toolkit.key_binding import KeyBindings
+
+    kb = KeyBindings()
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event):
+        event.app.exit(exception=KeyboardInterrupt())
+
+    try:
+        from app.util.input_arbiter import foreground_stdin
+        with foreground_stdin():
+            result = pt_prompt(
+                message + " ",
+                key_bindings=kb,
+                erase_when_done=False,
+            )
+        return result.strip() if result else None
+    except (KeyboardInterrupt, EOFError):
+        return None

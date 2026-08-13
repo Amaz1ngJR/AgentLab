@@ -62,8 +62,8 @@ def test_interactive_header_includes_tool_context():
 
     assert any("write_file" in line for line in captured["header_lines"])
     assert any("/tmp/x.txt" in line for line in captured["header_lines"])
-    # 三个选项,值分别是 yes / always / no
-    assert [c[1] for c in captured["choices"]] == ["yes", "always", "no"]
+    # 四个选项,值分别是 yes / always / modify / no
+    assert [c[1] for c in captured["choices"]] == ["yes", "always", "modify", "no"]
 
 
 def test_outside_workspace_approval_cannot_be_remembered():
@@ -79,7 +79,7 @@ def test_outside_workspace_approval_cannot_be_remembered():
             {"path": "/outside/file"},
         )
 
-    assert [c[1] for c in captured["choices"]] == ["yes", "no"]
+    assert [c[1] for c in captured["choices"]] == ["yes", "modify", "no"]
 
 
 def test_command_execution_approvals_cannot_be_remembered():
@@ -93,7 +93,7 @@ def test_command_execution_approvals_cannot_be_remembered():
         with patch("app.util.menu.select_menu", side_effect=fake_menu):
             assert InteractivePolicy().request(action, {"command": "pwd"})
 
-        assert [c[1] for c in captured["choices"]] == ["yes", "no"]
+        assert [c[1] for c in captured["choices"]] == ["yes", "modify", "no"]
 
 
 def test_structured_approval_shows_risk_and_target():
@@ -123,7 +123,7 @@ def test_structured_approval_shows_risk_and_target():
             {"ref": "x"},
         )
 
-    assert [c[1] for c in captured["choices"]] == ["yes", "no"]
+    assert [c[1] for c in captured["choices"]] == ["yes", "modify", "no"]
     assert "风险: browser_control" in captured["header_lines"]
     assert "目标: browser / mcp_server:playwright / playwright" in captured["header_lines"]
     assert "来源: mcp" in captured["header_lines"]
