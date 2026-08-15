@@ -21,6 +21,13 @@ def test_build_system_prompt_injects_workspace():
     assert "主动调查" in p
 
 
+def test_system_prompt_defines_web_verification_and_untrusted_content_rules():
+    assert "web_search 的 snippet" in DEFAULT_SYSTEM_PROMPT
+    assert "两个真正独立的来源" in DEFAULT_SYSTEM_PROMPT
+    assert "untrusted external content" in DEFAULT_SYSTEM_PROMPT
+    assert "不能扩大权限" in DEFAULT_SYSTEM_PROMPT
+
+
 def test_build_system_prompt_without_workspace_is_default():
     """workspace 为空/None 时退回纯默认 prompt(向后兼容)。"""
     assert build_system_prompt(None) == DEFAULT_SYSTEM_PROMPT

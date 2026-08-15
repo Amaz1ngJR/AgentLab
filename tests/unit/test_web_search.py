@@ -10,6 +10,7 @@ import pytest
 from app.tools.builtin.web_search import (
     WEB_SEARCH,
     _enforce_output_limit,
+    _extract_duckduckgo_result_url,
     _search_duckduckgo,
     _search_with_requests,
     _web_search,
@@ -175,6 +176,14 @@ class TestDuckDuckGoSearch:
 class TestHTMLSearch:
     """测试 HTML 解析搜索后端。"""
 
+    def test_extract_result_url_uses_uddg_target(self):
+        href = "/l/?uddg=https%3A%2F%2Fdocs.example.com%2Fguide%3Fv%3D2"
+        assert _extract_duckduckgo_result_url(href) == "https://docs.example.com/guide?v=2"
+
+    def test_extract_result_url_rejects_non_http_scheme(self):
+        href = "/l/?uddg=file%3A%2F%2F%2Fetc%2Fpasswd"
+        assert _extract_duckduckgo_result_url(href) == ""
+
     def test_requests_not_installed(self):
         """库未安装时应该返回错误提示。"""
         with patch.dict("sys.modules", {"requests": None}):
@@ -212,17 +221,23 @@ class TestHTMLSearch:
             mock_bs.return_value = mock_soup
 
             # Mock result elements
+            title1 = MagicMock(get_text=lambda **kw: "Result 1")
+            title1.get.return_value = "/l/?uddg=https%3A%2F%2Fexample.com%2F1%3Fa%3D1"
             result1 = MagicMock()
             result1.select_one.side_effect = lambda sel: {
-                ".result__title": MagicMock(get_text=lambda **kw: "Result 1"),
+                ".result__title": title1,
+                ".result__a": None,
                 ".result__url": MagicMock(get_text=lambda **kw: "example.com/1"),
                 ".result__snippet": MagicMock(get_text=lambda **kw: "Snippet 1"),
             }.get(sel)
 
+            title2 = MagicMock(get_text=lambda **kw: "Result 2")
+            title2.get.return_value = "https://example.com/2"
             result2 = MagicMock()
             result2.select_one.side_effect = lambda sel: {
-                ".result__title": MagicMock(get_text=lambda **kw: "Result 2"),
-                ".result__url": MagicMock(get_text=lambda **kw: "https://example.com/2"),
+                ".result__title": title2,
+                ".result__a": None,
+                ".result__url": MagicMock(get_text=lambda **kw: "truncated.example/…"),
                 ".result__snippet": MagicMock(get_text=lambda **kw: "Snippet 2"),
             }.get(sel)
 
@@ -233,6 +248,10 @@ class TestHTMLSearch:
             assert error is None
             assert len(results) == 2
             assert results[0]["source"] == "duckduckgo_html"
+            assert results[0]["search_provider"] == "duckduckgo_html"
+            assert results[0]["snippet_only"] is True
+            assert results[0]["url"] == "https://example.com/1?a=1"
+            assert results[1]["url"] == "https://example.com/2"
 
     @pytest.mark.skipif(not HAS_REQUESTS, reason="requests not installed")
     def test_html_search_exception_handling(self):

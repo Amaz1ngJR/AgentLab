@@ -1948,9 +1948,10 @@ AgentLab 需要具备类似现代 Agent 平台的互联网研究能力，但必�
 | SearchProvider | 把统一 SearchRequest 翻译为具体 provider 请求，返回原始来源元数据 | 修改搜索结果正文、伪造发布时间或吞掉来源 URL |
 | Fetcher | 受控获取公网 HTML/文本/PDF，校验每次重定向并提取正文 | 访问本机/私网，绕过 TLS，绕过付费墙，携带浏览器 cookie |
 | ControlGateway | 处理 JavaScript、登录态、点击和表单等动态网页 | Fetcher 失败时未经提示就升级为带登录态浏览器 |
-| CitationManager | 维护 claim/source/document/span 关系，输出可点击引用 | 把搜索结果页或模型记忆伪装成原始来源 |
+| VerificationEngine | 将回答中的关键事实建模为 Claim，以独立来源、时效、版本和可引用原文判断 supported/conflicted/insufficient/unverified | 仅凭搜索排名、摘要相似或多个转载页面宣称“已交叉验证” |
+| CitationManager | 维护 claim/evidence/source/document/span 关系，校验引用完整性并输出可点击引用 | 把搜索结果页、模型记忆或未抓取的 URL 伪装成原始证据 |
 
-`web_search` 用于发现来源，`web_fetch` 用于获取证据，`web_find` 用于在已缓存文档中定位可引用片段。搜索 snippet 只是索引线索，默认不得作为高置信结论的唯一证据。
+`web_search` 用于发现来源，`web_fetch` 用于获取证据，`web_find` 用于在已缓存文档中定位可引用片段。搜索 snippet 只是索引线索，默认不得作为高置信结论的唯一证据。事实核验以 Claim 为最小单元：关键 Claim 必须关联 Evidence，Evidence 必须来自 Source Store 中可回放的文档片段；多个 URL 只有在发布主体和内容链真正独立时才计为多个来源。
 
 #### 7.12.2 组件图
 
@@ -2047,8 +2048,40 @@ class FetchedDocument:
     truncated: bool
 
 @dataclass
+class Evidence:
+    evidence_id: str
+    source_id: str
+    document_id: str
+    span_start: int | None
+    span_end: int | None
+    quote: str
+    source_type: str                  # official / primary / secondary / unknown
+    independence_group: str           # 同源转载共享同一组，不重复计数
+    published_at: str | None
+    accessed_at: str
+
+@dataclass
+class Claim:
+    claim_id: str
+    text: str
+    importance: str                   # critical / normal / supporting
+    temporal: bool
+    evidence_ids: list[str]
+
+@dataclass
+class ClaimVerificationResult:
+    claim_id: str
+    status: str                       # supported / conflicted / insufficient / unverified
+    confidence: float
+    supporting_evidence_ids: list[str]
+    conflicting_evidence_ids: list[str]
+    reason: str
+
+@dataclass
 class Citation:
     citation_id: str
+    claim_id: str
+    evidence_id: str
     source_id: str
     document_id: str
     canonical_url: str
@@ -2058,7 +2091,9 @@ class Citation:
     accessed_at: str
 ```
 
-`source_id/document_id/citation_id` 必须在一次 run 中稳定，不能让模型自行生成。URL 标准化必须保留原始 requested URL 和最终 canonical URL，不因去除 tracking 参数而丢失审计事实。大文本只放 Blob/Cache，SQLite 保存元数据、hash 和引用关系。
+`source_id/document_id/evidence_id/claim_id/citation_id` 必须在一次 run 中稳定，不能让模型自行生成。URL 标准化必须保留原始 requested URL 和最终 canonical URL，不因去除 tracking 参数而丢失审计事实。大文本只放 Blob/Cache，SQLite 保存元数据、hash 和引用关系。
+
+Claim、Evidence 与 Citation 的职责不能合并：Claim 是待核验事实，Evidence 是从已抓取文档定位出的原始片段，Citation 是最终回答中 Claim 到 Evidence 的展示引用。VerificationEngine 负责判断证据是否支持 Claim、是否存在冲突、是否满足时效和版本范围，以及多个来源是否真正独立；CitationManager 只为已注册且通过运行时校验的关系生成引用，不负责替模型补造证据。
 
 #### 7.12.4 工具接口
 

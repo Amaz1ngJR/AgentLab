@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Optional
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 from app.tools.registry import Tool
 from app.util.redact import redact
@@ -33,6 +33,30 @@ DEFAULT_MAX_RESULTS = 10          # 默认最多返回多少条结果
 MAX_OUTPUT_BYTES = 32_000         # 序列化后 JSON 的硬上限
 MAX_SNIPPET_CHARS = 500           # 单条结果摘要截断
 DEFAULT_TIMEOUT = 15              # 搜索请求超时(秒)
+
+
+def _extract_duckduckgo_result_url(href: str) -> str:
+    """从 DuckDuckGo 结果链接提取真实 URL，拒绝非 HTTP(S) scheme。
+
+    HTML 端点常把真实地址放在 ``uddg`` query 参数中；直接使用页面展示 URL
+    会丢路径或使用省略文本。无法解析时仅接受完整的公网 HTTP(S) 形式，后续
+    真正 fetch 时仍由 web_fetch 执行 DNS/SSRF 校验。
+    """
+    href = (href or "").strip()
+    if not href:
+        return ""
+
+    absolute = urljoin("https://duckduckgo.com", href)
+    parsed = urlparse(absolute)
+    if parsed.hostname and parsed.hostname.lower().endswith("duckduckgo.com"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            absolute = unquote(target)
+            parsed = urlparse(absolute)
+
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return absolute
 
 
 def _search_duckduckgo(query: str, max_results: int, timeout: int) -> tuple[list[dict], Optional[str]]:
@@ -61,11 +85,17 @@ def _search_duckduckgo(query: str, max_results: int, timeout: int) -> tuple[list
                 if idx >= max_results:
                     break
 
+                actual_url = _extract_duckduckgo_result_url(item.get("href", ""))
+                if not actual_url:
+                    continue
                 # DuckDuckGo 返回格式: {title, href, body}
                 result = {
                     "title": redact(item.get("title", ""))[:200],
-                    "url": item.get("href", ""),
+                    "url": actual_url,
                     "snippet": redact(item.get("body", ""))[:MAX_SNIPPET_CHARS],
+                    "snippet_only": True,
+                    "search_provider": "duckduckgo",
+                    # 兼容既有调用；后续 Source 模型落地后删除该别名。
                     "source": "duckduckgo",
                 }
                 results.append(result)
@@ -109,23 +139,28 @@ def _search_with_requests(query: str, max_results: int, timeout: int) -> tuple[l
                 break
 
             title_elem = result_div.select_one(".result__title")
-            link_elem = result_div.select_one(".result__url")
+            # DuckDuckGo 的真实结果链接在标题 <a href>；.result__url 只是展示文本，
+            # 可能被截断，不能作为可抓取 URL。
+            anchor_elem = result_div.select_one(".result__a") or title_elem
             snippet_elem = result_div.select_one(".result__snippet")
 
             if not title_elem:
                 continue
 
             title = redact(title_elem.get_text(strip=True))[:200]
-            url_text = link_elem.get_text(strip=True) if link_elem else ""
+            href = anchor_elem.get("href", "") if anchor_elem else ""
+            actual_url = _extract_duckduckgo_result_url(href)
+            if not actual_url:
+                continue
             snippet = redact(snippet_elem.get_text(strip=True))[:MAX_SNIPPET_CHARS] if snippet_elem else ""
-
-            # 构造完整 URL(DuckDuckGo HTML 返回的是相对链接)
-            actual_url = f"https://{url_text}" if url_text and not url_text.startswith("http") else url_text
 
             result = {
                 "title": title,
                 "url": actual_url,
                 "snippet": snippet,
+                "snippet_only": True,
+                "search_provider": "duckduckgo_html",
+                # 兼容既有调用；后续 Source 模型落地后删除该别名。
                 "source": "duckduckgo_html",
             }
             results.append(result)

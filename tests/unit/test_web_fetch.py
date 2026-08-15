@@ -11,6 +11,7 @@ from app.tools.builtin.web_fetch import (
     MAX_CONTENT_CHARS,
     WEB_FETCH,
     _extract_beautifulsoup,
+    _extract_canonical_url,
     _extract_content,
     _truncate,
     _web_fetch,
@@ -135,6 +136,18 @@ class TestUrlValidation:
         get.assert_not_called()
 
 
+class TestCanonicalUrl:
+    def test_attribute_order_does_not_matter(self):
+        html = '<link href="/canonical" data-x="1" rel="alternate canonical">'
+        assert _extract_canonical_url(html, "https://example.com/page") == \
+            "https://example.com/canonical"
+
+    def test_private_canonical_falls_back_to_final_url(self):
+        html = '<link rel="canonical" href="http://127.0.0.1/internal">'
+        assert _extract_canonical_url(html, "https://example.com/page") == \
+            "https://example.com/page"
+
+
 class TestTruncate:
     """正文截断。"""
 
@@ -192,7 +205,11 @@ class TestFetchAndExtract:
                        url: str = "https://example.com/article"):
         resp = MagicMock()
         resp.raise_for_status = MagicMock()
-        resp.headers = {"Content-Type": content_type}
+        resp.headers = {
+            "Content-Type": content_type,
+            "ETag": '"test-etag"',
+            "Last-Modified": "Wed, 06 Aug 2026 00:00:00 GMT",
+        }
         resp.url = url
         resp.status_code = 200
         resp.encoding = "utf-8"
@@ -200,8 +217,12 @@ class TestFetchAndExtract:
         return resp
 
     def test_successful_fetch_returns_json(self):
+        html = SAMPLE_HTML.replace(
+            "</head>",
+            '<link rel="canonical" href="/canonical-article"></head>',
+        )
         with (
-            patch("requests.get", return_value=self._mock_response(SAMPLE_HTML)),
+            patch("requests.get", return_value=self._mock_response(html)),
             patch("app.tools.builtin.web_fetch._extract_trafilatura", return_value=None),
             patch("app.tools.builtin.web_fetch._extract_readability", return_value=None),
         ):
@@ -209,7 +230,21 @@ class TestFetchAndExtract:
 
         parsed = json.loads(result)
         assert parsed["url"] == "https://example.com/article"
+        assert parsed["requested_url"] == "https://example.com/article"
+        assert parsed["final_url"] == "https://example.com/article"
+        assert parsed["canonical_url"] == "https://example.com/canonical-article"
+        assert parsed["http_status"] == 200
+        assert parsed["content_type"] == "text/html"
+        assert parsed["encoding"] == "utf-8"
+        assert parsed["etag"] == '"test-etag"'
+        assert parsed["last_modified"] == "Wed, 06 Aug 2026 00:00:00 GMT"
+        assert parsed["response_bytes"] == len(html.encode("utf-8"))
+        assert parsed["retrieved_at"].endswith("Z")
+        assert len(parsed["content_hash"]) == 64
+        assert parsed["trust"] == "untrusted_external_content"
         assert parsed["title"] == "测试文章标题"
+        assert parsed["content"].startswith("<untrusted_web_content")
+        assert parsed["content"].endswith("</untrusted_web_content>")
         assert "WebRTC" in parsed["content"]
         assert parsed["extractor"] == "beautifulsoup"
         assert "chars" in parsed
@@ -295,7 +330,11 @@ class TestNoExtractor:
     def test_no_extractor_returns_install_hint(self):
         # mock 所有抽取器都返回 None
         with patch("app.tools.builtin.web_fetch._fetch_html",
-                   return_value=("<html></html>", "https://example.com", None)), \
+                   return_value=("<html></html>", {
+                       "requested_url": "https://example.com",
+                       "final_url": "https://example.com",
+                       "redirect_chain": [],
+                   }, None)), \
              patch("app.tools.builtin.web_fetch._extract_content",
                    return_value=("", "", "none")):
             result = _web_fetch({"url": "https://example.com"})
