@@ -24,15 +24,95 @@
 
 需要 **Python 3.11+**。
 
-```bash
-conda create -n agentlab python=3.11   # 或自建 venv
-conda activate agentlab
-pip install -e .
-cp .env.example .env
+`python -m pip install -e .` 会安装依赖并注册当前虚拟环境内的 `agentlab` 命令；源码修改后无需重复安装。
+
+### Windows：创建 `myenv` 并部署
+
+Windows 建议使用 Python Launcher 创建项目专属虚拟环境，避免 MSYS2 的 `python.exe` 与系统 `pip.exe` 指向不同环境。以下命令均在 AgentLab 项目根目录的 PowerShell 中执行。
+
+1. 确认已安装 Python 3.11：
+
+```powershell
+py --list
+py -3.11 --version
 ```
 
-`pip install -e .` 会安装依赖并注册全局 `agentlab` 命令；源码修改后无需重复安装。
-Windows PowerShell 使用 `Copy-Item .env.example .env` 复制环境变量模板。
+如果找不到 `py`，请安装 [python.org](https://www.python.org/downloads/windows/) 提供的 Windows Python，并在安装时勾选 **Add Python to PATH** 和 **Install launcher for all users**。
+
+2. 创建并激活名为 `myenv` 的虚拟环境：
+
+```powershell
+py -3.11 -m venv myenv
+.\myenv\Scripts\Activate.ps1
+```
+
+如果 PowerShell 提示禁止运行脚本，可仅对当前终端临时放开策略，然后重新激活：
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\myenv\Scripts\Activate.ps1
+```
+
+激活成功后，命令行前会显示 `(myenv)`。
+
+3. 验证环境并安装 AgentLab：
+
+```powershell
+python -c "import sys; print(sys.executable)"
+python -m pip --version
+python -m pip install --upgrade pip
+python -m pip install -e .
+Copy-Item .env.example .env
+```
+
+`sys.executable` 和 pip 路径都应包含当前项目的 `myenv\Scripts`。请始终使用 `python -m pip`，不要混用裸 `pip` 和其他位置的 `python`。
+
+4. 编辑 `.env` 配置模型凭据，然后启动：
+
+```powershell
+python -m app
+# 或使用安装后注册的命令
+agentlab --workspace .
+```
+
+5. 退出环境；以后重新进入项目时再次激活：
+
+```powershell
+deactivate
+
+# 下次使用
+cd C:\Users\YanJunru\Code\YJR\AgentLab
+.\myenv\Scripts\Activate.ps1
+python -m app
+```
+
+如果不方便激活，可直接使用虚拟环境解释器完成部署和启动：
+
+```powershell
+.\myenv\Scripts\python.exe -m pip install --upgrade pip
+.\myenv\Scripts\python.exe -m pip install -e .
+.\myenv\Scripts\python.exe -m app
+```
+
+遇到 `ModuleNotFoundError` 或 `python -m pip` 不可用时，先检查命令实际指向：
+
+```powershell
+Get-Command python,pip
+where.exe python
+where.exe pip
+python -c "import sys; print(sys.executable)"
+```
+
+如果 `python` 指向 `C:\msys64\...\python.exe`，而 `pip` 指向 `C:\Users\...\Python311\Scripts\pip.exe`，说明环境发生错配；退出当前终端，重新使用 `py -3.11 -m venv myenv` 创建环境，不要用裸 `pip` 修补另一个 Python。
+
+### macOS / Linux：Conda 安装
+
+```bash
+conda create -n agentlab python=3.11
+conda activate agentlab
+python -m pip install -e .
+cp .env.example .env
+```
 
 **可选依赖**（根据需要安装，跨平台通用）：
 

@@ -21,13 +21,41 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ---
 
-## 2. 当前需要做的事情（最多 5 项）
+## 2. 接下来开发计划（按优先级，最多 5 项）
 
-1. **抽出 Runtime Service 与 Approval Broker**：把 Session 创建、消息执行、取消、审批、事件订阅和资源关闭从 CLI 拆成公共服务；CLI 先迁移到该服务（见 6.1、6.10）。
-2. **完善 Loop Engineering 证据闭环**（PRD §7.6，基础闭环见 3.11）：把 loop run / iteration / verification / worktree / commit 证据完整写入 `loop_store`，实现 api/human Verifier 与 `/loop evidence`、`/loop diff`（见 6.14）。
-3. **建立 ComputerControlGateway**：先包装 Playwright MCP，让 snapshot/click/type 进入统一 Observation、风险判断、审批和审计，并接入 browser Verifier（见 6.6、6.7）。
-4. **实现 FastAPI Server MVP**：提供 session/message/approval/cancel API 与 SSE 事件，增加 `agentlab serve`；先完成 API 和简单管理页，再扩展完整 Web UI（见 6.10）。
-5. **实现受控互联网检索骨架**：抽出 WebRetrievalService/SearchProvider，让现有 `web_search/web_fetch` 转为薄适配器，建立 source/document/citation 数据模型与 fake provider 测试（见 6.15）。
+以下顺序遵循“先解耦运行时，再开放新入口；先形成证据与安全边界，再增加执行能力”。每一项完成后都应更新第 3 节里程碑，并保持 CLI 行为兼容。
+
+1. **P0：抽出 Runtime Service 与异步 Approval Broker**（见 6.1、6.10）
+   - 建立不依赖 CLI 输入输出的 `RuntimeService`，统一负责 session 创建/切换、消息执行、取消、事件订阅和资源关闭。
+   - 建立可挂起、批准、拒绝和超时的 `ApprovalBroker`；审批请求使用稳定 ID，并支持多个前端异步回应。
+   - 将 CLI 迁移为 Runtime Service 的第一个客户端，移除 CLI 对 `AgentSession`、MCP 生命周期和持久化细节的直接编排。
+   - **验收**：现有 CLI 功能与审批语义不回归；service/broker 有离线并发、取消、超时和资源清理测试；完整 unit tests 通过。
+
+2. **P0：完善 Loop Engineering 的持久化证据闭环**（PRD §7.6，基础闭环见 3.11）
+   - 增加 `loop_store`，持久化 goal、run、iteration、任务快照、验证结果、worktree、diff/commit 引用、预算消耗和终止原因。
+   - 实现 `/loop evidence`、`/loop diff` 和中断后恢复；证据记录只存脱敏、限长内容，并能关联工具审计 ID。
+   - 优先补齐 API Verifier 与真正可交互的 Human Verifier；browser Verifier 在第 3 项网关完成后接入。
+   - **验收**：进程重启后可查看并恢复 Loop；成功不能仅由模型自述判定；失败、拒批、超时、预算耗尽均留下可追溯证据。
+
+3. **P1：建立 ComputerControlGateway 并接入 browser Verifier**（见 6.6、6.7）
+   - 先包装现有 Playwright MCP，将 snapshot/click/type/navigation 规范化为 Observation 和 Action，不让 Runtime 依赖 MCP 工具的原始返回结构。
+   - 在网关统一执行目标校验、风险分级、审批、敏感字段处理、截图/DOM 限长、审计和取消。
+   - 基于 Observation 实现 browser Verifier，支持 URL、可见文本、元素状态和截图证据检查。
+   - **验收**：浏览器写动作无法绕过 Approval Broker；页面内容不能修改权限或 GoalSpec；使用本地测试页面完成离线端到端验证。
+
+4. **P1：实现 FastAPI Server MVP 与 SSE 事件流**（见 6.10）
+   - 基于 Runtime Service 提供 session、message/run、approval、cancel、loop evidence API，以及可重连的 SSE 事件端点。
+   - 增加 `agentlab serve`，仅默认监听 loopback；定义请求 ID、错误模型、事件序号、断线与关闭语义。
+   - 先提供最小管理页验证聊天、工具进度和审批交互，不在此阶段扩展完整 Web UI/TUI。
+   - **验收**：CLI 与 API 复用同一 runtime 路径；两个 session 并发不串上下文/审批；API、SSE 重连、取消和安全默认值有集成测试。
+
+5. **P1：实现受控互联网检索与引用骨架**（见 6.15）
+   - 抽出 `WebRetrievalService`、可替换 `SearchProvider`、受控 Fetcher、Source/Document Store 和 `CitationManager`；现有 `web_search/web_fetch` 降为薄工具适配器。
+   - 统一 URL 规范化、SSRF 防护、重定向检查、缓存、来源去重、获取时间、正文定位、截断和 prompt injection 数据边界。
+   - 为最终回答提供可校验 citation，禁止引用未实际抓取或无法映射到 source/document 的链接。
+   - **验收**：fake provider 可离线覆盖搜索→抓取→引用全链路；引用能追溯 URL、获取时间和正文片段；现有 Web 安全测试保持通过。
+
+执行约束：每项按“接口/数据模型 → fake 与单元测试 → 最小实现 → CLI/API 集成 → 文档与跨平台回归”推进；不要同时启动后续 P1 大模块，直到 P0 的 Runtime Service 和证据模型接口稳定。
 
 ---
 

@@ -2,7 +2,9 @@ openai>=1.40.0
 anthropic>=0.40.0
 python-dotenv>=1.0.0
 pyyaml>=6.0
-prompt_toolkit>=3.0
+# CLI (the PyPI package uses a hyphen; Python imports it as prompt_toolkit).
+# Keep this exact so a normal requirements upgrade repairs older/broken installs.
+prompt-toolkit==3.0.52
 pathspec>=0.12
 # 1.27.2 includes Windows executable resolution and process-tree cleanup.
 mcp>=1.27.2
