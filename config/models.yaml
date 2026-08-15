@@ -102,3 +102,14 @@ models:
     capabilities: [chat, tools]
     params:
       temperature: 0.2
+
+  # ── CRS 网关 GPT 模型（gpt-5.6-sol）──────────────────────────────────────────
+  # 使用内部 CRS 网关访问 GPT-5.6-sol 模型，采用 OpenAI Responses API 格式
+  crs_gpt:
+    provider: openai
+    model: gpt-5.6-sol
+    base_url_env: CRS_OAI_URL
+    api_key_env: CRS_OAI_KEY
+    capabilities: [chat, tools]
+    params:
+      temperature: 0.7

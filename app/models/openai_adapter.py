@@ -60,9 +60,13 @@ class OpenAIAdapter:
                      system: Optional[str]) -> dict[str, Any]:
         # Responses API 通过 instructions 顶级字段传 system,比塞进 input 更清晰
         # (语义和 Anthropic 的 system 参数一致)
+
+        # 转换消息格式：将 Anthropic 格式转为 Responses API 格式
+        converted_input = _convert_messages_to_responses_format(messages)
+
         params: dict[str, Any] = {
             "model": self._cfg.model,
-            "input": list(messages),
+            "input": converted_input,
             "temperature": self._cfg.temperature if temperature is None else temperature,
         }
         if system:
@@ -232,3 +236,123 @@ def _estimate_input_tokens(messages: list[dict], system: Optional[str]) -> int:
                 if isinstance(part, dict):
                     char_count += len(part.get("text", "") or "")
     return char_count // 3
+
+
+def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
+    """将 Anthropic/通用消息格式转换为 OpenAI Responses API 格式。
+
+    AgentLab 内部使用混合格式:
+      - 用户消息: {"role": "user", "content": "..."}
+      - Anthropic assistant: {"role": "assistant", "content": [{"type": "text", ...}, {"type": "tool_use", ...}]}
+      - Anthropic tool_result: {"role": "user", "content": [{"type": "tool_result", ...}]}
+      - OpenAI Responses items: {"type": "message", "role": "assistant", "content": [...]}
+
+    Responses API 需要的格式:
+      - 用户文本: {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "..."}]}
+      - Assistant 文本: {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "..."}]}
+      - 工具调用: {"type": "function_call", "call_id": "...", "name": "...", "arguments": {...}}
+      - 工具结果: {"type": "function_call_output", "call_id": "...", "output": "..."}
+    """
+    result = []
+
+    for msg in messages:
+        # 如果已经是 Responses API 格式 (有 type 字段), 清理并保留
+        if "type" in msg:
+            # 移除不支持的字段（如 parsed_arguments）
+            cleaned = {k: v for k, v in msg.items() if k not in ('parsed_arguments',)}
+            result.append(cleaned)
+            continue
+
+        role = msg.get("role")
+        content = msg.get("content")
+
+        # 处理用户消息
+        if role == "user":
+            if isinstance(content, str):
+                # 简单文本消息
+                result.append({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": content}]
+                })
+            elif isinstance(content, list):
+                # 多模态内容 (文本 + 图片) 或 工具结果
+                converted_content = []
+                tool_results = []
+
+                for item in content:
+                    if isinstance(item, dict):
+                        item_type = item.get("type")
+                        if item_type == "text":
+                            converted_content.append({"type": "input_text", "text": item.get("text", "")})
+                        elif item_type == "image":
+                            # Anthropic 图片格式转 Responses API
+                            source = item.get("source", {})
+                            if source.get("type") == "base64":
+                                converted_content.append({
+                                    "type": "input_image",
+                                    "image_url": f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
+                                })
+                        elif item_type == "tool_result":
+                            # Anthropic tool_result 转为 Responses API function_call_output
+                            tool_results.append({
+                                "type": "function_call_output",
+                                "call_id": item.get("tool_use_id", ""),
+                                "output": item.get("content", "") if isinstance(item.get("content"), str) else str(item.get("content", ""))
+                            })
+                        else:
+                            # 其他类型尝试直接保留
+                            converted_content.append(item)
+
+                # 如果有普通内容，添加为 message
+                if converted_content:
+                    result.append({
+                        "type": "message",
+                        "role": "user",
+                        "content": converted_content
+                    })
+
+                # 如果有工具结果，添加为 function_call_output items
+                result.extend(tool_results)
+
+        # 处理 assistant 消息
+        elif role == "assistant":
+            if isinstance(content, str):
+                # 简单文本回复
+                result.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": content}]
+                })
+            elif isinstance(content, list):
+                # Anthropic 格式: content 是 block 列表
+                text_blocks = []
+                tool_calls = []
+
+                for block in content:
+                    if isinstance(block, dict):
+                        block_type = block.get("type")
+                        if block_type == "text":
+                            text_blocks.append({"type": "output_text", "text": block.get("text", "")})
+                        elif block_type == "tool_use":
+                            # Anthropic tool_use 转为 Responses API function_call
+                            # 注意: arguments 必须是 JSON 字符串, 不是对象
+                            tool_calls.append({
+                                "type": "function_call",
+                                "call_id": block.get("id", ""),
+                                "name": block.get("name", ""),
+                                "arguments": json.dumps(block.get("input", {}))
+                            })
+
+                # 添加 assistant message (文本部分)
+                if text_blocks:
+                    result.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": text_blocks
+                    })
+
+                # 添加 function_call items (工具调用)
+                result.extend(tool_calls)
+
+    return result
