@@ -62,13 +62,13 @@ def _extract_duckduckgo_result_url(href: str) -> str:
 def _search_duckduckgo(query: str, max_results: int, timeout: int) -> tuple[list[dict], Optional[str]]:
     """使用 DuckDuckGo 搜索,返回 (结果列表, 错误信息)。
 
-    使用 duckduckgo_search 库(需要安装: pip install duckduckgo-search)。
+    使用 ddgs 库(需要安装: pip install ddgs)。
     如果库未安装,返回空列表和提示信息。
     """
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
-        return [], "duckduckgo_search library not installed. Install with: pip install duckduckgo-search"
+        return [], "ddgs library not installed. Install with: pip install ddgs"
 
     results = []
     error = None

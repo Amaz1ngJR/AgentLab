@@ -6,6 +6,9 @@ __pycache__/
 venv/
 .pytest_cache/
 
+# Ollama project-local model cache
+.ollama/
+
 # Env
 .env
 .env.local

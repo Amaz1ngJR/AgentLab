@@ -187,6 +187,22 @@ def test_executor_completes_task_without_tools():
     assert out.evidence == "子任务完成了"
 
 
+def test_executor_pure_conversation_does_not_force_tool_call():
+    """介绍、解释等纯对话应直接完成，任务指令不能强迫模型调用无意义工具。"""
+    router = FakeRouter([_resp_text("我是 AgentLab，本地编码助手。")])
+    ex = Executor(router, _registry(_echo_tool()))
+
+    out = ex.run_task(Task("t1", "介绍下你自己"), [], system="", max_steps=4)
+
+    assert out.status == COMPLETED
+    assert out.tool_calls_made == 0
+    assert len(router.calls) == 1
+    directive = router.calls[0][-1]["content"]
+    assert "纯对话、介绍、解释、总结" in directive
+    assert "直接回答，不要调用工具" in directive
+    assert "禁止只输出文字说明" not in directive
+
+
 def test_executor_runs_tool_then_completes():
     router = FakeRouter([
         _resp_tool("c1", "echo", {"msg": "hi"}),

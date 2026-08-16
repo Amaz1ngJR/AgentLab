@@ -141,19 +141,65 @@ ANTHROPIC_BASE_URL=https://your-proxy/api/
 python -m app
 ```
 
-### 选项 B：用本地 Qwen2.5-Coder 7B（完全离线）
+### 选项 B：用 Ollama 下载并启用本地模型
+
+先安装 [Ollama](https://ollama.com/download)，然后启动服务：
+
+```powershell
+# Windows（安装后通常会自动启动；未启动时手动执行）
+ollama serve
+```
 
 ```bash
-# 一键安装(检测/启动 Ollama + 下载 Qwen2.5-Coder 7B + 验证可推理)
+# macOS / Linux
+ollama serve
+```
+
+打开另一个终端下载模型。推荐 16 GB 显存设备使用 Qwen3 14B：
+
+```bash
+ollama pull qwen3:14b
+ollama list
+
+# 先直接测试模型；输入 /bye 退出
+ollama run qwen3:14b
+```
+
+如需将模型保存在项目目录，必须在首次 `pull` 和每次启动 Ollama 服务前设置相同的 `OLLAMA_MODELS`。路径按实际项目位置修改：
+
+```powershell
+# Windows PowerShell
+$env:OLLAMA_MODELS = "$PWD\.ollama\qwen3-14b\models"
+[Environment]::SetEnvironmentVariable("OLLAMA_MODELS", $env:OLLAMA_MODELS, "User")
+ollama serve
+ollama pull qwen3:14b
+```
+
+```bash
+# macOS / Linux
+export OLLAMA_MODELS="$PWD/.ollama/qwen3-14b/models"
+ollama serve
+# 在另一个同样设置了 OLLAMA_MODELS 的终端执行：ollama pull qwen3:14b
+```
+
+激活 AgentLab 的 Qwen3 14B profile：
+
+```dotenv
+# .env
+ACTIVE_PROFILE=local_qwen3_14b
+```
+
+```bash
+python -m app
+# 或不修改 .env，单次指定 profile
+python -m app --profile local_qwen3_14b -p "用一句话介绍你自己"
+```
+
+也可以使用现有的一键脚本安装默认的 Qwen2.5-Coder 7B：
+
+```bash
 bash scripts/install_local_model.sh                 # macOS / Linux
 # Windows: powershell -ExecutionPolicy Bypass -File scripts\install_local_model.ps1
-
-# 切到本地 profile
-echo "ACTIVE_PROFILE=local_qwen" > .env
-python -m app
-
-# 端到端验证(连通 + 工具调用 + 任务面板)
-bash scripts/verify_local_model.sh
 ```
 
 模型选型 / 硬件评估 / 局域网 GPU 模式见 [`docs/local_model_guide.md`](docs/local_model_guide.md)。
@@ -339,6 +385,7 @@ WORKSPACE_ROOT=/Users/you/some-project
 | `gpt_official` | OpenAI 官方 GPT（Responses API） | `OPENAI_API_KEY`（可选 `OPENAI_MODEL` 覆盖型号） |
 | `siliconflow` | 硅基流动 SiliconFlow（OpenAI 兼容云端） | `SILICONFLOW_API_KEY`（可选 `SILICONFLOW_MODEL` 覆盖型号） |
 | `local_qwen` | 本机 Ollama + Qwen2.5-Coder 7B | 无（需先 `ollama pull`） |
+| `local_qwen3_14b` | 本机 Ollama + Qwen3 14B | 无（需先 `ollama pull qwen3:14b`） |
 | `local_deepseek` | 本机 Ollama + DeepSeek-R1 7B | 无（不带工具能力） |
 | `lan_qwen` | 局域网 GPU 主机 Ollama | 无（修改 profile 里的 `base_url`） |
 

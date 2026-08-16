@@ -116,6 +116,50 @@ def test_create_message_text_only():
     assert resp.usage["output_tokens"] == 8
 
 
+def test_create_message_normalizes_null_message_content():
+    """Ollama 不接受 JSON null content，助手工具调用历史也需要规范化。"""
+    with patch("openai.OpenAI") as MockOpenAI:
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _stream_text("done")
+
+        adapter = OpenAICompatibleAdapter(_cfg())
+        adapter.create_message(messages=[
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ])
+
+    sent = mock_client.chat.completions.create.call_args.kwargs["messages"]
+    assert sent[0]["content"] == ""
+    assert sent[0]["tool_calls"] == [{"id": "c1"}]
+
+
+def test_create_message_normalizes_mixed_provider_history():
+    """切换到 Ollama 后应将 Responses API 历史转换为 Chat 格式。"""
+    with patch("openai.OpenAI") as MockOpenAI:
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _stream_text("done")
+
+        adapter = OpenAICompatibleAdapter(_cfg())
+        adapter.create_message(messages=[
+            {"role": "assistant", "type": "message", "content": [
+                {"type": "output_text", "text": "准备调用工具"},
+            ]},
+            {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            {"role": "assistant", "content": None},
+        ])
+
+    sent = mock_client.chat.completions.create.call_args.kwargs["messages"]
+    assert sent[0] == {"role": "assistant", "content": "准备调用工具"}
+    assert sent[1]["role"] == "assistant"
+    assert sent[1]["content"] == ""
+    assert sent[1]["tool_calls"][0]["function"]["name"] == "shell"
+    assert sent[2] == {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+    assert sent[3] == {"role": "assistant", "content": ""}
+
+
 def test_provider_payload_structure():
     """provider_payload 是 list[dict],单元素是 OpenAI assistant message,可被 messages.extend 原样追加。"""
     with patch("openai.OpenAI") as MockOpenAI:

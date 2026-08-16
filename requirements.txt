@@ -10,7 +10,7 @@ pathspec>=0.12
 mcp>=1.27.2
 
 # Web search (optional, for web_search tool)
-duckduckgo-search>=6.0.0
+ddgs>=9.0.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 

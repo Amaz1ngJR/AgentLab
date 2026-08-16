@@ -10,13 +10,13 @@ models:
       temperature: 0.2
       context_size: 8192
 
-  local_qwen14b:
+  local_qwen3_14b:
     provider: ollama
-    model: qwen2.5-coder:14b-instruct
+    model: qwen3:14b
     base_url: http://127.0.0.1:11434/v1
     capabilities: [chat, tools]
     params:
-      temperature: 0.2
+      temperature: 0.6
       context_size: 8192
 
   local_deepseek:

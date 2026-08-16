@@ -24,6 +24,78 @@ from app.models.protocol import (
 )
 
 
+def _content_to_text(content: Any) -> str:
+    """将 Responses/Anthropic 的结构化 content 转为 Chat Completions 文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
+def _normalize_chat_messages(messages: list[dict]) -> list[dict[str, Any]]:
+    """把混合 provider 历史转换为 Ollama/OpenAI Chat Completions 格式。"""
+    normalized: list[dict[str, Any]] = []
+    pending_calls: list[dict[str, Any]] = []
+
+    for message in messages:
+        msg_type = message.get("type")
+        if msg_type == "function_call":
+            arguments = message.get("arguments") or "{}"
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            pending_calls.append({
+                "id": message.get("call_id") or message.get("id") or "",
+                "type": "function",
+                "function": {"name": message.get("name") or "", "arguments": arguments},
+            })
+            continue
+
+        if pending_calls:
+            normalized.append({"role": "assistant", "content": "", "tool_calls": pending_calls})
+            pending_calls = []
+
+        if msg_type == "function_call_output":
+            normalized.append({
+                "role": "tool",
+                "tool_call_id": message.get("call_id") or "",
+                "content": _content_to_text(message.get("output")),
+            })
+            continue
+
+        role = message.get("role")
+        if role not in {"system", "user", "assistant", "tool"}:
+            continue
+        converted: dict[str, Any] = {
+            "role": role,
+            "content": _content_to_text(message.get("content")),
+        }
+        # 只保留 Chat Completions 支持的字段，避免 Responses API 的 id、status、
+        # phase 等字段被透传给 Ollama 后触发 invalid message format。
+        if role == "assistant" and message.get("tool_calls"):
+            converted["tool_calls"] = message["tool_calls"]
+        if role == "tool" and message.get("tool_call_id") is not None:
+            converted["tool_call_id"] = message["tool_call_id"]
+        if message.get("name") is not None:
+            converted["name"] = message["name"]
+        normalized.append(converted)
+
+    if pending_calls:
+        normalized.append({"role": "assistant", "content": "", "tool_calls": pending_calls})
+    return normalized
+
+
 class OpenAICompatibleAdapter:
     def __init__(self, cfg: LLMConfig):
         from openai import OpenAI
@@ -44,9 +116,14 @@ class OpenAICompatibleAdapter:
         return "openai_compatible"
 
     def _base_params(self, messages: list[dict], temperature: Optional[float]) -> dict[str, Any]:
+        # 会话可能在 OpenAI Responses 与 Ollama 之间切换。Responses 历史中的
+        # function_call、function_call_output 和 content 列表不能直接发送给 Chat
+        # Completions；这里统一转换为 Ollama 接受的 assistant/tool/纯文本格式。
+        normalized_messages = _normalize_chat_messages(messages)
+
         params: dict[str, Any] = {
             "model": self._cfg.model,
-            "messages": messages,
+            "messages": normalized_messages,
             "temperature": self._cfg.temperature if temperature is None else temperature,
         }
         if self._cfg.top_p is not None:
