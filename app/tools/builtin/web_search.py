@@ -65,10 +65,17 @@ def _search_duckduckgo(query: str, max_results: int, timeout: int) -> tuple[list
     使用 ddgs 库(需要安装: pip install ddgs)。
     如果库未安装,返回空列表和提示信息。
     """
+    # ddgs 是当前包名；保留 duckduckgo_search 兼容旧环境和已有安装。
     try:
         from ddgs import DDGS
     except ImportError:
-        return [], "ddgs library not installed. Install with: pip install ddgs"
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return [], (
+                "DuckDuckGo library not installed. Install with: "
+                "pip install ddgs"
+            )
 
     results = []
     error = None

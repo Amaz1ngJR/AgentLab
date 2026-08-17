@@ -122,6 +122,9 @@ class AgentSession:
         self.max_steps = max_steps
         self.messages: list[dict[str, Any]] = []
         self._on_event = on_event or (lambda e: None)
+        # RuntimeService 可在不替换 CLI 原渲染回调的前提下旁路订阅完整事件流。
+        self._turn_subscribers: list[Callable[[TurnEvent], None]] = []
+        self._run_subscribers: list[Callable[[RunEvent], None]] = []
         self._progress: ProgressFn = progress or (lambda label: nullcontext())
         self.last_turn_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self.cumulative_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
@@ -147,6 +150,36 @@ class AgentSession:
         # 编排 run 的目标与结果状态,供 SessionRouter.persist_current 写 runs 审计
         self.last_goal: str = ""
         self.last_run_status: str = ""
+
+    def subscribe_events(
+        self,
+        *,
+        on_turn: Callable[[TurnEvent], None] | None = None,
+        on_run: Callable[[RunEvent], None] | None = None,
+    ) -> Callable[[], None]:
+        """旁路订阅事件；返回取消订阅函数，CLI 原回调保持不变。"""
+        if on_turn is not None:
+            self._turn_subscribers.append(on_turn)
+        if on_run is not None:
+            self._run_subscribers.append(on_run)
+
+        def unsubscribe() -> None:
+            if on_turn in self._turn_subscribers:
+                self._turn_subscribers.remove(on_turn)
+            if on_run in self._run_subscribers:
+                self._run_subscribers.remove(on_run)
+
+        return unsubscribe
+
+    def _emit_turn_event(self, event: TurnEvent) -> None:
+        self._on_event(event)
+        for callback in list(self._turn_subscribers):
+            callback(event)
+
+    def _emit_run_event(self, event: RunEvent) -> None:
+        self._on_run_event(event)
+        for callback in list(self._run_subscribers):
+            callback(event)
 
     def close(self) -> None:
         """释放会话持有的外部资源(MCP server 进程等)。重复调用安全。"""
@@ -186,7 +219,7 @@ class AgentSession:
                 max_steps=self.max_steps,
                 task_store=self.task_store,
                 planner=self._planner,
-                on_event=self._on_run_event,
+                on_event=self._emit_run_event,
                 progress=self._progress,
                 messages=self.messages,
                 context_manager=self.context_manager,
@@ -274,7 +307,7 @@ class AgentSession:
 
                 # 文本未被流式打印过才补发 text 事件，避免重复
                 if resp.text and not text_streamed:
-                    self._on_event(TurnEvent(kind="text", text=resp.text))
+                    self._emit_turn_event(TurnEvent(kind="text", text=resp.text))
 
                 if not resp.tool_calls:
                     return resp.text
@@ -298,7 +331,7 @@ class AgentSession:
 
                 try:
                     for call in resp.tool_calls:
-                        self._on_event(TurnEvent(
+                        self._emit_turn_event(TurnEvent(
                             kind="tool_call",
                             tool_name=call.name,
                             tool_input=call.arguments,
@@ -324,7 +357,7 @@ class AgentSession:
                                 call.arguments,
                                 approval_action=approval_action,
                             )
-                            self._on_event(TurnEvent(kind="tool_denied", tool_name=call.name))
+                            self._emit_turn_event(TurnEvent(kind="tool_denied", tool_name=call.name))
                             # 补齐 tool_result 配对后抛出中断
                             tool_results.append(ToolResult(
                                 tool_call_id=call.id,
@@ -347,7 +380,7 @@ class AgentSession:
                                 call.arguments,
                                 approval_action=approval_action,
                             )
-                            self._on_event(TurnEvent(kind="tool_denied", tool_name=call.name))
+                            self._emit_turn_event(TurnEvent(kind="tool_denied", tool_name=call.name))
                         else:
                             t0 = time.monotonic()
                             output, is_error = self.tools.execute(
@@ -358,7 +391,7 @@ class AgentSession:
                             # 进入历史前截断超大输出(与编排路径一致,见 executor)。
                             from app.agent.executor import _truncate_tool_output
                             output = _truncate_tool_output(output)
-                            self._on_event(TurnEvent(
+                            self._emit_turn_event(TurnEvent(
                                 kind="tool_result",
                                 tool_name=call.name,
                                 tool_input=call.arguments,

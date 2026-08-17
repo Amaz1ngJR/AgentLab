@@ -45,7 +45,7 @@ def test_main_workspace_overrides_environment_before_session_build(
     monkeypatch.setattr(cli, "_repl", lambda current_router: 0)
 
     assert cli.main(["--workspace", "target"]) == 0
-    router.close_all.assert_called_once()
+    router.close.assert_called_once()
 
 
 def test_main_rejects_missing_workspace(monkeypatch, tmp_path):

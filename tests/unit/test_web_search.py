@@ -16,12 +16,17 @@ from app.tools.builtin.web_search import (
     _web_search,
 )
 
-# 检查可选依赖是否安装
+# 检查当前或旧版可选依赖是否安装
 try:
-    import duckduckgo_search
-    HAS_DUCKDUCKGO = True
+    import ddgs
+    DDGS_MODULE = "ddgs"
 except ImportError:
-    HAS_DUCKDUCKGO = False
+    try:
+        import duckduckgo_search
+        DDGS_MODULE = "duckduckgo_search"
+    except ImportError:
+        DDGS_MODULE = None
+HAS_DUCKDUCKGO = DDGS_MODULE is not None
 
 try:
     import requests
@@ -115,7 +120,7 @@ class TestDuckDuckGoSearch:
         ]
         mock_ddgs.__enter__.return_value.text.return_value = iter(mock_results)
 
-        with patch("duckduckgo_search.DDGS", return_value=mock_ddgs):
+        with patch(f"{DDGS_MODULE}.DDGS", return_value=mock_ddgs):
             results, error = _search_duckduckgo("test query", 10, 15)
 
             assert error is None
@@ -135,7 +140,7 @@ class TestDuckDuckGoSearch:
         ]
         mock_ddgs.__enter__.return_value.text.return_value = iter(mock_results)
 
-        with patch("duckduckgo_search.DDGS", return_value=mock_ddgs):
+        with patch(f"{DDGS_MODULE}.DDGS", return_value=mock_ddgs):
             results, error = _search_duckduckgo("test", 5, 15)
 
             assert error is None
@@ -147,7 +152,7 @@ class TestDuckDuckGoSearch:
         mock_ddgs = MagicMock()
         mock_ddgs.__enter__.return_value.text.side_effect = RuntimeError("Network error")
 
-        with patch("duckduckgo_search.DDGS", return_value=mock_ddgs):
+        with patch(f"{DDGS_MODULE}.DDGS", return_value=mock_ddgs):
             results, error = _search_duckduckgo("test", 10, 15)
 
             assert results == []
@@ -165,7 +170,7 @@ class TestDuckDuckGoSearch:
         ]
         mock_ddgs.__enter__.return_value.text.return_value = iter(mock_results)
 
-        with patch("duckduckgo_search.DDGS", return_value=mock_ddgs):
+        with patch(f"{DDGS_MODULE}.DDGS", return_value=mock_ddgs):
             results, error = _search_duckduckgo("test", 10, 15)
 
             assert error is None

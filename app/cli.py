@@ -32,6 +32,7 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 
 from app.agent.approval import AutoApprove, InteractivePolicy
+from app.agent.approval_broker import ApprovalBroker, BrokerApprovalPolicy
 from app.agent.cancel import CancelToken
 from app.agent.context import ContextManager
 from app.agent.context_budget import ContextBudget
@@ -42,6 +43,7 @@ from app.agent.planner import Planner
 from app.agent.profiles import load_agent_profiles
 from app.agent.runtime import AgentSession, TurnEvent, build_system_prompt
 from app.agent.session_router import SessionRouter
+from app.agent.service import RuntimeService
 from app.agent.tasks import TaskStore
 from app.config.loader import load_config
 from app.mcp.adapter import build_mcp_tools
@@ -1124,7 +1126,7 @@ def _check_local_endpoint(cfg) -> None:
     sys.exit(2)
 
 
-def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
+def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     cfg = load_config(profile_name=profile)
     if cfg.provider == "anthropic" and not (cfg.auth_token or cfg.api_key):
         print("未找到 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY。\n请在 .env 或 ~/.claude/settings.json 中配置后重试。", file=sys.stderr)
@@ -1219,6 +1221,11 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
 
     # ── Storage + SessionRouter ───────────────────────────────────────────────
     storage = Storage()
+    approval_broker = ApprovalBroker()
+    # CLI 继续使用原有同步菜单，但审批先进入 Broker；未来 HTTP/TUI 可不设置
+    # fallback，通过 request_id 异步调用 RuntimeService.approve/deny。
+    fallback_approval = AutoApprove() if auto_approve else InteractivePolicy()
+    shared_approval = BrokerApprovalPolicy(approval_broker, fallback=fallback_approval)
     agent_profiles = load_agent_profiles()
     default_profile_id = cfg.profile_name or "default"
 
@@ -1299,7 +1306,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
         sess = AgentSession(
             llm=llm,
             tools=reg,
-            approval=AutoApprove() if auto_approve else InteractivePolicy(),
+            approval=shared_approval,
             system_prompt=sys_prompt,
             max_steps=agent_profile.max_steps,
             on_event=_print_event,
@@ -1375,18 +1382,19 @@ def _build_session(auto_approve: bool, profile: str | None) -> SessionRouter:
         workspace_root=ws,
     )
 
+    service = RuntimeService(router, approval_broker=approval_broker)
     # 启动:有未归档历史 session 就恢复最近一个,否则新建(避免每次启动堆积空会话)
     start_agent = default_profile_id if default_profile_id in agent_profiles else None
-    sid, resumed = router.resume_or_new(agent_id=start_agent)
+    sid, resumed = service.resume_or_new(agent_id=start_agent)
     row = storage.get_session(sid)
     title = row["title"] if row else ""
     if resumed:
-        msg_count = len(router.current.messages) if router.current else 0
+        msg_count = len(service.current.messages) if service.current else 0
         print(f"会话     : 恢复 {sid}  ({title})  历史消息 {msg_count} 条 "
               f"— /session new 开新会话, /session list 看全部\n")
     else:
         print(f"会话     : 新建 {sid}  ({title})\n")
-    return router
+    return service
 
 
 def _normalize_model_id(name: str | None) -> str:
@@ -1713,7 +1721,13 @@ class _EscWatcher:
                     pass
 
 
-def _chat_with_cancel(session: AgentSession, line: str, *, resume: bool = False) -> str:
+def _chat_with_cancel(
+    session: AgentSession,
+    line: str,
+    *,
+    resume: bool = False,
+    service: RuntimeService | None = None,
+) -> str:
     """跑一轮 chat,并把 Ctrl-C 接到协作式取消(对应 PRD 紧急停止)。
 
     编排路径(orchestrate=True)的模型调用是同步阻塞的,无法被强行打断;取消采用
@@ -1758,13 +1772,16 @@ def _chat_with_cancel(session: AgentSession, line: str, *, resume: bool = False)
 
     try:
         with _EscWatcher(on_esc=lambda: _request_cancel("Esc")):
+            if service is not None:
+                return service.send_message(line, cancel=token, resume=resume)
+            # 兼容直接传 AgentSession 的旧测试和第三方调用方。
             return session.chat(line, cancel=token, resume=resume)
     finally:
         if can_trap and prev_handler is not None:
             signal.signal(signal.SIGINT, prev_handler)
 
 
-def _repl(router: SessionRouter) -> int:
+def _repl(router: RuntimeService) -> int:
     """交互式对话。
 
     用 prompt_toolkit 替代内建 input(),解决:
@@ -1811,9 +1828,9 @@ def _repl(router: SessionRouter) -> int:
         if line in ("exit", "quit"):
             return 0
 
-        # /session ... 命令交给 router 处理
+        # /session ... 命令统一经过 RuntimeService，避免前端直接编排 router。
         if line.startswith("/session"):
-            out = router.handle_command(line)
+            out = router.handle_session_command(line)
             if out is not None:
                 print(out)
             continue
@@ -1866,11 +1883,10 @@ def _repl(router: SessionRouter) -> int:
             extra = line[len("/resume"):].strip()
             goal = extra or "继续完成上一轮未完成的任务。"
             try:
-                _chat_with_cancel(session, goal, resume=True)
+                _chat_with_cancel(session, goal, resume=True, service=router)
             except Exception as exc:
                 print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
                 continue
-            router.persist_current()
             _print_stats(session)
             continue
 
@@ -1879,13 +1895,11 @@ def _repl(router: SessionRouter) -> int:
             if repaired:
                 print(f"  ⚠ 检测到 {repaired} 个悬空 tool_use，已自动修复（历史损坏可能由上次中断引起）。",
                       file=sys.stderr)
-            _chat_with_cancel(session, line)
+            _chat_with_cancel(session, line, service=router)
         except Exception as exc:
             # 脱敏后输出,避免 Authorization / API key 等凭据泄漏到终端
             print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
             continue
-        # 每轮对话后把消息历史 + 任务快照存盘,支持下次 /session switch 恢复
-        router.persist_current()
         _print_stats(session)
 
 
@@ -1987,14 +2001,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.prompt:
                 session = router.current
                 try:
-                    _chat_with_cancel(session, args.prompt)
-                    router.persist_current()
+                    _chat_with_cancel(session, args.prompt, service=router)
                 finally:
                     _print_stats(session)
                 return 0
             return _repl(router)
         finally:
-            router.close_all()  # 关闭所有 session + 共享的 MCP server
+            router.close()  # 取消 run/审批并关闭所有 session、PTY 和 MCP
     except KeyboardInterrupt:
         print()
         return 130

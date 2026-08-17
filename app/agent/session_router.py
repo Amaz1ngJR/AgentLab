@@ -139,36 +139,37 @@ class SessionRouter:
         return self._profiles
 
     def persist_current(self) -> None:
-        """把当前 session 的消息历史 + 任务快照存盘（每次 chat 后调用）。
+        """把当前 session 的消息历史 + 任务快照存盘。"""
+        if self.current_id:
+            self.persist(self.current_id)
 
-        任务快照让退出重启后 /session switch 能恢复任务状态;若本轮是编排 run
-        (session 记录了 last_goal/last_run_status),额外写一条 runs 审计。
-        """
-        if not (self.current_id and self.current):
+    def persist(self, session_id: str) -> None:
+        """持久化指定 session，避免并发 run 因 current 切换而写错会话。"""
+        sess = self._sessions.get(session_id)
+        if sess is None:
             return
-        sess = self.current
-        self._storage.save_messages(self.current_id, sess.messages)
+        self._storage.save_messages(session_id, sess.messages)
         # 标记最后活跃时间:让 resume_or_new 的"最近"= 最后对话时间,而非创建/
         # 重命名时间,避免每次启动恢复到从未对话过的空壳 session。只在确有消息时
         # touch,空会话不抢占"最近"位置。
         if sess.messages:
-            self._storage.touch_session(self.current_id)
+            self._storage.touch_session(session_id)
         store = getattr(sess, "task_store", None)
         if store is not None:
-            self._storage.save_tasks(self.current_id, store.snapshot())
+            self._storage.save_tasks(session_id, store.snapshot())
         # 上下文压缩摘要审计:把本轮产生的 ContextSummary flush 到 context_summaries。
         # 原始消息已由 save_messages 保留 —— 压缩只换"模型输入里的旧片段",不删原文。
         ctx = getattr(sess, "context_manager", None)
         if ctx is not None:
             for summary in ctx.drain_records():
-                self._storage.save_context_summary(self.current_id, summary.to_record())
+                self._storage.save_context_summary(session_id, summary.to_record())
         # 编排 run 审计:有 goal 才记(单轮 legacy chat 不写 runs)
         goal = getattr(sess, "last_goal", "") or ""
         status = getattr(sess, "last_run_status", "") or ""
         if goal and status:
             usage = getattr(sess, "last_turn_usage", {}) or {}
             self._storage.log_run(
-                self.current_id, goal, status,
+                session_id, goal, status,
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
             )
