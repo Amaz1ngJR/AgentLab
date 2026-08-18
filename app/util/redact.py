@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import traceback as _tb
-from typing import Iterable
+from typing import Any, Iterable
 
 # 各 provider 凭据的字面量 pattern。顺序很重要:
 #   1. Bearer header 先跑,避免后续 token 字面量替换之后, "Bearer ***" 中的
@@ -48,6 +48,19 @@ def redact(text: str) -> str:
     for pattern, repl in _TOKEN_PATTERNS:
         out = pattern.sub(repl, out)
     return out
+
+
+def redact_value(value: Any) -> Any:
+    """递归脱敏 JSON 兼容值，保持容器结构和转义边界不变。"""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {key: redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_value(item) for item in value)
+    return value
 
 
 def redact_lines(lines: Iterable[str]) -> list[str]:

@@ -108,11 +108,18 @@ class LoopCommandHandler:
         支持：
           /loop start [goal_id]    # 启动 loop
           /loop status             # 显示状态
+          /loop evidence [loop_id] # 查看持久化证据
+          /loop diff [loop_id]     # 查看持久化 diff
+          /loop resume [loop_id]   # 恢复未完成 Loop
           /loop stop               # 停止（Ctrl-C）
         """
         parts = line.strip().split(maxsplit=2)
         if len(parts) == 1:
-            return "用法: /loop start [goal_id] | /loop status | /loop stop"
+            return (
+                "用法: /loop start [goal_id] | /loop status | "
+                "/loop evidence [loop_id] | /loop diff [loop_id] | "
+                "/loop resume [loop_id] | /loop stop"
+            )
 
         subcommand = parts[1]
 
@@ -121,10 +128,22 @@ class LoopCommandHandler:
             return self._start_loop(goal_id)
         elif subcommand == "status":
             return self._show_loop_status()
+        elif subcommand == "evidence":
+            loop_id = parts[2] if len(parts) > 2 else None
+            return self._show_loop_evidence(loop_id)
+        elif subcommand == "diff":
+            loop_id = parts[2] if len(parts) > 2 else None
+            return self._show_loop_diff(loop_id)
+        elif subcommand == "resume":
+            loop_id = parts[2] if len(parts) > 2 else None
+            return self._resume_loop(loop_id)
         elif subcommand == "stop":
             return "Loop 停止功能:运行时按 Ctrl-C 或 Esc 中断。"
         else:
-            return "未知子命令: /loop start | /loop status | /loop stop"
+            return (
+                "未知子命令: /loop start | /loop status | /loop evidence | "
+                "/loop diff | /loop resume | /loop stop"
+            )
 
     def _show_current_goal(self) -> str:
         """显示当前 goal。"""
@@ -210,7 +229,7 @@ class LoopCommandHandler:
             f"验证器: {len(goal_dict['verification_plan'])} 个"
         )
 
-    def _start_loop(self, goal_id: str | None) -> str:
+    def _start_loop(self, goal_id: str | None, resume_run: dict | None = None) -> str:
         """启动 loop。"""
         # 解析 goal
         if goal_id:
@@ -242,6 +261,10 @@ class LoopCommandHandler:
         verifier = Verifier(
             workspace_root=str(self.workspace_root),
             approval=session.approval,
+            human_confirm=lambda prompt: session.approval.request(
+                "verifier_human",
+                {"prompt": prompt, "goal_id": goal.goal_id},
+            ),
         )
 
         # WorktreeManager:只在 git_worktree 模式下创建
@@ -264,15 +287,111 @@ class LoopCommandHandler:
             verifier=verifier,
             worktree_manager=worktree_manager,
             approval=session.approval,
-            on_event=session._on_run_event if hasattr(session, "_on_run_event") else None,
+            on_event=session._emit_run_event if hasattr(session, "_emit_run_event") else None,
+            storage=self.storage,
+            session_id=getattr(goal, "session_id", None) or self._current_session_id(),
+            loop_id=resume_run["id"] if resume_run else None,
         )
+        if resume_run:
+            loop.current_iteration = int(resume_run.get("current_iteration", 0))
+            used = resume_run.get("budget_used", {})
+            loop.budget_used.iterations = int(used.get("iterations", loop.current_iteration))
+            loop.budget_used.tool_calls = int(used.get("tool_calls", 0))
+            loop.budget_used.runtime_seconds = float(used.get("runtime_seconds", 0.0))
+            loop.budget_used.cost_usd = float(used.get("cost_usd", 0.0))
         self.current_loop = loop
 
         # 执行(通过 CLI 提供的 run_loop_fn,带取消处理)
         result = self.run_loop_fn(loop)
         return result
 
-    def _show_loop_status(self) -> str:
+    def _current_session_id(self) -> str | None:
+        """从当前 session 附加元数据获取 ID；CLI 装配时会写入该字段。"""
+        session = self.get_session()
+        return getattr(session, "session_id", None) if session else None
+
+    def _resolve_loop_id(self, loop_id: str | None) -> str | None:
+        if loop_id:
+            return loop_id
+        if self.current_loop:
+            return self.current_loop.loop_id
+        from app.storage.loop_store import list_loop_runs
+        rows = list_loop_runs(
+            self.storage.conn,
+            session_id=self._current_session_id(),
+        )
+        return rows[0]["id"] if rows else None
+
+    def _show_loop_evidence(self, loop_id: str | None) -> str:
+        from app.storage.loop_store import load_loop_evidence
+        resolved = self._resolve_loop_id(loop_id)
+        if not resolved:
+            return "没有可查看的 Loop 证据。"
+        evidence = load_loop_evidence(self.storage.conn, resolved)
+        if not evidence:
+            return f"Loop 不存在: {resolved}"
+        lines = [
+            f"Loop 证据: {resolved}",
+            f"状态: {evidence['status']}",
+            f"Goal: {evidence['goal_id']}",
+            f"迭代: {evidence['current_iteration']}",
+            f"预算: {evidence['budget_used']}",
+            f"终止原因: {evidence.get('termination_reason') or '-'}",
+            f"验证记录: {len(evidence['verifications'])}",
+        ]
+        for result in evidence["verifications"]:
+            passed = sum(1 for check in result["checks"] if check["status"] == "pass")
+            lines.append(
+                f"  - iteration={result['iteration_id']} status={result['status']} "
+                f"checks={passed}/{len(result['checks'])}"
+            )
+        if evidence["worktree"]:
+            lines.append(f"Worktree: {evidence['worktree']['path']}")
+        for artifact in evidence["artifacts"]:
+            preview = artifact["content"].replace("\n", " ")[:120]
+            lines.append(f"制品[{artifact['kind']}]: {artifact['id']} {preview}")
+        return "\n".join(lines)
+
+    def _show_loop_diff(self, loop_id: str | None) -> str:
+        from app.storage.loop_store import load_loop_diff
+        resolved = self._resolve_loop_id(loop_id)
+        if not resolved:
+            return "没有可查看的 Loop diff。"
+        artifact = load_loop_diff(self.storage.conn, resolved)
+        if not artifact:
+            return f"Loop {resolved} 尚无持久化 diff 证据。"
+        return (
+            f"Loop diff: {resolved}\n"
+            f"artifact: {artifact['id']}\n"
+            f"metadata: {artifact['metadata']}\n\n"
+            f"{artifact['content']}"
+        )
+
+    def _resume_loop(self, loop_id: str | None) -> str:
+        """从持久化 Goal 和预算状态创建新 Runner，沿用原 loop_id 继续执行。"""
+        from app.storage.loop_store import load_goal_spec, load_loop_run, list_loop_runs
+        resolved = loop_id
+        if not resolved:
+            rows = list_loop_runs(
+                self.storage.conn,
+                session_id=self._current_session_id(),
+                unfinished_only=True,
+            )
+            resolved = rows[0]["id"] if rows else None
+        if not resolved:
+            return "没有可恢复的未完成 Loop。"
+        run = load_loop_run(self.storage.conn, resolved)
+        if not run:
+            return f"Loop 不存在: {resolved}"
+        if run["status"] in {"succeeded", "failed", "blocked", "budget_exhausted"}:
+            return f"Loop {resolved} 已终止(status={run['status']}),不能恢复。"
+        goal_dict = load_goal_spec(self.storage.conn, run["goal_id"])
+        if not goal_dict:
+            return f"Loop {resolved} 的 Goal 不存在: {run['goal_id']}"
+        # cancelled 代表用户主动停止，显式 /loop resume 允许继续；累计预算不能清零。
+        goal = _dict_to_goal(goal_dict)
+        return self._start_loop(goal.goal_id, resume_run=run)
+
         """显示 loop 状态。"""
         if not self.current_loop:
             return "当前无运行中的 Loop。"

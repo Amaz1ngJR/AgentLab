@@ -40,6 +40,19 @@ def test_redact_no_op_on_clean_text():
     assert redact("") == ""
 
 
+def test_redact_value_preserves_nested_structure():
+    from app.util.redact import redact_value
+
+    value = {
+        "output": 'api_key="secret-value" and "quoted"',
+        "items": ["auth_token=secret-value", 1, None],
+    }
+    cleaned = redact_value(value)
+    assert cleaned["output"] == 'api_key="***" and "quoted"'
+    assert cleaned["items"] == ["auth_token=***", 1, None]
+    assert value["output"] != cleaned["output"]
+
+
 def test_redact_multiple_in_one_string():
     out = redact("key1=sk-ant-aaaaaaaa key2=cr_bbbbbbbbbbbbbbbbbbbb")
     assert "sk-ant-***" in out

@@ -113,3 +113,10 @@ models:
     capabilities: [chat, tools]
     params:
       temperature: 0.7
+      # 已于 2026-08-17 使用当前 CRS 网关 + gpt-5.6-sol 实测：
+      # none、minimal、low、medium、high、xhigh、max 均请求成功。
+      # 中文可理解为：无、最小、低、中、高、极高、最高。
+      # high < xhigh < max；强度越高通常延迟和 token 消耗越大。
+      # OpenAI Responses API 会映射为 reasoning={effort: <值>}；
+      # 可用 LLM_REASONING_EFFORT 临时覆盖。网关或模型升级后支持范围可能变化。
+      reasoning_effort: max

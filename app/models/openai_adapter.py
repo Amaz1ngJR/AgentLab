@@ -33,6 +33,46 @@ from app.models.protocol import (
 )
 
 
+_MISSING_TOOL_OUTPUT = "[历史中的工具结果缺失，状态未知，请勿假设工具已执行]"
+
+
+def _repair_responses_tool_pairs(items: list[dict]) -> list[dict]:
+    """返回满足 Responses API 工具调用配对约束的新列表。
+
+    历史会话可能因中断或旧版持久化损坏而丢失 function_call_output。
+    给悬空调用补一个合成结果；同时丢弃没有调用方的孤立结果。这里不修改
+    session.messages，避免模型输入清理意外改写审计历史。
+    """
+    call_ids = {
+        item.get("call_id")
+        for item in items
+        if item.get("type") == "function_call" and item.get("call_id")
+    }
+    output_ids = {
+        item.get("call_id")
+        for item in items
+        if item.get("type") == "function_call_output" and item.get("call_id")
+    }
+    # 保留原顺序：在每个 function_call 后插入缺失的结果，避免把旧调用的
+    # 合成 output 统一堆到当前用户消息之后。
+    repaired: list[dict] = []
+    for item in items:
+        item_type = item.get("type")
+        call_id = item.get("call_id")
+        if item_type == "function_call":
+            repaired.append(item)
+            if call_id:
+                if call_id not in output_ids:
+                    repaired.append({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": _MISSING_TOOL_OUTPUT,
+                    })
+        elif item_type != "function_call_output" or call_id in call_ids:
+            repaired.append(item)
+    return repaired
+
+
 class OpenAIAdapter:
     """走 OpenAI Responses API 的 adapter,用于 GPT-5 等 OpenAI 原生模型。"""
 
@@ -61,18 +101,25 @@ class OpenAIAdapter:
         # Responses API 通过 instructions 顶级字段传 system,比塞进 input 更清晰
         # (语义和 Anthropic 的 system 参数一致)
 
-        # 转换消息格式：将 Anthropic 格式转为 Responses API 格式
-        converted_input = _convert_messages_to_responses_format(messages)
+        # 转换后统一修复工具调用配对。旧会话可能因中断或旧版持久化
+        # 损坏而缺少 output；上下文切分也可能留下孤立 output。
+        cleaned_input = _repair_responses_tool_pairs(
+            _convert_messages_to_responses_format(messages)
+        )
 
         params: dict[str, Any] = {
             "model": self._cfg.model,
-            "input": converted_input,
+            "input": cleaned_input,
             "temperature": self._cfg.temperature if temperature is None else temperature,
         }
         if system:
             params["instructions"] = system
         if self._cfg.top_p is not None:
             params["top_p"] = self._cfg.top_p
+        if self._cfg.reasoning_effort is not None:
+            # Responses API 的字段是 reasoning={"effort": ...}，不是
+            # Chat Completions 风格的顶级 reasoning_effort。
+            params["reasoning"] = {"effort": self._cfg.reasoning_effort}
         return params
 
     def chat(self, messages: list[dict], temperature: Optional[float] = None) -> str:

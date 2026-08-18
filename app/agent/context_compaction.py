@@ -124,11 +124,18 @@ class ContextSummary:
 def _is_tool_result_message(m: dict[str, Any]) -> bool:
     """判断一条消息是否承载 tool_result(它必须紧跟产生它的 tool_use,不能被拆散)。
 
-    Anthropic 风格:role=user,content 是含 type=tool_result 的 block 列表。
-    OpenAI Chat 风格:role=tool。两种都识别。
+    支持三种格式:
+    - Anthropic 风格: role=user, content 是含 type=tool_result 的 block 列表
+    - OpenAI Chat 风格: role=tool
+    - OpenAI Responses API 风格: type=function_call_output (顶级字段)
     """
+    # OpenAI Responses API: type=function_call_output
+    if m.get("type") == "function_call_output":
+        return True
+    # OpenAI Chat Completions: role=tool
     if m.get("role") == "tool":
         return True
+    # Anthropic: role=user + content 中有 type=tool_result
     content = m.get("content")
     if isinstance(content, list):
         for block in content:

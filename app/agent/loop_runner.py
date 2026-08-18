@@ -71,6 +71,9 @@ class LoopRunner:
         worktree_manager: WorktreeManager | None = None,
         approval: ApprovalPolicy | None = None,
         on_event: Callable[[RunEvent], None] | None = None,
+        storage=None,
+        session_id: str | None = None,
+        loop_id: str | None = None,
     ):
         """
         Args:
@@ -87,8 +90,10 @@ class LoopRunner:
         self.worktree_manager = worktree_manager
         self.approval = approval
         self.on_event = on_event or (lambda e: None)
+        self.storage = storage
+        self.session_id = session_id or goal.session_id
 
-        self.loop_id = f"loop-{uuid.uuid4().hex[:8]}"
+        self.loop_id = loop_id or f"loop-{uuid.uuid4().hex[:8]}"
         self.status = "ready"
         self.current_iteration = 0
         self.budget_used = LoopBudgetUsed()
@@ -99,6 +104,103 @@ class LoopRunner:
         # 验证失败后 _diagnose_and_repair 会填入修复指令,下一轮带 resume=True 执行。
         self._next_instruction: str | None = None
         self._last_execution_error: str | None = None
+        self._iteration_id: str | None = None
+        self._iteration_started_at: str | None = None
+        self._finished_at: str | None = None
+        self.commit_sha: str = ""
+        self.commit_error: str = ""
+        self.diff_artifact_id: str | None = None
+        self.termination_reason: str = ""
+
+    def _now(self) -> str:
+        return datetime.utcnow().isoformat()
+
+    def _budget_dict(self) -> dict:
+        if self.started_at:
+            self.budget_used.runtime_seconds = time.time() - self.started_at
+        return {
+            "iterations": self.budget_used.iterations,
+            "tool_calls": self.budget_used.tool_calls,
+            "runtime_seconds": self.budget_used.runtime_seconds,
+            "cost_usd": self.budget_used.cost_usd,
+        }
+
+    def _persist_run(self, *, finished: bool = False) -> None:
+        if self.storage is None:
+            return
+        from app.storage.loop_store import save_loop_run
+        if finished and self._finished_at is None:
+            self._finished_at = self._now()
+        save_loop_run(self.storage.conn, {
+            "id": self.loop_id,
+            "goal_id": self.goal.goal_id,
+            "session_id": self.session_id,
+            "status": self.status,
+            "current_iteration": self.current_iteration,
+            "budget_used": self._budget_dict(),
+            "worktree_id": self.worktree.worktree_id if self.worktree else None,
+            "started_at": datetime.fromtimestamp(self.started_at).isoformat()
+            if self.started_at else self._now(),
+            "finished_at": self._finished_at,
+            "termination_reason": self.termination_reason,
+        })
+
+    def _persist_iteration(
+        self,
+        status: str,
+        *,
+        verification: VerificationResult | None = None,
+        repair_plan_ref: str | None = None,
+        finished: bool = False,
+    ) -> None:
+        if self.storage is None or self._iteration_id is None:
+            return
+        from app.storage.loop_store import save_loop_iteration
+        tasks = getattr(self.orchestrator, "task_store", None)
+        if tasks is None:
+            tasks = getattr(self.orchestrator, "_task_store", None)
+        snapshot = tasks.snapshot() if tasks is not None and hasattr(tasks, "snapshot") else []
+        import json
+        save_loop_iteration(self.storage.conn, {
+            "id": self._iteration_id,
+            "loop_id": self.loop_id,
+            "iteration_index": self.current_iteration,
+            "status": status,
+            "task_summary": json.dumps(snapshot, ensure_ascii=False),
+            "failure_category": verification.failure_category if verification else None,
+            "repair_plan_ref": repair_plan_ref,
+            "started_at": self._iteration_started_at or self._now(),
+            "finished_at": self._now() if finished else None,
+        })
+
+    def _persist_verification(self, result: VerificationResult) -> None:
+        if self.storage is None:
+            return
+        from dataclasses import asdict
+        from app.storage.loop_store import save_verification_result
+        save_verification_result(self.storage.conn, {
+            "id": f"verification-{uuid.uuid4().hex}",
+            "loop_id": self.loop_id,
+            "iteration_id": self._iteration_id,
+            "status": result.status,
+            "checks": [asdict(check) for check in result.checks],
+            "failure_category": result.failure_category,
+            "confidence": result.confidence,
+            "next_hint": result.next_hint,
+            "created_at": result.created_at or self._now(),
+        })
+
+    def _save_artifact(self, kind: str, content: str, metadata: dict | None = None) -> str | None:
+        if self.storage is None or not content:
+            return None
+        from app.storage.loop_store import save_loop_artifact
+        return save_loop_artifact(self.storage.conn, {
+            "loop_id": self.loop_id,
+            "iteration_id": self._iteration_id,
+            "kind": kind,
+            "content": content,
+            "metadata": metadata or {},
+        })
 
     def run(self, cancel: CancelToken | None = None) -> str:
         """运行 Loop，返回最终状态消息。
@@ -114,6 +216,7 @@ class LoopRunner:
         """
         cancel = cancel or CancelToken()
         self.started_at = time.time()
+        self._persist_run()
 
         try:
             # 发送 loop_started 事件
@@ -151,9 +254,13 @@ class LoopRunner:
                 # 开始新 iteration
                 self.current_iteration += 1
                 self.budget_used.iterations = self.current_iteration
+                self._iteration_id = f"{self.loop_id}-iteration-{self.current_iteration}"
+                self._iteration_started_at = self._now()
                 if self.started_at:
                     self.budget_used.runtime_seconds = time.time() - self.started_at
                 self.status = "executing"
+                self._persist_run()
+                self._persist_iteration("executing")
                 self.on_event(RunEvent(
                     kind=LOOP_ITERATION_STARTED,
                     text=f"Iteration {self.current_iteration}",
@@ -175,15 +282,19 @@ class LoopRunner:
                 self.status = "verifying"
                 verification = self._verify()
                 self.verification_results.append(verification)
+                self._persist_verification(verification)
 
                 # 判断验证结果
                 if verification.is_success():
+                    self._persist_iteration("succeeded", verification=verification, finished=True)
                     return self._finish_succeeded(verification)
                 elif verification.status == "blocked":
+                    self._persist_iteration("blocked", verification=verification, finished=True)
                     return self._finish_blocked(verification.next_hint or "验证被阻塞")
                 else:
                     # 失败或不确定 → 诊断并修复
                     self.status = "diagnosing"
+                    self._persist_iteration("failed", verification=verification, finished=True)
                     self._diagnose_and_repair(verification)
 
             # 循环被取消
@@ -204,6 +315,18 @@ class LoopRunner:
         )
         # 验证器也要在 worktree 内跑命令/查文件,否则会去主工作区验证(看不到改动)。
         self.verifier.workspace_root = self.worktree.path
+        if self.storage is not None:
+            from app.storage.loop_store import save_worktree
+            save_worktree(self.storage.conn, {
+                "id": self.worktree.worktree_id,
+                "loop_id": self.loop_id,
+                "path": self.worktree.path,
+                "base_branch": self.worktree.base_branch,
+                "base_commit": self.worktree.base_commit,
+                "is_dirty": self.worktree_manager.check_dirty(self.worktree),
+                "status": "active",
+            })
+        self._persist_run()
 
         self.on_event(RunEvent(
             kind=WORKTREE_PREPARED,
@@ -342,6 +465,18 @@ class LoopRunner:
             + "\n".join(f"  - {c}" for c in self.goal.success_criteria)
         )
         self._next_instruction = repair_instruction
+        repair_ref = self._save_artifact(
+            "repair_plan",
+            repair_instruction,
+            {"failure_category": verification.failure_category},
+        )
+        self._persist_iteration(
+            "repairing",
+            verification=verification,
+            repair_plan_ref=repair_ref,
+            finished=True,
+        )
+        self._persist_run()
 
         self.on_event(RunEvent(
             kind=REPAIR_PLANNED,
@@ -371,6 +506,7 @@ class LoopRunner:
     def _finish_succeeded(self, verification: VerificationResult) -> str:
         """Loop 成功完成。"""
         self.status = "succeeded"
+        self.termination_reason = "verification_passed"
 
         # 生成 diff summary（如果有 worktree）
         diff_summary = ""
@@ -400,6 +536,29 @@ class LoopRunner:
                         )
                     except Exception as exc:
                         commit_error = str(exc)
+
+        self.commit_sha = commit_sha
+        self.commit_error = commit_error
+        if diff_summary:
+            self.diff_artifact_id = self._save_artifact(
+                "diff",
+                diff_summary,
+                {"commit_sha": commit_sha, "commit_error": commit_error},
+            )
+        if commit_sha:
+            self._save_artifact("commit", commit_sha, {"verified": True})
+        if self.worktree and self.storage is not None and self.worktree_manager:
+            from app.storage.loop_store import save_worktree
+            save_worktree(self.storage.conn, {
+                "id": self.worktree.worktree_id,
+                "loop_id": self.loop_id,
+                "path": self.worktree.path,
+                "base_branch": self.worktree.base_branch,
+                "base_commit": self.worktree.base_commit,
+                "is_dirty": self.worktree_manager.check_dirty(self.worktree),
+                "status": "active",
+            })
+        self._persist_run(finished=True)
 
         self.on_event(RunEvent(
             kind=LOOP_COMPLETED,
@@ -434,6 +593,10 @@ class LoopRunner:
     def _finish_failed(self, reason: str) -> str:
         """Loop 因内部执行异常失败，禁止继续验证并误报成功。"""
         self.status = "failed"
+        self.termination_reason = reason
+        self._save_artifact("error", reason)
+        self._persist_iteration("failed", finished=True)
+        self._persist_run(finished=True)
         self.on_event(RunEvent(
             kind=LOOP_FAILED,
             text=f"Loop 执行失败: {reason}",
@@ -444,6 +607,10 @@ class LoopRunner:
     def _finish_blocked(self, reason: str) -> str:
         """Loop 被阻塞。"""
         self.status = "blocked"
+        self.termination_reason = reason
+        self._save_artifact("error", reason, {"category": "blocked"})
+        self._persist_iteration("blocked", finished=True)
+        self._persist_run(finished=True)
         self.on_event(RunEvent(
             kind=LOOP_BLOCKED,
             text=f"Loop 被阻塞: {reason}",
@@ -454,6 +621,9 @@ class LoopRunner:
     def _finish_budget_exhausted(self) -> str:
         """预算耗尽。"""
         self.status = "budget_exhausted"
+        self.termination_reason = "budget_exhausted"
+        self._persist_iteration("budget_exhausted", finished=True)
+        self._persist_run(finished=True)
         self.on_event(RunEvent(
             kind=LOOP_BUDGET_EXHAUSTED,
             text=f"预算耗尽 (已执行 {self.current_iteration} 轮)",
@@ -471,4 +641,7 @@ class LoopRunner:
     def _finish_cancelled(self) -> str:
         """用户取消。"""
         self.status = "cancelled"
+        self.termination_reason = "user_cancelled"
+        self._persist_iteration("cancelled", finished=True)
+        self._persist_run(finished=True)
         return f"Loop 已取消 (已执行 {self.current_iteration} 轮)"

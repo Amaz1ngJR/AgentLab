@@ -11,7 +11,11 @@ OpenAI Responses API 的关键差异需要 mock 反映:
 from unittest.mock import MagicMock, patch
 
 from app.config.schemas import LLMConfig
-from app.models.openai_adapter import OpenAIAdapter
+from app.models.openai_adapter import (
+    OpenAIAdapter,
+    _MISSING_TOOL_OUTPUT,
+    _repair_responses_tool_pairs,
+)
 from app.models.protocol import ToolResult
 
 
@@ -109,7 +113,24 @@ def _build_final(output_items: list, in_tokens: int = 12, out_tokens: int = 8) -
     return final
 
 
-# ── 用例 ──────────────────────────────────────────────────────────────────────
+def test_reasoning_effort_maps_to_responses_reasoning_parameter():
+    cfg = _cfg()
+    cfg.reasoning_effort = "high"
+    with patch("openai.OpenAI") as MockOpenAI:
+        adapter = OpenAIAdapter(cfg)
+        params = adapter._base_params(
+            [{"role": "user", "content": "solve"}],
+            temperature=None,
+            system=None,
+        )
+    assert params["reasoning"] == {"effort": "high"}
+
+
+def test_reasoning_parameter_omitted_when_not_configured():
+    with patch("openai.OpenAI"):
+        adapter = OpenAIAdapter(_cfg())
+        params = adapter._base_params([], temperature=None, system=None)
+    assert "reasoning" not in params
 
 
 def test_create_message_text_only():
@@ -230,3 +251,33 @@ def test_streaming_progress_callback():
     final_progress = progress_log[-1]
     assert final_progress["input_tokens"] == 20
     assert final_progress["output_tokens"] == 4
+
+
+def test_base_params_repairs_missing_and_orphan_tool_outputs():
+    messages = [
+        {"type": "function_call", "call_id": "call_missing", "name": "read_file",
+         "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_orphan", "output": "x"},
+        {"role": "user", "content": "continue"},
+    ]
+    with patch("openai.OpenAI"):
+        params = OpenAIAdapter(_cfg())._base_params(messages, None, None)
+
+    items = params["input"]
+    assert [item.get("call_id") for item in items if item.get("type") == "function_call_output"] == [
+        "call_missing"
+    ]
+    assert items[1] == {
+        "type": "function_call_output",
+        "call_id": "call_missing",
+        "output": _MISSING_TOOL_OUTPUT,
+    }
+    assert messages[1]["call_id"] == "call_orphan"  # 清理不改写原始审计历史
+
+
+def test_repair_responses_tool_pairs_keeps_complete_pairs_unchanged():
+    items = [
+        {"type": "function_call", "call_id": "call_ok", "name": "shell", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_ok", "output": "done"},
+    ]
+    assert _repair_responses_tool_pairs(items) == items

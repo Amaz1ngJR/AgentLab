@@ -2,6 +2,7 @@
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -231,8 +232,47 @@ def test_verifier_empty_checks():
     assert result.failure_category == "no_verifier"
 
 
-def test_verifier_human_check_blocked(temp_workspace):
-    """human 类型总是返回 blocked。"""
+def test_verifier_human_check_uses_interactive_confirmation(temp_workspace):
+    verifier = Verifier(
+        workspace_root=str(temp_workspace),
+        human_confirm=lambda prompt: prompt == "确认页面正常",
+    )
+    check = VerificationCheck(type="human", prompt="确认页面正常")
+    result = verifier.verify([check])
+    assert result.status == "pass"
+    assert result.checks[0].evidence_ref == "human:confirmed"
+
+
+def test_verifier_api_check_success(temp_workspace):
+    response = MagicMock()
+    response.status = 201
+    response.read.return_value = b'{"ok": true}'
+    response.__enter__.return_value = response
+    verifier = Verifier(workspace_root=str(temp_workspace), approval=AutoApprove())
+    check = VerificationCheck(
+        type="api",
+        method="POST",
+        endpoint="https://example.com/api",
+        expected_status=201,
+        request_body='{"name":"test"}',
+        response_contains='"ok": true',
+    )
+    with patch("urllib.request.urlopen", return_value=response) as urlopen:
+        result = verifier.verify([check])
+    assert result.status == "pass"
+    assert result.checks[0].evidence_ref == "api:POST:https://example.com/api"
+    assert urlopen.call_args.args[0].method == "POST"
+
+
+def test_verifier_api_check_requires_approval(temp_workspace):
+    verifier = Verifier(workspace_root=str(temp_workspace), approval=DenyAll())
+    check = VerificationCheck(type="api", endpoint="https://example.com/api")
+    result = verifier.verify([check])
+    assert result.status == "blocked"
+    assert "拒绝" in result.checks[0].summary
+
+def test_verifier_human_check_blocked_without_interactor(temp_workspace):
+    """没有交互器时 human verifier 安全阻塞。"""
     verifier = Verifier(workspace_root=str(temp_workspace))
     check = VerificationCheck(type="human", description="请确认功能正常")
     result = verifier.verify([check])

@@ -35,7 +35,10 @@ class VerificationCheck:
     method: str | None = None
     endpoint: str | None = None
     expected_status: int | None = None
-    # 通用
+    request_body: str | None = None
+    response_contains: str | None = None
+    # human 类型：前端显示 prompt，并返回 approve/deny；未配置交互器时 blocked。
+    prompt: str | None = None
     timeout: int = 30
     retry_on_flaky: int = 0
     description: str | None = None

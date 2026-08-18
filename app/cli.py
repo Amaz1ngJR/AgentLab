@@ -1013,6 +1013,10 @@ def _handle_model_command(router: SessionRouter, line: str) -> str:
         if temperature is not None:
             lines.append(f"  temperature: {temperature}")
 
+        reasoning_effort = getattr(llm, 'reasoning_effort', None)
+        if reasoning_effort:
+            lines.append(f"  reasoning  : {reasoning_effort}")
+
         context_size = getattr(llm, 'context_size', None)
         if context_size:
             lines.append(f"  context    : {context_size} tokens")
@@ -1327,6 +1331,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         )
         # 附加 agent_profile 供 CLI prompt 显示用(非 AgentSession 核心属性)
         sess.agent_profile = agent_profile
+        sess.session_id = session_id
         # 附加 mem_policy 供退出时写摘要(§6.2,read_write 策略会话结束写入)
         sess.mem_policy = mem_policy
         return sess

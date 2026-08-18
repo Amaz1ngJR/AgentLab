@@ -31,6 +31,14 @@ class ModelRouter:
     def provider(self) -> str:
         return self._adapter.provider
 
+    @property
+    def temperature(self) -> float | None:
+        return getattr(getattr(self._adapter, "_cfg", None), "temperature", None)
+
+    @property
+    def reasoning_effort(self) -> str | None:
+        return getattr(getattr(self._adapter, "_cfg", None), "reasoning_effort", None)
+
     def chat(self, messages: list[dict], temperature: Optional[float] = None) -> str:
         return self._adapter.chat(messages, temperature=temperature)
 

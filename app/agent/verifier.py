@@ -19,11 +19,14 @@ PRD §7.6.5
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from app.agent.approval import ApprovalPolicy
 from app.agent.goals import VerificationCheck
@@ -62,9 +65,11 @@ class Verifier:
         self,
         workspace_root: str | None = None,
         approval: ApprovalPolicy | None = None,
+        human_confirm: Callable[[str], bool] | None = None,
     ):
         self.workspace_root = Path(workspace_root) if workspace_root else Path.cwd()
         self.approval = approval
+        self.human_confirm = human_confirm
 
     def verify(self, checks: list[VerificationCheck]) -> VerificationResult:
         """执行验证计划，返回统一结果。
@@ -133,12 +138,10 @@ class Verifier:
             return self._check_command(check)
         elif check.type == "file_assertion":
             return self._check_file_assertion(check)
+        elif check.type == "api":
+            return self._check_api(check)
         elif check.type == "human":
-            return CheckResult(
-                name=check.description or "人工确认",
-                status="blocked",
-                summary="需要用户手动确认",
-            )
+            return self._check_human(check)
         else:
             # 未实现的类型
             return CheckResult(
@@ -237,6 +240,97 @@ class Verifier:
                 summary=f"exit code {result.returncode} (expected {expected})",
                 error=stderr_preview or result.stdout.strip()[:200],
             )
+
+    def _check_api(self, check: VerificationCheck) -> CheckResult:
+        """API Verifier：执行受控 HTTP 请求并验证状态码和响应片段。
+
+        网络请求属于外部副作用，包含 method/endpoint/body 的完整请求必须先经过
+        approval。urllib 默认不会把响应体写入磁盘，证据只保留有界摘要。
+        """
+        endpoint = (check.endpoint or "").strip()
+        if not endpoint.startswith(("http://", "https://")):
+            return CheckResult(
+                name=check.description or "api",
+                status="blocked",
+                summary="API endpoint 必须是 http/https URL",
+            )
+        method = (check.method or "GET").upper()
+        if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}:
+            return CheckResult(
+                name=check.description or "api",
+                status="blocked",
+                summary=f"不支持的 HTTP method: {method}",
+            )
+        name = check.description or f"api: {method} {endpoint}"
+        approval_args = {
+            "method": method,
+            "endpoint": endpoint,
+            "body": check.request_body or "",
+            "purpose": "loop_verification",
+        }
+        if self.approval is None:
+            return CheckResult(name=name, status="blocked", summary="缺少 API 验证审批策略")
+        try:
+            if not self.approval.request("verifier_api", approval_args):
+                return CheckResult(name=name, status="blocked", summary="用户拒绝 API 验证")
+        except Exception as exc:
+            return CheckResult(name=name, status="blocked", summary=f"API 审批失败: {exc}")
+
+        body = (check.request_body or "").encode() or None
+        request = urllib.request.Request(endpoint, data=body, method=method)
+        if body is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=check.timeout or 30) as response:
+                status = response.status
+                content = response.read(65537).decode("utf-8", errors="replace")[:65536]
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            content = exc.read(65537).decode("utf-8", errors="replace")[:65536]
+        except Exception as exc:
+            return CheckResult(name=name, status="fail", summary=f"API 请求失败: {exc}", error=str(exc))
+
+        expected = check.expected_status if check.expected_status is not None else 200
+        if status != expected:
+            return CheckResult(
+                name=name,
+                status="fail",
+                summary=f"HTTP {status} (expected {expected})",
+                error=content[:200],
+            )
+        if check.response_contains and check.response_contains not in content:
+            return CheckResult(
+                name=name,
+                status="fail",
+                summary=f"响应不包含期望内容: {check.response_contains[:80]}",
+            )
+        return CheckResult(
+            name=name,
+            status="pass",
+            summary=f"HTTP {status}: {content[:200]}",
+            evidence_ref=f"api:{method}:{endpoint}",
+        )
+
+    def _check_human(self, check: VerificationCheck) -> CheckResult:
+        """Human Verifier：真正等待前端给出主观验收决定。"""
+        name = check.description or "人工确认"
+        prompt = check.prompt or check.assertion or check.description or "请确认目标是否达成"
+        if self.human_confirm is None:
+            return CheckResult(
+                name=name,
+                status="blocked",
+                summary="未配置 Human Verifier 人工确认交互器",
+            )
+        try:
+            approved = bool(self.human_confirm(prompt))
+        except Exception as exc:
+            return CheckResult(name=name, status="blocked", summary=f"人工确认失败: {exc}")
+        return CheckResult(
+            name=name,
+            status="pass" if approved else "fail",
+            summary="用户确认通过" if approved else "用户确认未通过",
+            evidence_ref="human:confirmed" if approved else "human:rejected",
+        )
 
     def _check_file_assertion(self, check: VerificationCheck) -> CheckResult:
         """file_assertion 验证器：检查文件存在、内容包含/不包含。

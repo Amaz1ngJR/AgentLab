@@ -15,9 +15,9 @@
 
 AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、云端/本地 adapter、流式输出、多轮工具调用、ToolDescriptor 九级风险与统一工具审计、方向键审批、内置文件/代码搜索/web 搜索/shell/交互式终端/todo 工具、stdio MCP Client（Playwright 浏览器控制）、多 Agent `/session` 切换、SQLite 持久化与长期记忆、Skill Loader（按 AgentProfile 注入工作流上下文）、`Planner + Executor + Replanner` 编排路径（带依赖 TaskStore + 结构化 `RunEvent`，已接入 CLI 主路径，支持 Ctrl-C 协作式取消与任务状态持久化恢复）、上下文预算与自动压缩（`ContextBudget` + `ContextCompressor` + 结构化摘要 + `/context` 命令族，编排稳定点超阈值自动压缩、可审计）。
 
-**Loop 模式（Loop Engineering，§7.6）的基础闭环已接通**：`/goal new` 定义目标和验证命令，`/loop start` 创建隔离 worktree，调用 `Orchestrator` 执行 Planner→Executor→Replanner，随后进入 Verifier 验证；失败时生成修复指令继续迭代，成功时展示完整 worktree 状态，并在用户审批后生成可合并提交。command Verifier 复用同一审批策略和跨平台 shell 解释器；执行器异常会直接终止 Loop，不能再被旧文件或旧测试误判为成功。尚缺 browser/api/human Verifier、Loop 运行证据完整持久化、`Learner` / Project Knowledge、子 Agent 和后台 Loop。
+**Loop 模式（Loop Engineering，§7.6）的证据闭环已接通**：`/goal new` 定义目标和验证命令，`/loop start` 创建隔离 worktree，调用 `Orchestrator` 执行 Planner→Executor→Replanner，再由 command/file/API/Human Verifier 验证；失败时生成修复指令继续迭代，成功时经审批生成可合并提交。run、iteration、任务快照、验证结果、worktree、repair/diff/commit、预算和终止原因完整持久化，可用 `/loop evidence`、`/loop diff` 回看，并用 `/loop resume` 恢复未完成运行。尚缺 browser/database/remote/llm_judge Verifier、`Learner` / Project Knowledge、子 Agent 和后台 Loop。
 
-距离 PRD 的核心缺口：Loop Engineering 的高级验证、学习与协作能力尚未完成；Runtime Service 与异步 Approval Broker 已完成并接入 CLI，但还没有自建 Computer Control Gateway、FastAPI Server、终端 TUI 和 Web UI。互联网能力目前仍是单工具形态，尚无统一 WebRetrievalService、Source Store 和 CitationManager。
+距离 PRD 的核心缺口：Loop Engineering 的学习与协作能力尚未完成；Runtime Service、异步 Approval Broker 和 Loop 持久化证据闭环已完成并接入 CLI，但还没有自建 Computer Control Gateway、FastAPI Server、终端 TUI 和 Web UI。互联网能力目前仍是单工具形态，尚无统一 WebRetrievalService、Source Store 和 CitationManager。
 
 ---
 
@@ -25,25 +25,19 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 以下顺序遵循“先解耦运行时，再开放新入口；先形成证据与安全边界，再增加执行能力”。每一项完成后都应更新第 3 节里程碑，并保持 CLI 行为兼容。
 
-1. **P0：完善 Loop Engineering 的持久化证据闭环**（PRD §7.6，基础闭环见 3.11）
-   - 增加 `loop_store`，持久化 goal、run、iteration、任务快照、验证结果、worktree、diff/commit 引用、预算消耗和终止原因。
-   - 实现 `/loop evidence`、`/loop diff` 和中断后恢复；证据记录只存脱敏、限长内容，并能关联工具审计 ID。
-   - 优先补齐 API Verifier 与真正可交互的 Human Verifier；browser Verifier 在第 2 项网关完成后接入。
-   - **验收**：进程重启后可查看并恢复 Loop；成功不能仅由模型自述判定；失败、拒批、超时、预算耗尽均留下可追溯证据。
-
-2. **P1：建立 ComputerControlGateway 并接入 browser Verifier**（见 6.6、6.7）
+1. **P1：建立 ComputerControlGateway 并接入 browser Verifier**（见 6.6、6.7）
    - 先包装现有 Playwright MCP，将 snapshot/click/type/navigation 规范化为 Observation 和 Action，不让 Runtime 依赖 MCP 工具的原始返回结构。
    - 在网关统一执行目标校验、风险分级、审批、敏感字段处理、截图/DOM 限长、审计和取消。
    - 基于 Observation 实现 browser Verifier，支持 URL、可见文本、元素状态和截图证据检查。
    - **验收**：浏览器写动作无法绕过 Approval Broker；页面内容不能修改权限或 GoalSpec；使用本地测试页面完成离线端到端验证。
 
-3. **P1：实现 FastAPI Server MVP 与 SSE 事件流**（见 6.10）
+2. **P1：实现 FastAPI Server MVP 与 SSE 事件流**（见 6.10）
    - 基于 Runtime Service 提供 session、message/run、approval、cancel、loop evidence API，以及可重连的 SSE 事件端点。
    - 增加 `agentlab serve`，仅默认监听 loopback；定义请求 ID、错误模型、事件序号、断线与关闭语义。
    - 先提供最小管理页验证聊天、工具进度和审批交互，不在此阶段扩展完整 Web UI/TUI。
    - **验收**：CLI 与 API 复用同一 runtime 路径；两个 session 并发不串上下文/审批；API、SSE 重连、取消和安全默认值有集成测试。
 
-4. **P1：实现受控互联网检索与引用骨架**（见 6.15）
+3. **P1：实现受控互联网检索与引用骨架**（见 6.15）
    - 抽出 `WebRetrievalService`、可替换 `SearchProvider`、受控 Fetcher、Source/Document Store 和 `CitationManager`；现有 `web_search/web_fetch` 降为薄工具适配器。
    - 统一 URL 规范化、SSRF 防护、重定向检查、缓存、来源去重、获取时间、正文定位、截断和 prompt injection 数据边界。
    - 为最终回答提供可校验 citation，禁止引用未实际抓取或无法映射到 source/document 的链接。
@@ -177,9 +171,14 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `ToolRegistry` 对 completed/error/denied/approval_required 统一产出 `ToolAuditEvent`；CLI 为每个 Session 注入审计 sink，写入 SQLite `tool_executions`。表已补风险、目标、来源、host、审批动作、结果状态和 observation 字段，并可自动迁移旧数据库。
 - 文件内容、代码搜索结果和网页正文使用工具级 `audit_redactor` 只记录有界摘要；MCP 协议错误不再伪装成功，而是作为工具错误回灌模型并进入审计。
 
----
+### 3.14 Loop Engineering 持久化证据闭环
 
-## 4. 当前能力快照
+- `LoopRunner` 已把 run、每轮 iteration、TaskStore 快照、VerificationResult、预算消耗、终止原因、worktree 状态、修复计划、diff 和验证提交持续写入 SQLite，不再只在内存和终端事件中存在。
+- `loop_store` 新增有界且脱敏的 `loop_artifacts` 制品表，并补齐 iteration/artifact/evidence/diff/list API；旧数据库启动时自动迁移 `termination_reason` 字段。
+- `/loop evidence [loop_id]` 可回看状态、预算、终止原因、逐轮验证和制品；`/loop diff [loop_id]` 可读取持久化 diff；`/loop resume [loop_id]` 可恢复 cancelled 或进程中断留下的未完成 Loop，并继承迭代与工具预算。
+- Verifier 新增经过审批的 API 检查（method/status/response contains）和真正可交互的 Human 检查；无交互器或无审批策略时安全返回 blocked。
+- 新增 `test_loop_evidence.py` 并扩展 Verifier 测试，覆盖成功证据、任务快照、预算、脱敏/限长制品、diff 查询、恢复状态、API 审批和 Human 决策；当前 553 项 unit tests 全部通过。
+
 
 | 模块 | 当前进展 | 关键文件 |
 |---|---|---|
@@ -188,7 +187,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 模型层 | Anthropic / OpenAI Responses / OpenAI-compatible；统一内部协议；JSON tool call fallback | `app/models/` |
 | Runtime | CLI 主路径已切到编排:`AgentSession(orchestrate=True)` 委托 Orchestrator;`orchestrate=False` 仍保留 legacy 单轮循环 | `app/agent/runtime.py`, `app/agent/orchestrator.py` |
 | 编排 | Planner(JSON 计划) + Executor(单任务工具循环,带 progress/流式/用量) + Replanner(失败追加补救) + CancelToken + 结构化 RunEvent;已接 CLI（PRD 的 Task 模式） | `app/agent/planner.py`, `app/agent/executor.py`, `app/agent/replanner.py`, `app/agent/events.py`, `app/agent/cancel.py` |
-| Loop Engineering | **基础闭环已实现**：GoalSpec → Orchestrator 执行 → Verifier → 诊断修复 → worktree 审批提交；待完善：扩展 Verifier、完整证据持久化、Learner、Project Knowledge、子 Agent（见 6.14） | `app/agent/goals.py`, `verifier.py`, `loop_runner.py`, `app/workspace/worktree.py`, `app/storage/loop_store.py` |
+| Loop Engineering | GoalSpec → Orchestrator → Verifier → 诊断修复 → worktree 审批提交；run/iteration/verification/worktree/repair/diff/commit/预算/终止原因完整持久化；支持 `/loop evidence/diff/resume`；Learner、Project Knowledge、子 Agent 待做（见 6.14） | `app/agent/goals.py`, `verifier.py`, `loop_runner.py`, `loop_commands.py`, `app/workspace/worktree.py`, `app/storage/loop_store.py` |
 | 多 Agent / Session | AgentProfile + SessionRouter + `/session` 命令族；SQLite 持久化、恢复、隔离（含任务快照恢复） | `app/agent/profiles.py`, `app/agent/session_router.py`, `app/storage/` |
 | 长期记忆 | none/read/read_write 三策略 + 注入；LIKE 检索（未做向量） | `app/memory/` |
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |

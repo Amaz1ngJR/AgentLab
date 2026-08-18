@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from app.storage.loop_store import init_loop_tables
-from app.util.redact import redact
+from app.util.redact import redact, redact_value
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "agentlab.db"
@@ -257,7 +257,10 @@ class Storage:
             con.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
             now = _now()
             for m in messages:
-                content = redact(json.dumps(m, ensure_ascii=False))
+                # 先逐字段脱敏再序列化。对已经 JSON 转义的整串做正则替换会
+                # 吞掉 \" 等转义边界，造成下次恢复时 json.loads 失败。
+                safe_message = redact_value(m)
+                content = json.dumps(safe_message, ensure_ascii=False)
                 con.execute(
                     "INSERT INTO messages(session_id,role,content,created_at) VALUES(?,?,?,?)",
                     (session_id, m.get("role", ""), content, now),
@@ -272,8 +275,11 @@ class Storage:
         for r in rows:
             try:
                 result.append(json.loads(r["content"]))
-            except json.JSONDecodeError:
-                pass
+            except (json.JSONDecodeError, TypeError):
+                # 旧版本可能在 json.dumps 后对整串做脱敏，导致个别工具输出的
+                # JSON 转义被破坏。跳过坏行；provider adapter 会给由此悬空的
+                # 工具调用补合成结果，让旧会话仍可继续。
+                continue
         return result
 
     def count_messages(self, session_id: str) -> int:

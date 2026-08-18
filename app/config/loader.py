@@ -162,6 +162,22 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
     else:
         enable_thinking = bool(params.get("enable_thinking", False))
 
+    # OpenAI Responses 推理强度。YAML 使用 reasoning_effort，兼容用户熟悉的
+    # model_reasoning_effort 名称；环境变量可临时覆盖而无需修改 profile。
+    reasoning_effort = (
+        _env("LLM_REASONING_EFFORT")
+        or params.get("reasoning_effort")
+        or params.get("model_reasoning_effort")
+    )
+    if reasoning_effort is not None:
+        reasoning_effort = str(reasoning_effort).strip().lower()
+        allowed_efforts = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+        if reasoning_effort not in allowed_efforts:
+            raise ValueError(
+                "reasoning_effort 必须是 "
+                f"{sorted(allowed_efforts)} 之一，当前值: {reasoning_effort!r}"
+            )
+
     return LLMConfig(
         provider=profile.provider,
         model=profile.model,
@@ -174,6 +190,7 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
         timeout_seconds=float(_env("LLM_TIMEOUT_SECONDS") or "120"),
         stream=_env_bool("LLM_STREAM", default=False),
         enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
         profile_name=active_profile,
         capabilities=list(profile.capabilities),
     )

@@ -35,6 +35,39 @@ def test_messages_round_trip(tmp_path):
     assert loaded[1]["content"] == "hi"
 
 
+def test_message_redaction_preserves_json_escaping(tmp_path):
+    """工具输出含凭据字段和引号时，脱敏后仍必须能完整恢复。"""
+    s = _store(tmp_path)
+    s.create_session("s1", "default", "cloud_claude")
+    output = 'config: api_key="secret-value" auth_token=None; keep "quoted" text'
+    msgs = [{
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": output,
+    }]
+
+    s.save_messages("s1", msgs)
+    loaded = s.load_messages("s1")
+
+    assert len(loaded) == 1
+    assert loaded[0]["call_id"] == "call_1"
+    assert "secret-value" not in loaded[0]["output"]
+    assert 'keep "quoted" text' in loaded[0]["output"]
+
+
+def test_load_messages_skips_legacy_invalid_json(tmp_path):
+    s = _store(tmp_path)
+    s.create_session("s1", "default", "cloud_claude")
+    s.save_messages("s1", [{"role": "user", "content": "valid"}])
+    s.conn.execute(
+        "INSERT INTO messages(session_id,role,content,created_at) VALUES(?,?,?,?)",
+        ("s1", "", '{"type":"function_call_output","output":"broken "quote""}', "now"),
+    )
+    s.conn.commit()
+
+    assert s.load_messages("s1") == [{"role": "user", "content": "valid"}]
+
+
 def test_delete_session_hard_removes(tmp_path):
     s = _store(tmp_path)
     s.create_session("s1", "default", "cloud_claude")
