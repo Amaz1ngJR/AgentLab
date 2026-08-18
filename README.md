@@ -256,6 +256,7 @@ agentlab --workspace .                 # 从任意目录启动，以当前目录
 agentlab -w /path/to/project           # 指定其他工作区
 agentlab -w . --profile local_qwen     # 指定工作区和模型 profile
 
+python -m app --version                # 显示当前版本后退出
 python -m app                          # 交互式 REPL
 python -m app -p "帮我看 README.md"    # 单次 prompt 后退出
 python -m app -y                       # 自动放行所有工具（跳过审批）
@@ -273,6 +274,7 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 
 | 命令 | 作用 |
 |---|---|
+| `/version` | 显示当前运行的 AgentLab 版本 |
 | `/reset` | 清空当前会话的消息和任务 |
 | `/resume [目标]` | 继续上一轮未完成的任务（失败任务重置为 pending） |
 | `/model` | 列出所有配置的模型（同 `/model list`） |

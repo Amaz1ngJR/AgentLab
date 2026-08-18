@@ -104,7 +104,7 @@ class TestDuckDuckGoSearch:
     def test_duckduckgo_not_installed(self):
         """库未安装时应该返回错误提示。"""
         # Mock ImportError at the import point inside the function
-        with patch.dict("sys.modules", {"duckduckgo_search": None}):
+        with patch.dict("sys.modules", {"ddgs": None, "duckduckgo_search": None}):
             results, error = _search_duckduckgo("test", 10, 15)
             assert results == []
             assert error is not None

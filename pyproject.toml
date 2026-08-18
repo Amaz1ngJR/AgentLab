@@ -4,11 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentlab-local"
-version = "0.1.0"
+dynamic = ["version", "dependencies"]
 description = "A cross-platform local agent runtime with configurable models, skills, and MCP servers."
 readme = "README.md"
 requires-python = ">=3.11"
-dynamic = ["dependencies"]
 
 [project.scripts]
 agentlab = "app.cli:main"
@@ -17,5 +16,6 @@ agentlab = "app.cli:main"
 include = ["app", "app.*"]
 
 [tool.setuptools.dynamic]
+version = { attr = "app.version.__version__" }
 dependencies = { file = ["requirements.txt"] }
 

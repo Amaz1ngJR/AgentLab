@@ -82,9 +82,10 @@ def _search_duckduckgo(query: str, max_results: int, timeout: int) -> tuple[list
 
     try:
         with DDGS() as ddgs:
-            # text() 返回生成器,我们需要限制数量
+            # 新版 ddgs 参数名是 query，旧版 duckduckgo_search 参数名是
+            # keywords；使用位置参数可同时兼容两者。
             raw_results = ddgs.text(
-                keywords=query,
+                query,
                 max_results=max_results,
             )
 

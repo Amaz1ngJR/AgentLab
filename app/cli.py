@@ -58,6 +58,7 @@ from app.tools.builtin.interactive import PtySessionManager, make_terminal_tools
 from app.tools.builtin.todo import make_todo_write_tool
 from app.tools.registry import ToolRegistry
 from app.util.redact import format_exception, format_traceback
+from app.version import __version__, version_text
 
 _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -1141,7 +1142,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
 
     llm = build_model_router(cfg)
 
-    print("== AgentLab ==")
+    print(f"== AgentLab v{__version__} ==")
     print(f"provider : {cfg.provider}")
     print(f"model    : {cfg.model}")
     if cfg.base_url:
@@ -1169,7 +1170,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
 
     print(f"工具     : {' / '.join(tool_display)}")
     print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
-    print("输入 /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
+    print("输入 /version 查看版本; /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
     print("执行中按 Esc 或 Ctrl-C 可中断,停下后直接输入新指令即可调整方向。\n")
 
     # ── MCP server 接入 ───────────────────────────────────────────────────────
@@ -1457,6 +1458,7 @@ def _print_input_separator() -> None:
 
 # 顶层斜杠命令 → 说明,用于补全菜单右侧 meta 文本
 _SLASH_COMMANDS = {
+    "/version": "显示当前 AgentLab 版本",
     "/reset": "清空当前会话的消息和任务",
     "/resume": "继续上一轮未完成/失败的任务",
     "/session": "管理多 Agent 会话",
@@ -1832,6 +1834,9 @@ def _repl(router: RuntimeService) -> int:
             continue
         if line in ("exit", "quit"):
             return 0
+        if line == "/version":
+            print(version_text())
+            continue
 
         # /session ... 命令统一经过 RuntimeService，避免前端直接编排 router。
         if line.startswith("/session"):
@@ -1984,6 +1989,12 @@ def _workspace_directory(value: str) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agentlab")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=version_text(),
+        help="显示当前 AgentLab 版本后退出",
+    )
     parser.add_argument("-p", "--prompt", help="一次性 prompt，执行完即退出")
     parser.add_argument("-y", "--yes", action="store_true", help="自动放行所有工具调用")
     parser.add_argument("--profile", help="使用 config/models.yaml 中的指定 profile")
