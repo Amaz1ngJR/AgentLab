@@ -55,7 +55,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 - CLI REPL：交互模式、单次 `-p/--prompt`、`--profile`、`-y` 自动审批；prompt_toolkit 输入框、spinner 进度（`✻ thinking… (3.2s · ↓ 42 tokens)`）、token/耗时统计。
 - 模型层：Anthropic Messages、OpenAI Responses、OpenAI-compatible 三种 adapter；内部协议统一 `ModelResponse / ToolCall / ToolResult`；OpenAI-compatible 具备 JSON tool call fallback；实际模型 ID 规范化 + 代理静默映射提示。
-- Runtime：同步多轮"模型 → 工具 → 模型"循环；工具审批、工具错误回灌、流式文本回调、`max_steps` 限制。
+- Runtime：同步多轮"模型 → 工具 → 模型"循环；工具审批、工具错误回灌、流式文本回调；`max_steps` 作为 run 级模型往返总预算，`max_task_steps` 限制单个子任务，二者共同防止空转与单任务独占。
 - 审批：`AutoApprove / InteractivePolicy(方向键菜单) / DenyAll`。
 - 安全基础：workspace 内按风险执行、越界使用不可持久化的独立审批动作、错误/工具输出脱敏（`redact`）、MCP env allowlist。
 
@@ -83,7 +83,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.4 多 Agent、Session 切换与长期记忆
 
-- `app/agent/profiles.py`：`AgentProfile`（agent_id/name/model_profile/system_prompt/tools/mcp_servers/memory_policy/max_steps）+ `load_agent_profiles()` 读 `config/agents.yaml`。
+- `app/agent/profiles.py`：`AgentProfile`（agent_id/name/model_profile/system_prompt/tools/mcp_servers/memory_policy/max_steps/max_task_steps）+ `load_agent_profiles()` 读 `config/agents.yaml`。
 - `app/storage/__init__.py`：SQLite（标准库，无 ORM），表 `agent_profiles / sessions / messages / memories / tool_executions`；会话 CRUD、消息存盘/加载、记忆写入/LIKE 搜索、工具执行审计；写入经 `redact()`。
 - `app/agent/session_router.py`：`SessionRouter` 维护 session_id → AgentSession 映射；`/session` 命令族 `list / agents / new / switch / rename / archive / delete`；session 间消息完全隔离；可从 SQLite 恢复历史。
   - `archive`=软删除（置 `archived=1`，列表隐藏、可恢复）；`delete`=硬删除（连消息/审计抹除，不可恢复；memories 不随之删除）。
@@ -119,9 +119,9 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `app/agent/tasks.py`：`TaskStore` 升级为任务状态唯一来源。`Task` 新增 `dependencies / evidence / error / history`；状态增 `blocked / failed`（编排路径专用,`todo_write` 仍只写简单三态）。新增 `add / extend / get / update_status / claim_next（按依赖）/ has_runnable / has_open / is_done / is_stalled / snapshot`。`summary()` 向后兼容(保留 total/pending/in_progress/completed,加 blocked/failed)。
 - `app/agent/events.py`：结构化 `RunEvent`，kind 覆盖 `run_started / plan_created / task_started / message_delta / tool_requested / approval_required / tool_completed / tool_denied / task_updated / run_completed / run_failed`;`payload.tasks` 携带任务 snapshot。
 - `app/agent/planner.py`：`Planner` 让模型只输出 JSON 计划,`_extract_json` 容忍 markdown 围栏/前后散文,`_parse_tasks` 跳过非法项并去重 id;解析失败或模型异常时退化为单任务计划,保证永不卡死。
-- `app/agent/executor.py`：`Executor.run_task` 按"单个子任务"驱动有限步工具循环,把任务指令注入共享 messages,产出 `TaskOutcome(completed/failed/blocked)`;工具出错→failed,审批被拒→blocked,步数耗尽→failed;发 `RunEvent`,不直接写 TaskStore。
+- `app/agent/executor.py`：`Executor.run_task` 按"单个子任务"驱动有限轮模型/工具循环，把任务指令注入共享 messages，产出 `TaskOutcome(completed/failed/blocked)`；显式记录 `model_rounds` 与 `tool_calls_made`，工具出错→failed，审批被拒→blocked，单任务轮次耗尽→failed；发 `RunEvent`，不直接写 TaskStore。
 - `app/agent/replanner.py`：`Replanner.apply` 把 `TaskOutcome` 回写 TaskStore;失败任务追加一次"复查并修复"补救任务(重试任务再失败不再追加,避免无限循环),阻塞不追加。
-- `app/agent/orchestrator.py`：`Orchestrator.run(goal)` 串联 规划→claim→执行→重规划,带全局 `max_steps` 预算与协作式取消(`app/agent/cancel.py` 的 `CancelToken`);多次 `run()` 在已有任务之上追加新计划(任务 id 加 `rN-` 前缀避免跨 run 撞车),实现"用户中途追加目标";收工/卡死/取消/超预算分别发对应 RunEvent。
+- `app/agent/orchestrator.py`：`Orchestrator.run(goal)` 串联规划→claim→执行→重规划；`max_steps` 兼容旧配置名但语义明确为 run 级模型往返总预算，按 `TaskOutcome.model_rounds` 扣减（纯文本轮次也计数），`max_task_steps` 单独限制一个子任务，避免首任务独占全部预算；同时支持协作式取消。多次 `run()` 在已有任务之上追加新计划（任务 id 加 `rN-` 前缀避免跨 run 撞车），收工/卡死/取消/超预算分别发对应 RunEvent。
 - 测试 `tests/unit/test_orchestrator.py`(覆盖 §6.1 验收:初始计划、按依赖执行、工具失败后重规划、审批拒绝后阻塞、用户追加目标、取消、max_steps)。
 
 ### 3.9 编排路径接入 CLI + 任务状态持久化

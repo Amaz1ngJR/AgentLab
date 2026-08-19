@@ -28,7 +28,8 @@ class AgentProfile:
     skills          - 显式启用的 Skill 名单（skill_id），注入工作流上下文；
                       仅影响上下文，不授予工具权限（见 app/skills）
     memory_policy   - 记忆策略：none/read/read_write（默认 none）
-    max_steps       - 最大工具循环步数（默认 8）
+    max_steps       - 一次 run 的模型往返总上限（兼容旧配置名，默认 8）
+    max_task_steps  - 单个子任务的模型往返上限（默认 min(8, max_steps)）
     """
     agent_id: str
     name: str
@@ -39,6 +40,13 @@ class AgentProfile:
     skills: list[str] = field(default_factory=list)
     memory_policy: str = "none"   # none | read | read_write
     max_steps: int = 8
+    max_task_steps: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_steps <= 0:
+            raise ValueError("AgentProfile.max_steps 必须 > 0")
+        if self.max_task_steps is not None and self.max_task_steps <= 0:
+            raise ValueError("AgentProfile.max_task_steps 必须 > 0")
 
 
 def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
@@ -63,5 +71,9 @@ def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
             skills=list(body.get("skills") or []),
             memory_policy=body.get("memory_policy", "none"),
             max_steps=int(body.get("max_steps", 8)),
+            max_task_steps=(
+                int(body["max_task_steps"])
+                if body.get("max_task_steps") is not None else None
+            ),
         )
     return profiles

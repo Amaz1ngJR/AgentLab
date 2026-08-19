@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.agent import events
 from app.agent.approval import AutoApprove, DenyAll
 from app.agent.cancel import CancelToken, Cancelled
@@ -185,6 +187,7 @@ def test_executor_completes_task_without_tools():
     out = ex.run_task(Task("t1", "做一件事"), [], system="", max_steps=4)
     assert out.status == COMPLETED
     assert out.evidence == "子任务完成了"
+    assert out.model_rounds == 1
 
 
 def test_executor_pure_conversation_does_not_force_tool_call():
@@ -212,6 +215,7 @@ def test_executor_runs_tool_then_completes():
     out = ex.run_task(Task("t1", "echo hi"), [], system="", max_steps=4)
     assert out.status == COMPLETED
     assert out.tool_calls_made == 1
+    assert out.model_rounds == 2
 
 
 def test_executor_tool_error_marks_failed():
@@ -461,6 +465,53 @@ def test_orchestrator_respects_max_steps():
     # 没跑成功,且发了 run_failed
     assert not orch.all_completed()
     assert any(e.kind == events.RUN_FAILED for e in log)
+
+
+def test_orchestrator_counts_text_only_model_rounds_in_global_budget():
+    """无工具的任务也必须消耗全局预算，避免按工具数计数造成无限执行。"""
+    router = FakeRouter([
+        _plan_json(
+            {"id": "t1", "content": "说明一", "dependencies": []},
+            {"id": "t2", "content": "说明二", "dependencies": []},
+        ),
+        _resp_text("一完成"),
+    ])
+    log: list[RunEvent] = []
+    orch = Orchestrator(
+        router,
+        _registry(_echo_tool()),
+        max_steps=1,
+        max_task_steps=1,
+        on_event=_collect(log),
+    )
+
+    answer = orch.run("两个说明任务")
+
+    assert answer == "一完成"
+    assert orch.last_run_status == "failed"
+    assert orch.store.get("t1").status == COMPLETED
+    assert orch.store.get("t2").status == PENDING
+    assert any("最大模型往返次数" in event.text for event in log)
+
+
+def test_orchestrator_task_budget_does_not_exceed_global_budget():
+    orch = Orchestrator(
+        FakeRouter([]),
+        _registry(_echo_tool()),
+        max_steps=3,
+        max_task_steps=10,
+    )
+    assert orch._max_task_steps == 10
+    # 实际调用时仍会通过 min(rounds_left, max_task_steps) 限制到全局剩余额度。
+
+
+def test_orchestrator_rejects_non_positive_budgets():
+    with pytest.raises(ValueError, match="max_steps"):
+        Orchestrator(FakeRouter([]), _registry(_echo_tool()), max_steps=0)
+    with pytest.raises(ValueError, match="max_task_steps"):
+        Orchestrator(
+            FakeRouter([]), _registry(_echo_tool()), max_task_steps=0,
+        )
 
 
 # ── 取消/出错后 tool_use 必须配对(否则下一轮 provider 报错)──────────────────

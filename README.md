@@ -319,7 +319,8 @@ agents:
     system_prompt: |                # 可选,覆盖默认 system prompt
       你是专注代码的助手,优先用 code_search 定位,read_file 精读。
     memory_policy: read_write        # none / read / read_write
-    max_steps: 12
+    max_steps: 24                    # 一次 run 的模型往返总预算
+    max_task_steps: 10               # 单个子任务的模型往返上限
 ```
 
 `memory_policy`：

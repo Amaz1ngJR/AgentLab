@@ -135,6 +135,7 @@ class TaskOutcome:
     error: str = ""
     text: str = ""
     tool_calls_made: int = 0
+    model_rounds: int = 0
 
 
 class Executor:
@@ -177,8 +178,10 @@ class Executor:
 
         last_text = ""
         tool_calls_made = 0
+        model_rounds = 0
 
         for _ in range(max(1, max_steps)):
+            model_rounds += 1
             if cancel is not None:
                 cancel.raise_if_cancelled()
 
@@ -246,6 +249,7 @@ class Executor:
                     evidence=last_text.strip(),
                     text=last_text.strip(),
                     tool_calls_made=tool_calls_made,
+                    model_rounds=model_rounds,
                 )
 
             tool_results: list[ToolResult] = []
@@ -346,6 +350,7 @@ class Executor:
                                 evidence=last_text.strip(),
                                 text=last_text.strip(),
                                 tool_calls_made=tool_calls_made,
+                                model_rounds=model_rounds,
                             )
 
                     tool_results.append(ToolResult(
@@ -390,6 +395,7 @@ class Executor:
                     evidence=last_text.strip(),
                     text=last_text.strip(),
                     tool_calls_made=tool_calls_made,
+                    model_rounds=model_rounds,
                 )
 
         # 步数耗尽仍未收口:标记失败,让 Replanner 决定是否追加任务继续
@@ -399,4 +405,5 @@ class Executor:
             evidence=last_text.strip(),
             text=last_text.strip(),
             tool_calls_made=tool_calls_made,
+            model_rounds=model_rounds,
         )

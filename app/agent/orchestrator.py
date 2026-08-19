@@ -46,6 +46,7 @@ class Orchestrator:
         system: str = "",
         *,
         max_steps: int = 12,
+        max_task_steps: int | None = None,
         task_store: Optional[TaskStore] = None,
         planner: Optional[Planner] = None,
         on_event: Optional[Callable[[RunEvent], None]] = None,
@@ -57,7 +58,14 @@ class Orchestrator:
         self._tools = tools
         self._approval: ApprovalPolicy = approval or AutoApprove()
         self._system = system
+        if max_steps <= 0:
+            raise ValueError("max_steps 必须 > 0")
+        if max_task_steps is not None and max_task_steps <= 0:
+            raise ValueError("max_task_steps 必须 > 0")
         self._max_steps = max_steps
+        # 单任务模型往返上限与整个 run 的全局模型往返预算分开。默认不超过
+        # 全局预算，避免第一个任务独占全部额度后其他任务永远无法执行。
+        self._max_task_steps = max_task_steps or min(8, max_steps)
         self.store: TaskStore = task_store or TaskStore()
         self._planner = planner or Planner(llm)
         self._replanner = Replanner(self.store)
@@ -186,10 +194,10 @@ class Orchestrator:
         self._maybe_compact()
 
         # ── 2. 执行 + 重规划循环 ──────────────────────────────────────────────
-        steps_left = self._max_steps
+        rounds_left = self._max_steps
         last_text = ""
         try:
-            while steps_left > 0:
+            while rounds_left > 0:
                 cancel.raise_if_cancelled()
                 task = self.store.claim_next()
                 if task is None:
@@ -198,14 +206,15 @@ class Orchestrator:
                 self._emit(RunEvent(kind=events.TASK_STARTED, task_id=task.id,
                                     task_content=task.content))
 
-                # 给这个任务切一块步数预算(至少 1 步,至多剩余预算)
-                budget = max(1, min(steps_left, self._max_steps))
+                # 每个任务只获得独立的模型往返上限；全局预算由 rounds_left 控制。
+                # 不能把全部剩余额度一次性交给首个任务，否则多任务计划会饿死。
+                budget = max(1, min(rounds_left, self._max_task_steps))
                 outcome = self._executor.run_task(
                     task, self.messages,
                     system=self._system, max_steps=budget, cancel=cancel,
                     usage_acc=self.last_run_usage, on_actual_model=_record_model,
                 )
-                steps_left -= max(1, outcome.tool_calls_made)
+                rounds_left -= max(1, outcome.model_rounds)
                 self.last_run_tool_calls += outcome.tool_calls_made
 
                 patch = self._replanner.apply(task, outcome)
@@ -231,11 +240,12 @@ class Orchestrator:
                                 payload={"tasks": snapshot}))
             return last_text or "部分任务未能完成(被阻塞或失败)。"
 
-        if steps_left <= 0 and self.store.has_open():
+        if rounds_left <= 0 and self.store.has_open():
             self.last_run_status = "failed"
-            self._emit(RunEvent(kind=events.RUN_FAILED, text="达到最大步数仍未完成全部任务",
+            self._emit(RunEvent(kind=events.RUN_FAILED,
+                                text="达到最大模型往返次数仍未完成全部任务",
                                 payload={"tasks": snapshot}))
-            return last_text or "达到最大步数,任务未全部完成。"
+            return last_text or "达到最大模型往返次数,任务未全部完成。"
 
         self.last_run_status = "completed"
         self._emit(RunEvent(kind=events.RUN_COMPLETED, text=last_text,

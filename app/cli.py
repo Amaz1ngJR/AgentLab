@@ -1314,6 +1314,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             approval=shared_approval,
             system_prompt=sys_prompt,
             max_steps=agent_profile.max_steps,
+            max_task_steps=agent_profile.max_task_steps,
             on_event=_print_event,
             progress=progress_fn,
             task_store=task_store,

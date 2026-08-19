@@ -16,7 +16,10 @@ agents:
     name: 默认助手
     model_profile: cloud_claude_opus
     memory_policy: none
-    max_steps: 8
+    # max_steps 是一次用户 run 的模型往返总预算（保留旧名称兼容已有配置），
+    # max_task_steps 是单个 Planner 子任务最多允许的模型往返次数。
+    max_steps: 16
+    max_task_steps: 8
 
   # 代码助手——专注于代码阅读、搜索和修改
   coder:
@@ -28,11 +31,13 @@ agents:
     tools: []          # 空列表 = 使用全部内置工具
     skills: [code-review]   # 显式启用的 Skill;只注入工作流上下文,不授予工具权限
     memory_policy: read_write
-    max_steps: 12
+    max_steps: 24
+    max_task_steps: 10
 
   # 本地轻量助手——使用本地模型，不发数据到云端
   local:
     name: 本地助手
     model_profile: local_qwen
     memory_policy: none
-    max_steps: 8
+    max_steps: 16
+    max_task_steps: 8

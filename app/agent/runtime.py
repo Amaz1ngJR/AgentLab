@@ -105,6 +105,7 @@ class AgentSession:
         approval: Optional[ApprovalPolicy] = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = 8,
+        max_task_steps: int | None = None,
         on_event: Optional[Callable[[TurnEvent], None]] = None,
         progress: Optional[ProgressFn] = None,
         task_store: Optional[TaskStore] = None,
@@ -119,7 +120,12 @@ class AgentSession:
         self.tools = tools
         self.approval: ApprovalPolicy = approval or AutoApprove()
         self.system_prompt = system_prompt
+        if max_steps <= 0:
+            raise ValueError("max_steps 必须 > 0")
+        if max_task_steps is not None and max_task_steps <= 0:
+            raise ValueError("max_task_steps 必须 > 0")
         self.max_steps = max_steps
+        self.max_task_steps = max_task_steps
         self.messages: list[dict[str, Any]] = []
         self._on_event = on_event or (lambda e: None)
         # RuntimeService 可在不替换 CLI 原渲染回调的前提下旁路订阅完整事件流。
@@ -217,6 +223,7 @@ class AgentSession:
                 approval=self.approval,
                 system=self.system_prompt,
                 max_steps=self.max_steps,
+                max_task_steps=self.max_task_steps,
                 task_store=self.task_store,
                 planner=self._planner,
                 on_event=self._emit_run_event,

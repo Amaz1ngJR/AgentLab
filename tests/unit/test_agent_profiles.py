@@ -14,7 +14,8 @@ def test_parses_profile(tmp_path):
         "    name: 代码助手\n"
         "    model_profile: cloud_claude\n"
         "    memory_policy: read_write\n"
-        "    max_steps: 12\n",
+        "    max_steps: 12\n"
+        "    max_task_steps: 5\n",
         encoding="utf-8",
     )
     profiles = load_agent_profiles(f)
@@ -23,6 +24,7 @@ def test_parses_profile(tmp_path):
     assert p.name == "代码助手"
     assert p.memory_policy == "read_write"
     assert p.max_steps == 12
+    assert p.max_task_steps == 5
 
 
 def test_defaults(tmp_path):
@@ -31,4 +33,5 @@ def test_defaults(tmp_path):
     p = load_agent_profiles(f)["x"]
     assert p.memory_policy == "none"
     assert p.max_steps == 8
+    assert p.max_task_steps is None
     assert p.tools == []
