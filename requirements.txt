@@ -18,3 +18,6 @@ beautifulsoup4>=4.12.0
 # trafilatura 效果最好；没装则回退 beautifulsoup4（已在上方）纯文本抽取
 trafilatura>=1.6.0
 markdownify>=0.11.0
+
+# Image attachments and cross-platform clipboard image paste
+Pillow>=10.0.0

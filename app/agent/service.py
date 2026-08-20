@@ -121,6 +121,16 @@ class RuntimeService:
         )
         return result
 
+    def clear_session_images(self, session_id: str | None = None) -> dict[str, int]:
+        with self._lock:
+            self._ensure_open()
+            target = session_id or self.router.current_id
+            if target and target in self._session_runs:
+                raise RuntimeError("Session 正在执行，不能清理图片；请先停止当前 run")
+            result = self.router.clear_session_images(target)
+        self.publish("session_images_cleared", session_id=target, payload=result)
+        return result
+
     def list_sessions(self) -> list[dict]:
         return self.router.list_sessions()
 
@@ -142,6 +152,7 @@ class RuntimeService:
         self,
         message: str,
         *,
+        images: list[Any] | None = None,
         session_id: str | None = None,
         resume: bool = False,
         cancel: CancelToken | None = None,
@@ -164,6 +175,11 @@ class RuntimeService:
             session = self.router.current
             if session is None:
                 raise RuntimeError("session 加载失败")
+            if images and not getattr(session.llm, "supports_vision", False):
+                raise RuntimeError(
+                    "当前模型 profile 未声明 vision 能力，不能发送图片；"
+                    "请切换到支持图片的模型。"
+                )
             actual_run_id = run_id or f"run-{uuid.uuid4().hex}"
             token = cancel or CancelToken()
             active = _ActiveRun(actual_run_id, target_id, token)
@@ -192,7 +208,12 @@ class RuntimeService:
 
         self.publish("run_started", session_id=target_id, run_id=actual_run_id)
         try:
-            result = session.chat(message, cancel=token, resume=resume)
+            chat_kwargs = {"cancel": token, "resume": resume}
+            # 不传空的 images kwarg，兼容只实现旧 chat(message,cancel,resume) 接口的
+            # 测试替身和第三方 AgentSession。
+            if images:
+                chat_kwargs["images"] = images
+            result = session.chat(message, **chat_kwargs)
             self.router.persist(target_id)
             self.publish(
                 "run_completed",

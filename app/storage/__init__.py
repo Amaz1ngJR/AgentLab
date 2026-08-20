@@ -138,6 +138,25 @@ def _truncate(text: str, max_len: int = 500) -> str:
     return text[:max_len] + "…" if len(text) > max_len else text
 
 
+def _sanitize_message_for_storage(message: dict[str, Any]) -> dict[str, Any]:
+    """禁止把内联 base64/data URL 写入 SQLite，避免数据库无限膨胀。"""
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            if value.get("type") == "base64" and "data" in value:
+                return {
+                    "type": "omitted",
+                    "media_type": value.get("media_type", "image"),
+                    "reason": "inline image data is not persisted",
+                }
+            return {key: sanitize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        if isinstance(value, str) and value.startswith("data:image/"):
+            return "[inline image omitted from persistence]"
+        return value
+    return sanitize(message)
+
+
 class Storage:
     """SQLite 存储接口。每次操作自动提交。"""
 
@@ -252,14 +271,14 @@ class Storage:
 
     def save_messages(self, session_id: str,
                       messages: list[dict[str, Any]]) -> None:
-        """保存完整消息历史（覆盖）：先删再批量插。"""
+        """保存完整消息历史（覆盖）；图片只允许保存受控 file 引用。"""
         with self._tx() as con:
             con.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
             now = _now()
             for m in messages:
                 # 先逐字段脱敏再序列化。对已经 JSON 转义的整串做正则替换会
                 # 吞掉 \" 等转义边界，造成下次恢复时 json.loads 失败。
-                safe_message = redact_value(m)
+                safe_message = _sanitize_message_for_storage(redact_value(m))
                 content = json.dumps(safe_message, ensure_ascii=False)
                 con.execute(
                     "INSERT INTO messages(session_id,role,content,created_at) VALUES(?,?,?,?)",

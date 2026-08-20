@@ -48,6 +48,15 @@ def test_main_workspace_overrides_environment_before_session_build(
     router.close.assert_called_once()
 
 
+def test_main_rejects_image_without_prompt(monkeypatch):
+    build_session = MagicMock()
+    monkeypatch.setattr(cli, "_build_session", build_session)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--image", "shot.png"])
+    assert exc.value.code == 2
+    build_session.assert_not_called()
+
+
 def test_main_rejects_missing_workspace(monkeypatch, tmp_path):
     build_session = MagicMock()
     monkeypatch.setattr(cli, "_build_session", build_session)

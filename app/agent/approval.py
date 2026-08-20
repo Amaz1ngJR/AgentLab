@@ -134,7 +134,9 @@ class InteractivePolicy:
     # 工具参数预览的最大字符数,过长会截断
     _PREVIEW_MAX = 240
     # workspace 越界和任意命令执行必须逐次确认，不能被会话白名单吞掉。
-    _NON_PERSISTENT_ACTIONS = {"shell", "terminal_open", "terminal_send"}
+    _NON_PERSISTENT_ACTIONS = {
+        "shell", "terminal_open", "terminal_send", "clear_session_images",
+    }
     _NON_PERSISTENT_RISKS = {
         "browser_control",
         "desktop_control",

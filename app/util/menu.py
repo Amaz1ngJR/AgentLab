@@ -34,11 +34,11 @@ from prompt_toolkit.styles import Style
 T = TypeVar("T")
 
 _MENU_STYLE = Style.from_dict({
-    "header": "fg:#aaaaaa",          # 灰色:工具名 / 参数等次要信息
-    "title": "bold",                  # 加粗:Do you want to proceed?
-    "selected": "fg:#5fafff bold",    # 蓝色加粗:当前光标所在选项
-    "shortcut": "fg:#888888",         # 灰色:数字快捷键
-    "footer": "fg:#666666 italic",    # 暗灰斜体:键位说明
+    "header": "fg:#ffd75f bold",     # 黄色:待审批工具、参数和风险内容
+    "title": "fg:#ffd75f bold",      # 黄色:审批问题
+    "selected": "fg:#5fafff bold",   # 蓝色加粗:当前光标所在选项
+    "shortcut": "fg:#888888",        # 灰色:数字快捷键
+    "footer": "fg:#666666 italic",   # 暗灰斜体:键位说明
 })
 
 
@@ -63,7 +63,7 @@ def select_menu(
     if not choices:
         return None
 
-    # 非 TTY (管道 / 重定向): 走 input() 简化路径,避免 prompt_toolkit 抛错
+    # 非 TTY (管道 / 重定向):走 input() 简化路径,避免 prompt_toolkit 抛错
     if not sys.stdout.isatty() or not sys.stdin.isatty():
         return _select_menu_fallback(choices, header_lines, title)
 
@@ -73,12 +73,12 @@ def select_menu(
     def render() -> FormattedText:
         """每次渲染都重新生成所有行(prompt_toolkit 会自动重绘)。"""
         out: list[tuple[str, str]] = []
-        # header: 灰色,展示工具上下文
+        # header:黄色,展示待审批工具上下文
         for line in (header_lines or []):
             out.append(("class:header", line + "\n"))
         if header_lines:
             out.append(("", "\n"))
-        # title: 加粗
+        # title:黄色加粗审批问题
         out.append(("class:title", title + "\n"))
         # choices: 当前项前 ❯ + 蓝色,其余前 2 空格
         for i, (label, _) in enumerate(choices):
@@ -158,10 +158,12 @@ def _select_menu_fallback(
     header_lines: Optional[list[str]],
     title: str,
 ) -> Optional[T]:
-    """非 TTY 退化:打印选项后从 stdin 读单行数字。"""
+    """非 TTY 退化:黄色打印审批内容后从 stdin 读单行数字。"""
+    yellow = "\033[1;33m" if getattr(sys.stderr, "isatty", lambda: False)() else ""
+    reset = "\033[0m" if yellow else ""
     for line in (header_lines or []):
-        print(line, file=sys.stderr)
-    print(title, file=sys.stderr)
+        print(f"{yellow}{line}{reset}", file=sys.stderr)
+    print(f"{yellow}{title}{reset}", file=sys.stderr)
     for i, (label, _) in enumerate(choices):
         print(f"  {i + 1}. {label}", file=sys.stderr)
     try:

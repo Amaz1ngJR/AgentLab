@@ -48,6 +48,28 @@ def _chunk(*, content=None, tool_calls=None, finish_reason=None, usage=None, rea
     return chunk
 
 
+def test_multimodal_user_message_preserved_for_chat_completions(tmp_path, monkeypatch):
+    from PIL import Image
+    from app import attachments
+    from app.attachments import AttachmentStore, build_user_content
+    from app.models.compatible_adapter import _normalize_chat_messages
+
+    monkeypatch.setattr(attachments, "DEFAULT_ATTACHMENT_ROOT", tmp_path)
+    path = tmp_path / "shot.png"
+    Image.new("RGB", (3, 2), "blue").save(path)
+    attachment = AttachmentStore(tmp_path).add_path(
+        "s1", path, workspace_root=tmp_path,
+    )
+    normalized = _normalize_chat_messages([{
+        "role": "user", "content": build_user_content("看图", [attachment]),
+    }])
+    assert normalized[0]["content"][0] == {"type": "text", "text": "看图"}
+    assert normalized[0]["content"][1]["type"] == "image_url"
+    assert normalized[0]["content"][1]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
+
+
 def _tool_call_delta(*, index, id_=None, name=None, arguments=None):
     tc = MagicMock()
     tc.index = index

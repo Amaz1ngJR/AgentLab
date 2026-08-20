@@ -58,6 +58,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - Runtime：同步多轮"模型 → 工具 → 模型"循环；工具审批、工具错误回灌、流式文本回调；`max_steps` 作为 run 级模型往返总预算，`max_task_steps` 限制单个子任务，二者共同防止空转与单任务独占。
 - 审批：`AutoApprove / InteractivePolicy(方向键菜单) / DenyAll`。
 - 安全基础：workspace 内按风险执行、越界使用不可持久化的独立审批动作、错误/工具输出脱敏（`redact`）、MCP env allowlist。
+- 图片附件：CLI 支持 `/image`、`/paste-image` 和输入框 Ctrl+V/Shift+Insert 直接粘贴；`AttachmentStore` 校验 MIME/大小/像素/workspace 审批并落到 `data/attachments/<session>`，消息历史只存 file/hash 元数据，OpenAI Responses、Anthropic 与 Chat Completions adapter 在请求前分别物化为对应图片 block；profile 必须声明 `vision`。
 
 ### 3.2 内置工具
 

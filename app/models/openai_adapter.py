@@ -23,6 +23,7 @@ import json
 from typing import Any, Optional
 
 from app.config.schemas import LLMConfig
+from app.attachments import image_block_to_data_url
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -333,13 +334,12 @@ def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
                         if item_type == "text":
                             converted_content.append({"type": "input_text", "text": item.get("text", "")})
                         elif item_type == "image":
-                            # Anthropic 图片格式转 Responses API
-                            source = item.get("source", {})
-                            if source.get("type") == "base64":
-                                converted_content.append({
-                                    "type": "input_image",
-                                    "image_url": f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
-                                })
+                            # 内部图片块可能是受控 file 引用，也兼容旧版 base64；
+                            # 发请求时才读取编码，SQLite 中不会保存大段 base64。
+                            converted_content.append({
+                                "type": "input_image",
+                                "image_url": image_block_to_data_url(item),
+                            })
                         elif item_type == "tool_result":
                             # Anthropic tool_result 转为 Responses API function_call_output
                             tool_results.append({

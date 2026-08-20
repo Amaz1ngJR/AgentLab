@@ -11,9 +11,11 @@ OpenAI Responses API 的关键差异需要 mock 反映:
 from unittest.mock import MagicMock, patch
 
 from app.config.schemas import LLMConfig
+from app.attachments import build_user_content
 from app.models.openai_adapter import (
     OpenAIAdapter,
     _MISSING_TOOL_OUTPUT,
+    _convert_messages_to_responses_format,
     _repair_responses_tool_pairs,
 )
 from app.models.protocol import ToolResult
@@ -113,7 +115,26 @@ def _build_final(output_items: list, in_tokens: int = 12, out_tokens: int = 8) -
     return final
 
 
-def test_reasoning_effort_maps_to_responses_reasoning_parameter():
+def test_file_image_converts_to_responses_input_image(tmp_path, monkeypatch):
+    from app import attachments
+    from app.attachments import AttachmentStore
+    monkeypatch.setattr(attachments, "DEFAULT_ATTACHMENT_ROOT", tmp_path)
+    from PIL import Image
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (4, 4), "red").save(image_path)
+    attachment = AttachmentStore(tmp_path).add_path(
+        "s1", image_path, workspace_root=tmp_path,
+    )
+    converted = _convert_messages_to_responses_format([{
+        "role": "user",
+        "content": build_user_content("看图", [attachment]),
+    }])
+    blocks = converted[0]["content"]
+    assert blocks[0] == {"type": "input_text", "text": "看图"}
+    assert blocks[1]["type"] == "input_image"
+    assert blocks[1]["image_url"].startswith("data:image/png;base64,")
+
+
     cfg = _cfg()
     cfg.reasoning_effort = "high"
     with patch("openai.OpenAI") as MockOpenAI:

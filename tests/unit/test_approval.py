@@ -82,7 +82,20 @@ def test_outside_workspace_approval_cannot_be_remembered():
     assert [c[1] for c in captured["choices"]] == ["yes", "modify", "no"]
 
 
-def test_command_execution_approvals_cannot_be_remembered():
+def test_clear_session_images_approval_cannot_be_remembered():
+    captured = {}
+
+    def fake_menu(choices, **_):
+        captured["choices"] = choices
+        return "yes"
+
+    with patch("app.util.menu.select_menu", side_effect=fake_menu):
+        assert InteractivePolicy().request(
+            "clear_session_images", {"session_id": "s1"},
+        )
+    assert [choice[1] for choice in captured["choices"]] == ["yes", "modify", "no"]
+
+
     for action in ("shell", "terminal_open", "terminal_send"):
         captured = {}
 

@@ -9,11 +9,12 @@ from app.agent.service import RuntimeService
 
 
 class _Session:
-    def __init__(self, gate=None):
+    def __init__(self, gate=None, *, supports_vision=False):
         self.gate = gate
         self.messages = []
         self.closed = False
         self.cancel_seen = False
+        self.llm = type("LLM", (), {"supports_vision": supports_vision})()
 
     def subscribe_events(self, *, on_turn=None, on_run=None):
         self.on_turn = on_turn
@@ -25,7 +26,7 @@ class _Session:
 
         return unsubscribe
 
-    def chat(self, message, *, cancel, resume=False):
+    def chat(self, message, *, cancel, resume=False, images=None):
         self.messages.append({"role": "user", "content": message})
         if getattr(self, "on_turn", None):
             self.on_turn({"kind": "text", "text": message})
@@ -101,7 +102,27 @@ def test_send_message_persists_target_and_publishes_events():
     assert all(event.run_id == "run-1" for event in events)
 
 
-def test_same_session_rejects_concurrent_run():
+def test_images_require_vision_capability():
+    service = RuntimeService(_Router({"s1": _Session()}))
+    with pytest.raises(RuntimeError, match="vision"):
+        service.send_message("看图", images=[object()])
+
+
+def test_images_forwarded_to_vision_session():
+    session = _Session(supports_vision=True)
+    captured = {}
+
+    def chat(message, **kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    session.chat = chat
+    service = RuntimeService(_Router({"s1": session}))
+    image = object()
+    assert service.send_message("看图", images=[image]) == "ok"
+    assert captured["images"] == [image]
+
+
     gate = threading.Event()
     router = _Router({"s1": _Session(gate)})
     service = RuntimeService(router)

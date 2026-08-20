@@ -48,7 +48,7 @@ models:
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     api_key_env: ANTHROPIC_API_KEY
     base_url_env: ANTHROPIC_BASE_URL
-    capabilities: [chat, tools]
+    capabilities: [chat, tools, vision]
     params:
       temperature: 0.2
 
@@ -58,7 +58,7 @@ models:
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     api_key_env: ANTHROPIC_API_KEY
     base_url_env: ANTHROPIC_BASE_URL
-    capabilities: [chat, tools]
+    capabilities: [chat, tools, vision]
     params:
       temperature: 0.2
 
@@ -99,6 +99,7 @@ models:
     model: ${OPENAI_MODEL:-gpt-3.5-turbo}
     api_key_env: OPENAI_API_KEY
     base_url: https://api.openai.com/v1
+    # 默认 gpt-3.5-turbo 不支持图片；若 OPENAI_MODEL 换成视觉模型，请显式加 vision。
     capabilities: [chat, tools]
     params:
       temperature: 0.2
@@ -110,7 +111,7 @@ models:
     model: gpt-5.6-sol
     base_url_env: CRS_OAI_URL
     api_key_env: CRS_OAI_KEY
-    capabilities: [chat, tools]
+    capabilities: [chat, tools, vision]
     params:
       temperature: 0.7
       # 已于 2026-08-17 使用当前 CRS 网关 + gpt-5.6-sol 实测：

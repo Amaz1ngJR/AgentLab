@@ -142,7 +142,14 @@ class Orchestrator:
         except Exception:
             pass
 
-    def run(self, goal: str, *, cancel: Optional[CancelToken] = None, resume: bool = False) -> str:
+    def run(
+        self,
+        goal: str,
+        *,
+        cancel: Optional[CancelToken] = None,
+        resume: bool = False,
+        append_goal_message: bool = True,
+    ) -> str:
         """规划并执行一个目标,返回最终答复文本。
 
         cancel 用于协作式取消;不传则不可取消。
@@ -165,7 +172,8 @@ class Orchestrator:
                     kind=events.RUN_STARTED,
                     text=f"继续上一轮任务(已重置 {reset_count} 个失败任务)",
                 ))
-        self.messages.append({"role": "user", "content": goal})
+        if append_goal_message:
+            self.messages.append({"role": "user", "content": goal})
         self._emit(RunEvent(kind=events.RUN_STARTED, text=goal))
 
         def _record_model(m: str) -> None:

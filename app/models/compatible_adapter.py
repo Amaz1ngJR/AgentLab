@@ -14,6 +14,7 @@ import re
 from typing import Any, Optional
 
 from app.config.schemas import LLMConfig
+from app.attachments import image_block_to_data_url
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -42,6 +43,29 @@ def _content_to_text(content: Any) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "".join(parts)
+
+
+def _content_to_chat_content(content: Any) -> str | list[dict[str, Any]]:
+    """转换多模态 content；有图片时保留 Chat Completions block 结构。"""
+    if not isinstance(content, list):
+        return _content_to_text(content)
+    blocks: list[dict[str, Any]] = []
+    has_image = False
+    for item in content:
+        if not isinstance(item, dict):
+            if isinstance(item, str):
+                blocks.append({"type": "text", "text": item})
+            continue
+        item_type = item.get("type")
+        if item_type == "text":
+            blocks.append({"type": "text", "text": item.get("text", "")})
+        elif item_type == "image":
+            has_image = True
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": image_block_to_data_url(item)},
+            })
+    return blocks if has_image else _content_to_text(content)
 
 
 def _normalize_chat_messages(messages: list[dict]) -> list[dict[str, Any]]:
@@ -79,7 +103,11 @@ def _normalize_chat_messages(messages: list[dict]) -> list[dict[str, Any]]:
             continue
         converted: dict[str, Any] = {
             "role": role,
-            "content": _content_to_text(message.get("content")),
+            "content": (
+                _content_to_chat_content(message.get("content"))
+                if role == "user"
+                else _content_to_text(message.get("content"))
+            ),
         }
         # 只保留 Chat Completions 支持的字段，避免 Responses API 的 id、status、
         # phase 等字段被透传给 Ollama 后触发 invalid message format。

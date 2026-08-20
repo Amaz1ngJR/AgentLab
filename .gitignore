@@ -34,6 +34,7 @@ data/agentlab.db
 
 # Project data
 data/vector_store/
+data/attachments/
 
 # Skills are personal/local — only the folder's README is tracked.
 # (个人 Skill 不上传 GitHub；只保留 skills/README.md 作说明)

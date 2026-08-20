@@ -128,9 +128,32 @@ class SessionRouter:
         if session:
             session.close()
         self._storage.delete_session(session_id)
+        try:
+            from app.attachments import AttachmentStore
+            AttachmentStore().delete_session(session_id)
+        except Exception:
+            # 数据库硬删除不能因附件清理失败而回滚；遗留文件仍位于受控目录。
+            pass
         if self.current_id == session_id:
             self.current_id = None
         return True
+
+    def clear_session_images(self, session_id: str | None = None) -> dict[str, int]:
+        """清除 Session 历史中的图片引用和磁盘文件，但保留文本对话。"""
+        target = session_id or self.current_id
+        if not target:
+            raise ValueError("当前无活跃 session")
+        if target not in self._sessions and not self.switch(target):
+            raise KeyError(f"找不到 session: {target}")
+        session = self._sessions[target]
+        from app.attachments import AttachmentStore, strip_image_blocks
+
+        cleaned, reference_count = strip_image_blocks(session.messages)
+        # 先更新内存和 SQLite，确保即使文件清理失败，后续也不会再引用已删除图片。
+        session.messages[:] = cleaned
+        self._storage.save_messages(target, session.messages)
+        file_count = AttachmentStore().delete_session(target)
+        return {"references": reference_count, "files": file_count}
 
     def list_sessions(self) -> list[dict]:
         return self._storage.list_sessions()

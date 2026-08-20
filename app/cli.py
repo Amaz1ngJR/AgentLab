@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import sys
 import threading
@@ -26,12 +27,20 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 
 from app.agent.approval import AutoApprove, InteractivePolicy
+from app.attachments import (
+    AttachmentError,
+    AttachmentStore,
+    ImageAttachment,
+    capture_system_clipboard,
+)
 from app.agent.approval_broker import ApprovalBroker, BrokerApprovalPolicy
 from app.agent.cancel import CancelToken
 from app.agent.context import ContextManager
@@ -45,7 +54,7 @@ from app.agent.runtime import AgentSession, TurnEvent, build_system_prompt
 from app.agent.session_router import SessionRouter
 from app.agent.service import RuntimeService
 from app.agent.tasks import TaskStore
-from app.config.loader import load_config
+from app.config.loader import load_config, workspace_root
 from app.mcp.adapter import build_mcp_tools
 from app.mcp.config import enabled_servers
 from app.mcp.manager import MCPManager
@@ -117,11 +126,48 @@ def _fmt_tokens(n: int) -> str:
 # 不用 prompt_toolkit Style 是为了让任务列表跟 spinner / 文本走同一条 stdout 流,
 # 避免分别用 prompt_toolkit Application 与 ANSI 写入的协调问题
 _ANSI_RESET = "\033[0m"
-_ANSI_DIM = "\033[2;90m"        # 灰色 dim (completed 划过)
+_ANSI_WHITE = "\033[97m"         # 白色 (模型正式输出)
+_ANSI_GREEN = "\033[32m"         # 绿色 (启动初始化)
+_ANSI_DIM = "\033[2;90m"        # 灰色 dim (思考 / completed)
 _ANSI_BLUE_BOLD = "\033[1;34m"  # 蓝色加粗 (in_progress 高亮)
 _ANSI_BOLD = "\033[1m"           # 加粗 (汇总行)
 _ANSI_YELLOW = "\033[33m"        # 黄色 (blocked)
 _ANSI_RED = "\033[31m"           # 红色 (failed)
+_ANSI_YELLOW_BOLD = "\033[1;33m" # 黄色加粗 (执行审批)
+
+
+def _supports_color(stream=None) -> bool:
+    """仅在交互式终端启用颜色，并遵守 NO_COLOR / dumb 终端约定。"""
+    stream = stream or sys.stdout
+    if os.getenv("NO_COLOR") is not None or os.getenv("TERM", "").lower() == "dumb":
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError):
+        return False
+
+
+def _colorize(text: str, ansi: str, *, stream=None) -> str:
+    return f"{ansi}{text}{_ANSI_RESET}" if _supports_color(stream) else text
+
+
+def _model_text(text: str, *, stream=None) -> str:
+    """正式模型输出使用白色，与灰色思考过程区分。"""
+    return _colorize(text, _ANSI_WHITE, stream=stream)
+
+
+def _thinking_text(text: str, *, stream=None) -> str:
+    return _colorize(text, _ANSI_DIM, stream=stream)
+
+
+def _approval_text(text: str, *, stream=None) -> str:
+    """待审批工具调用使用黄色，审批菜单选项仍由 prompt_toolkit 保持蓝色。"""
+    return _colorize(text, _ANSI_YELLOW_BOLD, stream=stream)
+
+
+def _print_init(text: str = "", *, flush: bool = False) -> None:
+    """渲染启动初始化信息；每行单独 reset，避免颜色泄漏到交互提示。"""
+    print(_colorize(text, _ANSI_GREEN), flush=flush)
 
 
 def _task_field(t, name: str):
@@ -289,12 +335,15 @@ class _Spinner:
                 sys.stdout.write("\n")
                 self._line_buf = ""
             self._any_text = True
-            sys.stdout.write(delta)
-            # 维护"当前未换行尾行":有换行则取最后一段,否则累加到现有尾行
+            styled = _model_text(delta)
+            sys.stdout.write(styled)
+            # 维护"当前未换行尾行":有换行则取最后一段,否则累加到现有尾行。
+            # _line_buf 要保留颜色,因为 footer 重绘时会重新输出这段正文。
             if "\n" in delta:
-                self._line_buf = delta.rsplit("\n", 1)[1]
+                tail = delta.rsplit("\n", 1)[1]
+                self._line_buf = _model_text(tail) if tail else ""
             else:
-                self._line_buf += delta
+                self._line_buf += styled
             self._draw_footer()
             sys.stdout.flush()
 
@@ -311,14 +360,14 @@ class _Spinner:
             self._erase_footer()
             self._commit_tasks()
             if not self._any_thinking:
-                # 思考段起一个暗色标题,提示这是推理而非最终答案
-                sys.stdout.write(f"{_ANSI_DIM}💭 思考\n{_ANSI_RESET}")
+                # 思考段起一个灰色标题,提示这是推理而非最终答案
+                sys.stdout.write(_thinking_text("💭 思考\n"))
                 self._any_thinking = True
-            styled = f"{_ANSI_DIM}{delta}{_ANSI_RESET}"
+            styled = _thinking_text(delta)
             sys.stdout.write(styled)
             if "\n" in delta:
                 tail = delta.rsplit("\n", 1)[1]
-                self._line_buf = f"{_ANSI_DIM}{tail}{_ANSI_RESET}" if tail else ""
+                self._line_buf = _thinking_text(tail) if tail else ""
             else:
                 self._line_buf += styled
             self._draw_footer()
@@ -460,8 +509,8 @@ class _PlainProgress:
             return
         if not self._thinking_started:
             self._thinking_started = True
-            sys.stdout.write(f"\n{_ANSI_DIM}💭 思考\n")
-        sys.stdout.write(f"{_ANSI_DIM}{delta}{_ANSI_RESET}")
+            sys.stdout.write("\n" + _thinking_text("💭 思考\n"))
+        sys.stdout.write(_thinking_text(delta))
         sys.stdout.flush()
 
     def on_text(self, delta: str) -> None:
@@ -471,7 +520,7 @@ class _PlainProgress:
             self._text_started = True
             # 思考流后接正文:先空一行把灰字推开
             sys.stdout.write("\n\n" if self._thinking_started else "\n")
-        sys.stdout.write(delta)
+        sys.stdout.write(_model_text(delta))
         sys.stdout.flush()
 
 
@@ -717,9 +766,7 @@ def _print_event(ev: TurnEvent) -> None:
             _render_edit_file(ev.tool_input or {})
         elif ev.tool_name == "shell":
             _snapshot_shell_targets(ev.tool_input or {})
-            print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
-        else:
-            print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
+        print(_approval_text(f"  ! tool_use {ev.tool_name}({_fmt(ev.tool_input)})"), flush=True)
     elif ev.kind == "tool_result":
         preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
         tag = "ERR" if ev.tool_error else "ok"
@@ -731,12 +778,12 @@ def _print_event(ev: TurnEvent) -> None:
         if ev.tool_name in ("write_file", "edit_file") and not ev.tool_error:
             _close_active_vscode_diff()
     elif ev.kind == "tool_denied":
-        print(f"    [denied] 已拒绝 {ev.tool_name}", flush=True)
+        print(_approval_text(f"    [denied] 已拒绝 {ev.tool_name}"), flush=True)
         # write_file/edit_file 拒绝后也关闭 VS Code diff
         if ev.tool_name in ("write_file", "edit_file"):
             _close_active_vscode_diff()
     elif ev.kind == "text":
-        print(f"\n{ev.text}\n", flush=True)
+        print(f"\n{_model_text(ev.text)}\n", flush=True)
 
 
 def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
@@ -757,17 +804,20 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
     kind = ev.kind
     if kind == run_events.MESSAGE_DELTA:
         if ev.text:
-            print(f"\n{ev.text}\n", flush=True)
+            print(f"\n{_model_text(ev.text)}\n", flush=True)
     elif kind == run_events.TOOL_REQUESTED:
+        # 这里只做审批前 diff / shell 快照；黄色 tool_use 由紧随其后的
+        # APPROVAL_REQUIRED 统一输出，免审批工具不冒充审批内容。
         if ev.tool_name == "write_file":
             _render_write_file(ev.tool_input or {})
         elif ev.tool_name == "edit_file":
             _render_edit_file(ev.tool_input or {})
         elif ev.tool_name == "shell":
             _snapshot_shell_targets(ev.tool_input or {})
-            print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
-        else:
-            print(f"  · tool {ev.tool_name}({_fmt(ev.tool_input)})", flush=True)
+    elif kind == run_events.APPROVAL_REQUIRED:
+        action = ev.payload.get("approval_action") or ev.tool_name
+        detail = f"  ! tool_use {action}: {ev.tool_name}({_fmt(ev.tool_input)})"
+        print(_approval_text(detail), flush=True)
     elif kind == run_events.TOOL_COMPLETED:
         preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
         tag = "ERR" if ev.tool_error else "ok"
@@ -780,7 +830,7 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         if ev.tool_name in ("write_file", "edit_file") and not ev.tool_error:
             _close_active_vscode_diff()
     elif kind == run_events.TOOL_DENIED:
-        print(f"    [denied] 已拒绝 {ev.tool_name}", flush=True)
+        print(_approval_text(f"    [denied] 已拒绝 {ev.tool_name}"), flush=True)
         # write_file/edit_file 拒绝后也关闭 VS Code diff
         if ev.tool_name in ("write_file", "edit_file"):
             _close_active_vscode_diff()
@@ -1142,18 +1192,18 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
 
     llm = build_model_router(cfg)
 
-    print(f"== AgentLab v{__version__} ==")
-    print(f"provider : {cfg.provider}")
-    print(f"model    : {cfg.model}")
+    _print_init(f"== AgentLab v{__version__} ==")
+    _print_init(f"provider : {cfg.provider}")
+    _print_init(f"model    : {cfg.model}")
     if cfg.base_url:
-        print(f"base_url : {cfg.base_url}")
+        _print_init(f"base_url : {cfg.base_url}")
     if cfg.profile_name:
-        print(f"profile  : {cfg.profile_name}")
+        _print_init(f"profile  : {cfg.profile_name}")
     if cfg.capabilities:
-        print(f"能力     : {', '.join(cfg.capabilities)}")
+        _print_init(f"能力     : {', '.join(cfg.capabilities)}")
     from app.config.loader import workspace_root
     ws = workspace_root()
-    print(f"workspace: {ws}")
+    _print_init(f"workspace: {ws}")
 
     # 动态生成工具列表
     from app.tools.builtin import default_tools
@@ -1168,10 +1218,10 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         else:
             tool_display.append(name)
 
-    print(f"工具     : {' / '.join(tool_display)}")
-    print("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
-    print("输入 /version 查看版本; /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
-    print("执行中按 Esc 或 Ctrl-C 可中断,停下后直接输入新指令即可调整方向。\n")
+    _print_init(f"工具     : {' / '.join(tool_display)}")
+    _print_init("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
+    _print_init("输入 /version 查看版本; /image 或 Ctrl+V 附加图片; /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
+    _print_init("执行中按 Esc 或 Ctrl-C 可中断,停下后直接输入新指令即可调整方向。\n")
 
     # ── MCP server 接入 ───────────────────────────────────────────────────────
     # 读 config/mcp_servers.yaml 中 enabled 的 server,启动 manager(供所有 session 共用)。
@@ -1180,15 +1230,15 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     mcp_servers = enabled_servers()
     if mcp_servers:
         mcp_manager = MCPManager(mcp_servers)
-        print(f"MCP      : 正在连接 {len(mcp_servers)} 个 server "
-              f"({', '.join(s.name for s in mcp_servers)}) …", flush=True)
+        _print_init(f"MCP      : 正在连接 {len(mcp_servers)} 个 server "
+                    f"({', '.join(s.name for s in mcp_servers)}) …", flush=True)
         mcp_manager.start()
         # 启用前展示:server、transport、发现的工具(落实 §9.2 "启用前展示可暴露能力")
         for s in mcp_servers:
             tool_names = [t.name for t in mcp_manager.tools() if t.server == s.name]
-            print(f"           ▸ {s.name} [{s.transport}] risk={s.risk} "
-                  f"工具 {len(tool_names)} 个: {', '.join(tool_names) or '(无)'}")
-        print("           动作经外部 MCP server 执行;非只读工具默认每次需审批。")
+            _print_init(f"           ▸ {s.name} [{s.transport}] risk={s.risk} "
+                        f"工具 {len(tool_names)} 个: {', '.join(tool_names) or '(无)'}")
+        _print_init("           动作经外部 MCP server 执行;非只读工具默认每次需审批。")
 
         # ── 云端数据边界提示(PRD §7.8.2 / §12)─────────────────────────────────
         # 浏览器/桌面控制 + 云端模型时,页面快照/截图/DOM/表单内容会进 LLM 上下文
@@ -1241,9 +1291,9 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     if skill_catalog.all():
         enabled = skill_catalog.enabled_skills()
         enabled_names = ', '.join(s.skill_id for s in enabled) if enabled else '无'
-        print(f"Skill    : 发现 {len(skill_catalog.all())} 个 "
-              f"({', '.join(s.skill_id for s in skill_catalog.all())});"
-              f" 默认启用 {len(enabled)} 个 ({enabled_names})")
+        _print_init(f"Skill    : 发现 {len(skill_catalog.all())} 个 "
+                    f"({', '.join(s.skill_id for s in skill_catalog.all())});"
+                    f" 默认启用 {len(enabled)} 个 ({enabled_names})")
 
     def _session_factory(agent_profile, session_id: str) -> AgentSession:
         """按 AgentProfile 构建一个隔离的 AgentSession:独立工具表 + 任务清单 + 记忆注入。"""
@@ -1397,10 +1447,10 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     title = row["title"] if row else ""
     if resumed:
         msg_count = len(service.current.messages) if service.current else 0
-        print(f"会话     : 恢复 {sid}  ({title})  历史消息 {msg_count} 条 "
-              f"— /session new 开新会话, /session list 看全部\n")
+        _print_init(f"会话     : 恢复 {sid}  ({title})  历史消息 {msg_count} 条 "
+                    f"— /session new 开新会话, /session list 看全部\n")
     else:
-        print(f"会话     : 新建 {sid}  ({title})\n")
+        _print_init(f"会话     : 新建 {sid}  ({title})\n")
     return service
 
 
@@ -1459,6 +1509,9 @@ def _print_input_separator() -> None:
 
 # 顶层斜杠命令 → 说明,用于补全菜单右侧 meta 文本
 _SLASH_COMMANDS = {
+    "/paste-image": "粘贴剪贴板图片并附加到下一条消息",
+    "/image": "显示图片输入帮助；用 /image <路径> 添加图片",
+    "/attachments": "查看或清空待发送图片",
     "/version": "显示当前 AgentLab 版本",
     "/reset": "清空当前会话的消息和任务",
     "/resume": "继续上一轮未完成/失败的任务",
@@ -1467,6 +1520,10 @@ _SLASH_COMMANDS = {
     "/goal": "定义 Loop Engineering 目标",
     "/loop": "启动/查看/停止 Loop",
     "/model": "查看和切换模型配置",
+}
+_ATTACHMENT_SUBCOMMANDS = {
+    "clear": "清空尚未发送的图片",
+    "clear-session": "清理当前 Session 的全部历史图片",
 }
 # /session 子命令 → 说明
 _SESSION_SUBCOMMANDS = {
@@ -1532,8 +1589,19 @@ class _SlashCompleter(Completer):
                     yield Completion(cmd, start_position=-len(word), display_meta=desc)
             return
 
-        if parts[0] not in ("/session", "/context", "/goal", "/loop", "/model"):
+        if parts[0] not in ("/session", "/context", "/goal", "/loop", "/model", "/attachments"):
             return  # 只有这几个有更深层补全
+
+        # ── 第二级:/attachments 子命令 ──
+        if parts[0] == "/attachments":
+            if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
+                prefix = parts[1] if len(parts) == 2 else ""
+                for sub, desc in _ATTACHMENT_SUBCOMMANDS.items():
+                    if sub.startswith(prefix):
+                        yield Completion(
+                            sub, start_position=-len(prefix), display_meta=desc,
+                        )
+            return
 
         # ── 第二级:/context 子命令 ──
         if parts[0] == "/context":
@@ -1735,6 +1803,7 @@ def _chat_with_cancel(
     *,
     resume: bool = False,
     service: RuntimeService | None = None,
+    images: list[ImageAttachment] | None = None,
 ) -> str:
     """跑一轮 chat,并把 Ctrl-C 接到协作式取消(对应 PRD 紧急停止)。
 
@@ -1781,12 +1850,112 @@ def _chat_with_cancel(
     try:
         with _EscWatcher(on_esc=lambda: _request_cancel("Esc")):
             if service is not None:
-                return service.send_message(line, cancel=token, resume=resume)
+                return service.send_message(
+                    line, images=images, cancel=token, resume=resume,
+                )
             # 兼容直接传 AgentSession 的旧测试和第三方调用方。
-            return session.chat(line, cancel=token, resume=resume)
+            return session.chat(
+                line, images=images, cancel=token, resume=resume,
+            )
     finally:
         if can_trap and prev_handler is not None:
             signal.signal(signal.SIGINT, prev_handler)
+
+
+def _image_command(line: str) -> tuple[str, str | None]:
+    """解析 /image；返回 (action, payload)，裸命令只显示帮助，绝不发给 Agent。"""
+    if line == "/image":
+        return "help", None
+    if line.startswith("/image "):
+        value = line[len("/image "):].strip()
+        return ("path", value) if value else ("help", None)
+    return "not_image", None
+
+
+def _image_help_text() -> str:
+    return (
+        "图片输入方式:\n"
+        "  1. 复制图片后按 Ctrl+V / Shift+Insert，再输入问题并回车\n"
+        "  2. /paste-image 读取系统剪贴板图片\n"
+        "  3. /image <图片路径> 仅加入待发送队列\n"
+        "  4. /image <图片路径> -- <提示词> 立即发送图片和提示词\n"
+        "输入 /attachments 可查看待发送图片。"
+    )
+
+
+_IMAGE_PLACEHOLDER_RE = re.compile(r"\[AgentLab:image:([A-Za-z0-9_-]+)\]")
+
+
+def _clipboard_key_bindings(
+    pending_clipboard: dict[str, object],
+    attachment_store: AttachmentStore,
+    get_session_id,
+) -> KeyBindings:
+    """Ctrl+V/Shift+Insert：剪贴板是图片时加入待发送队列，否则正常粘贴文本。"""
+    bindings = KeyBindings()
+
+    def _paste(event) -> None:
+        clipboard = capture_system_clipboard()
+        if clipboard.image is not None:
+            try:
+                image = attachment_store.add_bytes(
+                    get_session_id() or "unbound",
+                    clipboard.image.data,
+                    clipboard.image.name,
+                )
+            except AttachmentError as exc:
+                pending_clipboard["error"] = str(exc)
+                return
+            images = pending_clipboard.setdefault("images", {})
+            images[image.attachment_id] = image
+            event.current_buffer.insert_text(
+                f"[AgentLab:image:{image.attachment_id}]"
+            )
+            get_app().invalidate()
+            return
+        # 非图片剪贴板必须保留 prompt_toolkit 原有的文本粘贴体验。
+        if clipboard.text:
+            event.current_buffer.insert_text(clipboard.text)
+
+    bindings.add("c-v")(_paste)
+    bindings.add("s-insert")(_paste)
+    return bindings
+
+
+def _extract_pasted_images(
+    line: str,
+    pending_clipboard: dict[str, object],
+) -> tuple[str, list[ImageAttachment]]:
+    images_by_id = pending_clipboard.get("images", {})
+    selected: list[ImageAttachment] = []
+
+    def replace(match: re.Match) -> str:
+        attachment = images_by_id.get(match.group(1))
+        if attachment is not None and attachment not in selected:
+            selected.append(attachment)
+        return ""
+
+    text = _IMAGE_PLACEHOLDER_RE.sub(replace, line).strip()
+    # /paste-image 和 /image（无内联 prompt）没有占位符，也约定附加到下一条
+    # 普通消息，因此把队列中剩余图片一并发送。发送后才清空，slash 命令不会误吞。
+    for attachment in list(images_by_id.values()):
+        if attachment not in selected:
+            selected.append(attachment)
+    images_by_id.clear()
+    return text, selected
+
+
+def _format_pending_attachments(pending_clipboard: dict[str, object]) -> str:
+    images = list((pending_clipboard.get("images") or {}).values())
+    if not images:
+        return "当前没有待发送图片。"
+    lines = [f"待发送图片: {len(images)} 张"]
+    for image in images:
+        lines.append(
+            f"  - {image.attachment_id}: {image.original_name} "
+            f"({image.width}x{image.height}, {image.size_bytes} bytes)"
+        )
+    return "\n".join(lines)
 
 
 def _repl(router: RuntimeService) -> int:
@@ -1799,10 +1968,17 @@ def _repl(router: RuntimeService) -> int:
     斜杠命令:/reset 清空当前会话;/session ... 管理多 Agent。
     输入 `/` 时弹出命令补全(由 _SlashCompleter 提供)。
     """
+    attachment_store = AttachmentStore()
+    pending_clipboard: dict[str, object] = {"images": {}}
     pt_session: PromptSession = PromptSession(
         history=InMemoryHistory(),
         completer=_SlashCompleter(router),
         complete_while_typing=True,   # 边打边弹,不用按 Tab
+        key_bindings=_clipboard_key_bindings(
+            pending_clipboard,
+            attachment_store,
+            lambda: router.current_id,
+        ),
     )
 
     while True:
@@ -1832,16 +2008,92 @@ def _repl(router: RuntimeService) -> int:
             return 0
 
         if not line:
+            # Ctrl+V 粘贴图片会插入可见占位符，因此这里不会误丢图片。
             continue
         if line in ("exit", "quit"):
             return 0
         if line == "/version":
             print(version_text())
             continue
+        image_action, image_payload = _image_command(line)
+        if image_action == "help":
+            print(_image_help_text())
+            continue
+        if line == "/paste-image":
+            clipboard = capture_system_clipboard()
+            if clipboard.image is None:
+                print("剪贴板中没有图片。")
+                continue
+            try:
+                current_session = router.current
+                if current_session is None or "vision" not in getattr(
+                    current_session.llm, "capabilities", [],
+                ):
+                    print(
+                        "当前模型 profile 未声明 vision 能力，不能粘贴图片；"
+                        "请先切换到视觉模型。"
+                    )
+                    continue
+                image = attachment_store.add_bytes(
+                    router.current_id or "unbound",
+                    clipboard.image.data,
+                    clipboard.image.name,
+                )
+            except AttachmentError as exc:
+                print(f"无法粘贴图片: {exc}")
+                continue
+            pending_clipboard["images"][image.attachment_id] = image
+            print(
+                f"已附加剪贴板图片 {image.attachment_id} "
+                f"({image.width}x{image.height})；下一条消息将发送该图片。"
+            )
+            continue
+        if line == "/attachments":
+            print(_format_pending_attachments(pending_clipboard))
+            continue
+        if line == "/attachments clear-session":
+            session = router.current
+            if session is None or router.current_id is None:
+                print("当前无活跃 session。")
+                continue
+            try:
+                approved = session.approval.request(
+                    "clear_session_images",
+                    {
+                        "session_id": router.current_id,
+                        "path": str(attachment_store.root / router.current_id),
+                        "purpose": "delete_all_session_images",
+                    },
+                )
+            except Exception as exc:
+                print(f"图片清理审批失败: {format_exception(exc)}")
+                continue
+            if not approved:
+                print("已取消清理 Session 图片。")
+                continue
+            try:
+                result = router.clear_session_images()
+            except Exception as exc:
+                print(f"清理 Session 图片失败: {format_exception(exc)}")
+                continue
+            pending_clipboard["images"].clear()
+            print(
+                f"已清理当前 Session 的全部图片：删除 {result['files']} 个文件，"
+                f"移除 {result['references']} 个历史引用。文本对话已保留。"
+            )
+            continue
+        if line == "/attachments clear":
+            pending_clipboard["images"].clear()
+            print("已清空待发送图片。")
+            continue
 
-        # /session ... 命令统一经过 RuntimeService，避免前端直接编排 router。
+        # 图片附件必须进入当前 session 的隔离目录；切换 session 时清空待发送队列，
+        # 避免上一会话的敏感截图被误发到另一个 Agent。
         if line.startswith("/session"):
+            before_session = router.current_id
             out = router.handle_session_command(line)
+            if router.current_id != before_session:
+                pending_clipboard["images"].clear()
             if out is not None:
                 print(out)
             continue
@@ -1851,6 +2103,44 @@ def _repl(router: RuntimeService) -> int:
             print("当前无活跃 session。用 /session new 创建。")
             continue
 
+        direct_images: list[ImageAttachment] = []
+        if image_action == "path":
+            raw = image_payload or ""
+            # `--` 是唯一“立即发送”分隔符；只有路径时永远只入队，不触发 Agent。
+            path_text, separator, prompt = raw.partition(" -- ")
+            if not path_text:
+                print("用法: /image <图片路径> [-- 提示词]")
+                continue
+            try:
+                image = attachment_store.add_path(
+                    router.current_id or "unbound",
+                    path_text.strip('"\''),
+                    workspace_root=workspace_root(),
+                    approval=getattr(session, "approval", None),
+                )
+            except (AttachmentError, OSError) as exc:
+                print(f"无法附加图片: {exc}")
+                continue
+            if "vision" not in getattr(session.llm, "capabilities", []):
+                print(
+                    "当前模型 profile 未声明 vision 能力，不能发送图片；"
+                    "请先用 /model switch 切换到视觉模型并新建 session。"
+                )
+                continue
+            if separator and prompt.strip():
+                line = prompt.strip()
+                direct_images = [image]
+            else:
+                pending_clipboard["images"][image.attachment_id] = image
+                print(
+                    f"已附加 {image.original_name} ({image.width}x{image.height})；"
+                    "下一条消息将发送该图片。"
+                )
+                continue
+        else:
+            direct_images = []
+
+        # 其余 slash 命令也不应消耗待发送附件。
         if line == "/reset":
             session.reset()
             print("(history cleared)")
@@ -1879,6 +2169,11 @@ def _repl(router: RuntimeService) -> int:
                 print(out)
             continue
 
+        line, pasted_images = _extract_pasted_images(line, pending_clipboard)
+        images = direct_images + pasted_images
+        if not line and images:
+            line = "请分析这些图片。"
+
         # /resume:继续上一轮未完成的任务(失败任务重置为 pending 重试)。
         # 可带补充说明(/resume <提示>),否则用默认继续指令。
         if line == "/resume" or line.startswith("/resume "):
@@ -1894,7 +2189,13 @@ def _repl(router: RuntimeService) -> int:
             extra = line[len("/resume"):].strip()
             goal = extra or "继续完成上一轮未完成的任务。"
             try:
-                _chat_with_cancel(session, goal, resume=True, service=router)
+                _chat_with_cancel(
+                    session,
+                    goal,
+                    resume=True,
+                    service=router,
+                    images=images,
+                )
             except Exception as exc:
                 print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
                 continue
@@ -1906,7 +2207,7 @@ def _repl(router: RuntimeService) -> int:
             if repaired:
                 print(f"  ⚠ 检测到 {repaired} 个悬空 tool_use，已自动修复（历史损坏可能由上次中断引起）。",
                       file=sys.stderr)
-            _chat_with_cancel(session, line, service=router)
+            _chat_with_cancel(session, line, service=router, images=images)
         except Exception as exc:
             # 脱敏后输出,避免 Authorization / API key 等凭据泄漏到终端
             print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
@@ -1997,6 +2298,10 @@ def main(argv: list[str] | None = None) -> int:
         help="显示当前 AgentLab 版本后退出",
     )
     parser.add_argument("-p", "--prompt", help="一次性 prompt，执行完即退出")
+    parser.add_argument(
+        "--image", action="append", default=[],
+        help="为单次 prompt 附加图片路径，可重复使用",
+    )
     parser.add_argument("-y", "--yes", action="store_true", help="自动放行所有工具调用")
     parser.add_argument("--profile", help="使用 config/models.yaml 中的指定 profile")
     parser.add_argument(
@@ -2006,6 +2311,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Agent 可操作的工作区目录；相对路径按当前终端目录解析",
     )
     args = parser.parse_args(argv)
+    if args.image and not args.prompt:
+        parser.error("--image 必须和 -p/--prompt 一起使用；交互模式请用 /image")
 
     # 显式 CLI 参数优先于项目 .env。load_dotenv(override=False) 会保留该值。
     if args.workspace is not None:
@@ -2017,8 +2324,19 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if args.prompt:
                 session = router.current
+                images: list[ImageAttachment] = []
                 try:
-                    _chat_with_cancel(session, args.prompt, service=router)
+                    attachment_store = AttachmentStore()
+                    for image_path in args.image:
+                        images.append(attachment_store.add_path(
+                            router.current_id or "unbound",
+                            image_path,
+                            workspace_root=workspace_root(),
+                            approval=session.approval,
+                        ))
+                    _chat_with_cancel(
+                        session, args.prompt, service=router, images=images,
+                    )
                 finally:
                     _print_stats(session)
                 return 0

@@ -10,6 +10,7 @@ from app.agent.approval import ApprovalPolicy, AutoApprove, request_tool_approva
 from app.agent.cancel import CancelToken
 from app.agent.events import RunEvent
 from app.agent.tasks import TaskStore
+from app.attachments import ImageAttachment, build_user_content
 from app.models.protocol import ToolResult
 from app.models.router import ModelRouter
 from app.tools.registry import ToolRegistry
@@ -235,8 +236,14 @@ class AgentSession:
         self._orch.messages = self.messages
         return self._orch
 
-    def chat(self, user_input: str, *, cancel: Optional[CancelToken] = None,
-             resume: bool = False) -> str:
+    def chat(
+        self,
+        user_input: str,
+        *,
+        images: list[ImageAttachment] | None = None,
+        cancel: Optional[CancelToken] = None,
+        resume: bool = False,
+    ) -> str:
         """处理一轮用户输入。
 
         orchestrate=True 时委托给 Orchestrator(规划→执行→重规划,产出 RunEvent);
@@ -244,11 +251,19 @@ class AgentSession:
         resume=True 时继续上一轮未完成的任务(失败任务重置为 pending),仅编排路径生效。
         """
         if self._orchestrate:
-            return self._chat_orchestrated(user_input, cancel=cancel, resume=resume)
-        return self._chat_legacy(user_input)
+            return self._chat_orchestrated(
+                user_input, images=images, cancel=cancel, resume=resume,
+            )
+        return self._chat_legacy(user_input, images=images)
 
-    def _chat_orchestrated(self, user_input: str, *, cancel: Optional[CancelToken] = None,
-                           resume: bool = False) -> str:
+    def _chat_orchestrated(
+        self,
+        user_input: str,
+        *,
+        images: list[ImageAttachment] | None = None,
+        cancel: Optional[CancelToken] = None,
+        resume: bool = False,
+    ) -> str:
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
         self.last_goal = user_input
@@ -256,7 +271,25 @@ class AgentSession:
         turn_start = time.monotonic()
         try:
             orch = self._ensure_orchestrator()
-            answer = orch.run(user_input, cancel=cancel, resume=resume)
+            if images:
+                # Planner 仍接收纯文本目标；图片消息先进入共享历史，Executor 随后
+                # 可在首个子任务中看到并分析这些图片。
+                orch.messages.append({
+                    "role": "user",
+                    "content": build_user_content(user_input, images),
+                })
+                planner_input = (
+                    f"{user_input}\n\n"
+                    f"[用户同时附加了 {len(images)} 张图片，请结合图片完成任务。]"
+                )
+                answer = orch.run(
+                    planner_input,
+                    cancel=cancel,
+                    resume=resume,
+                    append_goal_message=False,
+                )
+            else:
+                answer = orch.run(user_input, cancel=cancel, resume=resume)
             # 把 run 级统计拷回 session,供 CLI 展示 / 持久化
             self.last_turn_usage = dict(orch.last_run_usage)
             for k in ("input_tokens", "output_tokens"):
@@ -269,8 +302,16 @@ class AgentSession:
             self.last_turn_seconds = time.monotonic() - turn_start
             self.cumulative_seconds += self.last_turn_seconds
 
-    def _chat_legacy(self, user_input: str) -> str:
-        self.messages.append({"role": "user", "content": user_input})
+    def _chat_legacy(
+        self,
+        user_input: str,
+        *,
+        images: list[ImageAttachment] | None = None,
+    ) -> str:
+        self.messages.append({
+            "role": "user",
+            "content": build_user_content(user_input, images),
+        })
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
         turn_start = time.monotonic()

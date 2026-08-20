@@ -55,7 +55,22 @@ def test_message_redaction_preserves_json_escaping(tmp_path):
     assert 'keep "quoted" text' in loaded[0]["output"]
 
 
-def test_load_messages_skips_legacy_invalid_json(tmp_path):
+def test_message_storage_omits_inline_image_base64(tmp_path):
+    s = _store(tmp_path)
+    s.create_session("s1", "default", "cloud_claude")
+    s.save_messages("s1", [{
+        "role": "user",
+        "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "A" * 1000},
+        }],
+    }])
+    loaded = s.load_messages("s1")
+    source = loaded[0]["content"][0]["source"]
+    assert source["type"] == "omitted"
+    assert "data" not in source
+
+
     s = _store(tmp_path)
     s.create_session("s1", "default", "cloud_claude")
     s.save_messages("s1", [{"role": "user", "content": "valid"}])

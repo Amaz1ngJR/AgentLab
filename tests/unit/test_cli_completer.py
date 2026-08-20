@@ -27,8 +27,8 @@ def _complete(c, text):
 def test_top_level_slash():
     c = _completer()
     assert set(_complete(c, "/")) == {
-        "/version", "/reset", "/resume", "/session", "/context",
-        "/goal", "/loop", "/model",
+        "/paste-image", "/image", "/attachments", "/version", "/reset",
+        "/resume", "/session", "/context", "/goal", "/loop", "/model",
     }
 
 
@@ -37,7 +37,12 @@ def test_top_level_prefix():
     assert _complete(c, "/se") == ["/session"]
 
 
-def test_session_subcommands():
+def test_attachment_subcommands():
+    c = _completer()
+    assert set(_complete(c, "/attachments ")) == {"clear", "clear-session"}
+    assert _complete(c, "/attachments clear-s") == ["clear-session"]
+
+
     c = _completer()
     out = _complete(c, "/session ")
     assert "list" in out and "switch" in out and "archive" in out

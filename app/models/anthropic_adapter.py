@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from app.config.schemas import LLMConfig
+from app.attachments import materialize_image_block
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -16,6 +17,32 @@ from app.models.protocol import (
     ToolCall,
     ToolResult,
 )
+
+
+def _materialize_anthropic_messages(messages: list[dict]) -> list[dict]:
+    """把内部 file 图片引用转换为 Anthropic Messages 的 base64 source。"""
+    converted: list[dict] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            converted.append(message)
+            continue
+        blocks: list[Any] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                media_type, data = materialize_image_block(block)
+                blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    },
+                })
+            else:
+                blocks.append(block)
+        converted.append({**message, "content": blocks})
+    return converted
 
 
 class AnthropicAdapter:
@@ -57,6 +84,7 @@ class AnthropicAdapter:
 
     def chat(self, messages: list[dict], temperature: Optional[float] = None) -> str:
         system_text, converted = self._split_system(messages)
+        converted = _materialize_anthropic_messages(converted)
         params: dict[str, Any] = {
             "model": self._cfg.model,
             "messages": converted,
@@ -82,6 +110,7 @@ class AnthropicAdapter:
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
     ) -> ModelResponse:
         system_from_msgs, converted = self._split_system(messages)
+        converted = _materialize_anthropic_messages(converted)
         system_text = system or system_from_msgs
 
         params: dict[str, Any] = {

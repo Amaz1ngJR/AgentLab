@@ -10,6 +10,7 @@
 - **Web 搜索**：`web_search` 在互联网上搜索信息，返回标题、链接和摘要；使用 DuckDuckGo（注重隐私，无需 API key）
 - **Shell 命令**：跨平台 shell 工具（Mac/Linux 用 bash，Windows 用 PowerShell），默认 cwd 为 workspace，外部 cwd 需审批
 - **交互式终端**：`terminal_open` / `terminal_send` / `terminal_close` / `terminal_list` 维持 PTY 会话，适合远程登录、REPL、交互式安装器等需要持续对话的程序
+- **图片输入**：支持 `/image <路径> [-- 提示词]`、`/paste-image`，以及在聊天输入框直接按 Ctrl+V / Shift+Insert 粘贴剪贴板图片；图片以受控附件引用持久化
 - **浏览器控制**：通过 Playwright MCP 打开网页、截图、读 DOM、点击、输入（默认禁用，需显式启用）
 - **多 Agent / 会话**：`/session` 命令族在一个进程里创建、切换、归档多个 Agent 会话；会话消息存 SQLite，可恢复
 - **长期记忆**：按 AgentProfile 的 `memory_policy` 检索历史记忆注入上下文，`read_write` 策略会话结束写摘要
@@ -257,6 +258,7 @@ agentlab -w /path/to/project           # 指定其他工作区
 agentlab -w . --profile local_qwen     # 指定工作区和模型 profile
 
 python -m app --version                # 显示当前版本后退出
+python -m app --image ./error.png -p "分析截图"  # 单次图片 prompt
 python -m app                          # 交互式 REPL
 python -m app -p "帮我看 README.md"    # 单次 prompt 后退出
 python -m app -y                       # 自动放行所有工具（跳过审批）
@@ -274,6 +276,10 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 
 | 命令 | 作用 |
 |---|---|
+| `/paste-image` | 从系统剪贴板读取图片，附加到下一条消息 |
+| `/image <路径> [-- 提示词]` | 从本地路径附加图片；提供提示词时立即发送 |
+| `/attachments` / `/attachments clear` | 查看或清空待发送图片 |
+| `/attachments clear-session` | 经审批清理当前 Session 的全部历史图片和磁盘附件，保留文本对话 |
 | `/version` | 显示当前运行的 AgentLab 版本 |
 | `/reset` | 清空当前会话的消息和任务 |
 | `/resume [目标]` | 继续上一轮未完成的任务（失败任务重置为 pending） |
@@ -296,6 +302,84 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 | `exit` / `quit` / Ctrl-D | 退出 |
 
 不同 session 的消息历史、任务清单互相隔离，切换时不串。
+
+### 图片输入
+
+支持 PNG、JPEG、WEBP 和 GIF，单张最大 5MB、最大 2500 万像素。当前
+`cloud_claude`、`cloud_claude_opus` 和已实测的 `crs_gpt` profile 声明了
+`vision` 能力；`gpt_official` 默认模型是非视觉的 `gpt-3.5-turbo`，切换到
+视觉模型后需在 profile capabilities 中显式加入 `vision`。其他 profile 发送图片
+时会明确拒绝，避免图片被静默丢弃。
+
+```text
+# 直接在聊天输入框复制图片后按 Ctrl+V 或 Shift+Insert
+# 输入框会出现 [AgentLab:image:...] 占位符，再输入问题并回车
+# 注意：部分终端会拦截 Ctrl+V；此时必须使用 Shift+Insert 或 /paste-image
+
+/image
+# 裸 /image 只显示帮助，不会发送消息
+
+/paste-image
+请分析剪贴板里的报错截图
+
+/image ./screenshots/error.png -- 分析错误原因并给出修复步骤
+
+/image ./screenshots/a.png
+/attachments
+请比较刚才附加的图片
+```
+
+图片会复制到 `data/attachments/<session_id>/`，SQLite 仅保存路径、MIME、尺寸和
+SHA-256 引用，不保存大段 base64。发送给云端模型前才读取编码；这意味着图片内容
+会离开本机，请勿发送密钥、身份证件或其他敏感图片。读取 workspace 外的图片仍需
+逐次审批。若终端拦截 Ctrl+V，可使用 Shift+Insert 或 `/paste-image`；终端本身
+通常不会把图片二进制像普通文本一样直接传给应用，因此 `/paste-image` 是最稳定的
+跨终端方式。`/image` 裸命令只显示帮助，`/image <路径>` 只加入待发送队列，只有
+显式写 `/image <路径> -- <提示词>` 才会立即发送。
+
+#### 清理图片
+
+只清理当前 CLI 中尚未发送的待发送图片，不删除磁盘文件：
+
+```text
+/attachments clear
+```
+
+清理当前 Session 中已经发送/上传的所有图片，同时移除历史消息中的图片引用并
+删除 `data/attachments/<session_id>/`，但 **不会删除 Session 本身**，也会保留
+文字对话、Assistant 回复、任务、统计和其他历史数据：
+
+```text
+/attachments clear-session
+```
+
+该操作会先显示审批确认；Session 正在执行 run 时会拒绝清理，需先停止当前任务。
+如果一条消息同时包含文字和图片，只移除图片、保留文字；如果一条消息只有图片，
+清理后该空消息会被移除。清理完成后 Session ID 保持不变，仍可继续对话，且恢复
+该 Session 时不会再尝试读取已经删除的图片。
+
+彻底删除某个 Session 时，会同步清理该 Session 的消息和附件目录：
+
+```text
+/session delete <session_id>
+```
+
+清理本机所有 Session 的已上传/粘贴图片时，请先退出 AgentLab，再执行：
+
+```bash
+# macOS / Linux
+rm -rf data/attachments
+```
+
+```powershell
+# Windows PowerShell
+Remove-Item -Recurse -Force .\data\attachments
+```
+
+`data/attachments/` 会在下次附加图片时自动创建。直接删除全部附件不会删除
+SQLite 中的历史消息；旧消息仍保留图片路径引用，恢复该会话并再次发送上下文时
+可能提示图片文件不存在。如果旧会话也不再需要，优先使用 `/session delete` 逐个
+删除，使消息和附件一起清理。
 
 **使用提示**：
 - 所有斜杠命令支持 Tab 自动补全；`/model switch` 会补全 `config/models.yaml` 里的 profile 名
