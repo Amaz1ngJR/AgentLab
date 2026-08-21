@@ -23,7 +23,7 @@ config/control.yaml
 .playwright-mcp/
 
 # Browser profiles (contain login cookies/session — must never be committed)
-data/browser-profiles/
+data/
 
 # SQLite database (sessions/messages/memories/audit)
 data/agentlab.db

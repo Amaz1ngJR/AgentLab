@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 from app.config.schemas import LLMConfig
 from app.attachments import image_block_to_data_url
+from app.models.token_progress import StreamingTokenProgress
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -192,17 +193,12 @@ class OpenAICompatibleAdapter:
         if getattr(self._cfg, "enable_thinking", False):
             params["extra_body"] = {"enable_thinking": True}
 
-        # 输入 token 估算（在真值到达前用），约 3 字符一个 token
-        in_tokens_est = max(1, sum(len(str(m.get("content", ""))) for m in all_messages) // 3)
-        in_tokens = in_tokens_est
+        # Chat Completions 兼容端点也通常只在最后一个 usage chunk 返回输入真值。
+        # 开始阶段不展示字符估算，避免用户误以为已经精确消耗固定 token。
+        in_tokens = 0
         out_tokens = 0
-        out_chars = 0
-
-        def emit_progress() -> None:
-            if on_progress:
-                on_progress({"input_tokens": in_tokens, "output_tokens": out_tokens})
-
-        emit_progress()
+        progress = StreamingTokenProgress(on_progress, in_tokens)
+        progress.emit(force=True)
 
         text_parts: list[str] = []
         reasoning_parts: list[str] = []  # 深度思考模型的推理过程(reasoning_content)
@@ -231,16 +227,13 @@ class OpenAICompatibleAdapter:
                         reasoning_parts.append(reasoning_chunk)
                         if on_thinking_delta:
                             on_thinking_delta(reasoning_chunk)
+                        progress.add_reasoning(reasoning_chunk)
                     if getattr(delta, "content", None):
                         chunk_text = delta.content
                         text_parts.append(chunk_text)
                         if on_text_delta:
                             on_text_delta(chunk_text)
-                        out_chars += len(chunk_text)
-                        est = max(out_tokens, out_chars // 3)
-                        if est != out_tokens:
-                            out_tokens = est
-                            emit_progress()
+                        progress.add_text(chunk_text)
                     if getattr(delta, "tool_calls", None):
                         for tc in delta.tool_calls:
                             idx = getattr(tc, "index", 0) or 0
@@ -262,7 +255,12 @@ class OpenAICompatibleAdapter:
                     in_tokens = p
                 if c is not None:
                     out_tokens = c
-                emit_progress()
+                progress.set_usage(
+                    input_tokens=in_tokens,
+                    output_tokens=out_tokens,
+                    force=True,
+                    final=True,
+                )
 
         text = "".join(text_parts)
 

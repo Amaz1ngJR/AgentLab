@@ -32,7 +32,33 @@ def test_foreground_stdin_pauses_and_resumes():
         clear_background_reader(r)
 
 
-def test_foreground_stdin_resumes_on_exception():
+def test_foreground_stdin_is_reentrant():
+    """菜单和修改建议输入框嵌套占用 stdin 时只暂停/恢复一次。"""
+    r = _FakeReader()
+    set_background_reader(r)
+    try:
+        with foreground_stdin():
+            with foreground_stdin():
+                assert r.paused == 1
+                assert r.resumed == 0
+            assert r.resumed == 0
+        assert r.resumed == 1
+    finally:
+        clear_background_reader(r)
+
+
+def test_reader_registered_during_foreground_scope_is_paused():
+    """前台已占用时新注册 EscWatcher，也不能开始抢 stdin。"""
+    r = _FakeReader()
+    try:
+        with foreground_stdin():
+            set_background_reader(r)
+            assert r.paused == 1
+        assert r.resumed == 1
+    finally:
+        clear_background_reader(r)
+
+
     """前台代码抛异常时,reader 仍被恢复(finally 保证)。"""
     r = _FakeReader()
     set_background_reader(r)

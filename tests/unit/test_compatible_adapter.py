@@ -256,7 +256,29 @@ def _stream_thinking(reasoning: str, answer: str, prompt_tokens=12, completion_t
     return iter(chunks)
 
 
-def test_thinking_stream_separates_reasoning_from_answer():
+def test_thinking_stream_updates_live_token_progress():
+    """只有 reasoning_content、尚无正文时，实时 output token 也必须增长。"""
+    progress = []
+    with patch("openai.OpenAI") as MockOpenAI:
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = iter([
+            _chunk(reasoning="思考第一步"),
+            _chunk(reasoning="思考第二步"),
+            _chunk(content="答案"),
+            _chunk(usage=(50, 12)),
+        ])
+        OpenAICompatibleAdapter(_cfg(enable_thinking=True)).create_message(
+            messages=[{"role": "user", "content": "问题"}],
+            on_progress=progress.append,
+        )
+    live_values = [entry["output_tokens"] for entry in progress[:-1]]
+    assert len(set(live_values)) >= 3
+    assert progress[-1] == {
+        "input_tokens": 50, "output_tokens": 12, "final": True,
+    }
+
+
     """enable_thinking 时:reasoning_content 走 on_thinking_delta + resp.reasoning,
     正式答案走 on_text_delta + resp.text,两者不串味,且推理不进对话历史。"""
     thinking_chunks: list[str] = []

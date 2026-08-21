@@ -25,15 +25,19 @@ class _PausableReader(Protocol):
     def resume(self) -> None: ...
 
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _reader: Optional[_PausableReader] = None
+_foreground_depth = 0
 
 
 def set_background_reader(obj: _PausableReader) -> None:
-    """注册当前后台 stdin reader(需实现 pause()/resume())。"""
+    """注册当前后台 stdin reader；前台已占用时立即保持暂停。"""
     global _reader
     with _lock:
         _reader = obj
+        should_pause = _foreground_depth > 0
+    if should_pause:
+        obj.pause()
 
 
 def clear_background_reader(obj: _PausableReader) -> None:
@@ -46,19 +50,20 @@ def clear_background_reader(obj: _PausableReader) -> None:
 
 @contextmanager
 def foreground_stdin():
-    """前台独占 stdin 期间暂停后台 reader;无 reader 时为空操作。
-
-    用法:
-        with foreground_stdin():
-            app.run()   # prompt_toolkit 菜单独占 stdin,Esc 监听线程不抢字节
-    """
+    """可重入地独占 stdin；最外层进入/退出时才 pause/resume 后台 reader。"""
+    global _foreground_depth
     with _lock:
+        _foreground_depth += 1
         obj = _reader
-    if obj is None:
-        yield
-        return
-    obj.pause()
+        should_pause = _foreground_depth == 1 and obj is not None
+    if should_pause:
+        obj.pause()
     try:
         yield
     finally:
-        obj.resume()
+        with _lock:
+            _foreground_depth = max(0, _foreground_depth - 1)
+            current = _reader
+            should_resume = _foreground_depth == 0 and current is not None
+        if should_resume:
+            current.resume()

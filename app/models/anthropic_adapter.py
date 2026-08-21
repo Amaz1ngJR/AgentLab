@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from app.config.schemas import LLMConfig
 from app.attachments import materialize_image_block
+from app.models.token_progress import StreamingTokenProgress
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -128,11 +129,8 @@ class AnthropicAdapter:
 
         in_tokens = 0
         out_tokens = 0
-        out_chars = 0  # 字符累计，用于在代理只在末尾返回 usage 时估算 token
-
-        def emit_progress() -> None:
-            if on_progress:
-                on_progress({"input_tokens": in_tokens, "output_tokens": out_tokens})
+        progress = StreamingTokenProgress(on_progress)
+        progress.emit(force=True)
 
         with self._client.messages.stream(**params) as stream:
             for event in stream:
@@ -142,7 +140,11 @@ class AnthropicAdapter:
                     if usage:
                         in_tokens = getattr(usage, "input_tokens", 0) or 0
                         out_tokens = getattr(usage, "output_tokens", 0) or 0
-                    emit_progress()
+                    progress.set_usage(
+                        input_tokens=in_tokens,
+                        output_tokens=out_tokens,
+                        force=True,
+                    )
                 elif etype == "content_block_delta":
                     delta = getattr(event, "delta", None)
                     if delta is not None and getattr(delta, "type", None) == "text_delta":
@@ -150,18 +152,14 @@ class AnthropicAdapter:
                         if text_chunk:
                             if on_text_delta:
                                 on_text_delta(text_chunk)
-                            out_chars += len(text_chunk)
-                            est = max(out_tokens, out_chars // 3)
-                            if est != out_tokens:
-                                out_tokens = est
-                                emit_progress()
+                            progress.add_text(text_chunk)
                 elif etype == "message_delta":
                     usage = getattr(event, "usage", None)
                     if usage:
                         v = getattr(usage, "output_tokens", None)
-                        if v is not None and v > out_tokens:
+                        if v is not None:
                             out_tokens = v
-                            emit_progress()
+                            progress.set_usage(output_tokens=v)
 
             message = stream.get_final_message()
 
@@ -197,7 +195,12 @@ class AnthropicAdapter:
 
         # 用最终 usage 再发一次进度，确保 spinner 显示的数字与 [stats] 一致
         if on_progress:
-            on_progress(dict(usage))
+            progress.set_usage(
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+                force=True,
+                final=True,
+            )
 
         # provider_payload 是 list[dict],由 Runtime 调 messages.extend(...) 追加。
         # Anthropic 要求把这一轮所有 content block(text + tool_use)合在

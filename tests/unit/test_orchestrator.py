@@ -145,7 +145,24 @@ def test_planner_parses_json_plan():
     assert plan.tasks[1].dependencies == ["t1"]
 
 
-def test_planner_falls_back_to_single_task_on_garbage():
+def test_planner_does_not_receive_full_execution_system():
+    """Orchestrator 不应把 Skills/MCP/记忆组成的执行 prompt 重复塞给 Planner。"""
+    router = FakeRouter([
+        _plan_json({"id": "t1", "content": "完成", "dependencies": []}),
+        _resp_text("完成"),
+    ])
+    huge_execution_system = "SKILL-WORKFLOW " * 1000
+    orch = Orchestrator(
+        router,
+        _registry(_echo_tool()),
+        system=huge_execution_system,
+    )
+    orch.run("简单目标")
+    planning_prompt = router.calls[0][0]["content"]
+    assert planning_prompt == "简单目标"
+    assert "SKILL-WORKFLOW" not in planning_prompt
+
+
     router = FakeRouter([_resp_text("这不是 JSON,只是闲聊")])
     plan = Planner(router).create_plan("做点什么")
     assert len(plan.tasks) == 1

@@ -81,6 +81,23 @@ def _delta_event(text: str) -> MagicMock:
     return ev
 
 
+def _reasoning_delta_event(text: str, *, summary: bool = False) -> MagicMock:
+    ev = MagicMock()
+    ev.type = (
+        "response.reasoning_summary_text.delta"
+        if summary else "response.reasoning_text.delta"
+    )
+    ev.delta = text
+    return ev
+
+
+def _function_args_delta_event(text: str) -> MagicMock:
+    ev = MagicMock()
+    ev.type = "response.function_call_arguments.delta"
+    ev.delta = text
+    return ev
+
+
 class _FakeStream:
     """模拟 client.responses.stream() 返回的上下文管理器。
 
@@ -267,6 +284,7 @@ def test_streaming_progress_callback():
             on_progress=progress_log.append,
         )
 
+    assert progress_log[0] == {"input_tokens": 0, "output_tokens": 0}
     assert len(progress_log) >= 2
     # 最终值应该是真实 usage,不是估算
     final_progress = progress_log[-1]
@@ -274,7 +292,33 @@ def test_streaming_progress_callback():
     assert final_progress["output_tokens"] == 4
 
 
-def test_base_params_repairs_missing_and_orphan_tool_outputs():
+def test_streaming_progress_includes_reasoning_and_tool_arguments():
+    """长时间 reasoning/tool-call 阶段也应持续增长，而不是固定在输入 token。"""
+    final = _build_final([_message_item("ok")], in_tokens=30, out_tokens=20)
+    stream = _FakeStream(events=[
+        _reasoning_delta_event("推理第一段"),
+        _reasoning_delta_event("推理第二段", summary=True),
+        _function_args_delta_event('{"path":"README.md"}'),
+    ], final=final)
+    progress_log = []
+    thinking = []
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MagicMock()
+        MockOpenAI.return_value = client
+        client.responses.stream.return_value = stream
+        OpenAIAdapter(_cfg()).create_message(
+            messages=[{"role": "user", "content": "分析"}],
+            on_progress=progress_log.append,
+            on_thinking_delta=thinking.append,
+        )
+    live_values = [entry["output_tokens"] for entry in progress_log[:-1]]
+    assert len(set(live_values)) >= 3
+    assert "".join(thinking) == "推理第一段推理第二段"
+    assert progress_log[-1] == {
+        "input_tokens": 30, "output_tokens": 20, "final": True,
+    }
+
+
     messages = [
         {"type": "function_call", "call_id": "call_missing", "name": "read_file",
          "arguments": "{}"},

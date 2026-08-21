@@ -48,6 +48,37 @@ def test_interactive_cancel_treated_as_no():
         assert InteractivePolicy().request("write_file", {}) is False
 
 
+def test_modify_keeps_foreground_stdin_across_menu_and_prompt():
+    """修改建议必须在同一次 stdin 独占中完成，避免 EscWatcher 抢走首个按键。"""
+    policy = InteractivePolicy()
+    depths = []
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_foreground():
+        depths.append("enter")
+        try:
+            yield
+        finally:
+            depths.append("exit")
+
+    with patch("app.util.input_arbiter.foreground_stdin", fake_foreground), \
+         patch("app.util.menu.select_menu", return_value="modify"), \
+         patch("app.util.menu.prompt_text", return_value="请改用另一个文件"):
+        result = policy.request_tool(
+            ToolDescriptor(
+                name="write_file", description="write",
+                input_schema={"type": "object", "properties": {}},
+                executor=lambda _: "ok", risk="write",
+            ),
+            "write_file",
+            {"path": "x"},
+        )
+    assert result.approved is False
+    assert result.feedback == "请改用另一个文件"
+    # Broker 外层会负责整个 resolver 生命周期；Policy 本身仍能正确传回建议。
+    assert depths == []
 def test_interactive_header_includes_tool_context():
     """传给 menu 的 header_lines 必须包含工具名与参数,方便用户判断。"""
     captured = {}

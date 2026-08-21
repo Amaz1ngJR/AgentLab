@@ -184,8 +184,14 @@ class Orchestrator:
             cancel.raise_if_cancelled()
             with self._progress("planning") as handle:
                 on_progress = getattr(handle, "update", None)
-                plan = self._planner.create_plan(goal, context=self._system,
-                                                 on_progress=on_progress)
+                plan = self._planner.create_plan(
+                    goal,
+                    # Planner 已有独立、严格的 PLANNER_SYSTEM。把完整执行 system
+                    # （含 Skills/MCP/记忆，实测可多出数千 token）再塞进 user prompt
+                    # 会重复上下文，导致 planning 一开始就显示 3.9k 输入 token。
+                    context="",
+                    on_progress=on_progress,
+                )
         except Cancelled:
             self.last_run_status = "cancelled"
             self._emit(RunEvent(kind=events.RUN_FAILED, text="已取消(规划阶段)"))

@@ -24,6 +24,7 @@ from typing import Any, Optional
 
 from app.config.schemas import LLMConfig
 from app.attachments import image_block_to_data_url
+from app.models.token_progress import StreamingTokenProgress
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -149,33 +150,49 @@ class OpenAIAdapter:
             params["tools"] = [_to_responses_tool(t) for t in tools]
 
         # ── 流式累积状态 ────────────────────────────────────────────────────
-        # 输入 token 估算(在真实值到达前用,约 3 字符 / token)
-        in_tokens_est = max(1, _estimate_input_tokens(messages, system))
-        in_tokens = in_tokens_est
+        # 输入 token 只能在服务端 usage 到达时确定。Responses API 通常只在
+        # response.completed 返回真值；在此之前显示 0，避免把粗略字符估算误标成
+        # 已消费 token（例如 planning 一上来固定显示 3.9k）。
+        in_tokens = 0
         out_tokens = 0
-        out_chars = 0  # 用于估算 output_tokens
+        progress = StreamingTokenProgress(on_progress, in_tokens)
+        progress.emit(force=True)
 
-        def emit_progress() -> None:
-            if on_progress:
-                on_progress({"input_tokens": in_tokens, "output_tokens": out_tokens})
-
-        emit_progress()
-
-        # 流式事件中只处理文本增量(让 spinner 实时刷新);工具调用结果与最终
-        # provider_payload 等待 get_final_response() 一次性拿全,避免分片重组的复杂度
+        # 流式事件中累计正文、reasoning summary 和 function arguments。厂商通常只在
+        #结束时返回真实 usage，期间用增量估算让 spinner 持续变化。
         with self._client.responses.stream(**params) as stream:
             for event in stream:
                 etype = getattr(event, "type", None)
+                delta_text = getattr(event, "delta", "") or ""
+                response = getattr(event, "response", None)
+                event_usage = getattr(response, "usage", None) if response is not None else None
+                if event_usage is not None:
+                    event_input = getattr(event_usage, "input_tokens", None)
+                    event_output = getattr(event_usage, "output_tokens", None)
+                    if event_input is not None:
+                        in_tokens = event_input
+                    progress.set_usage(
+                        input_tokens=event_input,
+                        output_tokens=event_output,
+                    )
                 if etype == "response.output_text.delta":
-                    delta_text = getattr(event, "delta", "") or ""
                     if delta_text:
                         if on_text_delta:
                             on_text_delta(delta_text)
-                        out_chars += len(delta_text)
-                        est = max(out_tokens, out_chars // 3)
-                        if est != out_tokens:
-                            out_tokens = est
-                            emit_progress()
+                        progress.add_text(delta_text)
+                elif etype in {
+                    "response.reasoning_text.delta",
+                    "response.reasoning_summary_text.delta",
+                }:
+                    if delta_text:
+                        if on_thinking_delta:
+                            on_thinking_delta(delta_text)
+                        progress.add_reasoning(delta_text)
+                elif etype in {
+                    "response.function_call_arguments.delta",
+                    "response.custom_tool_call_input.delta",
+                }:
+                    progress.add_text(delta_text)
 
             final = stream.get_final_response()
 
@@ -211,8 +228,17 @@ class OpenAIAdapter:
         usage_obj = getattr(final, "usage", None)
         if usage_obj is not None:
             in_tokens = getattr(usage_obj, "input_tokens", in_tokens) or in_tokens
-            out_tokens = getattr(usage_obj, "output_tokens", out_tokens) or out_tokens
-            emit_progress()
+            out_tokens = getattr(usage_obj, "output_tokens", progress.output_tokens)
+            if out_tokens is None:
+                out_tokens = progress.output_tokens
+            progress.set_usage(
+                input_tokens=in_tokens,
+                output_tokens=out_tokens,
+                force=True,
+                final=True,
+            )
+        else:
+            out_tokens = progress.output_tokens
 
         return ModelResponse(
             text="".join(text_parts),

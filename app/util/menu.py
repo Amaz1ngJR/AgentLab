@@ -205,6 +205,8 @@ def prompt_text(message: str) -> Optional[str]:
 
     try:
         from app.util.input_arbiter import foreground_stdin
+        # prompt_text 可能紧跟在 select_menu 后、且外层 Broker 已经持有前台锁；
+        # foreground_stdin 可重入，整个“菜单→修改建议”流程不会让 EscWatcher 抢 stdin。
         with foreground_stdin():
             result = pt_prompt(
                 message + " ",

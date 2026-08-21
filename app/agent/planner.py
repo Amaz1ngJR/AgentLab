@@ -110,8 +110,9 @@ class Planner:
     def create_plan(self, goal: str, context: str = "", *, on_progress=None) -> TaskPlan:
         """生成初始计划。context 可放 workspace、已知约束等补充信息。
 
-        on_progress 是可选的 token 进度回调(签名同 create_message 的 on_progress),
-        让 CLI spinner 在规划阶段也能实时刷新计数。
+        on_progress 是可选的 token 进度回调。Planner 使用自己精简的
+        PLANNER_SYSTEM；context 只接受真正的规划约束，不应传入完整执行 system
+        （Skills/MCP/记忆会重复并显著增加 planning 输入 token）。
         """
         self.last_usage = {"input_tokens": 0, "output_tokens": 0}
         prompt = goal if not context else f"{context}\n\n目标:{goal}"

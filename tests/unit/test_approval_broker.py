@@ -2,6 +2,7 @@
 import asyncio
 import threading
 import time
+from unittest.mock import patch
 
 from app.agent.approval import ApprovalResult
 from app.agent.approval_broker import ApprovalBroker, BrokerApprovalPolicy
@@ -72,7 +73,32 @@ def test_close_wakes_all_waiters():
     assert result_box[0].cancelled is True
 
 
-def test_fallback_policy_keeps_cli_synchronous_behavior():
+def test_broker_keeps_foreground_stdin_for_full_resolver():
+    from contextlib import contextmanager
+
+    broker = ApprovalBroker(default_timeout=1)
+    calls = []
+
+    @contextmanager
+    def fake_foreground():
+        calls.append("enter")
+        try:
+            yield
+        finally:
+            calls.append("exit")
+
+    def resolver():
+        calls.append("menu")
+        calls.append("prompt")
+        return ApprovalResult(False, feedback="修改")
+
+    with patch("app.util.input_arbiter.foreground_stdin", fake_foreground):
+        result = broker.request("write_file", {}, resolver=resolver)
+
+    assert result.feedback == "修改"
+    assert calls == ["enter", "menu", "prompt", "exit"]
+
+
     class Fallback:
         def request(self, action, args):
             return action == "write_file" and args["path"] == "x"

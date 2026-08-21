@@ -110,16 +110,26 @@ def _count_visual_lines(text: str, term_width: int) -> int:
 
 
 def _fmt_duration(seconds: float) -> str:
+    """紧凑显示耗时：秒、分秒或时分秒。"""
     if seconds < 60:
         return f"{seconds:.1f}s"
-    m, s = divmod(int(seconds), 60)
-    return f"{m}m {s}s"
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    return f"{minutes}m {secs}s"
 
 
 def _fmt_tokens(n: int) -> str:
-    if n < 1000:
-        return f"{n} tokens"
-    return f"{n / 1000:.1f}k tokens"
+    """紧凑显示 token；保留足够精度，避免大数刷屏。"""
+    if n < 1_000:
+        return f"{n}"
+    if n < 1_000_000:
+        value = n / 1_000
+        return f"{value:.1f}k" if value < 100 else f"{value:.0f}k"
+    value = n / 1_000_000
+    return f"{value:.2f}m" if value < 100 else f"{value:.1f}m"
 
 
 # 任务列表渲染用的 ANSI 颜色 / 字符
@@ -315,9 +325,18 @@ class _Spinner:
 
     def update(self, metrics: dict[str, int]) -> None:
         with self._lock:
+            # 单个模型调用内 progress 应单调；若 Provider 在 final usage 给出更精确
+            # 的较小值，仍允许 final 覆盖。是否 final 由显式字段标记。
+            final = bool(metrics.get("final", False))
+            incoming_in = int(metrics.get("input_tokens", 0) or 0)
+            incoming_out = int(metrics.get("output_tokens", 0) or 0)
             self._metrics = {
-                "input_tokens": int(metrics.get("input_tokens", 0) or 0),
-                "output_tokens": int(metrics.get("output_tokens", 0) or 0),
+                "input_tokens": incoming_in if final else max(
+                    self._metrics["input_tokens"], incoming_in,
+                ),
+                "output_tokens": incoming_out if final else max(
+                    self._metrics["output_tokens"], incoming_out,
+                ),
             }
             self._render()
 
@@ -377,11 +396,16 @@ class _Spinner:
         elapsed = time.monotonic() - self._t0
         out_t = self._metrics["output_tokens"]
         in_t = self._metrics["input_tokens"]
+        if out_t > 0 and in_t > 0:
+            return (
+                f"{_fmt_duration(elapsed)} · in {_fmt_tokens(in_t)} tokens"
+                f" · out {_fmt_tokens(out_t)} tokens"
+            )
         if out_t > 0:
-            return f"{_fmt_duration(elapsed)} · ↓ {_fmt_tokens(out_t)}"
+            return f"{_fmt_duration(elapsed)} · out ~{_fmt_tokens(out_t)} tokens"
         if in_t > 0:
-            return f"{_fmt_duration(elapsed)} · ↑ {_fmt_tokens(in_t)}"
-        return _fmt_duration(elapsed)
+            return f"{_fmt_duration(elapsed)} · in {_fmt_tokens(in_t)} tokens · out 等待中"
+        return f"{_fmt_duration(elapsed)} · token 等待中"
 
     def _task_lines(self) -> list[str]:
         """从 task_store 取最新快照,渲染成行列表。store=None 或空时返回 []。"""
@@ -492,7 +516,7 @@ class _PlainProgress:
     def __exit__(self, *_) -> None:
         elapsed = time.monotonic() - self._t0
         out_t = self._metrics["output_tokens"]
-        suffix = f" · ↓ {_fmt_tokens(out_t)}" if out_t else ""
+        suffix = f" · out {_fmt_tokens(out_t)} tokens" if out_t else ""
         if self._text_started or self._thinking_started:
             sys.stdout.write("\n\n")
             sys.stdout.flush()
@@ -1473,10 +1497,10 @@ def _normalize_model_id(name: str | None) -> str:
 def _print_stats(session: AgentSession) -> None:
     t, c = session.last_turn_usage, session.cumulative_usage
     print(
-        f"  [stats] turn {session.last_turn_seconds:.1f}s "
-        f"in={t['input_tokens']} out={t['output_tokens']} | "
-        f"session {session.cumulative_seconds:.1f}s "
-        f"in={c['input_tokens']} out={c['output_tokens']}",
+        f"  [stats] turn {_fmt_duration(session.last_turn_seconds)} "
+        f"in={_fmt_tokens(t['input_tokens'])} out={_fmt_tokens(t['output_tokens'])} | "
+        f"session {_fmt_duration(session.cumulative_seconds)} "
+        f"in={_fmt_tokens(c['input_tokens'])} out={_fmt_tokens(c['output_tokens'])}",
         flush=True,
     )
     # 服务器实际返回的模型 ID 与请求模型不一致时给警告。

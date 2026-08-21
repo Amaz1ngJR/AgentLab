@@ -125,9 +125,14 @@ class ApprovalBroker:
             except Exception:
                 pass
 
+        # Resolver 的整个生命周期（菜单 + 修改建议输入框）必须一次性占有 stdin。
+        # 过去 select_menu 退出后会短暂 resume EscWatcher，随后 prompt_text 再次
+        # pause；竞态窗口里后台线程可能抢走第一个按键，表现为输入框不出现/继续执行。
         if resolver is not None:
             try:
-                resolved = resolver()
+                from app.util.input_arbiter import foreground_stdin
+                with foreground_stdin():
+                    resolved = resolver()
                 result = (
                     resolved
                     if isinstance(resolved, ApprovalResult)

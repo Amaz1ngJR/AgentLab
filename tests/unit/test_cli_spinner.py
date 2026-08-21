@@ -198,7 +198,36 @@ def _drive_spinner_text(deltas, monkeypatch) -> str:
     return term.screen()
 
 
-def test_streamed_text_is_append_only_no_duplication(monkeypatch):
+def test_spinner_status_distinguishes_unknown_input_and_live_output(monkeypatch):
+    import app.cli as cli
+
+    sink = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", sink)
+    spinner = _Spinner("planning")
+    spinner._t0 = 0.0
+    assert "token 等待中" in spinner._fmt_status()
+    spinner.update({"input_tokens": 0, "output_tokens": 9})
+    assert "out ~9 tokens" in spinner._fmt_status()
+    spinner.update({"input_tokens": 3900, "output_tokens": 12, "final": True})
+    status = spinner._fmt_status()
+    assert "in 3.9k tokens" in status
+    assert "out 12 tokens" in status
+
+
+    """迟到的中间 usage 不能让实时 token 倒退；final 可用真值校准。"""
+    import app.cli as cli
+
+    sink = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", sink)
+    spinner = _Spinner("thinking")
+    spinner._t0 = 0.0
+    spinner.update({"input_tokens": 100, "output_tokens": 8})
+    spinner.update({"input_tokens": 100, "output_tokens": 3})
+    assert spinner._metrics["output_tokens"] == 8
+    spinner.update({"input_tokens": 120, "output_tokens": 5, "final": True})
+    assert spinner._metrics == {"input_tokens": 120, "output_tokens": 5}
+
+
     """逐字流式一段超长多行文本:每行只出现一次,不因重绘叠成瀑布。
 
     这是 _erase_footer 有界擦除的回归点 —— footer 与未换行尾行靠 \\033[J 真正
