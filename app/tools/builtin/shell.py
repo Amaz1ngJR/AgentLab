@@ -7,7 +7,8 @@
   - requires_approval=True,每次执行前用户必须显式同意(默认行为;-y 模式跳过)
   - cwd 默认是 workspace;指定外部 cwd 时使用独立的越界审批
   - timeout 默认 30s,超时后子进程被杀掉
-  - 输出截断到 8KB,避免巨型日志撑爆模型上下文
+  - 输出先经过 AgentLab 内置 RTK 风格过滤器（无需外部二进制），失败时回退原文
+  - 最终仍截断到 8KB，避免巨型日志撑爆模型上下文
 
 跨平台说明:
   - Unix(macOS / Linux): 用 ["bash", "-c", command],利用 shell 解析管道、
@@ -31,6 +32,7 @@ from app.tools.builtin.files import (
     _resolve_within_workspace,
 )
 from app.tools.registry import Tool
+from app.tools.rtk_builtin import BuiltinRTK
 
 # 单次输出上限:8KB。超出截断并附说明,避免让模型上下文吞下兆级 log。
 MAX_OUTPUT_BYTES = 8_000
@@ -54,7 +56,7 @@ def _build_argv(command: str) -> list[str]:
 
 
 def _run_shell(args: dict) -> str:
-    """执行命令,返回合并后的 stdout / stderr / exit code 文本。"""
+    """执行命令，并使用 AgentLab 内置 RTK 风格过滤器压缩输出。"""
     command = args.get("command", "")
     if not command:
         return "refused: empty command"
@@ -95,15 +97,26 @@ def _run_shell(args: dict) -> str:
         # 没装 bash / powershell 时
         return f"shell not found: {exc}"
 
-    # ── 拼装输出 ─────────────────────────────────────────────────────────────
-    # 顺序: stdout 主体 → [stderr] 标记 + stderr 内容 → exit code
-    # 模型看到这种结构能立刻判断"是否成功 + 错误原因"
+    # ── 内置 RTK 输出过滤 ────────────────────────────────────────────────────
+    # 命令仍由 AgentLab 原样执行：审批、cwd、timeout 与退出码完全不变。RTK 仅在
+    # 执行完成后处理输出；过滤失败或收益不足时会返回原始 stdout/stderr。
+    compression = BuiltinRTK().compress(
+        command,
+        proc.stdout or "",
+        proc.stderr or "",
+        proc.returncode,
+    )
+    body = compression.output
+
     parts: list[str] = []
-    if proc.stdout:
-        parts.append(proc.stdout.rstrip())
-    if proc.stderr:
-        parts.append("[stderr]")
-        parts.append(proc.stderr.rstrip())
+    if body:
+        parts.append(body.rstrip())
+    if compression.applied:
+        parts.append(
+            f"[rtk: {compression.category}, "
+            f"{compression.original_bytes}->{compression.output_bytes} bytes, "
+            f"-{compression.savings_percent:.0f}%]"
+        )
     parts.append(f"[exit code: {proc.returncode}]")
 
     output = "\n".join(parts)
@@ -121,7 +134,8 @@ SHELL = Tool(
     description=(
         "执行 shell 命令(macOS/Linux 用 bash,Windows 用 PowerShell)。"
         "cwd 默认是 workspace;外部 cwd 需要独立审批。"
-        "返回 stdout / stderr / exit code。超过 8KB 的输出会被截断。"
+        "超过 8KB 的输出会被截断。常见开发命令会先经内置 RTK 风格过滤器压缩，"
+        "无需安装外部 rtk；过滤失败或收益不足时自动返回原始输出。"
         "默认超时 30 秒,可通过 timeout 字段指定更长(单位秒)。"
         "适用:跑测试、看 git 状态、构建项目、列文件等。"
     ),

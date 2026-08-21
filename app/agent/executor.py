@@ -312,13 +312,16 @@ class Executor:
                         self._emit(RunEvent(kind=events.TOOL_DENIED, task_id=task.id,
                                             tool_name=call.name))
 
-                        # 如果用户按 ESC 明确取消，立即中断
+                        # 修改建议和 Esc 都意味着“停止当前 turn，回到主输入框”。先补齐
+                        # tool_result 配对，避免历史损坏，再用协作式 Cancelled 收尾。
                         if approval_result.cancelled:
                             tool_results.append(ToolResult(
                                 tool_call_id=call.id, output=output, is_error=False,
                             ))
                             resulted_ids.add(call.id)
                             _flush_pending_tool_results()
+                            if approval_result.feedback:
+                                raise Cancelled(approval_result.feedback)
                             raise KeyboardInterrupt("用户取消操作")
                     else:
                         t0 = time.monotonic()

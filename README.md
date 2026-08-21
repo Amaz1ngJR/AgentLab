@@ -276,6 +276,7 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 
 | 命令 | 作用 |
 |---|---|
+| `/rtk` | 查看 AgentLab 内置 RTK Shell 输出压缩状态 |
 | `/paste-image` | 从系统剪贴板读取图片，附加到下一条消息 |
 | `/image <路径> [-- 提示词]` | 从本地路径附加图片；提供提示词时立即发送 |
 | `/attachments` / `/attachments clear` | 查看或清空待发送图片 |
@@ -384,6 +385,46 @@ SQLite 中的历史消息；旧消息仍保留图片路径引用，恢复该会�
 **使用提示**：
 - 所有斜杠命令支持 Tab 自动补全；`/model switch` 会补全 `config/models.yaml` 里的 profile 名
 - `/model switch` 只改后续新建 session 的模型，当前会话不受影响；切完接 `/session new` 生效，或重启 `agentlab` 全局切换
+
+## 内置 RTK Shell 输出压缩
+
+AgentLab 内置了受 [RTK（Rust Token Killer）](https://github.com/rtk-ai/rtk)
+启发的 Python 输出压缩引擎，**无需另外安装 `rtk`、Rust、Hook 或二进制文件**。
+它在 `shell` 命令执行完成后压缩输出，原始命令、审批、cwd、timeout 和退出码仍由
+AgentLab 控制。过滤器异常、命令不支持或节省不足时会自动返回原始输出。
+
+默认支持的类别包括：
+
+- `git status`、`git diff`、`git log`
+- `pytest`、Cargo/Node/Go 测试
+- `rg` / `grep`
+- `ls` / `tree` / `find` 和长文件读取
+- Ruff、Mypy、ESLint、TSC 等诊断输出
+- Docker、Kubectl、OpenShift 表格输出
+
+查看运行状态：
+
+```text
+/rtk
+```
+
+配置 `.env`：
+
+```env
+AGENTLAB_RTK_ENABLED=true
+AGENTLAB_RTK_ULTRA_COMPACT=false
+```
+
+压缩后的 shell 结果会附带一行元数据，例如：
+
+```text
+[rtk: pytest, 32000->1200 bytes, -96%]
+[exit code: 0]
+```
+
+需要完整原始输出时，可把 `AGENTLAB_RTK_ENABLED=false` 后重启 AgentLab；也可以
+改用更精确的命令缩小输出。该功能是 AgentLab 面向自身工具、审批和审计架构实现的
+独立 Python 适配版本。
 
 ## 多 Agent 与长期记忆
 

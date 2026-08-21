@@ -211,7 +211,6 @@ def prompt_text(message: str) -> Optional[str]:
             result = pt_prompt(
                 message + " ",
                 key_bindings=kb,
-                erase_when_done=False,
             )
         return result.strip() if result else None
     except (KeyboardInterrupt, EOFError):

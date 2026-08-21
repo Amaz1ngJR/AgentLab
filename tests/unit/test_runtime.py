@@ -1,7 +1,7 @@
 """离线测试：AgentSession 多轮工具循环、审批、超限、错误。"""
 from __future__ import annotations
 
-from app.agent.approval import AutoApprove, DenyAll
+from app.agent.approval import ApprovalResult, AutoApprove, DenyAll
 from app.agent.runtime import (
     DEFAULT_SYSTEM_PROMPT,
     DENIED_MESSAGE,
@@ -210,7 +210,29 @@ def test_approval_denied_skips_execution():
     assert last_msg["content"][0]["content"] == DENIED_MESSAGE
 
 
-def test_approval_denial_is_written_to_registry_audit():
+def test_legacy_modify_request_returns_to_input_without_second_model_call():
+    class ModifyPolicy:
+        def request_tool(self, tool, action, args):
+            return ApprovalResult(
+                False,
+                feedback="用户选择修改建议；已暂停当前任务，等待下一条用户指令。",
+                cancelled=True,
+            )
+
+    router = FakeRouter([
+        _resp_tool("call_x", "danger", {}),
+        _resp_text("不应继续 thinking"),
+    ])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_danger_tool()),
+        approval=ModifyPolicy(),
+    )
+    answer = session.chat("do dangerous thing")
+    assert "等待下一条用户指令" in answer
+    assert len(router.calls) == 1
+
+
     router = FakeRouter([
         _resp_tool("call_x", "danger", {}),
         _resp_text("stopped"),

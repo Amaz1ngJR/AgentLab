@@ -65,6 +65,7 @@ from app.storage import Storage
 from app.tools.builtin import default_tools
 from app.tools.builtin.interactive import PtySessionManager, make_terminal_tools
 from app.tools.builtin.todo import make_todo_write_tool
+from app.tools.rtk_builtin import BuiltinRTK, format_status as format_rtk_status
 from app.tools.registry import ToolRegistry
 from app.util.redact import format_exception, format_traceback
 from app.version import __version__, version_text
@@ -840,8 +841,10 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
             _snapshot_shell_targets(ev.tool_input or {})
     elif kind == run_events.APPROVAL_REQUIRED:
         action = ev.payload.get("approval_action") or ev.tool_name
-        detail = f"  ! tool_use {action}: {ev.tool_name}({_fmt(ev.tool_input)})"
-        print(_approval_text(detail), flush=True)
+        # write_file/edit_file 已经显示了 diff，不需要再打印 tool_use 信息
+        if ev.tool_name not in ("write_file", "edit_file"):
+            detail = f"  ! tool_use {action}: {ev.tool_name}({_fmt(ev.tool_input)})"
+            print(_approval_text(detail), flush=True)
     elif kind == run_events.TOOL_COMPLETED:
         preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
         tag = "ERR" if ev.tool_error else "ok"
@@ -1243,8 +1246,9 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             tool_display.append(name)
 
     _print_init(f"工具     : {' / '.join(tool_display)}")
+    _print_init(f"RTK      : {('enabled' if BuiltinRTK().config.enabled else 'disabled')} (built-in)")
     _print_init("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
-    _print_init("输入 /version 查看版本; /image 或 Ctrl+V 附加图片; /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
+    _print_init("输入 /version 查看版本; /rtk 查看内置输出压缩; /image 或 Ctrl+V 附加图片; /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
     _print_init("执行中按 Esc 或 Ctrl-C 可中断,停下后直接输入新指令即可调整方向。\n")
 
     # ── MCP server 接入 ───────────────────────────────────────────────────────
@@ -1389,7 +1393,8 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             system_prompt=sys_prompt,
             max_steps=agent_profile.max_steps,
             max_task_steps=agent_profile.max_task_steps,
-            on_event=_print_event,
+            # 编排模式下使用 on_run_event，非编排模式使用 on_event
+            on_event=None if agent_profile.orchestrate else _print_event,
             progress=progress_fn,
             task_store=task_store,
             # PtySessionManager 随会话关闭(close_all 杀掉残留的交互式子进程)。
@@ -1533,6 +1538,7 @@ def _print_input_separator() -> None:
 
 # 顶层斜杠命令 → 说明,用于补全菜单右侧 meta 文本
 _SLASH_COMMANDS = {
+    "/rtk": "查看内置 RTK Shell 输出压缩状态",
     "/paste-image": "粘贴剪贴板图片并附加到下一条消息",
     "/image": "显示图片输入帮助；用 /image <路径> 添加图片",
     "/attachments": "查看或清空待发送图片",
@@ -2038,6 +2044,9 @@ def _repl(router: RuntimeService) -> int:
             return 0
         if line == "/version":
             print(version_text())
+            continue
+        if line == "/rtk":
+            print(format_rtk_status())
             continue
         image_action, image_payload = _image_command(line)
         if image_action == "help":

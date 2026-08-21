@@ -10,7 +10,7 @@ import json
 import pytest
 
 from app.agent import events
-from app.agent.approval import AutoApprove, DenyAll
+from app.agent.approval import ApprovalResult, AutoApprove, DenyAll
 from app.agent.cancel import CancelToken, Cancelled
 from app.agent.events import RunEvent
 from app.agent.executor import Executor
@@ -251,7 +251,25 @@ def test_executor_denied_marks_blocked():
     assert "拒绝" in out.error
 
 
-def test_executor_dynamic_approval_denied_marks_blocked():
+def test_executor_modify_request_raises_cancelled_and_never_calls_model_again():
+    class ModifyPolicy:
+        def request_tool(self, tool, action, args):
+            return ApprovalResult(
+                False,
+                feedback="用户选择修改建议；已暂停当前任务，等待下一条用户指令。",
+                cancelled=True,
+            )
+
+    router = FakeRouter([
+        _resp_tool("c1", "danger", {}),
+        _resp_text("不应继续 thinking"),
+    ])
+    ex = Executor(router, _registry(_danger_tool()), approval=ModifyPolicy())
+    with pytest.raises(Cancelled, match="等待下一条用户指令"):
+        ex.run_task(Task("t1", "do danger"), [], system="", max_steps=4)
+    assert len(router.calls) == 1
+
+
     router = FakeRouter([
         _resp_tool("c1", "dynamic", {"outside": True}),
     ])
@@ -469,7 +487,29 @@ def test_orchestrator_cancellation_stops_run():
     assert any(e.kind == events.RUN_FAILED for e in log)
 
 
-def test_orchestrator_respects_max_steps():
+def test_orchestrator_modify_request_stops_run_without_replanning():
+    class ModifyPolicy:
+        def request_tool(self, tool, action, args):
+            return ApprovalResult(
+                False,
+                feedback="用户选择修改建议；已暂停当前任务，等待下一条用户指令。",
+                cancelled=True,
+            )
+
+    router = FakeRouter([
+        _plan_json({"id": "t1", "content": "危险操作", "dependencies": []}),
+        _resp_tool("c1", "danger", {}),
+        _resp_text("不应再次调用模型"),
+    ])
+    orch = Orchestrator(
+        router, _registry(_danger_tool()), approval=ModifyPolicy(),
+    )
+    answer = orch.run("执行危险操作")
+    assert "等待下一条用户指令" in answer
+    assert orch.last_run_status == "cancelled"
+    assert len(router.calls) == 2  # 一次 planning + 一次 executor，之后立即停止
+
+
     """全局步数预算耗尽时,run 以"达到最大步数"收尾。"""
     # 单任务,但模型一直请求工具,永不收口
     responses = [_plan_json({"id": "t1", "content": "loop", "dependencies": []})]

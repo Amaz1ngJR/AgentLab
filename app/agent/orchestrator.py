@@ -240,11 +240,13 @@ class Orchestrator:
                 # 安全压缩旧历史(若预算触发)。
                 self._maybe_compact()
 
-        except Cancelled:
+        except Cancelled as exc:
             self.last_run_status = "cancelled"
-            self._emit(RunEvent(kind=events.RUN_FAILED, text="已取消",
+            reason = str(exc).strip()
+            text = reason or "已取消"
+            self._emit(RunEvent(kind=events.RUN_FAILED, text=text,
                                 payload={"tasks": self.store.snapshot()}))
-            return "已取消。"
+            return text if reason else "已取消。"
 
         # ── 3. 收尾 ──────────────────────────────────────────────────────────
         snapshot = self.store.snapshot()

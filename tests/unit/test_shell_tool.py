@@ -112,7 +112,27 @@ def test_shell_outside_cwd_requires_separate_approval(monkeypatch, tmp_path):
     assert run.call_args.kwargs["cwd"] == str(outside.resolve())
 
 
-def test_run_shell_timeout_returns_error(monkeypatch, tmp_path):
+def test_run_shell_uses_builtin_rtk_without_external_binary(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("AGENTLAB_RTK_ENABLED", "true")
+    raw = "\n".join(["tests/test_x.py::test_ok PASSED"] * 100 + ["100 passed in 1.0s"])
+    with patch("subprocess.run", return_value=_make_completed(stdout=raw)):
+        output = _run_shell({"command": "pytest -v"})
+    assert "100 passed in 1.0s" in output
+    assert "[rtk: pytest" in output
+    assert "[exit code: 0]" in output
+
+
+def test_run_shell_rtk_disabled_preserves_raw_output(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("AGENTLAB_RTK_ENABLED", "false")
+    raw = "line one\nline two"
+    with patch("subprocess.run", return_value=_make_completed(stdout=raw)):
+        output = _run_shell({"command": "pytest"})
+    assert raw in output
+    assert "[rtk:" not in output
+
+
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
 
     def fake_run(*args, **kwargs):

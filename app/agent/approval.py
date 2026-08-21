@@ -18,7 +18,11 @@ if TYPE_CHECKING:
 
 
 class ApprovalResult:
-    """审批结果。"""
+    """审批结果。
+
+    feedback 不代表普通拒绝，而是用户要求暂停当前 turn、回到主聊天输入框后再
+    提交下一条指令；Runtime 不应把反馈自动喂给模型继续 thinking。
+    """
     def __init__(self, approved: bool, feedback: str | None = None, cancelled: bool = False):
         self.approved = approved
         self.feedback = feedback  # 用户的修改建议
@@ -222,13 +226,13 @@ class InteractivePolicy:
             self._always.add(tool_name)  # 加入白名单
             return ApprovalResult(approved=True)
         if result == "modify":
-            # 让用户输入修改建议
-            from app.util.menu import prompt_text
-            feedback = prompt_text("请输入修改建议 (告诉 Agent 应该怎么做):")
-            if feedback and feedback.strip():
-                return ApprovalResult(approved=False, feedback=feedback.strip())
-            # 用户取消输入，视为拒绝
-            return ApprovalResult(approved=False)
+            # “修改建议”是暂停动作，不在审批弹窗里再开一个输入框。这样语义与用户
+            # 预期一致：立即停止当前 turn，回到主聊天框，由用户输入完整下一步指令。
+            return ApprovalResult(
+                approved=False,
+                feedback="用户选择修改建议；已暂停当前任务，等待下一条用户指令。",
+                cancelled=True,
+            )
         if result == "no":
             # 明确选择"拒绝"：Agent 自行调整
             return ApprovalResult(approved=False)

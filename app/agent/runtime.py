@@ -399,21 +399,23 @@ class AgentSession:
                             )
 
                         if approval_result and approval_result.cancelled:
-                            # 用户按 ESC/Ctrl-C 明确取消：立即中断整个 turn
+                            # 修改建议/取消都立即终止当前 turn；补齐结果后回到主输入框。
                             self.tools.record_denied(
                                 call.name,
                                 call.arguments,
                                 approval_action=approval_action,
                             )
                             self._emit_turn_event(TurnEvent(kind="tool_denied", tool_name=call.name))
-                            # 补齐 tool_result 配对后抛出中断
+                            feedback = approval_result.feedback or DENIED_MESSAGE
                             tool_results.append(ToolResult(
                                 tool_call_id=call.id,
-                                output=DENIED_MESSAGE,
+                                output=feedback,
                                 is_error=False,
                             ))
                             resulted_ids.add(call.id)
                             _flush_legacy()
+                            if approval_result.feedback:
+                                return approval_result.feedback
                             raise KeyboardInterrupt("用户取消操作")
 
                         if approval_result and not approval_result.approved:
