@@ -92,7 +92,35 @@ def test_format_task_lines_summary_and_items():
     assert "○ third" in _strip_ansi(lines[3])
 
 
-def test_strip_ansi_removes_color_codes():
+def test_failed_and_blocked_tasks_show_reason():
+    from app.agent.tasks import BLOCKED, FAILED
+
+    lines = _format_task_lines([
+        Task("1", "同步配置", FAILED, error="任务在 10 步内未完成"),
+        Task("2", "等待审批", BLOCKED, error="用户拒绝执行 shell"),
+    ])
+    plain = [_strip_ansi(line) for line in lines]
+    assert "✗ 同步配置" in plain[1]
+    assert plain[2] == "    原因: 任务在 10 步内未完成"
+    assert "⊘ 等待审批" in plain[3]
+    assert plain[4] == "    原因: 用户拒绝执行 shell"
+
+
+def test_failed_reason_is_single_line_bounded_and_has_fallback():
+    from app.agent.tasks import FAILED
+
+    long_reason = "第一行\n" + "x" * 300
+    lines = [_strip_ansi(line) for line in _format_task_lines([
+        Task("1", "失败任务", FAILED, error=long_reason),
+        Task("2", "无原因任务", FAILED),
+    ])]
+    reason_lines = [line for line in lines if "原因:" in line]
+    assert "\n" not in reason_lines[0]
+    assert reason_lines[0].endswith("…")
+    assert len(reason_lines[0]) < 180
+    assert reason_lines[1] == "    原因: 未记录失败原因"
+
+
     raw = "\033[1;34mhello\033[0m world"
     assert _strip_ansi(raw) == "hello world"
 

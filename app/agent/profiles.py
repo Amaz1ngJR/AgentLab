@@ -30,6 +30,7 @@ class AgentProfile:
     memory_policy   - 记忆策略：none/read/read_write（默认 none）
     max_steps       - 一次 run 的模型往返总上限（兼容旧配置名，默认 8）
     max_task_steps  - 单个子任务的模型往返上限（默认 min(8, max_steps)）
+    orchestrate     - 是否启用 Planner/Executor 编排路径（默认 True）
     """
     agent_id: str
     name: str
@@ -41,6 +42,7 @@ class AgentProfile:
     memory_policy: str = "none"   # none | read | read_write
     max_steps: int = 8
     max_task_steps: int | None = None
+    orchestrate: bool = True
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
@@ -75,5 +77,21 @@ def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
                 int(body["max_task_steps"])
                 if body.get("max_task_steps") is not None else None
             ),
+            orchestrate=_parse_bool(body.get("orchestrate"), default=True),
         )
     return profiles
+
+
+def _parse_bool(value, *, default: bool) -> bool:
+    """严格解析 YAML/字符串布尔值，避免 bool("false") 反而为 True。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"orchestrate 必须是布尔值，当前值: {value!r}")

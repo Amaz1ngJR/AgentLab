@@ -25,13 +25,35 @@ def test_parses_profile(tmp_path):
     assert p.memory_policy == "read_write"
     assert p.max_steps == 12
     assert p.max_task_steps == 5
+    assert p.orchestrate is True
 
 
-def test_defaults(tmp_path):
+def test_parses_orchestrate_false(tmp_path):
+    f = tmp_path / "a.yaml"
+    f.write_text(
+        "agents:\n  x:\n    model_profile: local_qwen\n    orchestrate: false\n",
+        encoding="utf-8",
+    )
+    assert load_agent_profiles(f)["x"].orchestrate is False
+
+
+def test_rejects_invalid_orchestrate_value(tmp_path):
+    import pytest
+
+    f = tmp_path / "a.yaml"
+    f.write_text(
+        "agents:\n  x:\n    model_profile: local_qwen\n    orchestrate: maybe\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="orchestrate"):
+        load_agent_profiles(f)
+
+
     f = tmp_path / "a.yaml"
     f.write_text("agents:\n  x:\n    model_profile: local_qwen\n", encoding="utf-8")
     p = load_agent_profiles(f)["x"]
     assert p.memory_policy == "none"
     assert p.max_steps == 8
     assert p.max_task_steps is None
+    assert p.orchestrate is True
     assert p.tools == []

@@ -202,6 +202,16 @@ def _truncate_task_content(content: str, max_chars: int = 60) -> str:
     return first_line
 
 
+def _truncate_task_reason(reason: str, max_chars: int = 160) -> str:
+    """把失败/阻塞原因压成单行并限长，避免异常堆栈撑爆任务面板。"""
+    if not reason:
+        return "未记录失败原因"
+    compact = " ".join(str(reason).split())
+    if len(compact) > max_chars:
+        return compact[:max_chars].rstrip() + "…"
+    return compact
+
+
 def _format_task_lines(tasks) -> list[str]:
     """把任务列表渲染成多行字符串(已包含 ANSI 颜色)。
 
@@ -215,6 +225,8 @@ def _format_task_lines(tasks) -> list[str]:
           ○ 工具能力声明                (普通色,待办)
           ⊘ 被阻塞的任务                (黄色,blocked)
           ✗ 失败的任务                  (红色,failed)
+
+        失败/阻塞任务下一行显示有界的 error 原因；未记录时明确提示。
 
     返回的每一行 *不* 含末尾换行,调用方决定怎么拼。
     任务为空时返回空列表(让调用方决定是否显示标题区)。
@@ -251,9 +263,13 @@ def _format_task_lines(tasks) -> list[str]:
         elif st == "in_progress":
             lines.append(f"  {_ANSI_BLUE_BOLD}❯ {content}{_ANSI_RESET}")
         elif st == "blocked":
+            reason = _truncate_task_reason(_task_field(t, "error"))
             lines.append(f"  {_ANSI_YELLOW}⊘ {content}{_ANSI_RESET}")
+            lines.append(f"    {_ANSI_YELLOW}原因: {reason}{_ANSI_RESET}")
         elif st == "failed":
+            reason = _truncate_task_reason(_task_field(t, "error"))
             lines.append(f"  {_ANSI_RED}✗ {content}{_ANSI_RESET}")
+            lines.append(f"    {_ANSI_RED}原因: {reason}{_ANSI_RESET}")
         else:
             lines.append(f"  ○ {content}")
 
@@ -299,6 +315,8 @@ class _Spinner:
         self._tasks_committed = False  # 任务面板每步只提交一次
         self._frame_idx = 0
         self._footer_rows = 0          # 当前 footer 占用的屏幕行数(0 = 未绘制)
+        self._last_thinking_delta = "" # 防止重复输出相同的 thinking delta
+        self._thinking_lines_seen: set[str] = set()  # 记录已输出的完整thinking行，防止重复
 
     def __enter__(self) -> "_Spinner":
         self._t0 = time.monotonic()
@@ -376,7 +394,36 @@ class _Spinner:
         """
         if not delta:
             return
+
+
         with self._lock:
+            # 防止重复输出：检查是否包含完整行，如果该行已经输出过则跳过
+            if "\n" in delta:
+                lines = delta.split("\n")
+                # 检查每个完整行是否已经输出过
+                filtered_lines = []
+                for i, line in enumerate(lines):
+                    # 最后一个元素如果不是空（说明delta不是以\n结尾），它是不完整的，保留
+                    is_complete = i < len(lines) - 1 or delta.endswith("\n")
+                    if is_complete:
+                        if line and line in self._thinking_lines_seen:
+                            # 已经输出过，跳过
+                            continue
+                        if line:  # 空行不记录
+                            self._thinking_lines_seen.add(line)
+                    filtered_lines.append(line)
+
+                # 如果所有行都被过滤掉了，直接返回
+                if not any(filtered_lines):
+                    return
+
+                delta = "\n".join(filtered_lines)
+
+            # 简单的连续重复检测
+            if delta == self._last_thinking_delta:
+                return
+            self._last_thinking_delta = delta
+
             self._erase_footer()
             self._commit_tasks()
             if not self._any_thinking:
@@ -508,6 +555,8 @@ class _PlainProgress:
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self._text_started = False
         self._thinking_started = False
+        self._last_thinking_delta = ""  # 防止重复输出相同的 thinking delta
+        self._thinking_lines_seen: set[str] = set()  # 记录已输出的完整thinking行，防止重复
 
     def __enter__(self) -> "_PlainProgress":
         self._t0 = time.monotonic()
@@ -532,6 +581,34 @@ class _PlainProgress:
     def on_thinking(self, delta: str) -> None:
         if not delta:
             return
+
+        # 防止重复输出：检查是否包含完整行，如果该行已经输出过则跳过
+        if "\n" in delta:
+            lines = delta.split("\n")
+            # 检查每个完整行是否已经输出过
+            filtered_lines = []
+            for i, line in enumerate(lines):
+                # 最后一个元素如果不是空（说明delta不是以\n结尾），它是不完整的，保留
+                is_complete = i < len(lines) - 1 or delta.endswith("\n")
+                if is_complete:
+                    if line and line in self._thinking_lines_seen:
+                        # 已经输出过，跳过
+                        continue
+                    if line:  # 空行不记录
+                        self._thinking_lines_seen.add(line)
+                filtered_lines.append(line)
+
+            # 如果所有行都被过滤掉了，直接返回
+            if not any(filtered_lines):
+                return
+
+            delta = "\n".join(filtered_lines)
+
+        # 简单的连续重复检测
+        if delta == self._last_thinking_delta:
+            return
+        self._last_thinking_delta = delta
+
         if not self._thinking_started:
             self._thinking_started = True
             sys.stdout.write("\n" + _thinking_text("💭 思考\n"))
@@ -581,9 +658,13 @@ def _make_progress(task_store=None):
 _progress = _make_progress(None)
 
 
-def _fmt(data: dict) -> str:
+def _fmt(data: dict, max_len: int = 200) -> str:
+    """格式化工具输入为 JSON，超长时截断"""
     try:
-        return json.dumps(data, ensure_ascii=False)
+        s = json.dumps(data, ensure_ascii=False)
+        if len(s) > max_len:
+            return s[:max_len] + "...}"
+        return s
     except (TypeError, ValueError):
         return repr(data)
 
@@ -1405,7 +1486,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             # 用 Planner/Executor/Replanner 编排:目标先拆任务,按依赖执行,失败
             # 重规划。Planner 用同一个 llm;system prompt 由 Orchestrator 注入到
             # 规划与执行两阶段。RunEvent 经 _print_run_event 渲染。
-            orchestrate=True,
+            orchestrate=agent_profile.orchestrate,
             planner=Planner(llm),
             on_run_event=print_run_event_with_state,
             context_manager=ctx_manager,
