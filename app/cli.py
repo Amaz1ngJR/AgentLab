@@ -315,8 +315,6 @@ class _Spinner:
         self._tasks_committed = False  # 任务面板每步只提交一次
         self._frame_idx = 0
         self._footer_rows = 0          # 当前 footer 占用的屏幕行数(0 = 未绘制)
-        self._last_thinking_delta = "" # 防止重复输出相同的 thinking delta
-        self._thinking_lines_seen: set[str] = set()  # 记录已输出的完整thinking行，防止重复
 
     def __enter__(self) -> "_Spinner":
         self._t0 = time.monotonic()
@@ -397,33 +395,6 @@ class _Spinner:
 
 
         with self._lock:
-            # 防止重复输出：检查是否包含完整行，如果该行已经输出过则跳过
-            if "\n" in delta:
-                lines = delta.split("\n")
-                # 检查每个完整行是否已经输出过
-                filtered_lines = []
-                for i, line in enumerate(lines):
-                    # 最后一个元素如果不是空（说明delta不是以\n结尾），它是不完整的，保留
-                    is_complete = i < len(lines) - 1 or delta.endswith("\n")
-                    if is_complete:
-                        if line and line in self._thinking_lines_seen:
-                            # 已经输出过，跳过
-                            continue
-                        if line:  # 空行不记录
-                            self._thinking_lines_seen.add(line)
-                    filtered_lines.append(line)
-
-                # 如果所有行都被过滤掉了，直接返回
-                if not any(filtered_lines):
-                    return
-
-                delta = "\n".join(filtered_lines)
-
-            # 简单的连续重复检测
-            if delta == self._last_thinking_delta:
-                return
-            self._last_thinking_delta = delta
-
             self._erase_footer()
             self._commit_tasks()
             if not self._any_thinking:
@@ -555,8 +526,6 @@ class _PlainProgress:
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self._text_started = False
         self._thinking_started = False
-        self._last_thinking_delta = ""  # 防止重复输出相同的 thinking delta
-        self._thinking_lines_seen: set[str] = set()  # 记录已输出的完整thinking行，防止重复
 
     def __enter__(self) -> "_PlainProgress":
         self._t0 = time.monotonic()
@@ -581,34 +550,6 @@ class _PlainProgress:
     def on_thinking(self, delta: str) -> None:
         if not delta:
             return
-
-        # 防止重复输出：检查是否包含完整行，如果该行已经输出过则跳过
-        if "\n" in delta:
-            lines = delta.split("\n")
-            # 检查每个完整行是否已经输出过
-            filtered_lines = []
-            for i, line in enumerate(lines):
-                # 最后一个元素如果不是空（说明delta不是以\n结尾），它是不完整的，保留
-                is_complete = i < len(lines) - 1 or delta.endswith("\n")
-                if is_complete:
-                    if line and line in self._thinking_lines_seen:
-                        # 已经输出过，跳过
-                        continue
-                    if line:  # 空行不记录
-                        self._thinking_lines_seen.add(line)
-                filtered_lines.append(line)
-
-            # 如果所有行都被过滤掉了，直接返回
-            if not any(filtered_lines):
-                return
-
-            delta = "\n".join(filtered_lines)
-
-        # 简单的连续重复检测
-        if delta == self._last_thinking_delta:
-            return
-        self._last_thinking_delta = delta
-
         if not self._thinking_started:
             self._thinking_started = True
             sys.stdout.write("\n" + _thinking_text("💭 思考\n"))

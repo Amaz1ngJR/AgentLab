@@ -256,7 +256,25 @@ def _stream_thinking(reasoning: str, answer: str, prompt_tokens=12, completion_t
     return iter(chunks)
 
 
-def test_thinking_stream_updates_live_token_progress():
+def test_compatible_adapter_normalizes_cumulative_reasoning_snapshots():
+    thinking = []
+    with patch("openai.OpenAI") as MockOpenAI:
+        mock_client = MagicMock()
+        MockOpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = iter([
+            _chunk(reasoning="目前可确定：蓝屏无信号"),
+            _chunk(reasoning="目前可确定：蓝屏无信号对应容器退出"),
+            _chunk(content="结论"),
+            _chunk(usage=(20, 10)),
+        ])
+        response = OpenAICompatibleAdapter(_cfg(enable_thinking=True)).create_message(
+            messages=[{"role": "user", "content": "分析"}],
+            on_thinking_delta=thinking.append,
+        )
+    assert thinking == ["目前可确定：蓝屏无信号", "对应容器退出"]
+    assert response.reasoning == "目前可确定：蓝屏无信号对应容器退出"
+
+
     """只有 reasoning_content、尚无正文时，实时 output token 也必须增长。"""
     progress = []
     with patch("openai.OpenAI") as MockOpenAI:

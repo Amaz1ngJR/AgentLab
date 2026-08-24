@@ -10,6 +10,7 @@ from typing import Any, Optional
 from app.config.schemas import LLMConfig
 from app.attachments import materialize_image_block
 from app.models.token_progress import StreamingTokenProgress
+from app.models.stream_normalizer import StreamDeltaNormalizer
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -130,6 +131,7 @@ class AnthropicAdapter:
         in_tokens = 0
         out_tokens = 0
         progress = StreamingTokenProgress(on_progress)
+        normalizer = StreamDeltaNormalizer()
         progress.emit(force=True)
 
         with self._client.messages.stream(**params) as stream:
@@ -148,7 +150,9 @@ class AnthropicAdapter:
                 elif etype == "content_block_delta":
                     delta = getattr(event, "delta", None)
                     if delta is not None and getattr(delta, "type", None) == "text_delta":
-                        text_chunk = getattr(delta, "text", "") or ""
+                        text_chunk = normalizer.normalize(
+                            "content", getattr(delta, "text", "") or ""
+                        )
                         if text_chunk:
                             if on_text_delta:
                                 on_text_delta(text_chunk)

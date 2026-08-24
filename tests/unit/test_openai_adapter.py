@@ -196,7 +196,25 @@ def test_create_message_text_only():
     assert resp.usage["output_tokens"] == 8
 
 
-def test_create_message_with_function_call():
+def test_cumulative_text_snapshots_are_not_duplicated():
+    final = _build_final([_message_item("目前可确定：蓝屏无信号对应容器退出")])
+    stream = _FakeStream(events=[
+        _delta_event("目前可确定：蓝屏无信号"),
+        _delta_event("目前可确定：蓝屏无信号对应容器退出"),
+    ], final=final)
+    seen = []
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MagicMock()
+        MockOpenAI.return_value = client
+        client.responses.stream.return_value = stream
+        OpenAIAdapter(_cfg()).create_message(
+            messages=[{"role": "user", "content": "分析"}],
+            on_text_delta=seen.append,
+        )
+    assert seen == ["目前可确定：蓝屏无信号", "对应容器退出"]
+    assert "".join(seen) == "目前可确定：蓝屏无信号对应容器退出"
+
+
     """工具调用: final.output 含 function_call item,被解析成 ToolCall。"""
     final = _build_final([
         _function_call_item("call_abc", "read_file", '{"path": "README.md"}'),

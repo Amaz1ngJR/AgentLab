@@ -16,6 +16,7 @@ from typing import Any, Optional
 from app.config.schemas import LLMConfig
 from app.attachments import image_block_to_data_url
 from app.models.token_progress import StreamingTokenProgress
+from app.models.stream_normalizer import StreamDeltaNormalizer
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -198,6 +199,7 @@ class OpenAICompatibleAdapter:
         in_tokens = 0
         out_tokens = 0
         progress = StreamingTokenProgress(on_progress, in_tokens)
+        normalizer = StreamDeltaNormalizer()
         progress.emit(force=True)
 
         text_parts: list[str] = []
@@ -222,18 +224,21 @@ class OpenAICompatibleAdapter:
                     # 推理增量:思考模型在正式 content 之前先吐 reasoning_content。
                     # 只用于实时展示,不计入 out_tokens 估算(usage 已包含它),
                     # 也不进入 text_parts / 对话历史。
-                    reasoning_chunk = getattr(delta, "reasoning_content", None)
+                    reasoning_chunk = normalizer.normalize(
+                        "reasoning", getattr(delta, "reasoning_content", None)
+                    )
                     if reasoning_chunk:
                         reasoning_parts.append(reasoning_chunk)
                         if on_thinking_delta:
                             on_thinking_delta(reasoning_chunk)
                         progress.add_reasoning(reasoning_chunk)
                     if getattr(delta, "content", None):
-                        chunk_text = delta.content
-                        text_parts.append(chunk_text)
-                        if on_text_delta:
-                            on_text_delta(chunk_text)
-                        progress.add_text(chunk_text)
+                        chunk_text = normalizer.normalize("content", delta.content)
+                        if chunk_text:
+                            text_parts.append(chunk_text)
+                            if on_text_delta:
+                                on_text_delta(chunk_text)
+                            progress.add_text(chunk_text)
                     if getattr(delta, "tool_calls", None):
                         for tc in delta.tool_calls:
                             idx = getattr(tc, "index", 0) or 0
@@ -245,7 +250,10 @@ class OpenAICompatibleAdapter:
                                 if getattr(fn, "name", None):
                                     buf["name"] = fn.name
                                 if getattr(fn, "arguments", None):
-                                    buf["args"] += fn.arguments
+                                    args_delta = normalizer.normalize(
+                                        f"tool_args:{idx}", fn.arguments
+                                    )
+                                    buf["args"] += args_delta
 
             usage = getattr(chunk, "usage", None)
             if usage:

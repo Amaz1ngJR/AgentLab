@@ -25,6 +25,7 @@ from typing import Any, Optional
 from app.config.schemas import LLMConfig
 from app.attachments import image_block_to_data_url
 from app.models.token_progress import StreamingTokenProgress
+from app.models.stream_normalizer import StreamDeltaNormalizer
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -156,6 +157,7 @@ class OpenAIAdapter:
         in_tokens = 0
         out_tokens = 0
         progress = StreamingTokenProgress(on_progress, in_tokens)
+        normalizer = StreamDeltaNormalizer()
         progress.emit(force=True)
 
         # 流式事件中累计正文、reasoning summary 和 function arguments。厂商通常只在
@@ -176,6 +178,7 @@ class OpenAIAdapter:
                         output_tokens=event_output,
                     )
                 if etype == "response.output_text.delta":
+                    delta_text = normalizer.normalize("output_text", delta_text)
                     if delta_text:
                         if on_text_delta:
                             on_text_delta(delta_text)
@@ -184,6 +187,7 @@ class OpenAIAdapter:
                     "response.reasoning_text.delta",
                     "response.reasoning_summary_text.delta",
                 }:
+                    delta_text = normalizer.normalize("reasoning", delta_text)
                     if delta_text:
                         if on_thinking_delta:
                             on_thinking_delta(delta_text)
@@ -192,6 +196,7 @@ class OpenAIAdapter:
                     "response.function_call_arguments.delta",
                     "response.custom_tool_call_input.delta",
                 }:
+                    delta_text = normalizer.normalize("tool_arguments", delta_text)
                     progress.add_text(delta_text)
 
             final = stream.get_final_response()

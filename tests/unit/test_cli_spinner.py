@@ -275,7 +275,21 @@ def test_streamed_text_preserves_exact_content(monkeypatch):
     assert screen.rstrip("\n") == "Hello, 本地模型!"
 
 
-def test_first_text_delta_erases_thinking_footer(monkeypatch):
+def test_thinking_renderer_preserves_legitimate_repeated_lines(monkeypatch):
+    """终端层不做语义去重；合法重复由 Provider 增量规范化保证不被误删。"""
+    import app.cli as cli
+
+    sink = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", sink)
+    progress = cli._PlainProgress("thinking")
+    progress.on_thinking("same\n")
+    progress.on_thinking("other\n")
+    progress.on_thinking("same\n")
+    plain = _strip_ansi(sink.getvalue())
+    assert plain.count("same") == 2
+    assert plain.count("other") == 1
+
+
     """thinking footer 画出后,第一段文本到达时应擦掉它(写过清屏序列 \\033[J)。"""
     import app.cli as cli
 
