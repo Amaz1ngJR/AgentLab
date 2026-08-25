@@ -564,9 +564,10 @@ AgentLab/
 │   ├── install_local_model.ps1  # Windows 同上
 │   └── verify_local_model.sh    # 端到端 5 步验证
 ├── docs/
-│   ├── technical_architecture.md  # 系统设计方案
-│   ├── local_model_guide.md       # 本地模型落地指南
-│   └── process.md                 # 开发进度与下一步计划
+│   ├── technical_architecture.md      # 系统设计方案
+│   ├── codex_runtime_learnings.md     # Codex Runtime 借鉴与 AgentLab 演进路线
+│   ├── local_model_guide.md           # 本地模型落地指南
+│   └── process.md                     # 开发进度与下一步计划
 ├── tests/unit/             # 离线单元测试
 ├── pyproject.toml          # Python 打包配置和 agentlab 全局命令
 └── .env.example
@@ -580,4 +581,4 @@ pip install -e .
 python -m pytest tests/unit/ -v
 ```
 
-进度与路线见 [`docs/process.md`](docs/process.md)；总体设计方案见 [`docs/technical_architecture.md`](docs/technical_architecture.md)。
+进度与路线见 [`docs/process.md`](docs/process.md)；总体设计方案见 [`docs/technical_architecture.md`](docs/technical_architecture.md)；Codex Runtime 的架构借鉴与 AgentLab 演进建议见 [`docs/codex_runtime_learnings.md`](docs/codex_runtime_learnings.md)。

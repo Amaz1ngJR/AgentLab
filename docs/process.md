@@ -17,7 +17,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 **Loop 模式（Loop Engineering，§7.6）的证据闭环已接通**：`/goal new` 定义目标和验证命令，`/loop start` 创建隔离 worktree，调用 `Orchestrator` 执行 Planner→Executor→Replanner，再由 command/file/API/Human Verifier 验证；失败时生成修复指令继续迭代，成功时经审批生成可合并提交。run、iteration、任务快照、验证结果、worktree、repair/diff/commit、预算和终止原因完整持久化，可用 `/loop evidence`、`/loop diff` 回看，并用 `/loop resume` 恢复未完成运行。尚缺 browser/database/remote/llm_judge Verifier、`Learner` / Project Knowledge、子 Agent 和后台 Loop。
 
-距离 PRD 的核心缺口：Loop Engineering 的学习与协作能力尚未完成；Runtime Service、异步 Approval Broker 和 Loop 持久化证据闭环已完成并接入 CLI，但还没有自建 Computer Control Gateway、FastAPI Server、终端 TUI 和 Web UI。互联网能力目前仍是单工具形态，尚无统一 WebRetrievalService、Source Store 和 CitationManager。
+距离 PRD 的核心缺口：Loop Engineering 的学习与协作能力尚未完成；Runtime Service、Protocol v1 事件信封、append-only Turn/Item/Event 存储和异步 Approval Broker 已完成第一阶段并接入 CLI，但还没有自建 Computer Control Gateway、FastAPI Server、终端 TUI 和 Web UI。互联网能力目前仍是单工具形态，尚无统一 WebRetrievalService、Source Store 和 CitationManager。
 
 ---
 
@@ -25,7 +25,13 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 以下顺序遵循“先解耦运行时，再开放新入口；先形成证据与安全边界，再增加执行能力”。每一项完成后都应更新第 3 节里程碑，并保持 CLI 行为兼容。
 
-1. **P1：建立 ComputerControlGateway 并接入 browser Verifier**（见 6.6、6.7）
+1. **P0：完成 Runtime Protocol 化与 CLI 迁移收口**
+   - 将 CLI 的 session、loop、storage 和 `_orch` 私有访问收敛到显式 RuntimeService API。
+   - 给 Runtime Event 增加 Protocol v1 sequence、schema_version、turn/item 关联和重放边界。
+   - 将关键 Turn/Item/Event 写入 append-only store，并补进程重启后的恢复测试。
+   - **验收**：CLI 不直接依赖 SessionRouter 内部字段；Protocol 事件可 JSONL 编解码、按游标重放；两个 Session 并发不串事件。
+
+2. **P1：建立 ComputerControlGateway 并接入 browser Verifier**（见 6.6、6.7）
    - 先包装现有 Playwright MCP，将 snapshot/click/type/navigation 规范化为 Observation 和 Action，不让 Runtime 依赖 MCP 工具的原始返回结构。
    - 在网关统一执行目标校验、风险分级、审批、敏感字段处理、截图/DOM 限长、审计和取消。
    - 基于 Observation 实现 browser Verifier，支持 URL、可见文本、元素状态和截图证据检查。
@@ -164,9 +170,17 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - CLI 主消息路径、`/resume`、单次 `-p`、session 命令和退出清理已迁移到 RuntimeService；`SessionRouter.persist(session_id)` 避免不同 session 并发完成时写错持久化目标。
 - 新增 `test_approval_broker.py` 与 `test_runtime_service.py`，覆盖并发 session、同 session 互斥、取消、超时、首决定生效、asyncio 非阻塞桥和资源关闭；同时修正 `web_search` 对新版 `ddgs` 与旧版 `duckduckgo_search` 的兼容测试，当前 547 项 unit tests 全部通过。
 
-### 3.13 ToolDescriptor、分级审批与统一工具审计
+### 3.13 Runtime Protocol v1 与 append-only Turn/Item 事件流
 
-- `app/tools/registry.py`：正式引入 `ToolDescriptor`，统一描述 `risk / target_type / scope / origin / host / requires_observation / audit_redactor`；`Tool` 保留为兼容别名，现有 Skill、测试和扩展无需一次性迁移。
+- 新增 `app/protocol/`，定义不依赖 CLI、AgentSession 或 Provider SDK 的 `ThreadRecord`、`TurnRecord`、`TurnItem`、`EventEnvelope`、`RuntimeFailure` 和 JSON 类型约束。
+- `EventEnvelope` 使用 `schema_version=1`、thread/turn/item ID、单调 sequence、UTC timestamp 和可 JSON 序列化 payload；提供 JSONL 编解码和显式 JSON Schema 草案。
+- `RuntimeService` 保留旧 `RuntimeEvent` callback 兼容层，同时发布带序号的 Protocol v1 事件；支持 `subscribe_protocol()`、`replay_events(thread_id, after_sequence=...)`。
+- SQLite 新增 `runtime_turns / runtime_items / runtime_events` append-only 表和游标查询；消息、工具审计和旧 Session 数据保持兼容；Session 硬删除同步清理 Runtime 记录。
+- 每个新 Turn 记录用户 Item、运行状态、完成 token、失败 code，并将兼容事件映射为 `thread.* / turn.* / item.*` 命名空间事件。
+- 新增 Protocol、JSONL、SQLite round-trip、事件重放和不可序列化 payload 测试；当前 `619` 项 unit tests 全部通过。
+
+### 3.15 ToolDescriptor、分级审批与统一工具审计
+
 - 九级风险分类已落地：`read / observe / network / write / browser_control / desktop_control / remote_execute / execute / destructive`。工具未显式覆盖 `requires_approval` 时由风险等级决定默认审批；workspace 越界仍由参数级 `approval_resolver` 提升为独立审批动作。
 - `InteractivePolicy` 已能展示风险、目标、来源和 host；browser/desktop/remote/execute/destructive、shell/terminal 以及 workspace 越界动作不可使用“本会话总是允许”。旧 `ApprovalPolicy.request(action,args)` 通过兼容适配继续可用。
 - 内置文件、代码搜索、Web、Shell、Todo、交互式终端和 MCP 工具均声明风险与目标元数据。MCP 工具继承 Server risk，并标注 `origin=mcp`、server host 和 browser observation 要求。
@@ -188,13 +202,13 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 配置 | `.env` + `config/models.yaml`（模型）+ `config/agents.yaml`（Agent）+ `config/mcp_servers.yaml`（MCP） | `app/config/`, `app/agent/profiles.py`, `app/mcp/config.py` |
 | 模型层 | Anthropic / OpenAI Responses / OpenAI-compatible；统一内部协议；JSON tool call fallback | `app/models/` |
 | Runtime | CLI 主路径已切到编排:`AgentSession(orchestrate=True)` 委托 Orchestrator;`orchestrate=False` 仍保留 legacy 单轮循环 | `app/agent/runtime.py`, `app/agent/orchestrator.py` |
-| 编排 | Planner(JSON 计划) + Executor(单任务工具循环,带 progress/流式/用量) + Replanner(失败追加补救) + CancelToken + 结构化 RunEvent;已接 CLI（PRD 的 Task 模式） | `app/agent/planner.py`, `app/agent/executor.py`, `app/agent/replanner.py`, `app/agent/events.py`, `app/agent/cancel.py` |
+| Protocol v1 | Thread/Turn/Item/EventEnvelope/RuntimeFailure 协议模型、JSON Schema、JSONL transport；Runtime Service 发布事件并支持游标重放；下一步收口 CLI 私有访问 | `app/protocol/`, `app/agent/service.py`, `app/storage/` |
 | Loop Engineering | GoalSpec → Orchestrator → Verifier → 诊断修复 → worktree 审批提交；run/iteration/verification/worktree/repair/diff/commit/预算/终止原因完整持久化；支持 `/loop evidence/diff/resume`；Learner、Project Knowledge、子 Agent 待做（见 6.14） | `app/agent/goals.py`, `verifier.py`, `loop_runner.py`, `loop_commands.py`, `app/workspace/worktree.py`, `app/storage/loop_store.py` |
 | 多 Agent / Session | AgentProfile + SessionRouter + `/session` 命令族；SQLite 持久化、恢复、隔离（含任务快照恢复） | `app/agent/profiles.py`, `app/agent/session_router.py`, `app/storage/` |
 | 长期记忆 | none/read/read_write 三策略 + 注入；LIKE 检索（未做向量） | `app/memory/` |
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |
 | 任务面板 / TaskStore | 任务状态唯一源:依赖/claim/blocked/failed/evidence/history/snapshot/restore;`todo_write` 走简单三态;CLI 面板渲染(含 blocked/failed 字形) | `app/agent/tasks.py`, `app/tools/builtin/todo.py` |
-| Runtime Service | session/run 门面、事件订阅、协作式取消、同 session 互斥、跨 session 并发和统一资源关闭；CLI 已迁移 | `app/agent/service.py`, `app/cli.py` |
+- `app/agent/service.py`：RuntimeService 门面，提供 session/run/approval/cancel 和旧版事件兼容；Protocol v1 发布、重放和 Turn/Item 持久化已接入，CLI 私有字段迁移待完成。
 | 审批 | 异步 ApprovalBroker + 稳定 request ID/超时/首决定生效；CLI fallback；`ToolDescriptor` 九级风险与旧 Policy 兼容 | `app/agent/approval_broker.py`, `app/agent/approval.py`, `app/tools/registry.py` |
 | 内置工具 | `read_file / write_file / edit_file / list_dir / code_search / web_search / web_fetch / shell / todo_write`；`terminal_*` 交互式终端会话 | `app/tools/builtin/` |
 | MCP | stdio Manager、工具发现、sync/async 桥、同名不覆盖、auto_approve 白名单；映射 ToolDescriptor 并继承 Server 风险，调用进入统一审计 | `app/mcp/` |
@@ -289,24 +303,26 @@ AgentLab/
 
 > 已完成的能力见第 3 节。本节各模块只列"当前状态 + 还要做什么 + 验收标准"。
 
-### 6.1 Runtime 与任务拆解
+### 6.1 Runtime Protocol 化与任务拆解
 
-当前状态：编排核心(见 3.8)与 CLI 接入 + 任务持久化(见 3.9)均已完成，对应 PRD 的 **Task 模式**。CLI 默认 `AgentSession(orchestrate=True)`,一轮对话走 规划→按依赖执行→失败重规划;`RunEvent` 经 `_print_run_event` 渲染到 spinner、任务面板(含 blocked/failed 字形)与工具行;Ctrl-C 触发 `CancelToken` 协作式取消;TaskStore 快照落 SQLite `runs/tasks`,`/session switch` 与重启后可恢复任务状态。PRD 新增的 **Loop 模式**（GoalSpec/LoopRunner/Verifier/Learner）在此之上，单列 6.14。
+当前状态：Task 编排核心、RuntimeService、ApprovalBroker 和 Protocol v1 第一阶段均已完成。`AgentSession` 支持 Direct/Task 路径，`RuntimeService` 可发布兼容 RuntimeEvent 与带 `schema_version/sequence/thread_id/turn_id/item_id` 的 EventEnvelope；SQLite 已持久化 `runtime_turns / runtime_items / runtime_events`，支持 JSONL 编解码和 `after_sequence` 事件重放。CLI 仍有少量 `_storage`、`_orch`、`loop_handler` 私有访问，Protocol 事件中的部分内容还以 `legacy_event` payload 过渡，下一阶段收口前端边界。
 
-**「只说不做」问题已修复**（commit `2caddfa`）：
-- 强化 Planner system prompt：明确要求只输出 JSON，任务 content 必须包含具体工具调用，避免「确认」「检查」等空泛任务
-- 强化 Executor 任务指令：明确要求「必须立即调用工具」，列举具体场景，禁止只输出文字
-- 新增空转检测：第一轮不调用工具时给模型纠正提示，智能识别合法完成消息（「已完成」「无需操作」）避免误伤
+已完成：
+
+- Planner/Executor/Replanner 按依赖执行，失败补救、审批阻塞和协作式取消。
+- `max_steps` run 级预算与 `max_task_steps` 子任务预算分离，按真实 `model_rounds` 扣减。
+- 简单 `orchestrate: false` Profile 可走 legacy 单轮循环；默认 Profile 仍使用编排路径。
+- Runtime Protocol v1 的 Thread/Turn/Item/EventEnvelope/RuntimeFailure 模型、JSON Schema 草案、JSONL transport 和 append-only 存储已落地（见 3.13）。
 
 接下来要做：
 
-- **P0：抽出 Runtime Service**，统一提供 create/switch session、send message、cancel、subscribe events、approve/deny 和 close；CLI 先改为调用 Service，不能让 Web/TUI 直接依赖 `_build_session` 或复制 `_session_factory`。
-- 在 Runtime Service 内新增异步 `ApprovalBroker`：Executor 发结构化 ApprovalRequest 后暂停当前 run，由 CLI/Web/TUI 提交 decision；保留同步 Policy adapter 兼容现有 CLI 和测试。
-- Replanner 当前是启发式;后续可选"让模型看 outcome 产出 plan patch"的 LLM 重规划。
-- `runs / tasks` 已落库,但还没有 CLI/Web 查看入口(如 `/runs`、任务历史回看)。
-- 编排路径会把"子任务指令"作为 user 消息写进历史,多轮后上下文偏长。PRD §7.3 的上下文压缩(见 6.13)会在 token 接近窗口上限时自动压缩旧历史兜底,任务不会因超限中断;"用独立通道传子任务指令、根本不进对话历史"是可选的源头优化,优先级下调。
+- **P0：收口 Runtime Service 边界**：CLI 不再访问 `_storage`、`_orch`、`_session_factory` 和 Router 私有字段，改为显式 Service API。
+- 将 `RunEvent`/`TurnEvent` 转换为规范 `TurnItem`，移除 `turn.legacy_event` 过渡事件。
+- 为 Protocol 事件增加有界订阅队列、慢消费者背压、初始化握手和能力声明。
+- 将关键事件、失败和审批状态在进程重启后完整恢复。
+- 后续合并 legacy 循环与 Orchestrator 为统一 `TurnEngine`，由 Direct/Task/Loop Policy 控制模式。
 
-验收标准:CLI 跑一个复杂目标时,能看到计划生成、任务按依赖推进、失败自动补救、审批拒绝后阻塞,且 Ctrl-C 能干净取消、重启后任务状态可恢复。(已满足,见 3.8 / 3.9 与 `tests/unit/test_orchestrator.py`、`test_runtime.py`、`test_storage.py`、`test_session_router.py`。)
+验收标准：CLI、未来 Web/TUI 只依赖 RuntimeService/Protocol Client；事件可 JSON Schema 校验并按游标重放；两个 Session 并发时 Thread/Turn/Item/事件不串线；简单请求不必调用 Planner。
 
 ### 6.2 多 Agent、Session 与长期记忆
 
@@ -628,3 +644,4 @@ python -m app --profile cloud_claude -p "打开 https://example.com 并告诉我
 - 查代码优先用 `rg` 或内置 `code_search`，不要让模型通过 shell 拼复杂 grep/find。
 - 修改 PRD 时只改目标设计；修改进度、完成情况、下一步计划时只改本文件，**完成项归到第 3 节而不是在下一步表里标记**。
 - 高风险能力的顺序应是：先结构化描述和审计，再接真实执行能力。
+- Codex Runtime 架构借鉴与 AgentLab 的 Protocol、TurnEngine、动态工具、上下文和系统沙箱演进路线统一维护在 [`codex_runtime_learnings.md`](./codex_runtime_learnings.md)，实施后再把完成项同步回本文件。

@@ -14,16 +14,34 @@ from typing import Any, Callable
 from app.agent.approval_broker import ApprovalBroker
 from app.agent.cancel import CancelToken
 from app.agent.session_router import SessionRouter
+from app.protocol.envelopes import EventEnvelope, utc_now
+from app.protocol.errors import RuntimeFailure
+from app.protocol.items import TurnItem
+from app.protocol.models import TurnRecord
 
 
 @dataclass(frozen=True)
 class RuntimeEvent:
-    """Service 对外发布的统一事件信封。"""
+    """旧版进程内事件；新前端应使用 EventEnvelope。"""
 
     kind: str
     session_id: str | None
     run_id: str | None
     payload: Any = None
+
+
+_LEGACY_EVENT_KIND = {
+    "session_created": "thread.created",
+    "session_resumed": "thread.resumed",
+    "session_switched": "thread.selected",
+    "session_images_cleared": "thread.images_cleared",
+    "run_started": "turn.started",
+    "turn_event": "turn.legacy_event",
+    "agent_run_event": "turn.agent_event",
+    "run_completed": "turn.completed",
+    "run_failed": "turn.failed",
+    "run_cancel_requested": "turn.cancel_requested",
+}
 
 
 @dataclass
@@ -54,6 +72,8 @@ class RuntimeService:
         self._runs: dict[str, _ActiveRun] = {}
         self._session_runs: dict[str, str] = {}
         self._subscribers: list[Callable[[RuntimeEvent], None]] = []
+        self._protocol_subscribers: list[Callable[[EventEnvelope], None]] = []
+        self._sequences: dict[str, int] = {}
         self._closed = False
 
     @property
@@ -78,6 +98,79 @@ class RuntimeService:
 
         return unsubscribe
 
+    def subscribe_protocol(
+        self,
+        callback: Callable[[EventEnvelope], None],
+        *,
+        thread_id: str | None = None,
+        after_sequence: int = 0,
+    ) -> Callable[[], None]:
+        """订阅 Protocol v1，并在注册前按游标重放已持久化事件。"""
+        if thread_id:
+            storage = getattr(self.router, "_storage", None)
+            if storage is not None:
+                for row in storage.list_runtime_events(
+                    thread_id, after_sequence=after_sequence,
+                ):
+                    callback(EventEnvelope(**row))
+        with self._lock:
+            self._ensure_open()
+            self._protocol_subscribers.append(callback)
+
+        def unsubscribe() -> None:
+            with self._lock:
+                if callback in self._protocol_subscribers:
+                    self._protocol_subscribers.remove(callback)
+
+        return unsubscribe
+
+    def replay_events(
+        self, thread_id: str, *, after_sequence: int = 0,
+    ) -> list[EventEnvelope]:
+        storage = getattr(self.router, "_storage", None)
+        rows = storage.list_runtime_events(
+            thread_id, after_sequence=after_sequence,
+        ) if storage is not None else []
+        return [EventEnvelope(**row) for row in rows]
+
+    def _next_sequence(self, thread_id: str) -> int:
+        with self._lock:
+            storage = getattr(self.router, "_storage", None)
+            persisted = storage.next_runtime_sequence(thread_id) if storage else 1
+            cached = self._sequences.get(thread_id, 1)
+            value = max(persisted, cached)
+            self._sequences[thread_id] = value + 1
+            return value
+
+    def _publish_protocol(
+        self,
+        *,
+        kind: str,
+        thread_id: str,
+        turn_id: str | None = None,
+        item_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> EventEnvelope:
+        event = EventEnvelope.create(
+            sequence=self._next_sequence(thread_id),
+            thread_id=thread_id,
+            turn_id=turn_id,
+            item_id=item_id,
+            kind=kind,
+            payload=payload,
+        )
+        storage = getattr(self.router, "_storage", None)
+        if storage is not None:
+            storage.append_runtime_event(event)
+        with self._lock:
+            subscribers = list(self._protocol_subscribers)
+        for callback in subscribers:
+            try:
+                callback(event)
+            except Exception:
+                pass
+        return event
+
     def publish(
         self,
         kind: str,
@@ -86,7 +179,7 @@ class RuntimeService:
         run_id: str | None = None,
         payload: Any = None,
     ) -> None:
-        """发布事件；单个前端回调失败不会影响 Agent 执行。"""
+        """发布兼容事件，并在有 thread_id 时同步发布 Protocol v1 事件。"""
         event = RuntimeEvent(kind, session_id, run_id, payload)
         with self._lock:
             subscribers = list(self._subscribers)
@@ -95,6 +188,13 @@ class RuntimeService:
                 callback(event)
             except Exception:
                 pass
+        if session_id:
+            self._publish_protocol(
+                kind=_LEGACY_EVENT_KIND.get(kind, f"legacy.{kind}"),
+                thread_id=session_id,
+                turn_id=run_id,
+                payload=_protocol_payload(payload),
+            )
 
     def new_session(self, agent_id: str | None = None, title: str = "") -> str:
         with self._lock:
@@ -207,6 +307,34 @@ class RuntimeService:
             )
 
         self.publish("run_started", session_id=target_id, run_id=actual_run_id)
+        turn = TurnRecord(
+            turn_id=actual_run_id,
+            thread_id=target_id,
+            status="running",
+            input_text=message,
+        )
+        storage = getattr(self.router, "_storage", None)
+        if storage is not None:
+            storage.save_runtime_turn(turn)
+        input_sequence = self._next_sequence(target_id)
+        input_item = TurnItem.create(
+            item_id=f"item-{uuid.uuid4().hex}",
+            thread_id=target_id,
+            turn_id=actual_run_id,
+            sequence=input_sequence,
+            kind="user.message",
+            status="completed",
+            payload={"text": message, "image_count": len(images or [])},
+        )
+        if storage is not None:
+            storage.append_runtime_item(input_item)
+        self._publish_protocol(
+            kind="item.completed",
+            thread_id=target_id,
+            turn_id=actual_run_id,
+            item_id=input_item.item_id,
+            payload={"item": input_item.to_dict()},
+        )
         try:
             chat_kwargs = {"cancel": token, "resume": resume}
             # 不传空的 images kwarg，兼容只实现旧 chat(message,cancel,resume) 接口的
@@ -215,6 +343,19 @@ class RuntimeService:
                 chat_kwargs["images"] = images
             result = session.chat(message, **chat_kwargs)
             self.router.persist(target_id)
+            usage = getattr(session, "last_turn_usage", {}) or {}
+            completed_turn = TurnRecord(
+                turn_id=actual_run_id,
+                thread_id=target_id,
+                status="completed",
+                input_text=message,
+                started_at=turn.started_at,
+                finished_at=utc_now(),
+                input_tokens=int(usage.get("input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+            )
+            if storage is not None:
+                storage.save_runtime_turn(completed_turn)
             self.publish(
                 "run_completed",
                 session_id=target_id,
@@ -223,6 +364,17 @@ class RuntimeService:
             )
             return result
         except BaseException as exc:
+            failure = RuntimeFailure.from_exception(exc)
+            if storage is not None:
+                storage.save_runtime_turn(TurnRecord(
+                    turn_id=actual_run_id,
+                    thread_id=target_id,
+                    status="cancelled" if isinstance(exc, KeyboardInterrupt) else "failed",
+                    input_text=message,
+                    started_at=turn.started_at,
+                    finished_at=utc_now(),
+                    failure_code=failure.code,
+                ))
             # BaseException 保证 KeyboardInterrupt 时也能发出收尾事件并释放 run 槽位。
             self.publish(
                 "run_failed",
@@ -266,6 +418,7 @@ class RuntimeService:
             self._closed = True
             active_runs = list(self._runs.values())
             self._subscribers.clear()
+            self._protocol_subscribers.clear()
         for active in active_runs:
             active.cancel.cancel()
         self.approval_broker.close()
@@ -278,3 +431,32 @@ class RuntimeService:
     def __getattr__(self, name: str):
         """过渡期兼容 CLI 的 loop_handler 等只读扩展，后续逐步收敛为显式 API。"""
         return getattr(self.router, name)
+
+
+def _protocol_payload(payload: Any) -> dict[str, Any]:
+    """将旧事件转换为公共协议 payload；异常只暴露结构化摘要。"""
+    if payload is None:
+        return {}
+    if isinstance(payload, BaseException):
+        return {"failure": RuntimeFailure.from_exception(payload).to_dict()}
+    if isinstance(payload, dict):
+        converted = {}
+        for key, value in payload.items():
+            if isinstance(value, BaseException):
+                converted[key] = RuntimeFailure.from_exception(value).to_dict()
+            elif hasattr(value, "to_dict") and callable(value.to_dict):
+                converted[key] = value.to_dict()
+            elif hasattr(value, "__dataclass_fields__"):
+                from dataclasses import asdict
+                converted[key] = asdict(value)
+            elif isinstance(value, (str, int, float, bool, type(None), list, dict)):
+                converted[key] = value
+            else:
+                converted[key] = str(value)
+        return converted
+    if hasattr(payload, "to_dict") and callable(payload.to_dict):
+        return {"value": payload.to_dict()}
+    if hasattr(payload, "__dataclass_fields__"):
+        from dataclasses import asdict
+        return {"value": asdict(payload)}
+    return {"value": str(payload)}

@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from app.storage.loop_store import init_loop_tables
+from app.protocol.envelopes import EventEnvelope
+from app.protocol.items import TurnItem
+from app.protocol.models import TurnRecord
 from app.util.redact import redact, redact_value
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -116,6 +119,51 @@ CREATE TABLE IF NOT EXISTS context_summaries (
     compression_model_profile TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS runtime_turns (
+    turn_id       TEXT PRIMARY KEY,
+    thread_id     TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    input_text    TEXT NOT NULL DEFAULT '',
+    started_at    TEXT NOT NULL,
+    finished_at   TEXT,
+    failure_code  TEXT,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (thread_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS runtime_items (
+    item_id       TEXT PRIMARY KEY,
+    thread_id     TEXT NOT NULL,
+    turn_id       TEXT NOT NULL,
+    sequence      INTEGER NOT NULL,
+    kind          TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    payload_json  TEXT NOT NULL DEFAULT '{}',
+    created_at    TEXT NOT NULL,
+    FOREIGN KEY (thread_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    FOREIGN KEY (turn_id) REFERENCES runtime_turns(turn_id) ON DELETE CASCADE,
+    UNIQUE(thread_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS runtime_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema_version INTEGER NOT NULL,
+    sequence      INTEGER NOT NULL,
+    thread_id     TEXT NOT NULL,
+    turn_id       TEXT,
+    item_id       TEXT,
+    kind          TEXT NOT NULL,
+    timestamp     TEXT NOT NULL,
+    payload_json  TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (thread_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    UNIQUE(thread_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_turns_thread ON runtime_turns(thread_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_items_turn ON runtime_items(turn_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_thread_seq ON runtime_events(thread_id, sequence);
 """
 
 _TOOL_EXECUTION_MIGRATIONS = {
@@ -246,6 +294,9 @@ class Storage:
         长期记忆按设计跨 session 留存,不随单个 session 删除。
         """
         with self._tx() as con:
+            con.execute("DELETE FROM runtime_events WHERE thread_id=?", (session_id,))
+            con.execute("DELETE FROM runtime_items WHERE thread_id=?", (session_id,))
+            con.execute("DELETE FROM runtime_turns WHERE thread_id=?", (session_id,))
             con.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM tool_executions WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM tasks WHERE session_id=?", (session_id,))
@@ -512,6 +563,101 @@ class Storage:
             (session_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    # ── Runtime Protocol v1 append-only store ────────────────────────────────
+
+    def save_runtime_turn(self, turn: TurnRecord) -> None:
+        data = turn.to_dict()
+        with self._tx() as con:
+            con.execute(
+                """INSERT OR REPLACE INTO runtime_turns
+                   (turn_id,thread_id,status,input_text,started_at,finished_at,
+                    failure_code,input_tokens,output_tokens)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    data["turn_id"], data["thread_id"], data["status"],
+                    redact(str(data["input_text"])), data["started_at"],
+                    data["finished_at"], data["failure_code"],
+                    int(data["input_tokens"]), int(data["output_tokens"]),
+                ),
+            )
+
+    def get_runtime_turn(self, turn_id: str) -> Optional[dict]:
+        row = self._con.execute(
+            "SELECT * FROM runtime_turns WHERE turn_id=?", (turn_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def append_runtime_item(self, item: TurnItem) -> None:
+        data = item.to_dict()
+        with self._tx() as con:
+            con.execute(
+                """INSERT INTO runtime_items
+                   (item_id,thread_id,turn_id,sequence,kind,status,payload_json,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    data["item_id"], data["thread_id"], data["turn_id"],
+                    int(data["sequence"]), data["kind"], data["status"],
+                    json.dumps(redact_value(data["payload"]), ensure_ascii=False),
+                    data["created_at"],
+                ),
+            )
+
+    def list_runtime_items(self, turn_id: str, after_sequence: int = 0) -> list[dict]:
+        rows = self._con.execute(
+            """SELECT * FROM runtime_items
+               WHERE turn_id=? AND sequence>? ORDER BY sequence""",
+            (turn_id, after_sequence),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json"))
+            result.append(item)
+        return result
+
+    def append_runtime_event(self, event: EventEnvelope) -> None:
+        data = event.to_dict()
+        with self._tx() as con:
+            con.execute(
+                """INSERT INTO runtime_events
+                   (schema_version,sequence,thread_id,turn_id,item_id,kind,timestamp,payload_json)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    int(data["schema_version"]), int(data["sequence"]),
+                    data["thread_id"], data["turn_id"], data["item_id"],
+                    data["kind"], data["timestamp"],
+                    json.dumps(redact_value(data["payload"]), ensure_ascii=False),
+                ),
+            )
+
+    def list_runtime_events(
+        self,
+        thread_id: str,
+        after_sequence: int = 0,
+        limit: int = 1000,
+    ) -> list[dict]:
+        rows = self._con.execute(
+            """SELECT schema_version,sequence,thread_id,turn_id,item_id,kind,
+                      timestamp,payload_json
+               FROM runtime_events
+               WHERE thread_id=? AND sequence>?
+               ORDER BY sequence LIMIT ?""",
+            (thread_id, after_sequence, max(1, min(limit, 10_000))),
+        ).fetchall()
+        result = []
+        for row in rows:
+            event = dict(row)
+            event["payload"] = json.loads(event.pop("payload_json"))
+            result.append(event)
+        return result
+
+    def next_runtime_sequence(self, thread_id: str) -> int:
+        row = self._con.execute(
+            "SELECT COALESCE(MAX(sequence),0)+1 AS next FROM runtime_events WHERE thread_id=?",
+            (thread_id,),
+        ).fetchone()
+        return int(row["next"]) if row else 1
 
     # ── agent_profiles ───────────────────────────────────────────────────────
     def upsert_agent_profile(self, agent_id: str, name: str,
