@@ -179,6 +179,15 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - 每个新 Turn 记录用户 Item、运行状态、完成 token、失败 code，并将兼容事件映射为 `thread.* / turn.* / item.*` 命名空间事件。
 - 新增 Protocol、JSONL、SQLite round-trip、事件重放和不可序列化 payload 测试；当前 `619` 项 unit tests 全部通过。
 
+### 3.14 Runtime Protocol 初始化、TurnItem 映射与事件背压
+
+- Protocol v1 新增 `ClientInfo / InitializeResult` 握手模型和能力协商；当前声明 `event_replay / turn_items / approvals / images / jsonl`，未知客户端能力安全忽略。
+- 新增有界 `EventSubscription`，慢消费者队列满时标记 overload 并要求客户端携带 `after_sequence` 重连，避免 UI 阻塞 Runtime。
+- `RuntimeService` 新增 `initialize_client / open_event_subscription / close_client`，在现有 callback 兼容层之外提供队列式协议消费。
+- `TurnEvent / RunEvent` 的常用事件已规范映射为 `agent.message / tool.call / tool.result / approval.request / task.execution / plan.created / turn.result` TurnItem；尚未覆盖的上下文与 Loop 事件继续走 legacy 兼容通道。
+- CLI 首批移除对 `router._storage` 和 `loop_handler` 的直接访问，改用 `current_thread_summary / handle_goal_command / handle_loop_command` 显式 Service API。
+- 新增握手、能力协商、未初始化拒绝、有界队列 overload、TurnItem 映射和 Thread 摘要测试；当前 `623` 项 unit tests 全部通过。
+
 ### 3.15 ToolDescriptor、分级审批与统一工具审计
 
 - 九级风险分类已落地：`read / observe / network / write / browser_control / desktop_control / remote_execute / execute / destructive`。工具未显式覆盖 `requires_approval` 时由风险等级决定默认审批；workspace 越界仍由参数级 `approval_resolver` 提升为独立审批动作。
@@ -187,7 +196,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `ToolRegistry` 对 completed/error/denied/approval_required 统一产出 `ToolAuditEvent`；CLI 为每个 Session 注入审计 sink，写入 SQLite `tool_executions`。表已补风险、目标、来源、host、审批动作、结果状态和 observation 字段，并可自动迁移旧数据库。
 - 文件内容、代码搜索结果和网页正文使用工具级 `audit_redactor` 只记录有界摘要；MCP 协议错误不再伪装成功，而是作为工具错误回灌模型并进入审计。
 
-### 3.14 Loop Engineering 持久化证据闭环
+### 3.16 Loop Engineering 持久化证据闭环
 
 - `LoopRunner` 已把 run、每轮 iteration、TaskStore 快照、VerificationResult、预算消耗、终止原因、worktree 状态、修复计划、diff 和验证提交持续写入 SQLite，不再只在内存和终端事件中存在。
 - `loop_store` 新增有界且脱敏的 `loop_artifacts` 制品表，并补齐 iteration/artifact/evidence/diff/list API；旧数据库启动时自动迁移 `termination_reason` 字段。
@@ -202,7 +211,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 配置 | `.env` + `config/models.yaml`（模型）+ `config/agents.yaml`（Agent）+ `config/mcp_servers.yaml`（MCP） | `app/config/`, `app/agent/profiles.py`, `app/mcp/config.py` |
 | 模型层 | Anthropic / OpenAI Responses / OpenAI-compatible；统一内部协议；JSON tool call fallback | `app/models/` |
 | Runtime | CLI 主路径已切到编排:`AgentSession(orchestrate=True)` 委托 Orchestrator;`orchestrate=False` 仍保留 legacy 单轮循环 | `app/agent/runtime.py`, `app/agent/orchestrator.py` |
-| Protocol v1 | Thread/Turn/Item/EventEnvelope/RuntimeFailure 协议模型、JSON Schema、JSONL transport；Runtime Service 发布事件并支持游标重放；下一步收口 CLI 私有访问 | `app/protocol/`, `app/agent/service.py`, `app/storage/` |
+| Protocol v1 | Thread/Turn/Item/EventEnvelope/RuntimeFailure、JSON Schema/JSONL、握手能力协商、有界订阅队列、游标重放；常用 Runtime 事件已映射 TurnItem | `app/protocol/`, `app/agent/service.py`, `app/storage/` |
 | Loop Engineering | GoalSpec → Orchestrator → Verifier → 诊断修复 → worktree 审批提交；run/iteration/verification/worktree/repair/diff/commit/预算/终止原因完整持久化；支持 `/loop evidence/diff/resume`；Learner、Project Knowledge、子 Agent 待做（见 6.14） | `app/agent/goals.py`, `verifier.py`, `loop_runner.py`, `loop_commands.py`, `app/workspace/worktree.py`, `app/storage/loop_store.py` |
 | 多 Agent / Session | AgentProfile + SessionRouter + `/session` 命令族；SQLite 持久化、恢复、隔离（含任务快照恢复） | `app/agent/profiles.py`, `app/agent/session_router.py`, `app/storage/` |
 | 长期记忆 | none/read/read_write 三策略 + 注入；LIKE 检索（未做向量） | `app/memory/` |

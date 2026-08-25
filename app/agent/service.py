@@ -17,7 +17,15 @@ from app.agent.session_router import SessionRouter
 from app.protocol.envelopes import EventEnvelope, utc_now
 from app.protocol.errors import RuntimeFailure
 from app.protocol.items import TurnItem
+from app.protocol.mapping import item_event_kind, runtime_event_to_item
 from app.protocol.models import TurnRecord
+from app.protocol.handshake import (
+    ClientInfo,
+    InitializeResult,
+    SUPPORTED_CAPABILITIES,
+    negotiate_capabilities,
+)
+from app.protocol.subscription import EventQueueOverloaded, EventSubscription
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,8 @@ class RuntimeService:
         self._session_runs: dict[str, str] = {}
         self._subscribers: list[Callable[[RuntimeEvent], None]] = []
         self._protocol_subscribers: list[Callable[[EventEnvelope], None]] = []
+        self._queue_subscribers: dict[str, EventSubscription] = {}
+        self._clients: dict[str, ClientInfo] = {}
         self._sequences: dict[str, int] = {}
         self._closed = False
 
@@ -97,6 +107,46 @@ class RuntimeService:
                     self._subscribers.remove(callback)
 
         return unsubscribe
+
+    def initialize_client(self, client: ClientInfo) -> InitializeResult:
+        """执行一次进程内 Protocol 握手，并返回协商后的能力。"""
+        with self._lock:
+            self._ensure_open()
+            client_id = f"client-{uuid.uuid4().hex}"
+            self._clients[client_id] = client
+        return InitializeResult(
+            protocol_version=1,
+            client_id=client_id,
+            accepted_capabilities=negotiate_capabilities(client),
+            server_capabilities=tuple(sorted(SUPPORTED_CAPABILITIES)),
+        )
+
+    def open_event_subscription(
+        self,
+        client_id: str,
+        *,
+        thread_id: str | None = None,
+        after_sequence: int = 0,
+        max_queue_size: int = 256,
+    ) -> EventSubscription:
+        """为已初始化客户端创建有界队列，并先写入游标之后的历史事件。"""
+        with self._lock:
+            self._ensure_open()
+            if client_id not in self._clients:
+                raise RuntimeError("client not initialized")
+            subscription = EventSubscription(client_id, max_queue_size=max_queue_size)
+            self._queue_subscribers[client_id] = subscription
+        if thread_id:
+            for event in self.replay_events(thread_id, after_sequence=after_sequence):
+                subscription.put(event)
+        return subscription
+
+    def close_client(self, client_id: str) -> None:
+        with self._lock:
+            subscription = self._queue_subscribers.pop(client_id, None)
+            self._clients.pop(client_id, None)
+        if subscription:
+            subscription.close()
 
     def subscribe_protocol(
         self,
@@ -164,12 +214,53 @@ class RuntimeService:
             storage.append_runtime_event(event)
         with self._lock:
             subscribers = list(self._protocol_subscribers)
+            queue_subscribers = list(self._queue_subscribers.items())
         for callback in subscribers:
             try:
                 callback(event)
             except Exception:
                 pass
+        overloaded: list[str] = []
+        for client_id, subscription in queue_subscribers:
+            try:
+                subscription.put(event)
+            except EventQueueOverloaded:
+                overloaded.append(client_id)
+        for client_id in overloaded:
+            self.close_client(client_id)
         return event
+
+    def _publish_runtime_item(
+        self, event: Any, *, thread_id: str, turn_id: str, source: str,
+    ) -> TurnItem | None:
+        sequence = self._next_sequence(thread_id)
+        item = runtime_event_to_item(
+            event, thread_id=thread_id, turn_id=turn_id, sequence=sequence,
+        )
+        if item is None:
+            # 尚未映射的上下文/Loop 事件继续走兼容通道。
+            self.publish(source, session_id=thread_id, run_id=turn_id, payload=event)
+            return None
+        storage = getattr(self.router, "_storage", None)
+        if storage is not None:
+            storage.append_runtime_item(item)
+        # 旧 callback 仍收到原事件，避免 CLI/第三方迁移期间行为变化。
+        legacy = RuntimeEvent(source, thread_id, turn_id, event)
+        with self._lock:
+            legacy_subscribers = list(self._subscribers)
+        for callback in legacy_subscribers:
+            try:
+                callback(legacy)
+            except Exception:
+                pass
+        self._publish_protocol(
+            kind=item_event_kind(item),
+            thread_id=thread_id,
+            turn_id=turn_id,
+            item_id=item.item_id,
+            payload={"item": item.to_dict()},
+        )
+        return item
 
     def publish(
         self,
@@ -230,6 +321,43 @@ class RuntimeService:
             result = self.router.clear_session_images(target)
         self.publish("session_images_cleared", session_id=target, payload=result)
         return result
+
+    def get_thread(self, thread_id: str | None = None) -> dict | None:
+        target = thread_id or self.router.current_id
+        if not target:
+            return None
+        storage = getattr(self.router, "_storage", None)
+        return storage.get_session(target) if storage is not None else None
+
+    def current_thread_summary(self) -> dict | None:
+        thread_id = self.router.current_id
+        if not thread_id:
+            return None
+        row = self.get_thread(thread_id) or {}
+        session = self.router.current
+        return {
+            "thread_id": thread_id,
+            "title": row.get("title", ""),
+            "agent_id": row.get("agent_id", ""),
+            "model_profile": row.get("model_profile", ""),
+            "message_count": len(getattr(session, "messages", []) or []),
+        }
+
+    def current_session(self):
+        """CLI 迁移期的显式 Session 访问；后续由 Protocol Client 替代。"""
+        return self.router.current
+
+    def handle_goal_command(self, command: str) -> str | None:
+        handler = getattr(self.router, "loop_handler", None)
+        if handler is None:
+            return "Loop 功能尚未初始化。"
+        return handler.handle_goal_command(command)
+
+    def handle_loop_command(self, command: str) -> str | None:
+        handler = getattr(self.router, "loop_handler", None)
+        if handler is None:
+            return "Loop 功能尚未初始化。"
+        return handler.handle_loop_command(command)
 
     def list_sessions(self) -> list[dict]:
         return self.router.list_sessions()
@@ -292,17 +420,13 @@ class RuntimeService:
         subscribe_events = getattr(session, "subscribe_events", None)
         if callable(subscribe_events):
             unsubscribe = subscribe_events(
-                on_turn=lambda event: self.publish(
-                    "turn_event",
-                    session_id=target_id,
-                    run_id=actual_run_id,
-                    payload=event,
+                on_turn=lambda event: self._publish_runtime_item(
+                    event, thread_id=target_id, turn_id=actual_run_id,
+                    source="turn_event",
                 ),
-                on_run=lambda event: self.publish(
-                    "agent_run_event",
-                    session_id=target_id,
-                    run_id=actual_run_id,
-                    payload=event,
+                on_run=lambda event: self._publish_runtime_item(
+                    event, thread_id=target_id, turn_id=actual_run_id,
+                    source="agent_run_event",
                 ),
             )
 
@@ -419,6 +543,11 @@ class RuntimeService:
             active_runs = list(self._runs.values())
             self._subscribers.clear()
             self._protocol_subscribers.clear()
+            subscriptions = list(self._queue_subscribers.values())
+            self._queue_subscribers.clear()
+            self._clients.clear()
+        for subscription in subscriptions:
+            subscription.close()
         for active in active_runs:
             active.cancel.cancel()
         self.approval_broker.close()

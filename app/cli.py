@@ -2035,12 +2035,11 @@ def _repl(router: RuntimeService) -> int:
 
     while True:
         _print_input_separator()
-        # 动态构建 prompt:显示 [session_id·标题]
-        if router.current_id and router.current:
-            sess_id = router.current_id
-            # 从 router._storage 获取 session 标题
-            sess_row = router._storage.get_session(sess_id)
-            title = sess_row["title"] if sess_row else "?"
+        # 动态构建 prompt:通过 RuntimeService 获取当前 Thread 摘要。
+        thread = router.current_thread_summary()
+        if thread:
+            sess_id = thread["thread_id"]
+            title = thread.get("title") or "?"
             # 标题可能很长，截断到合理长度
             if len(title) > 30:
                 title = title[:27] + "..."
@@ -2210,16 +2209,13 @@ def _repl(router: RuntimeService) -> int:
             print(_handle_model_command(router, line))
             continue
 
-        # /goal 和 /loop 命令:Loop Engineering 模式(§7.6)
+        # /goal 和 /loop 命令通过 RuntimeService 显式入口处理。
         if line.startswith("/goal") or line.startswith("/loop"):
-            loop_handler = getattr(router, "loop_handler", None)
-            if loop_handler is None:
-                print("Loop 功能尚未初始化。")
-                continue
-            if line.startswith("/goal"):
-                out = loop_handler.handle_goal_command(line)
-            else:
-                out = loop_handler.handle_loop_command(line)
+            out = (
+                router.handle_goal_command(line)
+                if line.startswith("/goal")
+                else router.handle_loop_command(line)
+            )
             if out:
                 print(out)
             continue

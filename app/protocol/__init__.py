@@ -7,6 +7,8 @@ from app.protocol.envelopes import EventEnvelope, PROTOCOL_VERSION
 from app.protocol.errors import RuntimeFailure
 from app.protocol.items import TurnItem
 from app.protocol.models import ThreadRecord, TurnRecord
+from app.protocol.handshake import ClientInfo, InitializeResult
+from app.protocol.subscription import EventQueueOverloaded, EventSubscription
 from app.protocol.schema import protocol_schemas
 
 __all__ = [

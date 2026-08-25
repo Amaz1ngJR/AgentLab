@@ -177,7 +177,41 @@ def test_different_sessions_can_run_concurrently_and_persist_correct_ids():
     assert sorted(router.persisted) == ["s1", "s2"]
 
 
-def test_close_is_idempotent_and_releases_router_resources():
+def test_service_exposes_thread_summary_without_cli_storage_access(tmp_path):
+    from app.agent.profiles import AgentProfile
+    from app.agent.runtime import AgentSession
+    from app.agent.session_router import SessionRouter
+    from app.models.protocol import ModelResponse
+    from app.storage import Storage
+    from app.tools.registry import ToolRegistry
+
+    class LLM:
+        model = "fake"
+        provider = "fake"
+        supports_vision = False
+        def create_message(self, messages, **kwargs):
+            return ModelResponse(text="ok", tool_calls=[], usage={}, provider_payload=[])
+        def format_tool_results(self, results):
+            return []
+
+    storage = Storage(tmp_path / "db")
+    router = SessionRouter(
+        storage,
+        lambda profile, sid: AgentSession(LLM(), ToolRegistry()),
+        {"default": AgentProfile("default", "Default", "fake")},
+    )
+    sid = router.new("default", "My Thread")
+    router.current.messages.append({"role": "user", "content": "hello"})
+    summary = RuntimeService(router).current_thread_summary()
+    assert summary == {
+        "thread_id": sid,
+        "title": "My Thread",
+        "agent_id": "default",
+        "model_profile": "fake",
+        "message_count": 1,
+    }
+
+
     session = _Session()
     router = _Router({"s1": session})
     service = RuntimeService(router)

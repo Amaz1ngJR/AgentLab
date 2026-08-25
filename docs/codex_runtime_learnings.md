@@ -612,6 +612,23 @@ initialized
 
 ---
 
+### 7.1 已完成：Protocol v1 基础与队列化事件（阶段 1-2）
+
+当前已完成：
+
+- Thread/Turn/Item/EventEnvelope/RuntimeFailure 和 JSON 值约束。
+- JSON Schema 草案、JSONL transport、SQLite append-only Turn/Item/Event。
+- Protocol sequence 与 `after_sequence` 游标重放。
+- `initialize_client` 握手和客户端能力协商。
+- 有界 EventSubscription、慢消费者 overload 和重连提示。
+- 常用 TurnEvent/RunEvent 到规范 TurnItem 的映射。
+- CLI 首批移除 `_storage` 和 `loop_handler` 私有访问。
+
+下一阶段从文档 P0 的剩余项继续：收口全部 CLI 私有访问、补初始化 transport、将
+上下文/Loop 事件全部映射 Item，并开始统一 TurnEngine。
+
+---
+
 ## 8. 建议目录结构
 
 ```text
