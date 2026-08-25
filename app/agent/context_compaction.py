@@ -225,6 +225,20 @@ def _find_balanced_json(text: str, start: int) -> Optional[str]:
     return None
 
 
+def _bound_transcript(text: str, max_chars: int = 80_000) -> str:
+    """限制摘要模型看到的历史文本，保留头尾并明确中间省略。"""
+    if len(text) <= max_chars:
+        return text
+    head = int(max_chars * 0.60)
+    tail = max_chars - head
+    omitted = len(text) - max_chars
+    return (
+        text[:head]
+        + f"\n\n[中间历史已省略 {omitted} 个字符，仅用于摘要输入；原始历史仍保留]\n\n"
+        + text[-tail:]
+    )
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """从模型输出抠出第一个 JSON 对象(容忍 markdown 围栏 / 前后散文 / 嵌套结构)。
 
@@ -290,14 +304,46 @@ class CompactionResult:
         self.reason = reason
 
 
+def _fallback_summary(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """模型摘要失败时的本地安全兜底，不编造事实，只保留可追溯摘要。"""
+    user_messages = [
+        str(m.get("content", "")) for m in messages if m.get("role") == "user"
+    ]
+    assistant_messages = [
+        str(m.get("content", "")) for m in messages if m.get("role") == "assistant"
+    ]
+    tool_count = sum(1 for m in messages if m.get("type") in {
+        "function_call", "function_call_output",
+    } or m.get("role") == "tool")
+    last_user = user_messages[-1][-2000:] if user_messages else "unknown"
+    last_assistant = assistant_messages[-1][-2000:] if assistant_messages else "unknown"
+    return {
+        "user_goal": last_user or "unknown",
+        "active_constraints": [],
+        "decisions": [],
+        "current_state": f"本地兜底摘要：压缩前包含 {len(messages)} 条消息、约 {tool_count} 条工具记录。",
+        "open_tasks": ["请基于最近消息和任务面板继续确认未完成工作。"],
+        "tool_evidence": [{
+            "source": "local_compaction_fallback",
+            "finding": f"最近一条助手输出：{last_assistant}",
+        }],
+        "files_and_artifacts": [],
+        "failed_attempts": [],
+        "approvals_and_risks": [],
+        "memory_candidates": [],
+        "handoff_note": "模型摘要生成失败，以上为本地有界兜底；不要把未知内容当作已确认事实。",
+    }
+
+
 class ContextCompressor:
     """选段 → 调模型摘要 → 校验/脱敏 → 产出摘要消息并就地替换旧历史。"""
 
     def __init__(self, llm, system: str = COMPRESSION_SYSTEM,
-                 model_profile: str = ""):
+                 model_profile: str = "", allow_local_fallback: bool = True):
         self._llm = llm
         self._system = system
         self._model_profile = model_profile
+        self._allow_local_fallback = allow_local_fallback
         self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
 
     def compact(
@@ -324,24 +370,40 @@ class ContextCompressor:
         old = messages[:split]
         token_before = estimate_messages_tokens(old)
 
-        # 把旧历史序列化成给压缩模型看的输入(单条 user 消息,避免重放 tool 结构)
+        # 长历史不能作为一条 user message 原样发给摘要模型；先限制摘要输入大小。
+        # 旧消息仍保留在 SQLite，只有摘要请求的 transcript 做有界采样，避免压缩请求
+        # 本身再次触发 context overflow。优先保留最早目标和最近证据。
+        transcript = self._render_transcript(old)
+        transcript = _bound_transcript(transcript)
+        fallback_reason = ""
         try:
-            transcript = self._render_transcript(old)
             resp = self._llm.create_message(
                 messages=[{"role": "user", "content": transcript}],
                 tools=None,
                 system=self._system,
+                max_tokens=1024,
                 on_progress=on_progress,
             )
             if getattr(resp, "usage", None):
                 for k in ("input_tokens", "output_tokens"):
                     self.last_usage[k] = resp.usage.get(k, 0)
             obj = _extract_json(getattr(resp, "text", "") or "")
-        except Exception as exc:  # 模型异常:不压缩,保留原始尾部
-            return CompactionResult(False, reason=f"压缩模型调用失败: {exc}")
+        except Exception as exc:  # 模型异常:进入本地兜底,不让手动 compact 失效
+            if not self._allow_local_fallback:
+                return CompactionResult(False, reason=f"压缩模型调用失败: {exc}")
+            # 保留诊断原因供 ContextManager/UI 展示，但继续构造本地摘要。
+            obj = _fallback_summary(old)
+            fallback_reason = f"local_fallback:{type(exc).__name__}"
 
+        # 当前 CRS 模型可能把 JSON 摘要请求误判成普通 coding prompt，甚至返回工具调用。
         if not _is_valid_summary(obj):
-            return CompactionResult(False, reason="摘要缺必填字段或非法 JSON")
+            # 强制手动压缩不能因为 CRS 返回 Markdown/截断/非 JSON 就彻底失效；
+            # 本地兜底只抽取历史中真实存在的最近用户/助手文本，不要求模型编造摘要。
+            if self._allow_local_fallback:
+                obj = _fallback_summary(old)
+                fallback_reason = "local_fallback:invalid_summary"
+            else:
+                return CompactionResult(False, reason="摘要缺必填字段或非法 JSON")
 
         obj = _redact_summary(obj)
         summary = ContextSummary(
@@ -364,7 +426,10 @@ class ContextCompressor:
 
         # 就地替换:用一条摘要消息顶掉被压缩的前缀,保留 recent tail。
         messages[:split] = [summary_msg]
-        return CompactionResult(True, summary=summary)
+        result = CompactionResult(True, summary=summary)
+        if fallback_reason:
+            result.reason = fallback_reason
+        return result
 
     @staticmethod
     def _render_transcript(messages: list[dict[str, Any]]) -> str:

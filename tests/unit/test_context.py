@@ -287,7 +287,7 @@ def test_compressor_compacts_and_returns_summary():
 
 def test_compressor_invalid_summary_keeps_messages():
     llm = FakeRouter([_resp_text("not json at all")])
-    comp = ContextCompressor(llm)
+    comp = ContextCompressor(llm, allow_local_fallback=False)
     msgs = _long_messages(12)
     snapshot = [dict(m) for m in msgs]
     result = comp.compact(msgs, keep_recent=4)
@@ -314,6 +314,17 @@ def test_compressor_redacts_secrets_in_summary():
     assert result.compacted
     # 摘要里的密钥应被脱敏
     assert "SECRETSECRETSECRET" not in json.dumps(result.summary.summary, ensure_ascii=False)
+
+
+def test_compressor_local_fallback_on_invalid_summary():
+    llm = FakeRouter([_resp_text("not json at all")])
+    comp = ContextCompressor(llm, allow_local_fallback=True)
+    msgs = _long_messages(12)
+    result = comp.compact(msgs, keep_recent=4)
+    assert result.compacted
+    assert result.summary is not None
+    assert "本地兜底" in result.summary.summary["current_state"]
+    assert len(msgs) == 5
 
 
 def test_summary_to_record_round_trips_fields():
@@ -390,7 +401,34 @@ def test_manager_force_compacts_even_when_disabled():
     assert result is True
 
 
-def test_manager_drain_records():
+def test_manager_force_compacts_history_smaller_than_recent_budget():
+    """回归：手动 compact 不应因 recent_budget 足够容纳全历史而得到 split=0。"""
+    llm = FakeRouter([_summary_resp()])
+    mgr = _manager(llm, limit=256_000, auto=True, keep=6)
+    # 总历史远小于 50% recent budget，但仍有大量可压缩旧消息。
+    msgs = [
+        {"role": "user" if i % 2 == 0 else "assistant",
+         "content": f"历史消息 {i} " + "较长内容" * 100}
+        for i in range(40)
+    ]
+    assert estimate_messages_tokens(msgs) < mgr.budget.recent_messages_budget
+    assert mgr.maybe_compact(msgs, force=True) is True
+    assert len(msgs) == 7  # 一条摘要 + 最近 6 条
+
+
+def test_safe_split_large_tool_history_keeps_recent_pair_boundary():
+    """Responses function_call/output 交替历史应在最近边界处找到安全切点。"""
+    msgs = []
+    for i in range(100):
+        msgs.extend([
+            {"type": "function_call", "call_id": f"c{i}", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": f"c{i}", "output": "ok"},
+        ])
+    split = _safe_split_point(msgs, keep_recent=6, recent_budget=None)
+    assert split > 0
+    assert not _is_tool_result_message(msgs[split])
+
+
     llm = FakeRouter([_summary_resp()])
     mgr = _manager(llm, limit=300, keep=4)
     mgr.maybe_compact(_long_messages(14))

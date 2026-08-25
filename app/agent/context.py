@@ -53,19 +53,45 @@ class ContextManager:
 
     # ── 查询 ──────────────────────────────────────────────────────────────────
 
-    def estimate(self, messages: list[dict[str, Any]], *, system: str = "") -> int:
-        """估算"本次模型输入"的 token 数(system + 历史消息)。"""
+    def estimate(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        system: str = "",
+        tools: Optional[list[dict[str, Any]]] = None,
+    ) -> int:
+        """估算模型输入：system + 历史消息 + Tool Schema。"""
+        import json
         from app.agent.context_budget import estimate_tokens
-        return estimate_tokens(system) + estimate_messages_tokens(messages)
+        tool_text = json.dumps(tools, ensure_ascii=False) if tools else ""
+        return (
+            estimate_tokens(system)
+            + estimate_messages_tokens(messages)
+            + estimate_tokens(tool_text)
+        )
 
-    def report(self, messages: list[dict[str, Any]], *, system: str = "") -> dict[str, Any]:
+    def report(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        system: str = "",
+        tools: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
         """给 /context 看的预算 + recent window + summary 状态快照。"""
-        est = self.estimate(messages, system=system)
+        from app.agent.context_budget import estimate_tokens
+        import json
+        message_tokens = estimate_messages_tokens(messages)
+        system_tokens = estimate_tokens(system)
+        tool_tokens = estimate_tokens(json.dumps(tools, ensure_ascii=False)) if tools else 0
+        est = system_tokens + message_tokens + tool_tokens
         b = self.budget
         return {
             "model_context_limit": b.model_context_limit,
             "reserved_output_tokens": b.reserved_output_tokens,
             "estimated_input_tokens": est,
+            "message_tokens": message_tokens,
+            "system_tokens": system_tokens,
+            "tool_schema_tokens": tool_tokens,
             "warn_threshold": b.warn_threshold,
             "compact_threshold": b.compact_threshold,
             "status": b.status_for(est),
@@ -86,13 +112,14 @@ class ContextManager:
         system: str = "",
         source_run_ids: Optional[list[str]] = None,
         force: bool = False,
+        tools: Optional[list[dict[str, Any]]] = None,
         on_progress=None,
     ) -> bool:
         """在稳定点检查预算并按需压缩。返回是否发生了压缩。
 
         force=True 时无视阈值与 auto_compact 直接尝试压缩(供 /context compact)。
         """
-        est = self.estimate(messages, system=system)
+        est = self.estimate(messages, system=system, tools=tools)
         status = self.budget.status_for(est)
 
         if not force:
@@ -103,7 +130,7 @@ class ContextManager:
                 self._emit(RunEvent(
                     kind=events.CONTEXT_BUDGET_WARNING,
                     text="上下文接近窗口上限,下个稳定点将压缩旧历史",
-                    payload=self.report(messages, system=system),
+                    payload=self.report(messages, system=system, tools=tools),
                 ))
                 return False
             if status != "compact":
@@ -114,9 +141,13 @@ class ContextManager:
             kind=events.CONTEXT_COMPACTION_STARTED,
             payload={"token_before": est},
         ))
+        # 手动 compact 的语义是“尽可能压缩旧历史”。不能继续传 recent_budget，
+        # 否则当整段历史本身低于 recent_messages_budget 时，选段算法会把全部消息
+        # 都判为 recent tail，split=0，最终错误报告“无可安全压缩的前缀”。
+        effective_recent_budget = None if force else self.budget.recent_messages_budget
         result = self._compressor.compact(
             messages, keep_recent=self.keep_recent,
-            recent_budget=self.budget.recent_messages_budget,
+            recent_budget=effective_recent_budget,
             source_run_ids=source_run_ids, on_progress=on_progress,
         )
         if not result.compacted or result.summary is None:
@@ -126,10 +157,16 @@ class ContextManager:
             ))
             return False
 
+        if result.reason.startswith("local_fallback:"):
+            self._emit(RunEvent(
+                kind=events.CONTEXT_COMPACTION_FAILED,
+                text=f"摘要模型不可用，已使用本地兜底压缩 ({result.reason.split(':', 1)[1]})",
+            ))
+
         self._pending_records.append(result.summary)
         self.last_summary = result.summary
         self._warned = False  # 压缩后重置,下一轮增长可再次预警
-        after = self.estimate(messages, system=system)
+        after = self.estimate(messages, system=system, tools=tools)
         self._emit(RunEvent(
             kind=events.CONTEXT_COMPACTION_COMPLETED,
             text="已压缩旧历史",

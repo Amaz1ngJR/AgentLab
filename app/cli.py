@@ -984,13 +984,19 @@ def _handle_context_command(session: AgentSession, line: str) -> str:
     sub = parts[1].strip() if len(parts) > 1 else ""
 
     if sub == "":
-        rep = ctx.report(session.messages, system=session.system_prompt)
+        rep = ctx.report(
+            session.messages,
+            system=session.system_prompt,
+            tools=session.tools.schemas() or None,
+        )
         pct = int(rep["usage_ratio"] * 100)
         lines = [
             f"模型窗口   : {rep['model_context_limit']} tokens"
             f"(预留输出 {rep['reserved_output_tokens']})",
             f"预计输入   : ~{rep['estimated_input_tokens']} tokens(~{pct}%) "
             f"[{rep['status']}]",
+            f"输入构成   : 消息 ~{rep['message_tokens']} / system ~{rep['system_tokens']} / "
+            f"tools ~{rep['tool_schema_tokens']}",
             f"阈值       : 警告 {rep['warn_threshold']} / 强制压缩 {rep['compact_threshold']}",
             f"消息条数   : {rep['messages']}(压缩时至少保留最近 {rep['keep_recent']} 条)",
             f"自动压缩   : {'开' if rep['auto_compact'] else '关'}",
@@ -1001,7 +1007,10 @@ def _handle_context_command(session: AgentSession, line: str) -> str:
 
     if sub == "compact":
         compacted = ctx.maybe_compact(
-            session.messages, system=session.system_prompt, force=True,
+            session.messages,
+            system=session.system_prompt,
+            force=True,
+            tools=session.tools.schemas() or None,
         )
         if compacted:
             return "已手动压缩当前会话的可压缩历史。"
