@@ -252,9 +252,7 @@ class LoopCommandHandler:
         session = self.get_session()
         if session is None:
             return "当前无活跃 session。"
-        if not hasattr(session, "_orch") or session._orch is None:
-            session._ensure_orchestrator()
-        orchestrator = session._orch
+        orchestrator = session.ensure_orchestrator()
 
         # Verifier:workspace_root 在 LoopRunner 准备 worktree 后会被覆盖
         from app.agent.verifier import Verifier
@@ -287,7 +285,7 @@ class LoopCommandHandler:
             verifier=verifier,
             worktree_manager=worktree_manager,
             approval=session.approval,
-            on_event=session._emit_run_event if hasattr(session, "_emit_run_event") else None,
+            on_event=session.emit_run_event,
             storage=self.storage,
             session_id=getattr(goal, "session_id", None) or self._current_session_id(),
             loop_id=resume_run["id"] if resume_run else None,

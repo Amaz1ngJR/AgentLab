@@ -314,7 +314,7 @@ AgentLab/
 
 ### 6.1 Runtime Protocol 化与任务拆解
 
-当前状态：Task 编排核心、RuntimeService、ApprovalBroker 和 Protocol v1 第一阶段均已完成。`AgentSession` 支持 Direct/Task 路径，`RuntimeService` 可发布兼容 RuntimeEvent 与带 `schema_version/sequence/thread_id/turn_id/item_id` 的 EventEnvelope；SQLite 已持久化 `runtime_turns / runtime_items / runtime_events`，支持 JSONL 编解码和 `after_sequence` 事件重放。CLI 仍有少量 `_storage`、`_orch`、`loop_handler` 私有访问，Protocol 事件中的部分内容还以 `legacy_event` payload 过渡，下一阶段收口前端边界。
+当前状态：Task 编排核心、RuntimeService、ApprovalBroker 和 Protocol v1 第一阶段均已完成。`AgentSession` 支持 Direct/Task 路径，`RuntimeService` 可发布兼容 RuntimeEvent 与带 `schema_version/sequence/thread_id/turn_id/item_id` 的 EventEnvelope；SQLite 已持久化 `runtime_turns / runtime_items / runtime_events`，支持 JSONL 编解码和 `after_sequence` 事件重放。CLI 的 `_storage`、`_orch`、`loop_handler` 私有访问已从前端路径移除，Loop 适配器也已改为显式 Session API；上下文、Loop 和未知运行事件现在均有结构化 Item 映射。JSONL transport 已具备握手顺序和版本校验，但独立进程 Server/SQ 尚未接入。
 
 已完成：
 
@@ -325,9 +325,9 @@ AgentLab/
 
 接下来要做：
 
-- **P0：收口 Runtime Service 边界**：CLI 不再访问 `_storage`、`_orch`、`_session_factory` 和 Router 私有字段，改为显式 Service API。
-- 将 `RunEvent`/`TurnEvent` 转换为规范 `TurnItem`，移除 `turn.legacy_event` 过渡事件。
-- 为 Protocol 事件增加有界订阅队列、慢消费者背压、初始化握手和能力声明。
+- **P0：收口 Runtime Service 边界**：CLI 不再访问 `_storage`、`_orch`、`_session_factory` 和 Router 私有字段，改为显式 Service API。（CLI/Service 边界已完成；Loop 适配器内部私有访问仍待收口）
+- 将 `RunEvent`/`TurnEvent` 转换为规范 `TurnItem`，移除 `turn.legacy_event` 过渡事件。（Turn/Run、上下文和 Loop 事件已映射；未知事件保存为 `runtime.event`）
+- 为 Protocol 事件增加有界订阅队列、慢消费者背压、初始化握手和能力声明。（进程内 Queue 与 JSONL 握手 transport 已完成；独立进程 Server/SQ 尚待补齐）
 - 将关键事件、失败和审批状态在进程重启后完整恢复。
 - 后续合并 legacy 循环与 Orchestrator 为统一 `TurnEngine`，由 Direct/Task/Loop Policy 控制模式。
 

@@ -148,6 +148,10 @@ class RuntimeService:
         if subscription:
             subscription.close()
 
+    def _protocol_storage(self):
+        """返回 Runtime Protocol 的持久化端口；测试替身可不提供该端口。"""
+        return getattr(self.router, "storage", None)
+
     def subscribe_protocol(
         self,
         callback: Callable[[EventEnvelope], None],
@@ -157,7 +161,7 @@ class RuntimeService:
     ) -> Callable[[], None]:
         """订阅 Protocol v1，并在注册前按游标重放已持久化事件。"""
         if thread_id:
-            storage = getattr(self.router, "_storage", None)
+            storage = self._protocol_storage()
             if storage is not None:
                 for row in storage.list_runtime_events(
                     thread_id, after_sequence=after_sequence,
@@ -177,7 +181,7 @@ class RuntimeService:
     def replay_events(
         self, thread_id: str, *, after_sequence: int = 0,
     ) -> list[EventEnvelope]:
-        storage = getattr(self.router, "_storage", None)
+        storage = self._protocol_storage()
         rows = storage.list_runtime_events(
             thread_id, after_sequence=after_sequence,
         ) if storage is not None else []
@@ -185,7 +189,7 @@ class RuntimeService:
 
     def _next_sequence(self, thread_id: str) -> int:
         with self._lock:
-            storage = getattr(self.router, "_storage", None)
+            storage = self._protocol_storage()
             persisted = storage.next_runtime_sequence(thread_id) if storage else 1
             cached = self._sequences.get(thread_id, 1)
             value = max(persisted, cached)
@@ -209,7 +213,7 @@ class RuntimeService:
             kind=kind,
             payload=payload,
         )
-        storage = getattr(self.router, "_storage", None)
+        storage = self._protocol_storage()
         if storage is not None:
             storage.append_runtime_event(event)
         with self._lock:
@@ -238,10 +242,21 @@ class RuntimeService:
             event, thread_id=thread_id, turn_id=turn_id, sequence=sequence,
         )
         if item is None:
-            # 尚未映射的上下文/Loop 事件继续走兼容通道。
-            self.publish(source, session_id=thread_id, run_id=turn_id, payload=event)
-            return None
-        storage = getattr(self.router, "_storage", None)
+            # 未知事件保留为结构化 legacy item，避免事件在协议层静默丢失。
+            from app.protocol.json_types import to_json_value
+            item = TurnItem.create(
+                item_id=f"item-{uuid.uuid4().hex}",
+                thread_id=thread_id,
+                turn_id=turn_id,
+                sequence=sequence,
+                kind="runtime.event",
+                status="completed",
+                payload={
+                    "source": source,
+                    "event": to_json_value(_protocol_payload(event)),
+                },
+            )
+        storage = self._protocol_storage()
         if storage is not None:
             storage.append_runtime_item(item)
         # 旧 callback 仍收到原事件，避免 CLI/第三方迁移期间行为变化。
@@ -326,8 +341,8 @@ class RuntimeService:
         target = thread_id or self.router.current_id
         if not target:
             return None
-        storage = getattr(self.router, "_storage", None)
-        return storage.get_session(target) if storage is not None else None
+        row = self.thread_record(target)
+        return row
 
     def current_thread_summary(self) -> dict | None:
         thread_id = self.router.current_id
@@ -343,21 +358,67 @@ class RuntimeService:
             "message_count": len(getattr(session, "messages", []) or []),
         }
 
+    def storage(self):
+        """RuntimeService 使用的持久化端口，不向 CLI 暴露 SQLite 连接。"""
+        return self.router.storage
+
     def current_session(self):
-        """CLI 迁移期的显式 Session 访问；后续由 Protocol Client 替代。"""
+        """返回当前 Session；仅作为 CLI 迁移期的显式 Service API。"""
         return self.router.current
 
+    def current_model(self):
+        """返回当前 Session 的模型适配器，供只读 CLI 命令展示。"""
+        session = self.current_session()
+        return getattr(session, "llm", None) if session is not None else None
+
+    def session_model(self, session_id: str | None = None):
+        """返回指定 Thread 的当前模型适配器，供只读 CLI 命令展示。"""
+        target = session_id or self.current_id
+        if not target:
+            return None
+        if target != self.current_id and not self.router.switch(target):
+            return None
+        session = self.router.current
+        return getattr(session, "llm", None) if session is not None else None
+
+    def set_loop_handler(self, handler) -> None:
+        """注入 Loop 命令适配器；前端通过 handle_* 方法调用。"""
+        self.router.loop_handler = handler
+
     def handle_goal_command(self, command: str) -> str | None:
-        handler = getattr(self.router, "loop_handler", None)
+        handler = self.router.loop_handler
         if handler is None:
             return "Loop 功能尚未初始化。"
         return handler.handle_goal_command(command)
 
     def handle_loop_command(self, command: str) -> str | None:
-        handler = getattr(self.router, "loop_handler", None)
+        handler = self.router.loop_handler
         if handler is None:
             return "Loop 功能尚未初始化。"
         return handler.handle_loop_command(command)
+
+    def loop_session(self):
+        """返回 Loop 适配器需要的当前 Session。"""
+        return self.current_session()
+
+    def thread_record(self, thread_id: str | None = None) -> dict | None:
+        return self.router.session_record(thread_id)
+
+    def storage_list_runtime_events(self, thread_id: str, *, after_sequence: int = 0):
+        return self.storage.list_runtime_events(thread_id, after_sequence=after_sequence)
+
+    def storage_next_runtime_sequence(self, thread_id: str) -> int:
+        return self.storage.next_runtime_sequence(thread_id)
+
+    def storage_append_runtime_event(self, event: EventEnvelope) -> None:
+        self.storage.append_runtime_event(event)
+
+    def storage_save_runtime_turn(self, turn: TurnRecord) -> None:
+        self.storage.save_runtime_turn(turn)
+
+    def storage_append_runtime_item(self, item: TurnItem) -> None:
+        self.storage.append_runtime_item(item)
+
 
     def list_sessions(self) -> list[dict]:
         return self.router.list_sessions()
@@ -437,7 +498,7 @@ class RuntimeService:
             status="running",
             input_text=message,
         )
-        storage = getattr(self.router, "_storage", None)
+        storage = self._protocol_storage()
         if storage is not None:
             storage.save_runtime_turn(turn)
         input_sequence = self._next_sequence(target_id)

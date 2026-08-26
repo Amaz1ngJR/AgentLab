@@ -39,12 +39,28 @@ class SessionRouter:
         # 由 CLI 注入的全局共享资源(如 MCPManager),在 close_all 时统一关闭。
         # 不放进单个 session 的 closeables,避免切换/归档某个 session 时误关全局连接。
         self.mcp_manager = None
+        self.loop_handler = None
 
     # ── 属性 ──────────────────────────────────────────────────────────────────
 
     @property
     def current(self) -> Optional[AgentSession]:
         return self._sessions.get(self.current_id) if self.current_id else None
+
+    @property
+    def current_session_id(self) -> Optional[str]:
+        """当前 Thread ID 的显式只读访问，供 RuntimeService 使用。"""
+        return self.current_id
+
+    @property
+    def storage(self) -> Storage:
+        """持久化端口；前端不应直接使用，RuntimeService 可用它完成审计。"""
+        return self._storage
+
+    def session_record(self, session_id: str | None = None) -> dict | None:
+        """返回 Thread 的持久化元数据，不暴露内部 SQLite 连接。"""
+        target = session_id or self.current_id
+        return self._storage.get_session(target) if target else None
 
     # ── 公开操作 ──────────────────────────────────────────────────────────────
 

@@ -9,7 +9,17 @@ from app.protocol.items import TurnItem
 from app.protocol.models import ThreadRecord, TurnRecord
 from app.protocol.handshake import ClientInfo, InitializeResult
 from app.protocol.subscription import EventQueueOverloaded, EventSubscription
-from app.protocol.schema import protocol_schemas
+from app.protocol.transport import (
+    InitializeRequest,
+    JsonlProtocolServer,
+    ProtocolTransportError,
+    decode_events,
+    encode_event,
+    encode_request,
+    initialized_response,
+    initialize_request,
+    write_event,
+)
 
 __all__ = [
     "EventEnvelope",
@@ -18,4 +28,18 @@ __all__ = [
     "ThreadRecord",
     "TurnItem",
     "TurnRecord",
+    "ClientInfo",
+    "InitializeResult",
+    "EventQueueOverloaded",
+    "EventSubscription",
+    "protocol_schemas",
+    "InitializeRequest",
+    "JsonlProtocolServer",
+    "ProtocolTransportError",
+    "decode_events",
+    "encode_event",
+    "encode_request",
+    "initialized_response",
+    "initialize_request",
+    "write_event",
 ]

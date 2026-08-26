@@ -627,12 +627,39 @@ initialized
 下一阶段从文档 P0 的剩余项继续：收口全部 CLI 私有访问、补初始化 transport、将
 上下文/Loop 事件全部映射 Item，并开始统一 TurnEngine。
 
+### 7.2 已完成：Runtime Service 边界收口（阶段 3）
+
+本阶段完成：
+
+- `SessionRouter` 提供显式 `storage / session_record / current_session_id` 端口，RuntimeService 不再依赖 Router 的私有存储字段。
+- RuntimeService 提供当前 Session、模型只读查询、Loop 命令入口和 Runtime 持久化端口；CLI 不再直接读取 `_storage` 或 `loop_handler`。
+- Loop 命令适配器通过显式 `set_loop_handler` 注入；Router 不再承担前端对内部装配细节的隐式转发。
+- 保留 legacy Session/Run API 作为迁移兼容层，现有 CLI、Protocol 事件和并发行为不变。
+
+验证结果：
+
+- Runtime/Protocol/SessionRouter 专项测试：35 passed。
+- 全量测试：626 passed。
+- `compileall`、`git diff --check` 通过。
+
+仍未完成：`loop_commands.py` 内部还直接读取 AgentSession 的 `_orch`、`_ensure_orchestrator` 和 `_emit_run_event`；RunEvent 中的上下文与 Loop 事件仍有 legacy 映射；初始化 transport 尚未提供握手前拒绝请求的完整 Server；统一 TurnEngine、Direct/Task/Loop 自适应路由、Provider retry/circuit breaker、ExecutionGateway 与 OS 沙箱仍待后续阶段实现。
+
+### 7.3 已完成：初始化 JSONL transport 与 Loop 事件协议收口（阶段 4）
+
+本阶段完成：
+
+- 新增 `InitializeRequest`、`JsonlProtocolServer` 和 `ProtocolTransportError`。
+- JSONL 连接必须先发送 `initialize`；握手成功前拒绝其它方法，握手后拒绝重复初始化和未实现请求。
+- 校验客户端名称、版本、能力数组和协议版本；响应返回 `client_id` 与协商能力。
+- `RunEvent` 的上下文预算、压缩、Goal、Loop、验证、修复、Worktree 和 Subagent 事件全部映射为结构化 `TurnItem`。
+- 未知运行事件不再静默回退为 `turn.legacy_event`，而是保存为 `runtime.event` 结构化 Item；原始 legacy callback 继续兼容。
+- Item payload 在协议边界再次脱敏，避免工具/模型事件中的凭据进入公共事件流。
+- 增加握手顺序、重复握手、版本不匹配、非法 JSON 和事件映射回归测试。
+
+仍未完成：独立 stdio 进程服务和完整命令 Submission Queue 尚未接入；统一 TurnEngine、Direct/Task/Loop 自适应路由、Provider retry/circuit breaker、动态工具暴露、ContextBundle、ExecutionGateway 与 OS 沙箱仍待后续阶段。
+
 ---
 
-## 8. 建议目录结构
-
-```text
-app/
   protocol/
     envelopes.py
     commands.py

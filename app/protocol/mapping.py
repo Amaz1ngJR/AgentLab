@@ -5,7 +5,8 @@ import uuid
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from app.protocol.items import ItemStatus, TurnItem
+from app.protocol.items import TurnItem
+from app.util.redact import redact_value
 
 _TURN_KIND = {
     "text": ("agent.message", "completed"),
@@ -15,7 +16,7 @@ _TURN_KIND = {
 }
 
 _RUN_KIND = {
-    "plan_created": ("plan.created", "completed"),
+    "plan_created": ("plan", "completed"),
     "task_started": ("task.execution", "started"),
     "message_delta": ("agent.message", "started"),
     "tool_requested": ("tool.call", "started"),
@@ -25,6 +26,24 @@ _RUN_KIND = {
     "task_updated": ("task.execution", "completed"),
     "run_completed": ("turn.result", "completed"),
     "run_failed": ("turn.result", "failed"),
+    "context_budget_warning": ("context.budget", "waiting"),
+    "context_compaction_started": ("context.compaction", "started"),
+    "context_compaction_completed": ("context.compaction", "completed"),
+    "context_compaction_failed": ("context.compaction", "failed"),
+    "goal_defined": ("loop.goal", "completed"),
+    "loop_started": ("loop.lifecycle", "started"),
+    "loop_iteration_started": ("loop.iteration", "started"),
+    "verification_started": ("verification", "started"),
+    "verification_completed": ("verification", "completed"),
+    "repair_planned": ("loop.repair", "started"),
+    "learner_candidate_created": ("loop.learning", "completed"),
+    "loop_completed": ("loop.lifecycle", "completed"),
+    "loop_failed": ("loop.lifecycle", "failed"),
+    "loop_blocked": ("loop.lifecycle", "waiting"),
+    "loop_budget_exhausted": ("loop.lifecycle", "failed"),
+    "worktree_prepared": ("workspace", "completed"),
+    "subagent_started": ("subagent", "started"),
+    "subagent_completed": ("subagent", "completed"),
 }
 
 
@@ -76,6 +95,6 @@ def _event_payload(event: Any) -> dict[str, Any]:
     # kind 已由 Item 表达；去除空默认值以减少事件体。
     data.pop("kind", None)
     return {
-        key: value for key, value in data.items()
+        key: redact_value(value) for key, value in data.items()
         if value not in (None, "", {}, [], False, 0, 0.0)
     }

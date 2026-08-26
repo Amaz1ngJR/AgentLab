@@ -188,6 +188,14 @@ class AgentSession:
         for callback in list(self._run_subscribers):
             callback(event)
 
+    def ensure_orchestrator(self):
+        """返回当前编排器，供 Runtime/Loop 适配器使用。"""
+        return self._ensure_orchestrator()
+
+    def emit_run_event(self, event: RunEvent) -> None:
+        """向 Session 的 RunEvent 管道发送一个结构化事件。"""
+        self._emit_run_event(event)
+
     def close(self) -> None:
         """释放会话持有的外部资源(MCP server 进程等)。重复调用安全。"""
         for c in self._closeables:
