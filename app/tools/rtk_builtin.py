@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shlex
+import threading
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
@@ -52,8 +53,30 @@ class CompressionResult:
         return max(0, self.original_bytes - self.output_bytes)
 
 
+@dataclass
+class CompressionStats:
+    """累计压缩统计。"""
+    total_calls: int = 0
+    applied_count: int = 0
+    total_original_bytes: int = 0
+    total_output_bytes: int = 0
+
+    @property
+    def total_saved_bytes(self) -> int:
+        return max(0, self.total_original_bytes - self.total_output_bytes)
+
+    @property
+    def average_savings_percent(self) -> float:
+        if self.total_original_bytes == 0:
+            return 0.0
+        return 100.0 * self.total_saved_bytes / self.total_original_bytes
+
+
 class BuiltinRTK:
     """对已完成命令的输出执行命令感知压缩。"""
+
+    _stats = CompressionStats()
+    _stats_lock = threading.Lock()
 
     def __init__(self, config: BuiltinRTKConfig | None = None):
         self.config = config or BuiltinRTKConfig.from_env()
@@ -68,7 +91,9 @@ class BuiltinRTK:
         raw = _join_streams(stdout, stderr)
         original_bytes = len(raw.encode("utf-8", errors="replace"))
         if not self.config.enabled or not raw.strip():
-            return _result(raw, False, "passthrough", original_bytes, "disabled_or_empty")
+            result = _result(raw, False, "passthrough", original_bytes, "disabled_or_empty")
+            self._record_stats(result)
+            return result
 
         category = classify_command(command)
         formatter = _FILTERS.get(category)
@@ -81,7 +106,9 @@ class BuiltinRTK:
                 filtered = formatter(stdout, stderr, returncode, self.config.ultra_compact)
                 reason = "filtered"
             except Exception:
-                return _result(raw, False, category, original_bytes, "filter_error")
+                result = _result(raw, False, category, original_bytes, "filter_error")
+                self._record_stats(result)
+                return result
 
         filtered = filtered.strip()
         if not filtered:
@@ -91,8 +118,41 @@ class BuiltinRTK:
         # 错误命令优先完整保留；只有专用过滤器确实压缩且保留失败信息才应用。
         minimum_saving = 0.05 if returncode != 0 and formatter else 0.10
         if filtered_bytes >= original_bytes * (1 - minimum_saving):
-            return _result(raw, False, category, original_bytes, "insufficient_savings")
-        return _result(filtered, True, category, original_bytes, reason)
+            result = _result(raw, False, category, original_bytes, "insufficient_savings")
+            self._record_stats(result)
+            return result
+        result = _result(filtered, True, category, original_bytes, reason)
+        self._record_stats(result)
+        return result
+
+    def _record_stats(self, result: CompressionResult) -> None:
+        """记录单次压缩结果到全局统计。"""
+        with self._stats_lock:
+            self._stats.total_calls += 1
+            if result.applied:
+                self._stats.applied_count += 1
+            self._stats.total_original_bytes += result.original_bytes
+            self._stats.total_output_bytes += result.output_bytes
+
+    @classmethod
+    def get_stats(cls) -> CompressionStats:
+        """返回累计统计快照。"""
+        with cls._stats_lock:
+            return CompressionStats(
+                total_calls=cls._stats.total_calls,
+                applied_count=cls._stats.applied_count,
+                total_original_bytes=cls._stats.total_original_bytes,
+                total_output_bytes=cls._stats.total_output_bytes,
+            )
+
+    @classmethod
+    def reset_stats(cls) -> None:
+        """清空累计统计。"""
+        with cls._stats_lock:
+            cls._stats.total_calls = 0
+            cls._stats.applied_count = 0
+            cls._stats.total_original_bytes = 0
+            cls._stats.total_output_bytes = 0
 
 
 def classify_command(command: str) -> str:
@@ -126,13 +186,36 @@ def classify_command(command: str) -> str:
 
 def format_status(config: BuiltinRTKConfig | None = None) -> str:
     cfg = config or BuiltinRTKConfig.from_env()
-    return "\n".join([
+    stats = BuiltinRTK.get_stats()
+
+    lines = [
         "RTK: built-in (no external binary required)",
         f"enabled: {str(cfg.enabled).lower()}",
         f"ultra_compact: {str(cfg.ultra_compact).lower()}",
         "filters: git, pytest/tests, grep, listing/read, diagnostics, docker/kubernetes",
         f"toggle: {RTK_ENV_ENABLED}=true|false (restart AgentLab)",
-    ])
+    ]
+
+    if stats.total_calls > 0:
+        lines.append("")
+        lines.append("Session statistics:")
+        lines.append(f"  total commands: {stats.total_calls}")
+        lines.append(f"  compressed: {stats.applied_count} ({100.0 * stats.applied_count / stats.total_calls:.1f}%)")
+        lines.append(f"  original size: {_format_bytes(stats.total_original_bytes)}")
+        lines.append(f"  compressed size: {_format_bytes(stats.total_output_bytes)}")
+        lines.append(f"  saved: {_format_bytes(stats.total_saved_bytes)} ({stats.average_savings_percent:.1f}%)")
+
+    return "\n".join(lines)
+
+
+def _format_bytes(n: int) -> str:
+    """格式化字节数为人类可读形式。"""
+    if n < 1024:
+        return f"{n}B"
+    elif n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    else:
+        return f"{n / (1024 * 1024):.1f}MB"
 
 
 def _filter_git_status(stdout: str, stderr: str, returncode: int, ultra: bool) -> str:

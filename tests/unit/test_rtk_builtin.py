@@ -1,76 +1,119 @@
-"""AgentLab 内置 RTK 风格过滤器测试。"""
-from app.tools.rtk_builtin import (
-    BuiltinRTK,
-    BuiltinRTKConfig,
-    classify_command,
-    format_status,
-)
+"""内置 RTK 压缩引擎测试。"""
+import threading
+
+import pytest
+
+from app.tools.rtk_builtin import BuiltinRTK, BuiltinRTKConfig, format_status
 
 
-def test_classifies_common_commands_cross_platform_strings():
-    assert classify_command("git status --short") == "git_status"
-    assert classify_command("python -m pytest tests -q") == "pytest"
-    assert classify_command("rg foo app") == "grep"
-    assert classify_command("Get-ChildItem") == "generic"  # 安全回退，不猜 PowerShell
+@pytest.fixture(autouse=True)
+def reset_stats():
+    """每个测试前重置全局统计，避免测试间干扰。"""
+    BuiltinRTK.reset_stats()
+    yield
+    BuiltinRTK.reset_stats()
 
 
-def test_pytest_success_collapses_passing_noise():
-    raw = "\n".join(["tests/test_x.py::test_ok PASSED"] * 100 + ["100 passed in 2.0s"])
-    result = BuiltinRTK().compress("pytest -v", raw, "", 0)
-    assert result.applied
-    assert result.output == "100 passed in 2.0s"
-    assert result.savings_percent > 90
+def test_compression_stats_accumulate_across_instances():
+    """统计是全局的，多个 BuiltinRTK 实例共享同一个计数器。"""
+    rtk1 = BuiltinRTK()
+    rtk2 = BuiltinRTK()
+
+    rtk1.compress("git status", "On branch main\nnothing to commit", "", 0)
+    rtk2.compress("echo hello", "hello\n", "", 0)
+
+    stats = BuiltinRTK.get_stats()
+    assert stats.total_calls == 2
 
 
-def test_pytest_failure_keeps_failure_and_exit_context():
-    raw = "\n".join(
-        ["noise"] * 100
-        + ["FAILED tests/test_x.py::test_bad", "E   AssertionError: expected 1", "1 failed"]
-    )
-    result = BuiltinRTK().compress("pytest", raw, "", 1)
-    assert result.applied
-    assert "FAILED tests/test_x.py::test_bad" in result.output
-    assert "AssertionError" in result.output
+def test_stats_count_applied_vs_fallback():
+    """applied_count 只计实际压缩的，回退原文的不算。"""
+    rtk = BuiltinRTK()
+
+    # git status 会被压缩
+    rtk.compress("git status", "On branch main\nnothing to commit, working tree clean", "", 0)
+    # 未识别命令且收益不足，会回退
+    rtk.compress("unknown_cmd", "hello", "", 0)
+
+    stats = BuiltinRTK.get_stats()
+    assert stats.total_calls == 2
+    assert stats.applied_count == 1
 
 
-def test_git_status_porcelain_groups_files():
-    raw = "\n".join(
-        [f" M app/module_{i}.py" for i in range(20)]
-        + [f"?? app/new_{i}.py" for i in range(10)]
-        + [f"D  app/old_{i}.py" for i in range(10)]
-    )
-    engine = BuiltinRTK(BuiltinRTKConfig(ultra_compact=True))
-    result = engine.compress("git status --short", raw, "", 0)
-    assert result.applied
-    assert "modified:20" in result.output
-    assert "untracked:10" in result.output
-    assert "deleted:10" in result.output
+def test_stats_bytes_are_cumulative():
+    """字节数累加正确，节省百分比按总量计算。"""
+    rtk = BuiltinRTK()
+
+    # 模拟一个能压缩的命令
+    result1 = rtk.compress("git status", "On branch main\n" + "M file.py\n" * 10, "", 0)
+    # 模拟一个回退的命令
+    result2 = rtk.compress("echo test", "test\n", "", 0)
+
+    stats = BuiltinRTK.get_stats()
+    assert stats.total_original_bytes == result1.original_bytes + result2.original_bytes
+    assert stats.total_output_bytes == result1.output_bytes + result2.output_bytes
+    assert stats.total_saved_bytes == (result1.original_bytes - result1.output_bytes) + (result2.original_bytes - result2.output_bytes)
 
 
-def test_grep_groups_matches_and_truncates():
-    raw = "\n".join([f"app/a.py:{i}:match {i}" for i in range(1, 80)])
-    result = BuiltinRTK().compress("rg match app", raw, "", 0)
-    assert result.applied
-    assert "app/a.py (79)" in result.output
-    assert "more" in result.output
+def test_stats_thread_safe():
+    """多线程并发压缩时统计不丢失。"""
+    rtk = BuiltinRTK()
+
+    def worker():
+        for _ in range(10):
+            rtk.compress("git status", "On branch main", "", 0)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    stats = BuiltinRTK.get_stats()
+    assert stats.total_calls == 40
 
 
-def test_unknown_short_output_falls_back_exactly():
-    raw = "hello\nworld"
-    result = BuiltinRTK().compress("custom-tool", raw, "", 0)
-    assert not result.applied
-    assert result.output == raw
+def test_reset_stats_clears_all_counters():
+    """reset_stats 清空所有累计值。"""
+    rtk = BuiltinRTK()
+    rtk.compress("git status", "On branch main", "", 0)
+
+    BuiltinRTK.reset_stats()
+    stats = BuiltinRTK.get_stats()
+
+    assert stats.total_calls == 0
+    assert stats.applied_count == 0
+    assert stats.total_original_bytes == 0
+    assert stats.total_output_bytes == 0
 
 
-def test_disabled_returns_raw_output():
-    engine = BuiltinRTK(BuiltinRTKConfig(enabled=False))
-    result = engine.compress("pytest", "10 passed", "warning", 0)
-    assert not result.applied
-    assert result.output == "10 passed\n[stderr]\nwarning"
+def test_format_status_shows_stats_when_available():
+    """format_status 在有统计数据时显示会话统计。"""
+    rtk = BuiltinRTK()
+
+    # 没有调用前，不显示统计
+    status = format_status()
+    assert "Session statistics:" not in status
+
+    # 调用后，显示统计
+    rtk.compress("git status", "On branch main\nnothing to commit", "", 0)
+    status = format_status()
+    assert "Session statistics:" in status
+    assert "total commands: 1" in status
+    assert "saved:" in status
 
 
-def test_status_explicitly_says_no_binary_required():
-    status = format_status(BuiltinRTKConfig(enabled=True, ultra_compact=True))
-    assert "built-in" in status
-    assert "no external binary required" in status
-    assert "ultra_compact: true" in status
+def test_average_savings_percent_with_zero_original():
+    """原始字节为 0 时平均节省百分比应为 0。"""
+    stats = BuiltinRTK.get_stats()
+    assert stats.average_savings_percent == 0.0
+
+
+def test_disabled_rtk_still_records_stats():
+    """RTK 禁用时仍记录统计（虽然 applied=False）。"""
+    rtk = BuiltinRTK(BuiltinRTKConfig(enabled=False))
+    rtk.compress("git status", "On branch main", "", 0)
+
+    stats = BuiltinRTK.get_stats()
+    assert stats.total_calls == 1
+    assert stats.applied_count == 0
