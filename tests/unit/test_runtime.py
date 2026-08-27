@@ -351,7 +351,25 @@ class _ProgressHandle:
         self._text_log.append(delta)
 
 
-# ── 编排模式委托(orchestrate=True)─────────────────────────────────────────────
+def test_mode_selected_event_is_emitted_for_planned_mode():
+    from app.agent.events import MODE_SELECTED
+    router = FakeRouter([
+        _plan_json({"id": "t1", "content": "唯一任务", "dependencies": []}),
+        _resp_text("完成"),
+    ])
+    seen = []
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+        on_run_event=seen.append,
+    )
+    session.chat("修改多个文件并运行测试")
+    selected = [event for event in seen if event.kind == MODE_SELECTED]
+    assert selected and selected[0].payload == {"mode": "task"}
+
+
 
 
 def _plan_json(*tasks):
@@ -363,7 +381,36 @@ def _plan_json(*tasks):
     )
 
 
-def test_orchestrated_chat_delegates_and_copies_stats():
+def test_auto_mode_bypasses_planner_for_simple_request():
+    """auto 模式的简单问答直接走 legacy 循环，不应消耗 Planner 请求。"""
+    router = FakeRouter([_resp_text("直接回答")])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+    )
+    assert session.chat("解释一下这个函数") == "直接回答"
+    assert session.execution_mode.value == "direct"
+    assert len(router.calls) == 1
+
+
+def test_auto_mode_uses_planner_for_multi_step_request():
+    """auto 模式的明显多步骤请求进入 Task/Orchestrator 路径。"""
+    router = FakeRouter([
+        _plan_json({"id": "t1", "content": "唯一任务", "dependencies": []}),
+        _resp_text("任务完成"),
+    ])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+    )
+    assert session.chat("修改多个文件并运行测试") == "任务完成"
+    assert session.execution_mode.value == "task"
+    assert len(router.calls) == 2
+
     """orchestrate=True 时,chat 委托 Orchestrator,并把 run 统计拷回 session。"""
     from app.agent.events import RUN_COMPLETED
     router = FakeRouter([

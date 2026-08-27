@@ -16,6 +16,7 @@ _TURN_KIND = {
 }
 
 _RUN_KIND = {
+    "mode_selected": ("turn.mode", "completed"),
     "plan_created": ("plan", "completed"),
     "task_started": ("task.execution", "started"),
     "message_delta": ("agent.message", "started"),

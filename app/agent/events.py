@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # ── kind 常量 ─────────────────────────────────────────────────────────────────
+MODE_SELECTED = "mode_selected"
 RUN_STARTED = "run_started"
 PLAN_CREATED = "plan_created"
 TASK_STARTED = "task_started"

@@ -28,6 +28,21 @@ def test_parses_profile(tmp_path):
     assert p.orchestrate is True
 
 
+def test_parses_auto_mode(tmp_path):
+    f = tmp_path / "a.yaml"
+    f.write_text(
+        "agents:\n  x:\n    model_profile: local_qwen\n    mode: auto\n",
+        encoding="utf-8",
+    )
+    assert load_agent_profiles(f)["x"].mode == "auto"
+
+
+def test_rejects_unknown_mode():
+    import pytest
+    with pytest.raises(ValueError, match="mode"):
+        AgentProfile("x", "X", "fake", mode="unknown")
+
+
 def test_parses_orchestrate_false(tmp_path):
     f = tmp_path / "a.yaml"
     f.write_text(
@@ -35,6 +50,7 @@ def test_parses_orchestrate_false(tmp_path):
         encoding="utf-8",
     )
     assert load_agent_profiles(f)["x"].orchestrate is False
+
 
 
 def test_rejects_invalid_orchestrate_value(tmp_path):

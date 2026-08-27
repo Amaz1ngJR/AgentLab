@@ -36,6 +36,10 @@ from app.models.protocol import (
 )
 
 
+class ProviderStreamError(RuntimeError):
+    """Provider 流式协议异常，不能伪装成正常模型响应。"""
+
+
 _MISSING_TOOL_OUTPUT = "[历史中的工具结果缺失，状态未知，请勿假设工具已执行]"
 
 
@@ -162,44 +166,55 @@ class OpenAIAdapter:
 
         # 流式事件中累计正文、reasoning summary 和 function arguments。厂商通常只在
         #结束时返回真实 usage，期间用增量估算让 spinner 持续变化。
-        with self._client.responses.stream(**params) as stream:
-            for event in stream:
-                etype = getattr(event, "type", None)
-                delta_text = getattr(event, "delta", "") or ""
-                response = getattr(event, "response", None)
-                event_usage = getattr(response, "usage", None) if response is not None else None
-                if event_usage is not None:
-                    event_input = getattr(event_usage, "input_tokens", None)
-                    event_output = getattr(event_usage, "output_tokens", None)
-                    if event_input is not None:
-                        in_tokens = event_input
-                    progress.set_usage(
-                        input_tokens=event_input,
-                        output_tokens=event_output,
-                    )
-                if etype == "response.output_text.delta":
-                    delta_text = normalizer.normalize("output_text", delta_text)
-                    if delta_text:
-                        if on_text_delta:
-                            on_text_delta(delta_text)
+        try:
+            with self._client.responses.stream(**params) as stream:
+                for event in stream:
+                    etype = getattr(event, "type", None)
+                    delta_text = getattr(event, "delta", "") or ""
+                    response = getattr(event, "response", None)
+                    event_usage = getattr(response, "usage", None) if response is not None else None
+                    if event_usage is not None:
+                        event_input = getattr(event_usage, "input_tokens", None)
+                        event_output = getattr(event_usage, "output_tokens", None)
+                        if event_input is not None:
+                            in_tokens = event_input
+                        progress.set_usage(
+                            input_tokens=event_input,
+                            output_tokens=event_output,
+                        )
+                    if etype == "response.output_text.delta":
+                        delta_text = normalizer.normalize("output_text", delta_text)
+                        if delta_text:
+                            if on_text_delta:
+                                on_text_delta(delta_text)
+                            progress.add_text(delta_text)
+                    elif etype in {
+                        "response.reasoning_text.delta",
+                        "response.reasoning_summary_text.delta",
+                    }:
+                        delta_text = normalizer.normalize("reasoning", delta_text)
+                        if delta_text:
+                            if on_thinking_delta:
+                                on_thinking_delta(delta_text)
+                            progress.add_reasoning(delta_text)
+                    elif etype in {
+                        "response.function_call_arguments.delta",
+                        "response.custom_tool_call_input.delta",
+                    }:
+                        delta_text = normalizer.normalize("tool_arguments", delta_text)
                         progress.add_text(delta_text)
-                elif etype in {
-                    "response.reasoning_text.delta",
-                    "response.reasoning_summary_text.delta",
-                }:
-                    delta_text = normalizer.normalize("reasoning", delta_text)
-                    if delta_text:
-                        if on_thinking_delta:
-                            on_thinking_delta(delta_text)
-                        progress.add_reasoning(delta_text)
-                elif etype in {
-                    "response.function_call_arguments.delta",
-                    "response.custom_tool_call_input.delta",
-                }:
-                    delta_text = normalizer.normalize("tool_arguments", delta_text)
-                    progress.add_text(delta_text)
 
-            final = stream.get_final_response()
+                # 仍在 with 内取最终响应：stream 关闭后 SDK 不保证还能取到。
+                final = stream.get_final_response()
+        except RuntimeError as exc:
+            # SDK 状态机异常通常来自代理的事件顺序不兼容；不能返回空的正常响应，
+            # 否则 Orchestrator 会误判为任务完成并停止继续处理。
+            message = str(exc)
+            if "Expected to have received" in message or "rate_limit" in message.lower():
+                raise ProviderStreamError(
+                    f"OpenAI Responses 流式协议异常: {message}"
+                ) from exc
+            raise
 
         # ── 从 final.output 解析最终结果 ────────────────────────────────────
         # output 是混合 item 列表:可能含 ResponseOutputMessage 与
@@ -337,8 +352,9 @@ def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
     for msg in messages:
         # 如果已经是 Responses API 格式 (有 type 字段), 清理并保留
         if "type" in msg:
-            # 移除不支持的字段（如 parsed_arguments）
-            cleaned = {k: v for k, v in msg.items() if k not in ('parsed_arguments',)}
+            # 移除不支持的字段（如 parsed_arguments, status 等内部字段）
+            # Responses API 只接受其规范中定义的字段
+            cleaned = {k: v for k, v in msg.items() if k not in ('parsed_arguments', 'status')}
             result.append(cleaned)
             continue
 

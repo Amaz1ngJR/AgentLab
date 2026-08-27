@@ -196,7 +196,11 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `ToolRegistry` 对 completed/error/denied/approval_required 统一产出 `ToolAuditEvent`；CLI 为每个 Session 注入审计 sink，写入 SQLite `tool_executions`。表已补风险、目标、来源、host、审批动作、结果状态和 observation 字段，并可自动迁移旧数据库。
 - 文件内容、代码搜索结果和网页正文使用工具级 `audit_redactor` 只记录有界摘要；MCP 协议错误不再伪装成功，而是作为工具错误回灌模型并进入审计。
 
-### 3.16 Loop Engineering 持久化证据闭环
+### 3.17 Direct / Task / Loop 本地模式路由
+
+- `app/agent/mode_router.py` 提供无模型调用的本地选择器：默认 `Direct`，明显多步骤/多文件请求进入 `Task`，显式验收/成功标准请求标记为 `Loop`。
+- `AgentSession(mode="auto")` 在请求级选择模式，简单问答直接复用低延迟 legacy 工具循环，复杂请求复用现有 `Orchestrator`；旧 `orchestrate=True/False` 配置语义保持兼容。
+- `mode_selected` 通过 `RunEvent` 和 Protocol `TurnItem` 对外发布，profile 可配置 `mode: auto/direct/task`。
 
 - `LoopRunner` 已把 run、每轮 iteration、TaskStore 快照、VerificationResult、预算消耗、终止原因、worktree 状态、修复计划、diff 和验证提交持续写入 SQLite，不再只在内存和终端事件中存在。
 - `loop_store` 新增有界且脱敏的 `loop_artifacts` 制品表，并补齐 iteration/artifact/evidence/diff/list API；旧数据库启动时自动迁移 `termination_reason` 字段。
@@ -314,7 +318,7 @@ AgentLab/
 
 ### 6.1 Runtime Protocol 化与任务拆解
 
-当前状态：Task 编排核心、RuntimeService、ApprovalBroker 和 Protocol v1 第一阶段均已完成。`AgentSession` 支持 Direct/Task 路径，`RuntimeService` 可发布兼容 RuntimeEvent 与带 `schema_version/sequence/thread_id/turn_id/item_id` 的 EventEnvelope；SQLite 已持久化 `runtime_turns / runtime_items / runtime_events`，支持 JSONL 编解码和 `after_sequence` 事件重放。CLI 的 `_storage`、`_orch`、`loop_handler` 私有访问已从前端路径移除，Loop 适配器也已改为显式 Session API；上下文、Loop 和未知运行事件现在均有结构化 Item 映射。JSONL transport 已具备握手顺序和版本校验，但独立进程 Server/SQ 尚未接入。
+当前状态：Task 编排核心、RuntimeService、ApprovalBroker 和 Protocol v1 第一阶段均已完成。`AgentSession` 支持 Direct/Task 路径，`mode: auto` 可按本地规则把简单请求留在 Direct、复杂请求交给 Task；RuntimeService 可发布兼容 RuntimeEvent 与带 `schema_version/sequence/thread_id/turn_id/item_id` 的 EventEnvelope；SQLite 已持久化 `runtime_turns / runtime_items / runtime_events`，支持 JSONL 编解码和 `after_sequence` 事件重放。CLI 的 `_storage`、`_orch`、`loop_handler` 私有访问已从前端路径移除，Loop 适配器也已改为显式 Session API；上下文、Loop 和未知运行事件均有结构化 Item 映射。JSONL transport 已具备握手顺序和版本校验，但独立进程 Server/SQ 尚未接入。
 
 已完成：
 

@@ -14,6 +14,7 @@ from app.config.schemas import LLMConfig
 from app.attachments import build_user_content
 from app.models.openai_adapter import (
     OpenAIAdapter,
+    ProviderStreamError,
     _MISSING_TOOL_OUTPUT,
     _convert_messages_to_responses_format,
     _repair_responses_tool_pairs,
@@ -364,3 +365,76 @@ def test_repair_responses_tool_pairs_keeps_complete_pairs_unchanged():
         {"type": "function_call_output", "call_id": "call_ok", "output": "done"},
     ]
     assert _repair_responses_tool_pairs(items) == items
+
+
+def test_stream_protocol_order_error_is_not_reported_as_success():
+    """SDK 事件顺序异常应抛出 ProviderStreamError，不能伪造正常 ModelResponse。"""
+    class BrokenStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def __iter__(self):
+            raise RuntimeError(
+                "Expected to have received `response.created` before `codex.rate_limits`"
+            )
+            yield  # pragma: no cover
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MagicMock()
+        MockOpenAI.return_value = client
+        client.responses.stream.return_value = BrokenStream()
+        adapter = OpenAIAdapter(_cfg())
+
+        import pytest
+        with pytest.raises(ProviderStreamError, match="流式协议异常"):
+            adapter.create_message(messages=[{"role": "user", "content": "hello"}])
+
+
+def test_convert_messages_filters_unsupported_fields():
+    """确保转换过程中过滤掉不支持的字段，如 status、parsed_arguments 等。
+    
+    这修复了 'Unknown parameter: input[N].status' 的 400 错误。
+    """
+    messages = [
+        # 已经是 Responses API 格式，但包含不支持的字段
+        {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "read_file",
+            "arguments": '{"path": "test.py"}',
+            "status": "completed",  # 不支持的字段
+            "parsed_arguments": {"path": "test.py"},  # 不支持的字段
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "file content",
+            "status": "success",  # 不支持的字段
+        },
+        # 普通消息格式
+        {"role": "user", "content": "继续"},
+    ]
+    
+    converted = _convert_messages_to_responses_format(messages)
+    
+    # 验证不支持的字段被移除
+    assert "status" not in converted[0]
+    assert "parsed_arguments" not in converted[0]
+    assert "status" not in converted[1]
+    
+    # 验证支持的字段保留
+    assert converted[0]["type"] == "function_call"
+    assert converted[0]["call_id"] == "call_123"
+    assert converted[0]["name"] == "read_file"
+    assert converted[0]["arguments"] == '{"path": "test.py"}'
+    
+    assert converted[1]["type"] == "function_call_output"
+    assert converted[1]["call_id"] == "call_123"
+    assert converted[1]["output"] == "file content"
+    
+    # 验证普通消息正确转换
+    assert converted[2]["type"] == "message"
+    assert converted[2]["role"] == "user"

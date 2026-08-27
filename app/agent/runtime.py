@@ -6,9 +6,11 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
+from app.agent import events
 from app.agent.approval import ApprovalPolicy, AutoApprove, request_tool_approval
 from app.agent.cancel import CancelToken
 from app.agent.events import RunEvent
+from app.agent.mode_router import ExecutionMode, ModeRouter, SessionState
 from app.agent.tasks import TaskStore
 from app.attachments import ImageAttachment, build_user_content
 from app.models.protocol import ToolResult
@@ -116,6 +118,7 @@ class AgentSession:
         planner: Optional[Any] = None,
         on_run_event: Optional[Callable[[RunEvent], None]] = None,
         context_manager: Optional[Any] = None,
+        mode: ExecutionMode | str | None = None,
     ):
         self.llm = llm
         self.tools = tools
@@ -144,10 +147,15 @@ class AgentSession:
         self.task_store: TaskStore = task_store or TaskStore()
         # 需要在会话结束时收尾的资源(如 MCPManager),退出时按序调用其 .stop()/.close()
         self._closeables: list[Any] = closeables or []
-        # ── 编排路径(可选)────────────────────────────────────────────────────
-        # orchestrate=True 时,chat() 委托给 Orchestrator(Planner/Executor/Replanner),
-        # 否则走下面的 legacy 单轮工具循环(默认,保持所有既有测试行为不变)。
+        # ── 编排模式(可选)────────────────────────────────────────────────────
+        # mode_router 会按请求复杂度选择 Direct/Task；显式 orchestrate=False 仍强制 Direct。
         self._orchestrate = orchestrate
+        self._configured_mode = (
+            ExecutionMode(mode) if mode is not None else None
+        )
+        if self._configured_mode is ExecutionMode.AUTO and not orchestrate:
+            raise ValueError("mode=auto 需要启用 orchestrate")
+        self._last_mode: ExecutionMode | None = None
         self._planner = planner
         self._on_run_event = on_run_event or (lambda e: None)
         self._orch = None  # 懒构建(见 _ensure_orchestrator)
@@ -216,6 +224,7 @@ class AgentSession:
         self.cumulative_seconds = 0.0
         self.last_goal = ""
         self.last_run_status = ""
+        self._last_mode = None
         self.task_store.clear()
 
     def _ensure_orchestrator(self):
@@ -244,6 +253,32 @@ class AgentSession:
         self._orch.messages = self.messages
         return self._orch
 
+    def _select_mode(
+        self,
+        user_input: str,
+        images: list[ImageAttachment] | None,
+        resume: bool,
+    ) -> ExecutionMode:
+        """选择本轮模式；显式 mode 优先，旧 orchestrate=False 保持 Direct。"""
+        if self._configured_mode is not None and self._configured_mode is not ExecutionMode.AUTO:
+            return self._configured_mode
+        if self._configured_mode is None:
+            return ExecutionMode.TASK if self._orchestrate else ExecutionMode.DIRECT
+        return ModeRouter.select(
+            user_input,
+            images,
+            SessionState(
+                has_active_goal=False,
+                has_open_tasks=resume and not self.task_store.is_empty(),
+                orchestrate_enabled=True,
+            ),
+        )
+
+    @property
+    def execution_mode(self) -> ExecutionMode | None:
+        """返回最近一次选定模式。"""
+        return self._last_mode
+
     def chat(
         self,
         user_input: str,
@@ -258,11 +293,22 @@ class AgentSession:
         否则走 legacy 单轮循环。cancel 仅编排路径生效(legacy 路径忽略)。
         resume=True 时继续上一轮未完成的任务(失败任务重置为 pending),仅编排路径生效。
         """
-        if self._orchestrate:
-            return self._chat_orchestrated(
-                user_input, images=images, cancel=cancel, resume=resume,
-            )
-        return self._chat_legacy(user_input, images=images)
+        mode = self._select_mode(user_input, images, resume)
+        self._last_mode = mode
+        # 每条路径都发事件：Direct 也要让 CLI/协议订阅方知道这轮没有走 Planner。
+        self._emit_run_event(RunEvent(
+            kind=events.MODE_SELECTED,
+            text=f"执行模式: {mode.value}",
+            payload={"mode": mode.value},
+        ))
+        if mode is ExecutionMode.DIRECT:
+            return self._chat_legacy(user_input, images=images)
+        # AUTO 模式的 Task/Loop 仍使用现有 Orchestrator；Loop 的完整生命周期
+        # 由 LoopCommandHandler 驱动，这里只负责普通目标的规划执行。
+        return self._chat_orchestrated(
+            user_input, images=images, cancel=cancel,
+            resume=resume,
+        )
 
     def _chat_orchestrated(
         self,

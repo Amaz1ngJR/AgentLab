@@ -660,7 +660,40 @@ initialized
 
 ---
 
-  protocol/
+### 7.4 已完成：Direct / Task / Loop 本地模式路由（阶段 5）
+
+本阶段完成：
+
+- 新增 `ExecutionMode`、`SessionState` 和无模型调用的 `ModeRouter`。
+- `mode=auto` 时，简单问答/单步读取走 Direct，不调用 Planner；明显多文件、多步骤、修改并测试等请求走 Task。
+- 明确包含 GoalSpec、成功标准、验收标准或 `/loop` 的请求标记为 Loop；Loop 的完整验证生命周期仍由 `/goal` / `/loop` Handler 驱动，不在普通 chat 中误启动。
+- Profile 支持 `mode: auto/direct/task`；未配置时保持旧 `orchestrate` 语义，`orchestrate: false` 始终走 Direct。
+- 新增 `mode_selected` RunEvent，并映射为 `turn.mode` TurnItem；Direct 与 Task 两条路径都会发出，CLI 显示当前执行模式。
+- 多附件 + 明确操作自动进入 Task；无开放任务时普通 `/resume` 不会意外恢复旧任务。
+- 增加模式选择、Planner 绕过、Task 路由、profile 校验和协议事件测试。
+
+验证：模式专项测试 26 passed（18 个模式路由测试 + 8 个协议事件测试）；全量单元测试 668 passed。
+
+测试覆盖：
+- **模式路由回归测试**（`tests/unit/test_mode_router.py`）：
+  - 基础模式选择（Direct/Task/Loop）
+  - 边界情况：空输入、单/多附件、大小写不敏感、优先级覆盖
+  - Session 状态兼容性：字典与 SessionState 对象
+  - orchestrate_enabled=False 强制 Direct
+  - 中英文任务标记识别，英文动作词按整词匹配
+  - 活跃 GoalSpec 叠加操作请求时留在 Loop
+  - 普通对话保持 Direct，避免误判
+- **协议事件测试**（`tests/unit/test_protocol_events.py`）：
+  - 通过 `chat()` 验证 Direct 与 Task 两条路径都发出 MODE_SELECTED
+  - MODE_SELECTED payload 结构与 execution_mode 一致性
+  - RunEvent dataclass 字段访问与默认值
+  - 嵌套 payload 支持（为 Turn/Item 演进准备）
+  - session_state 快照在事件中的传递
+
+仍未完成：统一 TurnEngine（目前 Direct 仍是 legacy 循环、Task 仍复用 Orchestrator）；Loop 专用策略、动态工具暴露、Provider retry/circuit breaker、独立 stdio Submission Queue、ContextBundle、ExecutionGateway 与 OS 沙箱仍待后续阶段。
+
+---
+
     envelopes.py
     commands.py
     events.py

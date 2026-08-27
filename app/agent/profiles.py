@@ -30,7 +30,8 @@ class AgentProfile:
     memory_policy   - 记忆策略：none/read/read_write（默认 none）
     max_steps       - 一次 run 的模型往返总上限（兼容旧配置名，默认 8）
     max_task_steps  - 单个子任务的模型往返上限（默认 min(8, max_steps)）
-    orchestrate     - 是否启用 Planner/Executor 编排路径（默认 True）
+    orchestrate     - 是否启用编排能力（False 强制 Direct，默认 True）
+    mode            - auto/direct/task；未设置时兼容 orchestrate 的旧语义
     """
     agent_id: str
     name: str
@@ -43,8 +44,13 @@ class AgentProfile:
     max_steps: int = 8
     max_task_steps: int | None = None
     orchestrate: bool = True
+    mode: str = "legacy"
 
     def __post_init__(self) -> None:
+        if self.mode not in {"legacy", "auto", "direct", "task"}:
+            raise ValueError(f"mode 必须是 legacy/auto/direct/task，当前值: {self.mode!r}")
+        if self.mode == "auto" and not self.orchestrate:
+            raise ValueError("mode=auto 需要 orchestrate=True")
         if self.max_steps <= 0:
             raise ValueError("AgentProfile.max_steps 必须 > 0")
         if self.max_task_steps is not None and self.max_task_steps <= 0:
@@ -78,8 +84,18 @@ def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
                 if body.get("max_task_steps") is not None else None
             ),
             orchestrate=_parse_bool(body.get("orchestrate"), default=True),
+            mode=_parse_mode(body.get("mode")),
         )
     return profiles
+
+
+def _parse_mode(value) -> str:
+    """解析 profile 模式；legacy 表示沿用 orchestrate 布尔开关。"""
+    if value is None:
+        return "legacy"
+    if not isinstance(value, str) or value.strip().lower() not in {"auto", "direct", "task"}:
+        raise ValueError(f"mode 必须是 auto/direct/task，当前值: {value!r}")
+    return value.strip().lower()
 
 
 def _parse_bool(value, *, default: bool) -> bool:

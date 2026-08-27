@@ -883,6 +883,9 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         # write_file/edit_file 拒绝后也关闭 VS Code diff
         if ev.tool_name in ("write_file", "edit_file"):
             _close_active_vscode_diff()
+    elif kind == run_events.MODE_SELECTED:
+        mode = (ev.payload or {}).get("mode", "")
+        print(f"  · 执行模式: {mode}", flush=True)
     elif kind == run_events.PLAN_CREATED:
         tasks = ev.payload.get("tasks", [])
         if len(tasks) > 1:  # 单任务计划不值得打面板,省噪音
@@ -1436,8 +1439,11 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             # 用 Planner/Executor/Replanner 编排:目标先拆任务,按依赖执行,失败
             # 重规划。Planner 用同一个 llm;system prompt 由 Orchestrator 注入到
             # 规划与执行两阶段。RunEvent 经 _print_run_event 渲染。
+            # 编排模式/本地模式路由：legacy 沿用 profile 的 orchestrate 语义，
+            # auto/direct/task 则显式交给 AgentSession。
             orchestrate=agent_profile.orchestrate,
             planner=Planner(llm),
+            mode=(agent_profile.mode if agent_profile.mode != "legacy" else None),
             on_run_event=print_run_event_with_state,
             context_manager=ctx_manager,
         )
