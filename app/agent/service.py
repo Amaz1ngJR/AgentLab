@@ -17,6 +17,7 @@ from app.agent.session_router import SessionRouter
 from app.protocol.envelopes import EventEnvelope, utc_now
 from app.protocol.errors import RuntimeFailure
 from app.protocol.items import TurnItem
+from app.protocol.json_types import to_json_value
 from app.protocol.mapping import item_event_kind, runtime_event_to_item
 from app.protocol.models import TurnRecord
 from app.protocol.handshake import (
@@ -84,6 +85,8 @@ class RuntimeService:
         self._queue_subscribers: dict[str, EventSubscription] = {}
         self._clients: dict[str, ClientInfo] = {}
         self._sequences: dict[str, int] = {}
+        self._sequence_lock = threading.Lock()
+        self._thread_locks: dict[str, threading.RLock] = {}
         self._closed = False
 
     @property
@@ -187,35 +190,70 @@ class RuntimeService:
         ) if storage is not None else []
         return [EventEnvelope(**row) for row in rows]
 
-    def _next_sequence(self, thread_id: str) -> int:
-        with self._lock:
-            storage = self._protocol_storage()
-            persisted = storage.next_runtime_sequence(thread_id) if storage else 1
-            cached = self._sequences.get(thread_id, 1)
-            value = max(persisted, cached)
+    def _thread_lock(self, thread_id: str) -> threading.RLock:
+        """返回某个 Thread 的写入锁。
+
+        序号分配、落库和派发必须在同一把锁里完成，否则两个线程可能按 1、2 拿到
+        序号却按 2、1 落库/派发，让 append-only 事实流出现乱序。锁按 Thread 划分，
+        不同 Thread 仍可并行，也避免在订阅者回调期间持有全局锁。
+        """
+        with self._sequence_lock:
+            lock = self._thread_locks.get(thread_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._thread_locks[thread_id] = lock
+            return lock
+
+    def _allocate_sequence(self, thread_id: str) -> int:
+        """分配该 Thread 的下一个序号；调用方需持有对应的 thread 锁。"""
+        storage = self._protocol_storage()
+        if storage is not None:
+            value = storage.allocate_runtime_sequence(thread_id)
             self._sequences[thread_id] = value + 1
             return value
+        # 没有持久化端口(测试替身)时退回进程内计数器。
+        value = self._sequences.get(thread_id, 1)
+        self._sequences[thread_id] = value + 1
+        return value
+
+    def _record_explicit_sequence(self, thread_id: str, sequence: int) -> None:
+        """同步显式序号，避免下一条自动序号回退到已占用位置。"""
+        self._sequences[thread_id] = max(
+            self._sequences.get(thread_id, 1), sequence + 1,
+        )
 
     def _publish_protocol(
         self,
         *,
         kind: str,
         thread_id: str,
+        sequence: int | None = None,
         turn_id: str | None = None,
         item_id: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> EventEnvelope:
-        event = EventEnvelope.create(
-            sequence=self._next_sequence(thread_id),
-            thread_id=thread_id,
-            turn_id=turn_id,
-            item_id=item_id,
-            kind=kind,
-            payload=payload,
-        )
-        storage = self._protocol_storage()
-        if storage is not None:
-            storage.append_runtime_event(event)
+        """落库并派发一个独立的 Protocol 事件。"""
+        with self._thread_lock(thread_id):
+            if sequence is None:
+                sequence = self._allocate_sequence(thread_id)
+            else:
+                self._record_explicit_sequence(thread_id, sequence)
+            event = EventEnvelope.create(
+                sequence=sequence,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=item_id,
+                kind=kind,
+                payload=payload,
+            )
+            storage = self._protocol_storage()
+            if storage is not None:
+                storage.append_runtime_event(event)
+            self._dispatch_protocol(event)
+        return event
+
+    def _dispatch_protocol(self, event: EventEnvelope) -> None:
+        """把已落库的事件派发给协议订阅者和有界队列。"""
         with self._lock:
             subscribers = list(self._protocol_subscribers)
             queue_subscribers = list(self._queue_subscribers.items())
@@ -232,19 +270,43 @@ class RuntimeService:
                 overloaded.append(client_id)
         for client_id in overloaded:
             self.close_client(client_id)
-        return event
+
+    def _publish_item(
+        self, thread_id: str, build_item: Callable[[int], TurnItem],
+    ) -> TurnItem:
+        """在同一把 Thread 锁内分配序号、原子落库并派发 item 事件。
+
+        Item 和描述它的 Event 共享同一个 sequence，并写在同一个事务里：两条事实流
+        因此不会漂移，也不会留下只落一半的中间态。
+        """
+        with self._thread_lock(thread_id):
+            sequence = self._allocate_sequence(thread_id)
+            item = build_item(sequence)
+            event = EventEnvelope.create(
+                sequence=sequence,
+                thread_id=thread_id,
+                turn_id=item.turn_id,
+                item_id=item.item_id,
+                kind=item_event_kind(item),
+                payload={"item": item.to_dict()},
+            )
+            storage = self._protocol_storage()
+            if storage is not None:
+                storage.append_runtime_item_with_event(item, event)
+            self._dispatch_protocol(event)
+        return item
 
     def _publish_runtime_item(
         self, event: Any, *, thread_id: str, turn_id: str, source: str,
     ) -> TurnItem | None:
-        sequence = self._next_sequence(thread_id)
-        item = runtime_event_to_item(
-            event, thread_id=thread_id, turn_id=turn_id, sequence=sequence,
-        )
-        if item is None:
+        def build_item(sequence: int) -> TurnItem:
+            item = runtime_event_to_item(
+                event, thread_id=thread_id, turn_id=turn_id, sequence=sequence,
+            )
+            if item is not None:
+                return item
             # 未知事件保留为结构化 legacy item，避免事件在协议层静默丢失。
-            from app.protocol.json_types import to_json_value
-            item = TurnItem.create(
+            return TurnItem.create(
                 item_id=f"item-{uuid.uuid4().hex}",
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -256,9 +318,8 @@ class RuntimeService:
                     "event": to_json_value(_protocol_payload(event)),
                 },
             )
-        storage = self._protocol_storage()
-        if storage is not None:
-            storage.append_runtime_item(item)
+
+        item = self._publish_item(thread_id, build_item)
         # 旧 callback 仍收到原事件，避免 CLI/第三方迁移期间行为变化。
         legacy = RuntimeEvent(source, thread_id, turn_id, event)
         with self._lock:
@@ -268,13 +329,6 @@ class RuntimeService:
                 callback(legacy)
             except Exception:
                 pass
-        self._publish_protocol(
-            kind=item_event_kind(item),
-            thread_id=thread_id,
-            turn_id=turn_id,
-            item_id=item.item_id,
-            payload={"item": item.to_dict()},
-        )
         return item
 
     def publish(
@@ -405,19 +459,21 @@ class RuntimeService:
         return self.router.session_record(thread_id)
 
     def storage_list_runtime_events(self, thread_id: str, *, after_sequence: int = 0):
-        return self.storage.list_runtime_events(thread_id, after_sequence=after_sequence)
+        return self._protocol_storage().list_runtime_events(
+            thread_id, after_sequence=after_sequence,
+        )
 
     def storage_next_runtime_sequence(self, thread_id: str) -> int:
-        return self.storage.next_runtime_sequence(thread_id)
+        return self._protocol_storage().next_runtime_sequence(thread_id)
 
     def storage_append_runtime_event(self, event: EventEnvelope) -> None:
-        self.storage.append_runtime_event(event)
+        self._protocol_storage().append_runtime_event(event)
 
     def storage_save_runtime_turn(self, turn: TurnRecord) -> None:
-        self.storage.save_runtime_turn(turn)
+        self._protocol_storage().save_runtime_turn(turn)
 
     def storage_append_runtime_item(self, item: TurnItem) -> None:
-        self.storage.append_runtime_item(item)
+        self._protocol_storage().append_runtime_item(item)
 
 
     def list_sessions(self) -> list[dict]:
@@ -501,24 +557,17 @@ class RuntimeService:
         storage = self._protocol_storage()
         if storage is not None:
             storage.save_runtime_turn(turn)
-        input_sequence = self._next_sequence(target_id)
-        input_item = TurnItem.create(
-            item_id=f"item-{uuid.uuid4().hex}",
-            thread_id=target_id,
-            turn_id=actual_run_id,
-            sequence=input_sequence,
-            kind="user.message",
-            status="completed",
-            payload={"text": message, "image_count": len(images or [])},
-        )
-        if storage is not None:
-            storage.append_runtime_item(input_item)
-        self._publish_protocol(
-            kind="item.completed",
-            thread_id=target_id,
-            turn_id=actual_run_id,
-            item_id=input_item.item_id,
-            payload={"item": input_item.to_dict()},
+        self._publish_item(
+            target_id,
+            lambda sequence: TurnItem.create(
+                item_id=f"item-{uuid.uuid4().hex}",
+                thread_id=target_id,
+                turn_id=actual_run_id,
+                sequence=sequence,
+                kind="user.message",
+                status="completed",
+                payload={"text": message, "image_count": len(images or [])},
+            ),
         )
         try:
             chat_kwargs = {"cancel": token, "resume": resume}

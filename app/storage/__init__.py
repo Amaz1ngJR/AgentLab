@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,6 +162,12 @@ CREATE TABLE IF NOT EXISTS runtime_events (
     UNIQUE(thread_id, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS runtime_sequences (
+    thread_id     TEXT PRIMARY KEY,
+    next_sequence INTEGER NOT NULL,
+    FOREIGN KEY (thread_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_runtime_turns_thread ON runtime_turns(thread_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runtime_items_turn ON runtime_items(turn_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_runtime_events_thread_seq ON runtime_events(thread_id, sequence);
@@ -213,6 +220,7 @@ class Storage:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._con = sqlite3.connect(str(self._path), check_same_thread=False)
         self._con.row_factory = sqlite3.Row
+        self._runtime_lock = threading.RLock()
         self._con.executescript(_SCHEMA)
         self._migrate_tool_executions()
         self._con.commit()
@@ -588,20 +596,57 @@ class Storage:
         ).fetchone()
         return dict(row) if row else None
 
-    def append_runtime_item(self, item: TurnItem) -> None:
+    @staticmethod
+    def _insert_runtime_item(con: sqlite3.Connection, item: TurnItem) -> None:
         data = item.to_dict()
-        with self._tx() as con:
-            con.execute(
-                """INSERT INTO runtime_items
-                   (item_id,thread_id,turn_id,sequence,kind,status,payload_json,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (
-                    data["item_id"], data["thread_id"], data["turn_id"],
-                    int(data["sequence"]), data["kind"], data["status"],
-                    json.dumps(redact_value(data["payload"]), ensure_ascii=False),
-                    data["created_at"],
-                ),
-            )
+        con.execute(
+            """INSERT INTO runtime_items
+               (item_id,thread_id,turn_id,sequence,kind,status,payload_json,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                data["item_id"], data["thread_id"], data["turn_id"],
+                int(data["sequence"]), data["kind"], data["status"],
+                json.dumps(redact_value(data["payload"]), ensure_ascii=False),
+                data["created_at"],
+            ),
+        )
+
+    @staticmethod
+    def _insert_runtime_event(con: sqlite3.Connection, event: EventEnvelope) -> None:
+        data = event.to_dict()
+        con.execute(
+            """INSERT INTO runtime_events
+               (schema_version,sequence,thread_id,turn_id,item_id,kind,timestamp,payload_json)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                int(data["schema_version"]), int(data["sequence"]),
+                data["thread_id"], data["turn_id"], data["item_id"],
+                data["kind"], data["timestamp"],
+                json.dumps(redact_value(data["payload"]), ensure_ascii=False),
+            ),
+        )
+
+    def append_runtime_item(self, item: TurnItem) -> None:
+        with self._runtime_lock:
+            with self._tx() as con:
+                self._insert_runtime_item(con, item)
+
+    def append_runtime_item_with_event(
+        self, item: TurnItem, event: EventEnvelope,
+    ) -> None:
+        """把 Item 和描述它的 Event 写在同一个事务里。
+
+        两者共享同一个 sequence，必须同时可见：否则订阅方会看到引用了不存在
+        Item 的 Event(或反过来)，重放时还会在该 sequence 上留下空洞。
+        """
+        if item.thread_id != event.thread_id:
+            raise ValueError("item and event must belong to the same thread")
+        if item.sequence != event.sequence:
+            raise ValueError("item and event must share the same sequence")
+        with self._runtime_lock:
+            with self._tx() as con:
+                self._insert_runtime_item(con, item)
+                self._insert_runtime_event(con, event)
 
     def list_runtime_items(self, turn_id: str, after_sequence: int = 0) -> list[dict]:
         rows = self._con.execute(
@@ -617,19 +662,9 @@ class Storage:
         return result
 
     def append_runtime_event(self, event: EventEnvelope) -> None:
-        data = event.to_dict()
-        with self._tx() as con:
-            con.execute(
-                """INSERT INTO runtime_events
-                   (schema_version,sequence,thread_id,turn_id,item_id,kind,timestamp,payload_json)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (
-                    int(data["schema_version"]), int(data["sequence"]),
-                    data["thread_id"], data["turn_id"], data["item_id"],
-                    data["kind"], data["timestamp"],
-                    json.dumps(redact_value(data["payload"]), ensure_ascii=False),
-                ),
-            )
+        with self._runtime_lock:
+            with self._tx() as con:
+                self._insert_runtime_event(con, event)
 
     def list_runtime_events(
         self,
@@ -652,12 +687,50 @@ class Storage:
             result.append(event)
         return result
 
-    def next_runtime_sequence(self, thread_id: str) -> int:
-        row = self._con.execute(
-            "SELECT COALESCE(MAX(sequence),0)+1 AS next FROM runtime_events WHERE thread_id=?",
-            (thread_id,),
+    def _max_runtime_sequence(self, con: sqlite3.Connection, thread_id: str) -> int:
+        """Item 和 Event 共享一条 Thread 序号轴，取值必须同时看两张表。"""
+        row = con.execute(
+            """SELECT MAX(sequence) AS max_sequence FROM (
+                   SELECT sequence FROM runtime_events WHERE thread_id=?
+                   UNION ALL
+                   SELECT sequence FROM runtime_items WHERE thread_id=?
+               )""",
+            (thread_id, thread_id),
         ).fetchone()
-        return int(row["next"]) if row else 1
+        return int(row["max_sequence"] or 0)
+
+    def next_runtime_sequence(self, thread_id: str) -> int:
+        """只读预看下一个序号，不消费它。"""
+        with self._runtime_lock:
+            row = self._con.execute(
+                "SELECT next_sequence FROM runtime_sequences WHERE thread_id=?",
+                (thread_id,),
+            ).fetchone()
+            reserved = int(row["next_sequence"]) if row else 0
+            return max(reserved, self._max_runtime_sequence(self._con, thread_id) + 1)
+
+    def allocate_runtime_sequence(self, thread_id: str) -> int:
+        """消费并返回该 Thread 的下一个序号。
+
+        计数器持久化在 runtime_sequences 里，因此重启和多个 Storage 实例之间
+        都不会把同一个序号发两次。已写入的行仍参与取值，兼容直接调用
+        append_runtime_* 手动指定 sequence 的路径。
+        """
+        with self._runtime_lock:
+            with self._tx() as con:
+                row = con.execute(
+                    "SELECT next_sequence FROM runtime_sequences WHERE thread_id=?",
+                    (thread_id,),
+                ).fetchone()
+                reserved = int(row["next_sequence"]) if row else 0
+                value = max(reserved, self._max_runtime_sequence(con, thread_id) + 1)
+                con.execute(
+                    """INSERT INTO runtime_sequences(thread_id,next_sequence)
+                       VALUES(?,?)
+                       ON CONFLICT(thread_id) DO UPDATE SET next_sequence=excluded.next_sequence""",
+                    (thread_id, value + 1),
+                )
+                return value
 
     # ── agent_profiles ───────────────────────────────────────────────────────
     def upsert_agent_profile(self, agent_id: str, name: str,
