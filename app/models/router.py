@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from app.config.schemas import LLMConfig
+from app.models.provider_retry import ProviderCircuitBreaker, call_with_retry
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -22,6 +23,7 @@ class ModelRouter:
 
     def __init__(self, adapter: Any):
         self._adapter = adapter
+        self._breaker = ProviderCircuitBreaker()
 
     @property
     def model(self) -> str:
@@ -61,15 +63,18 @@ class ModelRouter:
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
     ) -> ModelResponse:
-        return self._adapter.create_message(
-            messages,
-            tools=tools,
-            system=system,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            on_progress=on_progress,
-            on_text_delta=on_text_delta,
-            on_thinking_delta=on_thinking_delta,
+        return call_with_retry(
+            lambda: self._adapter.create_message(
+                messages,
+                tools=tools,
+                system=system,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                on_progress=on_progress,
+                on_text_delta=on_text_delta,
+                on_thinking_delta=on_thinking_delta,
+            ),
+            breaker=self._breaker,
         )
 
     def format_tool_results(self, results: list[ToolResult]) -> list[dict]:

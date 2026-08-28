@@ -102,21 +102,16 @@ def estimate_tokens(text: str) -> int:
 
 
 def estimate_message_tokens(message: dict[str, Any]) -> int:
-    """估算一条对话消息的 token 数。
+    """估算完整消息对象的 token 数，覆盖 Responses 顶层 input item。
 
-    消息的 content 可能是字符串,也可能是 provider 原生的 block 列表
-    (Anthropic 的 tool_use / tool_result 是 dict)。统一序列化成文本再估,
-    并为角色标记 / 结构开销加一个小的固定常数。
+    Responses API 的 function_call/function_call_output 把 arguments/output 放在
+    顶层，不能只统计 ``content``，否则长工具历史会被严重低估。
     """
-    content = message.get("content", "")
-    if isinstance(content, str):
-        body = content
-    else:
-        try:
-            body = json.dumps(content, ensure_ascii=False)
-        except (TypeError, ValueError):
-            body = str(content)
-    return estimate_tokens(body) + 4  # 4: role / 分隔符等结构开销的粗略常数
+    try:
+        body = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        body = str(message)
+    return estimate_tokens(body) + 4
 
 
 def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:

@@ -14,6 +14,7 @@ from typing import Any, Callable
 from app.agent.approval_broker import ApprovalBroker
 from app.agent.cancel import CancelToken
 from app.agent.session_router import SessionRouter
+from app.agent.submission import SubmissionQueue, SubmissionQueueOverloaded, TurnSubmission
 from app.protocol.envelopes import EventEnvelope, utc_now
 from app.protocol.errors import RuntimeFailure
 from app.protocol.items import TurnItem
@@ -87,6 +88,7 @@ class RuntimeService:
         self._sequences: dict[str, int] = {}
         self._sequence_lock = threading.Lock()
         self._thread_locks: dict[str, threading.RLock] = {}
+        self._submissions = SubmissionQueue(self._run_submission)
         self._closed = False
 
     @property
@@ -493,6 +495,62 @@ class RuntimeService:
             self.publish("session_switched", session_id=after)
         return result
 
+    def submit_turn(
+        self,
+        thread_id: str,
+        input_text: str,
+        *,
+        images: list[Any] | None = None,
+        resume: bool = False,
+        turn_id: str | None = None,
+    ) -> str:
+        """异步提交 Turn，立即返回 turn_id；结果和进度通过事件流获取。"""
+        with self._lock:
+            self._ensure_open()
+            record = self.router.session_record(thread_id) if hasattr(self.router, "session_record") else None
+            if hasattr(self.router, "storage") and record is None:
+                raise KeyError(f"找不到 session: {thread_id}")
+            if thread_id in self._session_runs:
+                raise RuntimeError(f"session {thread_id} 已有 run 正在执行")
+        actual_turn_id = turn_id or f"run-{uuid.uuid4().hex}"
+        try:
+            self._submissions.submit(TurnSubmission(
+                turn_id=actual_turn_id,
+                thread_id=thread_id,
+                input_text=input_text,
+                images=tuple(images or ()),
+                resume=resume,
+            ))
+        except SubmissionQueueOverloaded as exc:
+            failure = RuntimeFailure(
+                code="server_overloaded",
+                category="runtime",
+                message=str(exc),
+                retryable=True,
+                user_action_required=False,
+            )
+            self.publish(
+                "run_failed",
+                session_id=thread_id,
+                run_id=actual_turn_id,
+                payload={"error": failure.to_dict()},
+            )
+            raise
+        return actual_turn_id
+
+    def _run_submission(self, submission: TurnSubmission) -> None:
+        try:
+            self.send_message(
+                submission.input_text,
+                images=list(submission.images),
+                session_id=submission.thread_id,
+                resume=submission.resume,
+                run_id=submission.turn_id,
+            )
+        except BaseException:
+            # send_message 已发布失败事件；worker 不能因单个 Turn 退出。
+            pass
+
     def send_message(
         self,
         message: str,
@@ -660,6 +718,7 @@ class RuntimeService:
             subscription.close()
         for active in active_runs:
             active.cancel.cancel()
+        self._submissions.close()
         self.approval_broker.close()
         self.router.close_all()
 

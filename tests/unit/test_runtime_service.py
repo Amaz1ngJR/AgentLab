@@ -177,6 +177,50 @@ def test_different_sessions_can_run_concurrently_and_persist_correct_ids():
     assert sorted(router.persisted) == ["s1", "s2"]
 
 
+def test_submit_turn_returns_immediately_and_publishes_completion():
+    gate = threading.Event()
+    service = RuntimeService(_Router({"s1": _Session(gate)}))
+    events = []
+    completed = threading.Event()
+
+    def capture(event):
+        events.append(event)
+        if event.kind == "run_completed":
+            completed.set()
+
+    service.subscribe(capture)
+    started = time.monotonic()
+    turn_id = service.submit_turn("s1", "async hello", turn_id="async-1")
+    assert time.monotonic() - started < 0.2
+    assert turn_id == "async-1"
+    while turn_id not in service.active_runs():
+        time.sleep(0.001)
+    gate.set()
+    assert completed.wait(1)
+    assert [event.kind for event in events][-1] == "run_completed"
+    service.close()
+
+
+def test_submission_worker_survives_failed_turn():
+    class FailingSession(_Session):
+        def chat(self, message, **kwargs):
+            if message == "fail":
+                raise RuntimeError("boom")
+            return super().chat(message, **kwargs)
+
+    session = FailingSession()
+    service = RuntimeService(_Router({"s1": session}))
+    completed = threading.Event()
+    service.subscribe(lambda event: completed.set() if event.kind == "run_completed" else None)
+    service.submit_turn("s1", "fail", turn_id="bad")
+    deadline = time.time() + 1
+    while service.active_runs() and time.time() < deadline:
+        time.sleep(0.001)
+    service.submit_turn("s1", "ok", turn_id="good")
+    assert completed.wait(1)
+    service.close()
+
+
 def test_service_exposes_thread_summary_without_cli_storage_access(tmp_path):
     from app.agent.profiles import AgentProfile
     from app.agent.runtime import AgentSession

@@ -90,6 +90,7 @@ class Orchestrator:
         self.last_run_status: str = ""  # completed / blocked / failed / cancelled
         # 本轮 run() 累计的真实工具调用次数(供 Loop 模式累加进预算)。每次 run() 重置。
         self.last_run_tool_calls: int = 0
+        self.last_run_error: str = ""
 
     def _namespace_tasks(self, tasks: list) -> list:
         """给一批新计划的任务 id 加 run 前缀,并同步重映射其 dependencies。
@@ -118,26 +119,17 @@ class Orchestrator:
         ))
 
     def _maybe_compact(self) -> None:
-        """在稳定点(规划后 / 每个任务完成后)检查上下文预算并按需压缩。
-
-        无 context_manager 时直接返回(默认行为)。压缩就地改短 self.messages;
-        切点只落在已闭合的历史里,不会破坏正在执行任务的 tool_use/tool_result 对。
-        压缩异常一律吞掉:上下文压缩是兜底优化,绝不能让它中断主任务。
-        """
+        """在稳定点或模型调用前检查上下文预算并按需压缩。"""
         if self._ctx is None:
             return
-        # 先预检状态:只在需要压缩时才显示 spinner,避免每个稳定点都闪 "compacting (0.0s)"
-        # 的误导。context_manager 会在真正压缩时发 COMPACTION_STARTED/COMPLETED 事件,
-        # UI 那边会打印压缩进度,这里就不需要无条件套 spinner 了。
-        est = self._ctx.estimate(self.messages, system=self._system)
-        status = self._ctx.budget.status_for(est)
-        if status != "compact":
-            return  # 预算还够,不需要压缩
+        tools = self._tools.schemas() or None
         try:
             with self._progress("compacting") as handle:
-                on_progress = getattr(handle, "update", None)
-                self._ctx.maybe_compact(
-                    self.messages, system=self._system, on_progress=on_progress,
+                self._ctx.compact_before_model_call(
+                    self.messages,
+                    system=self._system,
+                    tools=tools,
+                    on_progress=getattr(handle, "update", None),
                 )
         except Exception:
             pass
@@ -160,6 +152,7 @@ class Orchestrator:
         self._run_seq += 1
         self.last_run_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_run_status = ""
+        self.last_run_error = ""
         self.last_run_tool_calls = 0
         if not resume:
             # 非 resume 模式:清空旧任务,只展示本轮计划
@@ -182,6 +175,12 @@ class Orchestrator:
         # ── 1. 规划 ──────────────────────────────────────────────────────────
         try:
             cancel.raise_if_cancelled()
+            if self._ctx is not None:
+                self._ctx.compact_before_model_call(
+                    self.messages,
+                    system=self._system,
+                    tools=self._tools.schemas() or None,
+                )
             with self._progress("planning") as handle:
                 on_progress = getattr(handle, "update", None)
                 plan = self._planner.create_plan(
@@ -252,18 +251,21 @@ class Orchestrator:
         snapshot = self.store.snapshot()
         if self.store.is_stalled():
             self.last_run_status = "blocked"
+            self.last_run_error = "部分任务被阻塞或失败,无法继续"
             self._emit(RunEvent(kind=events.RUN_FAILED, text="部分任务被阻塞或失败,无法继续",
                                 payload={"tasks": snapshot}))
             return last_text or "部分任务未能完成(被阻塞或失败)。"
 
         if rounds_left <= 0 and self.store.has_open():
             self.last_run_status = "failed"
+            self.last_run_error = "达到最大模型往返次数仍未完成全部任务"
             self._emit(RunEvent(kind=events.RUN_FAILED,
                                 text="达到最大模型往返次数仍未完成全部任务",
                                 payload={"tasks": snapshot}))
             return last_text or "达到最大模型往返次数,任务未全部完成。"
 
         self.last_run_status = "completed"
+        self.last_run_error = ""
         self._emit(RunEvent(kind=events.RUN_COMPLETED, text=last_text,
                             payload={"tasks": snapshot}))
         return last_text or "已完成。"

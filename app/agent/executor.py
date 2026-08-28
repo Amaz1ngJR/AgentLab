@@ -179,17 +179,31 @@ class Executor:
         last_text = ""
         tool_calls_made = 0
         model_rounds = 0
+        no_progress_rounds = 0
+        seen_tool_signatures: set[tuple[str, str]] = set()
 
         for _ in range(max(1, max_steps)):
             model_rounds += 1
             if cancel is not None:
                 cancel.raise_if_cancelled()
 
+            tools = self._tools.schemas() or None
             text_streamed = False
             with self._progress("thinking") as handle:
                 on_progress = getattr(handle, "update", None)
                 raw_on_text = getattr(handle, "on_text", None)
                 raw_on_thinking = getattr(handle, "on_thinking", None)
+
+                if self._ctx is not None:
+                    try:
+                        self._ctx.compact_before_model_call(
+                            messages,
+                            system=system,
+                            tools=tools,
+                            on_progress=on_progress,
+                        )
+                    except Exception:
+                        pass
 
                 def on_text_delta(delta: str) -> None:
                     nonlocal text_streamed
@@ -199,7 +213,7 @@ class Executor:
 
                 resp = self._llm.create_message(
                     messages=messages,
-                    tools=self._tools.schemas() or None,
+                    tools=tools,
                     system=system,
                     on_progress=on_progress,
                     on_text_delta=on_text_delta if raw_on_text else None,
@@ -223,6 +237,8 @@ class Executor:
 
             # 没有工具调用 = 模型认为这个子任务已经做完
             if not resp.tool_calls:
+                # 模型输出新的完成文本，说明本轮有进展；只有首次空转才给一次纠正机会。
+                no_progress_rounds = 0 if resp.text.strip() else no_progress_rounds + 1
                 # 空转检测：第一轮就没调用工具，且任务描述明显需要工具操作时，给予提示
                 # 但如果模型给出的文本说明了不需要操作（如"已完成"、"无需修改"等），则接受
                 if tool_calls_made == 0 and _looks_like_action_task(task.content) and \
@@ -274,6 +290,17 @@ class Executor:
                     if cancel is not None:
                         cancel.raise_if_cancelled()
                     tool_calls_made += 1
+                    signature = (call.name, repr(sorted(call.arguments.items())))
+                    if signature in seen_tool_signatures:
+                        return TaskOutcome(
+                            status=FAILED,
+                            error=f"模型重复请求工具 {call.name}，任务无进展",
+                            evidence=last_text.strip(),
+                            text=last_text.strip(),
+                            tool_calls_made=tool_calls_made,
+                            model_rounds=model_rounds,
+                        )
+                    seen_tool_signatures.add(signature)
                     self._emit(RunEvent(kind=events.TOOL_REQUESTED, task_id=task.id,
                                         tool_name=call.name, tool_input=call.arguments))
 
@@ -372,21 +399,13 @@ class Executor:
 
             messages.extend(self._llm.format_tool_results(tool_results))
 
-            # ── 任务内压缩检查点 ──────────────────────────────────────────────
-            # tool_result 刚入历史,tool_use/tool_result 对已闭合,这是安全的压缩点。
-            # 单个任务若跑满 max_steps(读大文件 / 传大 payload),上下文会在任务内
-            # 撑大;只在任务边界压缩的话,任务结束前可能已撑爆窗口。这里每轮工具
-            # 执行后检查一次,及时压缩,堵住"单任务长循环撑爆窗口"的缺口。
+            # tool_result 刚入历史后再次预检，尽早压缩下一轮要发送的上下文。
             if self._ctx is not None:
                 try:
-                    est = self._ctx.estimate(messages, system=system)
-                    if self._ctx.budget.status_for(est) == "compact":
-                        # 真需要压缩才显示 spinner(与 orchestrator._maybe_compact 对齐)
-                        with self._progress("compacting") as handle:
-                            on_progress = getattr(handle, "update", None)
-                            self._ctx.maybe_compact(
-                                messages, system=system, on_progress=on_progress,
-                            )
+                    self._ctx.compact_before_model_call(
+                        messages, system=system, tools=tools,
+                        on_progress=on_progress,
+                    )
                 except Exception:
                     pass  # 压缩失败不能中断任务主路径
 

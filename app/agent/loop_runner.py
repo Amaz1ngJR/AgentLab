@@ -401,7 +401,13 @@ class LoopRunner:
             return "cancelled"
         if run_status == "blocked":
             return "blocked"
-        # completed / failed 都进入验证:验证才是 Loop 是否达成目标的唯一裁判。
+        if run_status == "failed":
+            self._last_execution_error = (
+                getattr(self.orchestrator, "last_run_error", "")
+                or "编排任务未完成"
+            )
+            return "failed"
+        # completed 进入验证:验证才是 Loop 是否达成目标的唯一裁判。
         return "ok"
 
     def _verify(self) -> VerificationResult:

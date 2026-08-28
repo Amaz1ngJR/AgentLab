@@ -103,6 +103,25 @@ class ContextManager:
             "has_summary": self.last_summary is not None,
         }
 
+    def compact_before_model_call(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        system: str = "",
+        tools: Optional[list[dict[str, Any]]] = None,
+        on_progress=None,
+    ) -> bool:
+        """在任何模型请求前压缩超限历史，返回是否发生压缩。"""
+        estimate = self.estimate(messages, system=system, tools=tools)
+        if self.budget.status_for(estimate) != "compact":
+            return False
+        return self.maybe_compact(
+            messages,
+            system=system,
+            tools=tools,
+            on_progress=on_progress,
+        )
+
     # ── 压缩 ──────────────────────────────────────────────────────────────────
 
     def maybe_compact(

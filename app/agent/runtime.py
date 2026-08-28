@@ -366,6 +366,14 @@ class AgentSession:
             "role": "user",
             "content": build_user_content(user_input, images),
         })
+        # 在每次模型调用前检查，确保当前用户输入和 Responses 顶层 item 都计入预算。
+        tools = self.tools.schemas() or None
+        if self.context_manager is not None:
+            self.context_manager.compact_before_model_call(
+                self.messages,
+                system=self.system_prompt,
+                tools=tools,
+            )
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
         turn_start = time.monotonic()

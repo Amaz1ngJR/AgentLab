@@ -118,9 +118,13 @@ class TaskStore:
     # ── 编排路径(Planner / Executor / Replanner)─────────────────────────────
 
     def add(self, task: Task) -> None:
-        """追加一个任务(同 id 已存在时忽略,不覆盖已有进度)。"""
+        """追加一个任务；重试任务应带有限次数，不重复创建相同补救工作。"""
         if self.get(task.id) is None:
             self._tasks.append(task)
+
+    def open_tasks(self) -> list[Task]:
+        """返回当前仍需处理的任务快照。"""
+        return [copy.deepcopy(t) for t in self._tasks if t.status not in _TERMINAL]
 
     def extend(self, tasks: list[Task]) -> None:
         """批量追加。Planner 写初始计划、Replanner 追加新任务时用。"""

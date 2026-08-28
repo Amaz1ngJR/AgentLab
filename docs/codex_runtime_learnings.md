@@ -11,18 +11,21 @@
 
 ## 1. 结论摘要
 
-AgentLab 当前已经具备 `RuntimeService`、`ApprovalBroker`、`AgentSession`、
-`Orchestrator`、`RunEvent`、SQLite 持久化和上下文压缩，整体方向与 Codex Runtime
-一致。主要差距不是缺少某个工具，而是 Runtime 的边界仍不够稳定：
+主要剩余差距集中在后续 P1/P2 能力，而不是基础 Protocol 模型本身：
 
-1. `RuntimeService.send_message()` 仍是同步阻塞调用，Web/TUI 难以直接复用。
-2. Session、Run、Message、Task、Tool Audit 分散存储，缺少统一的 Turn/Item 事实流。
-3. `RuntimeEvent.payload` 为 `Any`，不能作为稳定、可版本化的公共协议。
-4. CLI 仍直接访问 Router、Session 私有字段和装配细节。
-5. Legacy 工具循环与 Orchestrator 并存，审批、取消、流式和错误处理存在双份实现。
-6. 所有编排请求默认先调用 Planner，简单任务会额外增加延迟和 token。
-7. 工具 Schema 通常全量发送，MCP/浏览器/远程工具增多后固定上下文会膨胀。
-8. Shell 只有应用层路径约束与审批，没有操作系统级沙箱。
+1. `RuntimeService.send_message()` 仍是同步阻塞调用，尚未提供完整的异步 Submission Queue。
+2. Legacy 工具循环与 Orchestrator 仍并存，尚未统一为单一 TurnEngine。
+3. 工具 Schema 尚未按 Turn 动态暴露，模型上下文成本仍可能膨胀。
+4. Provider 重试、退避和熔断尚未统一接入所有模型请求。
+5. Shell/Verifier 尚未全部通过统一 ExecutionGateway 和操作系统级沙箱。
+
+已完成的基础能力包括：
+
+- `Thread / Turn / Item / EventEnvelope / RuntimeFailure` 与 JSON 类型约束。
+- Protocol sequence、Item/Event 原子写入、进程内有界事件队列和游标重放。
+- JSONL 初始化握手与能力协商基础。
+- Direct/Task/Loop 本地模式路由和 Planner 绕过。
+- 上下文压缩、本地兜底，以及 OpenAI Responses 输入清理和流式错误识别。
 
 建议优先完成三件事：
 
@@ -33,6 +36,8 @@ AgentLab 当前已经具备 `RuntimeService`、`ApprovalBroker`、`AgentSession`
 ---
 
 ## 2. Codex Runtime 值得借鉴的关键设计
+
+本节保留目标架构和设计原则；已经落地的实现进度统一记录在第 7 节，避免在这里重复维护阶段状态。
 
 ### 2.1 Core 不直接输出 UI
 
@@ -540,160 +545,72 @@ initialized
 
 ## 7. AgentLab 分阶段实施路线
 
-### P0：Runtime Protocol 化
+本节只描述后续工作；已完成能力统一记录在 7.1 的里程碑中。
 
-1. 新增 `app/protocol/` 与 JSON 类型约束。
-2. 定义 `Thread / Turn / Item / EventEnvelope / RuntimeFailure`。
-3. 所有事件增加 `schema_version / sequence / timestamp`。
-4. RuntimeService 去掉 `__getattr__` 过渡访问。
-5. CLI 不再直接访问 `_storage`、`loop_handler`、`session._orch`。
-6. 用 append-only item store 持久化关键事实。
+### P0：Runtime Protocol 化（已完成）
 
-验收：
+- Protocol 数据模型、JSON 类型约束、版本化 EventEnvelope、JSONL 编解码和初始化握手。
+- RuntimeService 显式前端边界、进程内 Event Queue、慢消费者处理和游标重放。
+- SQLite append-only Turn/Item/Event 存储；Item/Event 共用 Thread sequence，并原子写入。
 
-- CLI 只依赖 Protocol Client。
-- Event 可 JSON 序列化并通过 Schema 校验。
-- 进程重启后可从 sequence 恢复事件流。
-- 两个客户端并发操作不同 Thread 不依赖全局 current session。
+剩余边界：独立 stdio 进程 Server 和完整命令 Submission Queue 尚未接入。
 
 ### P1：统一 TurnEngine 与交互状态机
 
-1. 合并 Legacy Runtime 与 Executor 工具循环。
-2. 引入 Direct / Task / Loop Policy。
-3. 增加 `waiting_approval / waiting_user_input / suspended`。
-4. “修改建议”在同一 Turn 内 steer/resume。
-5. 统一工具结果配对、取消和错误分类。
-6. 加入 Provider 重试与熔断。
+- 合并 Legacy Runtime 与 Executor 工具循环。
+- 将 Direct / Task / Loop 统一为同一 TurnEngine 的策略。
+- 增加 `waiting_approval / waiting_user_input / suspended` 和同一 Turn 内 steer/resume。
+- 统一工具结果配对、取消、失败分类、Provider retry 和 circuit breaker。
 
-验收：
-
-- 同一审批、图片、取消问题只需修一处。
-- 简单请求不调用 Planner。
-- 用户 steering 不重新规划已完成任务。
-- 503 可取消地退避重试，不重放已执行工具。
+验收：简单请求不调用 Planner；审批、图片、取消和错误处理只维护一套；503 可取消地退避重试，且不重放已执行工具。
 
 ### P1：动态工具与上下文
 
-1. 实现 `tool_search` 和按 Turn 工具集。
-2. 引入 ContextBundle / Fragment version。
-3. 稳定 System/Tool Block 支持 Provider cache。
-4. Project Knowledge 和权限状态进入 World State。
-5. 压缩检查点可审计、可恢复。
+- 实现 `tool_search` 和按 Turn 的工具集，未授权工具不进入模型上下文。
+- 引入 ContextBundle、Fragment version、World State 和 Provider cache 能力声明。
+- 补齐 Project Knowledge、权限状态和可审计/可恢复的压缩检查点。
 
-验收：
-
-- 普通 Coding Turn 的 Tool Schema token 至少下降 50%。
-- 未授权工具不出现在模型上下文。
-- 压缩后目标、任务和权限语义不变。
+验收：普通 Coding Turn 的 Tool Schema token 至少下降 50%；压缩后目标、任务和权限语义不变。
 
 ### P1：ExecutionGateway 与沙箱
 
-1. 抽出统一执行请求/结果。
-2. macOS Seatbelt MVP。
-3. Linux Bubblewrap MVP。
-4. Windows Restricted Token / Job Object MVP。
-5. 文件、网络 Permission Amendment。
-6. Verifier 和 Shell 全部迁移 Gateway。
+- 抽出统一执行请求/结果，Shell、Verifier、远程和子进程统一经过 Gateway。
+- 实现 macOS Seatbelt、Linux Bubblewrap/Landlock、Windows Restricted Token/Job Object 的最小安全后端。
+- 增加文件/网络 Permission Amendment；无可用沙箱时按配置 fail closed。
 
-验收：
-
-- workspace-only Shell 无法读取 home 中的任意文件。
-- network-off 命令无法联网。
-- 子进程树能被 timeout/cancel 完整清理。
-- 无可用沙箱时按配置 fail closed。
+验收：workspace-only Shell 无法读取 home；network-off 命令无法联网；timeout/cancel 能清理子进程树。
 
 ### P2：Fork、多 Agent 与后台任务
 
-1. `/session fork [turn_id]`。
-2. Fork 与 Git worktree 绑定。
-3. 子 Agent 使用权限子集和独立 Item 流。
-4. Guardian/Verifier 只读审查。
-5. 后台队列、断点恢复和启动预热。
+- `/session fork [turn_id]`、Git worktree 绑定、权限子集和独立 Item 流。
+- Guardian/Verifier 只读审查、后台队列、断点恢复和启动预热。
 
 ---
 
-### 7.1 已完成：Protocol v1 基础与队列化事件（阶段 1-2）
+### 7.1 已完成里程碑
 
-当前已完成：
+已完成：
 
-- Thread/Turn/Item/EventEnvelope/RuntimeFailure 和 JSON 值约束。
-- JSON Schema 草案、JSONL transport、SQLite append-only Turn/Item/Event。
-- Protocol sequence 与 `after_sequence` 游标重放。
-- `initialize_client` 握手和客户端能力协商。
-- 有界 EventSubscription、慢消费者 overload 和重连提示。
-- 常用 TurnEvent/RunEvent 到规范 TurnItem 的映射。
-- CLI 首批移除 `_storage` 和 `loop_handler` 私有访问。
+- Protocol v1 数据模型、JSON Schema、JSONL transport 和握手能力协商。
+- RuntimeService 显式边界、进程内有界事件订阅、慢消费者断开和游标重放。
+- SQLite append-only Turn/Item/Event 存储；Item/Event 共用序号并原子写入。
+- Runtime/Loop/上下文事件到规范 TurnItem 的映射，以及未知事件的 `runtime.event` 兜底。
+- Loop 适配器通过显式 Session API 工作，CLI 不直接读取 Router 私有字段。
+- Direct/Task/Loop 本地模式路由；`mode=auto` 的简单请求绕过 Planner。
+- 上下文 token 估算、压缩失败本地兜底、OpenAI Responses 输入字段清理和流式协议错误识别。
+- 内置 RTK 输出压缩与累计统计。
 
-下一阶段从文档 P0 的剩余项继续：收口全部 CLI 私有访问、补初始化 transport、将
-上下文/Loop 事件全部映射 Item，并开始统一 TurnEngine。
+- P0 基础 Protocol 已完成；剩余 P0 边界为独立 stdio Server 和完整命令 Submission Queue。
+- P1 Provider retry/circuit breaker 已有基础实现，尚未接入 retry 事件、配置化策略和所有 Provider 能力。
+- P1 异步 Submission Queue 已有进程内非阻塞 `submit_turn()`，尚未接入 JSONL/stdio 双向命令服务。
 
-### 7.2 已完成：Runtime Service 边界收口（阶段 3）
+验证基线：最近一次专项测试和全量测试将在本阶段完成后更新；`compileall` 与 `git diff --check` 已通过。
 
-本阶段完成：
-
-- `SessionRouter` 提供显式 `storage / session_record / current_session_id` 端口，RuntimeService 不再依赖 Router 的私有存储字段。
-- RuntimeService 提供当前 Session、模型只读查询、Loop 命令入口和 Runtime 持久化端口；CLI 不再直接读取 `_storage` 或 `loop_handler`。
-- Loop 命令适配器通过显式 `set_loop_handler` 注入；Router 不再承担前端对内部装配细节的隐式转发。
-- 保留 legacy Session/Run API 作为迁移兼容层，现有 CLI、Protocol 事件和并发行为不变。
-
-验证结果：
-
-- Runtime/Protocol/SessionRouter 专项测试：35 passed。
-- 全量测试：626 passed。
-- `compileall`、`git diff --check` 通过。
-
-仍未完成：`loop_commands.py` 内部还直接读取 AgentSession 的 `_orch`、`_ensure_orchestrator` 和 `_emit_run_event`；RunEvent 中的上下文与 Loop 事件仍有 legacy 映射；初始化 transport 尚未提供握手前拒绝请求的完整 Server；统一 TurnEngine、Direct/Task/Loop 自适应路由、Provider retry/circuit breaker、ExecutionGateway 与 OS 沙箱仍待后续阶段实现。
-
-### 7.3 已完成：初始化 JSONL transport 与 Loop 事件协议收口（阶段 4）
-
-本阶段完成：
-
-- 新增 `InitializeRequest`、`JsonlProtocolServer` 和 `ProtocolTransportError`。
-- JSONL 连接必须先发送 `initialize`；握手成功前拒绝其它方法，握手后拒绝重复初始化和未实现请求。
-- 校验客户端名称、版本、能力数组和协议版本；响应返回 `client_id` 与协商能力。
-- `RunEvent` 的上下文预算、压缩、Goal、Loop、验证、修复、Worktree 和 Subagent 事件全部映射为结构化 `TurnItem`。
-- 未知运行事件不再静默回退为 `turn.legacy_event`，而是保存为 `runtime.event` 结构化 Item；原始 legacy callback 继续兼容。
-- Item payload 在协议边界再次脱敏，避免工具/模型事件中的凭据进入公共事件流。
-- 增加握手顺序、重复握手、版本不匹配、非法 JSON 和事件映射回归测试。
-
-仍未完成：独立 stdio 进程服务和完整命令 Submission Queue 尚未接入；统一 TurnEngine、Direct/Task/Loop 自适应路由、Provider retry/circuit breaker、动态工具暴露、ContextBundle、ExecutionGateway 与 OS 沙箱仍待后续阶段。
+下一项：统一 TurnEngine 与交互状态机；随后动态工具暴露、ContextBundle 和 ExecutionGateway。
 
 ---
 
-### 7.4 已完成：Direct / Task / Loop 本地模式路由（阶段 5）
-
-本阶段完成：
-
-- 新增 `ExecutionMode`、`SessionState` 和无模型调用的 `ModeRouter`。
-- `mode=auto` 时，简单问答/单步读取走 Direct，不调用 Planner；明显多文件、多步骤、修改并测试等请求走 Task。
-- 明确包含 GoalSpec、成功标准、验收标准或 `/loop` 的请求标记为 Loop；Loop 的完整验证生命周期仍由 `/goal` / `/loop` Handler 驱动，不在普通 chat 中误启动。
-- Profile 支持 `mode: auto/direct/task`；未配置时保持旧 `orchestrate` 语义，`orchestrate: false` 始终走 Direct。
-- 新增 `mode_selected` RunEvent，并映射为 `turn.mode` TurnItem；Direct 与 Task 两条路径都会发出，CLI 显示当前执行模式。
-- 多附件 + 明确操作自动进入 Task；无开放任务时普通 `/resume` 不会意外恢复旧任务。
-- 增加模式选择、Planner 绕过、Task 路由、profile 校验和协议事件测试。
-
-验证：模式专项测试 26 passed（18 个模式路由测试 + 8 个协议事件测试）；全量单元测试 668 passed。
-
-测试覆盖：
-- **模式路由回归测试**（`tests/unit/test_mode_router.py`）：
-  - 基础模式选择（Direct/Task/Loop）
-  - 边界情况：空输入、单/多附件、大小写不敏感、优先级覆盖
-  - Session 状态兼容性：字典与 SessionState 对象
-  - orchestrate_enabled=False 强制 Direct
-  - 中英文任务标记识别，英文动作词按整词匹配
-  - 活跃 GoalSpec 叠加操作请求时留在 Loop
-  - 普通对话保持 Direct，避免误判
-- **协议事件测试**（`tests/unit/test_protocol_events.py`）：
-  - 通过 `chat()` 验证 Direct 与 Task 两条路径都发出 MODE_SELECTED
-  - MODE_SELECTED payload 结构与 execution_mode 一致性
-  - RunEvent dataclass 字段访问与默认值
-  - 嵌套 payload 支持（为 Turn/Item 演进准备）
-  - session_state 快照在事件中的传递
-
-仍未完成：统一 TurnEngine（目前 Direct 仍是 legacy 循环、Task 仍复用 Orchestrator）；Loop 专用策略、动态工具暴露、Provider retry/circuit breaker、独立 stdio Submission Queue、ContextBundle、ExecutionGateway 与 OS 沙箱仍待后续阶段。
-
----
-
+## 8. 建议目录结构
     envelopes.py
     commands.py
     events.py

@@ -290,7 +290,19 @@ def test_executor_modify_request_raises_cancelled_and_never_calls_model_again():
     assert approval_event.payload["approval_action"] == "dynamic_outside_workspace"
 
 
-def test_executor_step_budget_exhausted_fails():
+def test_executor_stops_repeated_identical_tool_requests():
+    """模型重复相同工具参数时应立即失败，不应耗尽整个任务预算。"""
+    router = FakeRouter([
+        _resp_tool("c1", "echo", {"msg": "same"}),
+        _resp_tool("c2", "echo", {"msg": "same"}),
+        _resp_text("不应再调用"),
+    ])
+    ex = Executor(router, _registry(_echo_tool()))
+    out = ex.run_task(Task("t1", "重复任务"), [], system="", max_steps=10)
+    assert out.status == FAILED
+    assert "重复请求工具" in out.error
+    assert len(router.calls) == 2
+
     # 模型一直请求工具,永不收口
     router = FakeRouter([_resp_tool(f"c{i}", "echo", {"msg": str(i)}) for i in range(10)])
     ex = Executor(router, _registry(_echo_tool()))

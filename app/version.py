@@ -5,7 +5,7 @@ CLI 的启动横幅、``--version`` 和 REPL 的 ``/version`` 也复用同一个
 安装包版本与界面显示不一致。
 """
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 
 def version_text() -> str:

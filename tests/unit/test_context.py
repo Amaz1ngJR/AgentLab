@@ -120,6 +120,21 @@ def test_estimate_message_tokens_handles_block_content():
     assert estimate_message_tokens(m) > 0
 
 
+def test_estimate_message_tokens_counts_responses_top_level_output():
+    small = {"type": "function_call_output", "call_id": "c1", "output": "x"}
+    large = {"type": "function_call_output", "call_id": "c1", "output": "x" * 20_000}
+    assert estimate_message_tokens(large) > estimate_message_tokens(small) + 1_000
+
+
+def test_estimate_message_tokens_counts_function_arguments():
+    small = {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"}
+    large = {
+        "type": "function_call", "call_id": "c1", "name": "shell",
+        "arguments": json.dumps({"command": "x" * 20_000}),
+    }
+    assert estimate_message_tokens(large) > estimate_message_tokens(small) + 1_000
+
+
 def test_estimate_messages_tokens_sums():
     msgs = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
     total = estimate_messages_tokens(msgs)
@@ -488,7 +503,45 @@ def test_storage_delete_session_clears_summaries(tmp_path):
 # ── Orchestrator 集成:超阈值时在稳定点压缩 ──────────────────────────────────────
 
 
-def test_orchestrator_compacts_at_stable_point():
+def test_compact_before_model_call_uses_full_item_estimate():
+    budget = ContextBudget.from_model(declared_context_size=1000)
+    comp = ContextCompressor(FakeRouter([_summary_resp()]))
+    ctx = ContextManager(budget, comp, keep_recent=1)
+    messages = [
+        {"type": "function_call_output", "call_id": "c1", "output": "x" * 4000},
+        {"role": "user", "content": "继续"},
+    ]
+    before = ctx.estimate(messages, system="system", tools=[{"name": "shell"}])
+    assert before >= budget.compact_threshold
+
+    """模型请求前的预检应把完整工具 Schema 传给 ContextManager。"""
+    class ContextSpy:
+        def __init__(self):
+            self.calls = []
+
+        def estimate(self, messages, **kwargs):
+            return 0
+
+        def compact_before_model_call(self, messages, **kwargs):
+            self.calls.append(kwargs)
+            return False
+
+    class ToolStub:
+        def schemas(self):
+            return [{"name": "echo", "description": "echo", "input_schema": {"type": "object"}}]
+
+    ctx = ContextSpy()
+    router = FakeRouter([
+        _resp_text(json.dumps({"tasks": [{"id": "t1", "content": "完成", "dependencies": []}]})),
+        _resp_text("完成"),
+    ])
+    tools = ToolStub()
+    orch = Orchestrator(router, tools, context_manager=ctx)
+    orch.run("目标")
+    assert ctx.calls
+    assert ctx.calls[0]["tools"]
+    assert ctx.calls[0]["tools"][0]["name"] == "echo"
+
     """编排路径:历史超阈值时,任务完成后的稳定点应触发压缩(调到压缩模型)。"""
     # Planner 返回单任务计划 → Executor 一步给出文本完成 → 稳定点压缩。
     # 模型调用顺序:plan(规划) → summary(规划后稳定点压缩) → task_done(执行) →

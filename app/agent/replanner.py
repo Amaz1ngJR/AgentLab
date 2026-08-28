@@ -82,7 +82,10 @@ class Replanner:
             note=f"failed: {outcome.error}",
         )
 
-        # 已是重试任务则不再追加,避免无限循环
+        return self._retry_task(task, outcome)
+
+    def _retry_task(self, task: Task, outcome: TaskOutcome) -> PlanPatch:
+        """仅为原始任务追加一次补救任务，避免反复复查造成预算耗尽。"""
         is_retry = task.content.startswith(_RETRY_PREFIX)
         if is_retry:
             return PlanPatch(task_id=task.id, new_status=FAILED,
@@ -93,7 +96,7 @@ class Replanner:
             id=f"{task.id}-retry{self._retry_seq}",
             content=f"{_RETRY_PREFIX}{task.content}(原因: {outcome.error})",
             status=PENDING,
-            dependencies=[],  # 原任务已 failed,补救任务不能依赖它(否则永远卡住)
+            dependencies=[],
         )
         self._store.add(retry)
         return PlanPatch(task_id=task.id, new_status=FAILED, added=[retry.id],
