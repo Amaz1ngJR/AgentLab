@@ -13,8 +13,8 @@ from __future__ import annotations
 import json
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Optional
 
 from app.util.redact import redact
 
@@ -33,6 +33,20 @@ TOOL_RISKS = frozenset({
     "remote_execute",
     "execute",
     "destructive",
+})
+
+# 能力标签只用于决定模型看到哪些工具；ToolRegistry.execute() 始终使用完整注册表。
+TOOL_CAPABILITIES = frozenset({
+    "inspect",
+    "filesystem_read",
+    "filesystem_write",
+    "code_search",
+    "execute",
+    "verify",
+    "web_search",
+    "web_fetch",
+    "network",
+    "custom",
 })
 
 # 未显式覆盖 requires_approval 时按风险决定。read 是本地无副作用读取;
@@ -110,6 +124,8 @@ class ToolDescriptor:
     host: Optional[str] = None
     requires_observation: bool = False
     audit_redactor: Optional[AuditRedactor] = None
+    # 工具能力标签：只影响模型可见集合，不影响 registry 的实际执行查找。
+    capabilities: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         if self.risk not in TOOL_RISKS:
@@ -117,6 +133,32 @@ class ToolDescriptor:
             raise ValueError(
                 f"unknown tool risk '{self.risk}' for {self.name}; expected one of: {allowed}"
             )
+        capabilities = set(self.capabilities)
+        if not capabilities:
+            if self.name in {"read_file", "list_dir"}:
+                capabilities.update({"inspect", "filesystem_read"})
+            elif self.name == "code_search":
+                capabilities.update({"inspect", "code_search", "filesystem_read"})
+            elif self.name in {"write_file", "edit_file"}:
+                capabilities.update({"filesystem_write"})
+            elif self.name == "shell":
+                capabilities.update({"execute", "verify"})
+            elif self.name == "web_search":
+                capabilities.update({"web_search", "network"})
+            elif self.name == "web_fetch":
+                capabilities.update({"web_fetch", "network"})
+            elif self.risk == "read":
+                capabilities.add("inspect")
+            else:
+                capabilities.add("custom")
+        unknown = capabilities - TOOL_CAPABILITIES
+        if unknown:
+            allowed = ", ".join(sorted(TOOL_CAPABILITIES))
+            raise ValueError(
+                f"unknown tool capability '{sorted(unknown)[0]}' for {self.name}; "
+                f"expected one of: {allowed}"
+            )
+        self.capabilities = frozenset(capabilities)
 
     def approval_action(self, args: dict[str, Any]) -> Optional[str]:
         """返回本次调用需要批准的动作名,无需审批则返回 None。"""
@@ -184,9 +226,91 @@ class ToolRegistry:
         """返回所有已注册的工具列表。"""
         return list(self._tools.values())
 
-    def schemas(self) -> list[dict[str, Any]]:
-        """返回所有工具的描述字典列表,直接传给模型的 tools 参数。"""
-        return [t.to_schema() for t in self._tools.values()]
+    def schemas(
+        self,
+        *,
+        capabilities: Iterable[str] | None = None,
+        include: Iterable[str] | None = None,
+        exclude: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """返回当前上下文需要暴露给模型的工具 Schema。
+
+        默认保持旧行为返回全部工具；传入 capabilities/include/exclude 后只筛选
+        模型可见集合，execute() 仍可查找完整注册表，避免动态暴露破坏历史调用。
+        """
+        selected = list(self._tools.values())
+        if capabilities is not None:
+            wanted = set(capabilities)
+            selected = [tool for tool in selected if tool.capabilities & wanted]
+        if include is not None:
+            names = set(include)
+            selected = [tool for tool in selected if tool.name in names]
+        if exclude is not None:
+            names = set(exclude)
+            selected = [tool for tool in selected if tool.name not in names]
+        return [tool.to_schema() for tool in selected]
+
+    def schemas_for_task(
+        self,
+        task: str,
+        *,
+        mode: str = "direct",
+        include: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """按任务文本选择最小工具集合；未识别时保守返回核心只读工具。"""
+        text = (task or "").lower()
+        selected = {"read_file", "code_search", "list_dir"}
+        # 第三方/MCP 工具没有统一名称，保留其显式注册能力；内置高成本工具仍按需加入。
+        selected.update(
+            tool.name for tool in self._tools.values()
+            if tool.origin != "builtin"
+        )
+        if any(word in text for word in (
+            "写", "改", "编辑", "删除", "创建", "修复", "实现", "修改",
+            "write", "edit", "delete", "create", "fix", "implement", "modify",
+        )):
+            selected.update({"write_file", "edit_file"})
+        if any(word in text for word in (
+            "测试", "运行", "构建", "lint", "test", "run", "build", "pytest",
+        )) or mode == "loop":
+            selected.add("shell")
+        if any(word in text for word in (
+            "最新", "联网", "网页", "新闻", "文档", "搜索", "latest", "web", "news",
+        )):
+            selected.update({"web_search", "web_fetch"})
+        if include is not None:
+            selected.update(include)
+        return self.schemas(include=selected)
+
+    def schemas_for_stage(
+        self,
+        stage: str,
+        *,
+        task: str = "",
+        include: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """按执行阶段选择工具；阶段规则优先于模糊任务关键词。"""
+        normalized = (stage or "direct").lower()
+        stage_tools = {
+            "inspect": {"read_file", "list_dir", "code_search"},
+            "analysis": {"read_file", "list_dir", "code_search"},
+            "plan": set(),
+            "direct": None,
+            "task": None,
+            "loop": None,
+            "verify": {"shell", "read_file", "code_search"},
+        }
+        selected = stage_tools.get(normalized)
+        if selected is None:
+            return self.schemas_for_task(task, mode=normalized, include=include)
+        if include is not None:
+            selected = set(selected) | set(include)
+        return self.schemas(include=selected)
+
+    def schema_names(self, *, capabilities: Iterable[str] | None = None) -> tuple[str, ...]:
+        """返回模型当前可见工具名称，便于事件和调试记录。"""
+        selected = self.schemas(capabilities=capabilities)
+        return tuple(str(item["name"]) for item in selected)
 
     def record_denied(
         self,

@@ -10,6 +10,7 @@ from app.protocol.transport import (
     InitializeRequest,
     JsonlProtocolServer,
     ProtocolTransportError,
+    StdioJsonlServer,
     decode_events,
     encode_event,
     encode_request,
@@ -47,7 +48,82 @@ def test_initialize_request_round_trip_and_encoding():
     assert '"id":"init-1"' in encoded
 
 
-def test_jsonl_server_rejects_non_initialize_before_handshake():
+def test_jsonl_server_dispatches_commands_and_polls_events():
+    class Runtime:
+        def __init__(self):
+            self.calls = []
+            self.subscription = type("Subscription", (), {
+                "get": lambda self, timeout=0: EventEnvelope.create(
+                    sequence=1, thread_id="s1", turn_id="t1", kind="turn.started",
+                ),
+            })()
+
+        def initialize_client(self, client):
+            return type("Result", (), {
+                "protocol_version": 1, "client_id": "client-1",
+                "accepted_capabilities": (), "server_capabilities": (),
+            })()
+
+        def open_event_subscription(self, *args, **kwargs):
+            self.calls.append(("subscribe", args, kwargs))
+            return self.subscription
+
+        def start_turn(self, *args, **kwargs):
+            self.calls.append(("start", args, kwargs))
+            return "turn-1"
+
+        def interrupt_turn(self, turn_id):
+            self.calls.append(("interrupt", turn_id))
+            return True
+
+        def resume_turn(self, *args, **kwargs):
+            self.calls.append(("resume", args, kwargs))
+            return "turn-2"
+
+        def steer_turn(self, *args):
+            self.calls.append(("steer", args))
+            return True
+
+        def answer_request(self, *args):
+            self.calls.append(("answer", args))
+            return True
+
+    runtime = Runtime()
+    server = JsonlProtocolServer(runtime)
+    server.handle_line(json.dumps({"id": 1, "method": "initialize", "params": {
+        "protocol_version": 1, "client": {"name": "pytest", "version": "1"},
+    }}))
+    assert server.handle_line(json.dumps({"id": 2, "method": "events.subscribe", "params": {
+        "thread_id": "s1", "after_sequence": 4,
+    }}))["result"]["subscribed"] is True
+    assert server.handle_line(json.dumps({"id": 3, "method": "turn.start", "params": {
+        "thread_id": "s1", "input": "hello",
+    }}))["result"]["turn_id"] == "turn-1"
+    assert server.handle_line(json.dumps({"id": 4, "method": "events.poll", "params": {}}))["result"]["event"]["kind"] == "turn.started"
+    assert server.handle_line(json.dumps({"id": 5, "method": "turn.interrupt", "params": {"turn_id": "turn-1"}}))["result"]["accepted"]
+    assert server.handle_line(json.dumps({"method": "turn.steer", "params": {"turn_id": "turn-1", "input": "adjust"}})) is None
+    assert [call[0] for call in runtime.calls] == ["subscribe", "start", "interrupt", "steer"]
+
+
+def test_stdio_server_writes_responses_and_errors_as_jsonl():
+    class Runtime:
+        def initialize_client(self, client):
+            return type("Result", (), {
+                "protocol_version": 1, "client_id": "client-1",
+                "accepted_capabilities": (), "server_capabilities": (),
+            })()
+
+    input_stream = StringIO(
+        '{"id":"init","method":"initialize","params":{"protocol_version":1,'
+        '"client":{"name":"pytest","version":"1"}}}\n'
+        '{"id":"bad","method":"unknown"}\n'
+    )
+    output_stream = StringIO()
+    StdioJsonlServer(Runtime()).serve(input_stream, output_stream)
+    lines = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+    assert lines[0]["result"]["client_id"] == "client-1"
+    assert lines[1]["error"]["code"] == "invalid_request"
+
     class Runtime:
         def initialize_client(self, client):
             raise AssertionError("must not be called")

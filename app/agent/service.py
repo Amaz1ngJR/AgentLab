@@ -538,6 +538,80 @@ class RuntimeService:
             raise
         return actual_turn_id
 
+    def start_turn(
+        self,
+        thread_id: str,
+        input_text: str,
+        *,
+        images: list[Any] | None = None,
+        resume: bool = False,
+        turn_id: str | None = None,
+    ) -> str:
+        """协议命令入口：把 Turn 放入 Submission Queue 后立即返回。"""
+        return self.submit_turn(
+            thread_id,
+            input_text,
+            images=images,
+            resume=resume,
+            turn_id=turn_id,
+        )
+
+    def interrupt_turn(self, turn_id: str) -> bool:
+        """协议命令入口：请求取消一个正在执行的 Turn。"""
+        return self.cancel_run(turn_id)
+
+    def resume_turn(
+        self,
+        thread_id: str,
+        input_text: str = "继续上一轮任务",
+        *,
+        turn_id: str | None = None,
+    ) -> str:
+        """协议命令入口：以 resume 模式重新提交一个 Thread。"""
+        return self.submit_turn(
+            thread_id,
+            input_text,
+            resume=True,
+            turn_id=turn_id,
+        )
+
+    def steer_turn(self, turn_id: str, input_text: str) -> bool:
+        """把用户 steering 注入当前历史，供当前 Turn 的下一次模型请求读取。"""
+        if not input_text.strip():
+            raise ValueError("steer input must not be empty")
+        with self._lock:
+            self._ensure_open()
+            active = self._runs.get(turn_id)
+            if active is None:
+                return False
+            session = self.router.switch(active.session_id) and self.router.current
+            if session is None:
+                return False
+            session.messages.append({"role": "user", "content": input_text})
+        self.publish(
+            "turn_steered",
+            session_id=active.session_id,
+            run_id=turn_id,
+            payload={"text": input_text},
+        )
+        return True
+
+    def answer_request(self, request_id: str, response: Any) -> bool:
+        """回应异步审批请求；response 可为 approve/deny 或结构化对象。"""
+        if isinstance(response, str):
+            decision = response
+            feedback = None
+        elif isinstance(response, dict):
+            decision = response.get("decision") or response.get("action")
+            feedback = response.get("feedback")
+        else:
+            raise ValueError("response must be a decision string or object")
+        if decision not in ("approve", "deny"):
+            raise ValueError("decision must be approve or deny")
+        return self.approval_broker.resolve(
+            request_id, decision, feedback=str(feedback) if feedback else None,
+        )
+
     def _run_submission(self, submission: TurnSubmission) -> None:
         try:
             self.send_message(

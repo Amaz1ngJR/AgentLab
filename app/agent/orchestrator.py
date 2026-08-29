@@ -108,6 +108,13 @@ class Orchestrator:
             t.id = prefix + t.id
         return tasks
 
+    def _tools_for_task(self, task: str, *, mode: str = "task") -> list[dict[str, Any]]:
+        """按任务文本为 Planner/Executor 提供动态工具 Schema。"""
+        selector = getattr(self._tools, "schemas_for_task", None)
+        if callable(selector):
+            return selector(task, mode=mode)
+        return self._tools.schemas()
+
     def _forward(self, ev: RunEvent) -> None:
         """Executor 的事件直接转发给外部 on_event。"""
         self._emit(ev)
@@ -118,11 +125,11 @@ class Orchestrator:
             text=note, payload={"tasks": self.store.snapshot()},
         ))
 
-    def _maybe_compact(self) -> None:
+    def _maybe_compact(self, tools: list[dict[str, Any]] | None = None) -> None:
         """在稳定点或模型调用前检查上下文预算并按需压缩。"""
         if self._ctx is None:
             return
-        tools = self._tools.schemas() or None
+        tools = tools if tools is not None else self._tools.schemas() or None
         try:
             with self._progress("compacting") as handle:
                 self._ctx.compact_before_model_call(
@@ -175,12 +182,8 @@ class Orchestrator:
         # ── 1. 规划 ──────────────────────────────────────────────────────────
         try:
             cancel.raise_if_cancelled()
-            if self._ctx is not None:
-                self._ctx.compact_before_model_call(
-                    self.messages,
-                    system=self._system,
-                    tools=self._tools.schemas() or None,
-                )
+            # 规划前压缩只需要核心只读工具，Planner 本身不接收工具。
+            self._maybe_compact(self._tools_for_task(goal, mode="inspect"))
             with self._progress("planning") as handle:
                 on_progress = getattr(handle, "update", None)
                 plan = self._planner.create_plan(
@@ -237,7 +240,7 @@ class Orchestrator:
 
                 # 任务之间是干净的稳定点:此时 tool_use/tool_result 都已闭合,
                 # 安全压缩旧历史(若预算触发)。
-                self._maybe_compact()
+                self._maybe_compact(self._tools_for_task(task.content))
 
         except Cancelled as exc:
             self.last_run_status = "cancelled"

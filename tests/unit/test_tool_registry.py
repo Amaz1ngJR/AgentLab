@@ -142,7 +142,49 @@ def test_registry_audits_executor_error():
     assert events[0].is_error is True
 
 
-def test_custom_audit_redactor_hides_payload():
+
+
+def test_registry_filters_visible_schemas_without_restricting_execution():
+    registry = ToolRegistry()
+    registry.register(_descriptor(name="inspect", capabilities={"inspect"}))
+    registry.register(_descriptor(name="verify", capabilities={"verify"}))
+
+    assert [item["name"] for item in registry.schemas(capabilities={"inspect"})] == ["inspect"]
+    assert [item["name"] for item in registry.schemas(exclude={"verify"})] == ["inspect"]
+    output, is_error = registry.execute("verify", {})
+    assert (output, is_error) == ("ok:", False)
+
+
+def test_registry_assigns_default_capabilities_to_builtin_tools():
+    tools = {tool.name: tool for tool in default_tools()}
+    assert "inspect" in tools["read_file"].capabilities
+    assert "filesystem_write" in tools["edit_file"].capabilities
+    assert "verify" in tools["shell"].capabilities
+    assert "network" in tools["web_search"].capabilities
+
+
+def test_schemas_for_task_keeps_simple_requests_small_and_adds_needed_tools():
+    registry = ToolRegistry()
+    for tool in default_tools():
+        registry.register(tool)
+
+    simple = {item["name"] for item in registry.schemas_for_task("解释这个函数")}
+    coding = {item["name"] for item in registry.schemas_for_task("修改代码并运行测试")}
+    web = {item["name"] for item in registry.schemas_for_task("查找最新技术文档")}
+
+    assert simple == {"read_file", "code_search", "list_dir"}
+    assert {"write_file", "edit_file", "shell"} <= coding
+    assert {"web_search", "web_fetch"} <= web
+    assert "shell" not in simple
+    assert "web_search" not in coding
+
+
+def test_schemas_for_stage_can_explicitly_include_a_tool():
+    registry = ToolRegistry()
+    registry.register(_descriptor(name="custom", capabilities={"custom"}))
+    assert [item["name"] for item in registry.schemas_for_stage(
+        "inspect", include={"custom"}
+    )] == ["custom"]
     events = []
 
     def summarize(args, result):

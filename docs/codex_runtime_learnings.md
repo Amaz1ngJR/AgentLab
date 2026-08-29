@@ -1,690 +1,221 @@
-# AgentLab 借鉴 OpenAI Codex Runtime 的演进方案
+# AgentLab 本地 Agent 演进路线
 
 | 项目 | 内容 |
 |---|---|
-| 文档定位 | Codex Runtime 架构调研、AgentLab 差距分析与实施路线 |
-| 调研对象 | [openai/codex](https://github.com/openai/codex) 的 `codex-core`、`codex-protocol`、`app-server`、沙箱与上下文压缩实现 |
-| 目标 | 让 AgentLab 在多前端复用、执行效率、上下文质量、恢复能力和系统安全方面持续演进 |
-| 约束 | 不照搬 Rust 实现；保持 Python 3.11、跨 macOS/Windows/Linux、本地优先和现有 CLI 兼容 |
+| 文档定位 | 面向单机本地 Coding Agent 的效率与智能演进方案 |
+| 参考 | OpenAI Codex Runtime 的架构思想；不直接复制其 Rust 实现 |
+| 目标 | 更快理解任务、更准确选择工具、更稳定完成修改、更可靠验证和恢复 |
+| 约束 | 保持 Python 3.11、本地优先、现有 CLI 兼容，不为多前端增加不必要的基础设施 |
 
----
+## 1. 目标与原则
 
-## 1. 结论摘要
+AgentLab 当前优先服务单机本地开发场景：用户输入一个任务，Agent 理解项目、读取必要文件、执行修改、运行验证并返回结果。
 
-主要剩余差距集中在后续 P1/P2 能力，而不是基础 Protocol 模型本身：
-
-1. `RuntimeService.send_message()` 仍是同步阻塞调用，尚未提供完整的异步 Submission Queue。
-2. Legacy 工具循环与 Orchestrator 仍并存，尚未统一为单一 TurnEngine。
-3. 工具 Schema 尚未按 Turn 动态暴露，模型上下文成本仍可能膨胀。
-4. Provider 重试、退避和熔断尚未统一接入所有模型请求。
-5. Shell/Verifier 尚未全部通过统一 ExecutionGateway 和操作系统级沙箱。
-
-已完成的基础能力包括：
-
-- `Thread / Turn / Item / EventEnvelope / RuntimeFailure` 与 JSON 类型约束。
-- Protocol sequence、Item/Event 原子写入、进程内有界事件队列和游标重放。
-- JSONL 初始化握手与能力协商基础。
-- Direct/Task/Loop 本地模式路由和 Planner 绕过。
-- 上下文压缩、本地兜底，以及 OpenAI Responses 输入清理和流式错误识别。
-
-建议优先完成三件事：
-
-- 统一 `Thread / Turn / Item` 数据模型与 `TurnEngine`。
-- 建立版本化 Protocol 和异步 Submission/Event Queue。
-- 建立 `ExecutionGateway` 与跨平台系统沙箱。
-
----
-
-## 2. Codex Runtime 值得借鉴的关键设计
-
-本节保留目标架构和设计原则；已经落地的实现进度统一记录在第 7 节，避免在这里重复维护阶段状态。
-
-### 2.1 Core 不直接输出 UI
-
-Codex Core 禁止业务库直接写 stdout/stderr，所有可见信息必须经过 TUI、App Server
-或 tracing 抽象。这保证 Core 不依赖任何具体前端。
-
-AgentLab 应落实同样边界：
+核心链路：
 
 ```text
-CLI / TUI / Web / IDE
-          ↓ Protocol
-RuntimeService / TurnEngine
-          ↓
-Model / Tool / Approval / Context / Execution
+用户请求
+  ↓
+a. 判断任务复杂度
+  ↓
+b. 构建最小必要上下文
+  ↓
+c. 选择最相关工具
+  ↓
+d. 执行模型与工具循环
+  ↓
+e. 验证修改结果
+  ↓
+f. 根据失败原因定向修复
+  ↓
+输出结果并保存必要状态
 ```
 
-目标规则：
+设计原则：
 
-- `app/agent/` 不 import `app.cli`，不调用 `print()` 或 prompt_toolkit。
-- CLI 只提交操作、订阅事件和回答审批，不创建模型、工具或 MCP 生命周期。
-- FastAPI、TUI 和未来 IDE 不复制 `_build_session` / `_session_factory`。
-- Runtime 通过结构化事件表达所有用户可见状态。
+- 简单请求不调用 Planner，不发送无关工具 Schema。
+- 复杂任务才拆分任务，并保持任务依赖清晰。
+- 工具调用必须有明确目的；重复调用或无进展时尽早停止。
+- 修改后优先运行相关的最小验证，而不是盲目运行全部测试。
+- 上下文压缩不能丢失目标、约束、任务状态、权限和验证证据。
+- 错误要区分 Provider、工具、环境、权限、上下文和代码验证失败。
+- 优先修复会直接影响任务完成率、延迟和 token 成本的问题。
 
-### 2.2 SQ / EQ 异步通信
+## 2. 当前已具备能力
 
-Codex Protocol 使用 Submission Queue / Event Queue：客户端提交操作，Runtime
-异步发出事件。客户端不需要同步持有一次 `chat()` 调用。
+### 2.1 任务执行
 
-AgentLab 目标接口：
+- Direct / Task / Loop 本地模式路由。
+- `mode=auto` 下简单请求绕过 Planner。
+- 多步骤任务的 Planner、Executor、Replanner 流程。
+- 任务状态、依赖、失败记录和有限补救任务。
+- 重复工具调用检测，避免任务无进展地耗尽模型步数。
+- 工具结果配对、取消、审批和流式输出的基础处理。
 
-```python
-turn_id = runtime.start_turn(thread_id, input)
-runtime.steer_turn(turn_id, input)
-runtime.interrupt_turn(turn_id)
-runtime.resume_turn(turn_id)
-runtime.answer_request(request_id, response)
+### 2.2 上下文与模型调用
 
-for event in runtime.subscribe(thread_id, after_seq=100):
-    render(event)
-```
+- 上下文 token 估算，覆盖 Responses API 顶层工具字段。
+- 模型调用前和任务稳定点的上下文压缩。
+- 压缩失败时保留本地历史，不阻断主任务。
+- OpenAI Responses 输入清理和流式协议错误识别。
+- Provider 基础重试、退避和熔断能力。
 
-CLI 可以在内部等待 `turn.completed`，但 Web/TUI 可直接异步消费事件。
+### 2.3 Runtime 基础
 
-### 2.3 Thread / Turn / Item
+- Session / Run / Task 的本地状态管理。
+- Thread / Turn / Item / EventEnvelope 的基础协议模型。
+- SQLite append-only Turn/Item/Event 存储。
+- 进程内异步 `submit_turn()`、有界事件订阅和历史事件重放。
+- 动态工具按任务和阶段筛选；简单请求仅暴露核心只读工具，修改/测试/联网任务按需增加工具。
 
-Codex App Server 的三个核心原语：
+这些 Runtime 能力作为内部稳定边界保留即可；当前不把独立服务、多前端协议作为主要开发目标。
 
-- **Thread**：长期对话，映射 AgentLab Session。
-- **Turn**：一次用户请求到完成、失败、暂停或取消，映射 AgentLab Run。
-- **Item**：Turn 内的用户输入、模型输出、推理、工具调用、审批、工具结果、文件修改。
+## 3. 下一阶段：只做本地 Agent 需要的能力
 
-建议数据结构：
+### P0：统一执行循环
 
-```python
-@dataclass(frozen=True)
-class TurnItem:
-    item_id: str
-    thread_id: str
-    turn_id: str
-    sequence: int
-    kind: str
-    status: str
-    created_at: str
-    payload: dict[str, JsonValue]
-```
+将 `AgentSession` 的 Legacy 循环、`Orchestrator`、`Executor` 和 `LoopRunner` 中重复的执行逻辑逐步收口到统一的 TurnEngine。Direct、Task、Loop 只负责策略差异，共享以下能力：
 
-采用 append-only Item 流后：
+- 模型请求与可取消重试；
+- 工具调用、结果配对和副作用边界；
+- 审批、取消、暂停和恢复；
+- 上下文构建和压缩；
+- token、耗时和工具统计；
+- 任务状态和结构化事件；
+- 结果验证与失败分类。
 
-- 审批请求和工具结果可稳定关联。
-- 进程崩溃后可确定 Turn 停在哪一步。
-- Web/TUI 可统一回放历史。
-- Session Fork、审计、证据和子 Agent 更容易实现。
-- 不再需要频繁覆盖整份消息、任务和 Run 状态。
+验收标准：同一种审批、取消、工具错误和 Provider 错误只维护一份实现；简单请求不产生 Planner 额外调用。
 
-### 2.4 稳定的版本化 Protocol
+### P0：动态工具选择
 
-Codex 的 Protocol crate 只定义数据类型，业务逻辑位于 Core。App Server 还能按当前
-版本生成 TypeScript 和 JSON Schema。
+不要每次向模型暴露全部工具。根据任务阶段提供最小工具集合：
 
-AgentLab 可新增：
+- 只读分析：`read_file`、`code_search`；
+- 修改任务：增加 `edit_file`；
+- 验证任务：增加 `shell`；
+- 任务管理：按需提供 `todo_write`；
+- 浏览器、远程、MCP 等高成本工具默认不加载。
+
+需要实现：
+
+- 工具分组和工具能力标签；
+- 根据任务类型和权限筛选工具；
+- 工具 Schema 缓存；
+- 任务中按需加载和卸载工具；
+- 未授权工具不进入模型上下文。
+
+验收标准：普通 Coding Turn 的 Tool Schema token 明显下降，工具误选率不高于当前实现。
+
+### P0：上下文质量
+
+在现有压缩基础上，把上下文拆为少量稳定区块：
 
 ```text
-app/protocol/
-  envelopes.py
-  commands.py
-  events.py
-  items.py
-  errors.py
-  schema.py
+项目目标与用户约束
+项目结构与关键文件
+当前任务和依赖
+已执行工具与结果
+测试/验证证据
+最近对话
 ```
 
-统一事件信封：
+需要保证：
 
-```python
-@dataclass(frozen=True)
-class EventEnvelope:
-    schema_version: int
-    sequence: int
-    thread_id: str
-    turn_id: str | None
-    item_id: str | None
-    kind: str
-    timestamp: str
-    payload: dict[str, JsonValue]
-```
+- 每轮只注入和当前任务相关的项目知识；
+- 用户目标、禁止事项和权限始终保留；
+- 测试失败信息和工具结果不会被摘要吞掉；
+- 压缩前后能记录 token 数和触发原因；
+- 长任务可从最近稳定点继续，而不是重新解释整个项目。
 
-协议要求：
+### P1：验证与定向修复
 
-- 禁止 `Any`、Python 对象和异常实例进入公共 payload。
-- 所有 ID 稳定，时间为 UTC ISO-8601。
-- Event kind 使用命名空间，如 `turn.started`、`tool.completed`。
-- 未知字段向前兼容，破坏性变更升级 `schema_version`。
-- 可生成 OpenAPI / JSON Schema / TypeScript 类型。
+将“复查并修复”从通用文本任务升级为结构化流程：
 
-### 2.5 Turn Steering、Suspend 与 RequestUserInput
+1. 解析命令、测试或 Verifier 的失败结果；
+2. 区分代码错误、环境缺失、权限拒绝、超时和 Provider 错误；
+3. 提取失败文件、行号、错误类型和相关输出；
+4. 只重新读取相关上下文；
+5. 生成最小修复动作；
+6. 修复后只运行相关验证；
+7. 连续无进展时停止并向用户报告原因。
 
-Codex 明确定义 Steering、Suspend、RecoverTurn 和 RequestUserInput。AgentLab 应将
-“修改建议”从普通拒绝提升为 Turn 状态：
+验收标准：失败任务不会反复生成相同的复查任务；修复任务能关联具体失败证据。
+
+### P1：项目知识与轻量记忆
+
+增加项目级而不是泛化聊天记忆：
+
+- 项目语言、框架和目录结构；
+- 安装、构建、测试和 lint 命令；
+- 关键配置文件和入口；
+- 用户明确指定的编码偏好；
+- 已验证的常见问题和解决方式。
+
+记忆必须带来源和更新时间，不能把模型猜测当成事实。项目文件变化后，应使相关缓存失效。
+
+### P1：安全且高效的本地执行
+
+暂不实现完整跨平台 OS 沙箱，但保留必要的本地安全能力：
+
+- workspace 路径限制；
+- 危险写操作和网络操作审批；
+- 命令超时和协作式取消；
+- 子进程树清理；
+- 工具输入和输出大小限制；
+- 不把凭据写入事件、日志和模型上下文。
+
+后续只有在 Agent 需要执行不可信代码时，才考虑 macOS Seatbelt、Linux Bubblewrap 或 Windows Job Object。
+
+### P1：并行化无副作用工作
+
+优先并行执行互不冲突的只读工作，例如：
+
+- 同时读取多个独立文件；
+- 同时搜索多个关键词；
+- 同时运行互不修改工作区的检查。
+
+涉及编辑同一文件、共享任务状态、Git 操作或可能产生副作用的工具仍然串行执行。
+
+## 4. 暂不开发
+
+以下能力不是单机本地 Agent 当前提高效率和智能的必要条件：
+
+- 独立 JSONL/stdio 常驻 Server；
+- WebSocket、HTTP/SSE 和多前端事件协议；
+- 完整 Submission/Event Queue 服务化；
+- Thread Fork、Rollout 和多 Agent 协作；
+- Guardian Agent 和复杂后台任务队列；
+- Provider 专属 continuation 和复杂 Prompt Cache；
+- 全平台 OS 沙箱和复杂 Permission Amendment；
+- 为协议生成 TypeScript/OpenAPI 的完整工具链。
+
+基础 JSONL、事件和进程内异步提交代码可以保留，作为未来 IDE 或 Web 接入的扩展点，但不应阻塞本地 Agent 的核心功能开发。
+
+## 5. 开发优先级
 
 ```text
-running
-  → waiting_approval
-  → waiting_user_input
-  → running
-  → completed / failed / cancelled
+1. 统一 TurnEngine 和错误/状态处理
+2. 动态工具选择，降低 Schema token 和误调用
+3. ContextBundle 轻量版，提升长任务上下文质量
+4. 验证失败解析与定向修复
+5. 项目知识和轻量记忆
+6. 只读任务并行化
+7. 本地执行安全和可恢复性增强
 ```
 
-建议命令：
-
-```python
-runtime.suspend_turn(turn_id, reason="user_amendment")
-runtime.submit_turn_input(turn_id, text, mode="steer")
-runtime.recover_turn(turn_id)
-```
-
-收益：用户修改方向时保留当前 Task、预算和工具上下文，不必重新 Planner 整个任务。
-
-### 2.6 Thread Settings Snapshot
-
-Codex 每个 Thread/Turn 保存模型、推理强度、审批策略、权限、工作目录、沙箱、环境和
-协作模式快照。
-
-AgentLab 应在 Turn 开始时冻结：
-
-```python
-@dataclass(frozen=True)
-class TurnContext:
-    model_profile: str
-    actual_model: str | None
-    workspace: str
-    tool_set_version: str
-    approval_policy: dict
-    permission_profile: dict
-    context_policy: dict
-    budgets: dict
-    environment: dict
-```
-
-执行过程中不再读取可变化的 `SessionRouter.current_id`、全局 `.env` 或动态工具表。
-这样模型切换、Session 切换和 Loop worktree 不会影响已经开始的 Turn。
-
-### 2.7 Thread Fork 与 Rollout
-
-Codex 支持 Thread Fork、Rollout Recorder 和历史截断。AgentLab 可增加：
-
-```text
-/session fork [turn_id]
-```
-
-应用：
-
-- 从同一历史节点尝试另一种修复方案。
-- 子 Agent 获得只读上下文分支。
-- 两个 Worktree 并行实现，Verifier 选择结果。
-- 保留原 Session，不让失败尝试持续污染上下文。
-
----
-
-## 3. 提升效率和智能的 Runtime 改进
-
-### 3.1 Direct / Task / Loop 自适应路由
-
-当前 `orchestrate: true` 时每个请求先调用 Planner。简单聊天、解释和单工具操作会
-多付一次模型延迟和 token。
-
-目标模式：
-
-| 模式 | 适用场景 | 是否 Planner |
-|---|---|---|
-| Direct | 问答、解释、单文件读取、单工具操作 | 否 |
-| Task | 多文件、多步骤、有依赖任务 | 是 |
-| Loop | GoalSpec + 验证 + 反复修复 | 是，且有 Verifier |
-
-先用本地规则分类，避免额外分类模型调用：
-
-```python
-mode = ModeRouter.select(user_input, attachments, session_state)
-```
-
-升级规则：
-
-- 默认 Direct。
-- 明显包含多个修改、测试和验收动作时进入 Task。
-- `/goal` 或显式 success criteria 进入 Loop。
-- Direct 执行中发现复杂依赖时可升级 Task。
-- Planner 失败时回退 Direct，而不是生成伪计划。
-
-### 3.2 动态工具暴露
-
-随着 MCP 和电脑控制工具增加，全量发送 Tool Schema 会浪费输入 token、降低模型工具
-选择准确率并扩大攻击面。
-
-建议始终暴露少量核心工具：
-
-```text
-read_file / code_search / edit_file / shell / todo_write / tool_search
-```
-
-高成本工具按需加载：
-
-```text
-browser_* / desktop_* / remote_* / cloud MCP / 特定数据库
-```
-
-模型通过 `tool_search` 请求能力，Runtime 根据 Profile、权限和任务动态注入。
-
-验收指标：
-
-- 普通 Coding Turn 的 Tool Schema token 减少至少 50%。
-- 未授权工具不会出现在模型上下文。
-- 小模型工具误选率不高于当前实现。
-
-### 3.3 统一 TurnEngine
-
-当前存在：
-
-- `AgentSession._chat_legacy()`
-- `Orchestrator → Executor`
-- `LoopRunner → Orchestrator → Verifier`
-
-应统一为一个 TurnEngine，模式只改变策略：
-
-```text
-TurnEngine
-├── DirectPolicy
-├── TaskPolicy
-└── LoopPolicy
-```
-
-共享：
-
-- 模型请求和重试
-- 工具执行
-- 审批和用户输入
-- 取消和暂停
-- token/耗时统计
-- 上下文构建
-- Event/Item 持久化
-
-可消除审批、工具配对、图片、流式输出和 Provider 错误修两遍的问题。
-
-### 3.4 Provider 重试、退避与熔断
-
-AgentLab 已遇到 `503 system_cpu_overloaded`。应在模型请求层增加结构化策略：
-
-```text
-429 / 502 / 503 / 504 / 网络断开
-→ Retry-After 优先
-→ 指数退避 2s / 5s / 10s + jitter
-→ 每次重试前检查取消
-→ 发 provider.retrying 事件
-→ 到上限后结构化失败
-```
-
-只重试尚未产生副作用的模型请求，不自动重放已执行写工具。
-
-连续失败可触发短期熔断：
-
-```text
-连续 3 次过载 → 30 秒快速失败 → 提示降低 reasoning 或切换 Provider
-```
-
-### 3.5 结构化错误分类
-
-不要让 Replanner 解析错误字符串。统一：
-
-```python
-@dataclass(frozen=True)
-class RuntimeFailure:
-    code: str
-    category: str
-    retryable: bool
-    user_action_required: bool
-    retry_after_seconds: float | None
-    details: dict[str, JsonValue]
-```
-
-至少覆盖：
-
-- `provider_overloaded`
-- `rate_limited`
-- `network_error`
-- `context_overflow`
-- `tool_failed`
-- `approval_denied`
-- `user_input_required`
-- `sandbox_denied`
-- `environment_missing`
-- `budget_exhausted`
-- `cancelled`
-
-对应决策：
-
-- Provider 过载：退避重试。
-- 测试失败：Replanner 修复。
-- 用户输入：Suspend。
-- 权限拒绝：不重试。
-- 上下文溢出：Compact 后重试。
-
-### 3.6 Prompt Cache 与 Provider Continuation
-
-Adapter 应声明能力：
-
-```python
-ProviderCapabilities(
-    prompt_cache=True,
-    continuation_id=True,
-    streaming_usage=True,
-    vision=True,
-)
-```
-
-利用：
-
-- Anthropic：稳定 System/Tool Block Prompt Caching。
-- OpenAI Responses：服务端 continuation / response context。
-- 本地模型：完整历史回放。
-- Provider 切换：统一 Item 历史重建输入。
-
-### 3.7 启动预热
-
-Codex 有 Session Startup Prewarm。AgentLab 可并行预热：
-
-- SQLite schema 与最近 Session metadata。
-- 模型 endpoint 健康检查。
-- MCP 工具清单缓存。
-- Skill/Project Knowledge hash。
-- 常用 Tool Schema 序列化。
-
-目标：启动后的第一次有效 token 延迟不被配置扫描和 MCP 冷启动叠加。
-
----
-
-## 4. 上下文质量演进
-
-### 4.1 ContextBundle 与 World State
-
-当前 AgentLab 主要将旧消息压成一条摘要。建议拆分上下文：
-
-```python
-ContextBundle(
-    base_instructions,
-    permissions,
-    workspace_state,
-    project_knowledge,
-    skills,
-    memories,
-    task_state,
-    evidence,
-    recent_messages,
-)
-```
-
-每个 Fragment 包含：
-
-- 来源和信任级别
-- 内容 hash / version
-- token 预算
-- 更新时间
-- 是否可缓存
-- 是否允许压缩
-
-只有发生变化的 World State 重新生成，避免 Skill、权限和项目说明反复进入摘要。
-
-### 4.2 压缩检查点
-
-参考 Codex 的 Compaction Checkpoint：
-
-- 压缩历史与摘要元数据分离。
-- 保留最近真实用户消息。
-- 重新注入 canonical initial context。
-- 压缩前后 live history 与 persisted history 一致。
-- 支持手动压缩、Turn 前压缩和 Turn 中稳定点压缩。
-- 记录触发原因、窗口编号、token 前后值和模型。
-
-### 4.3 信任标签
-
-外部网页、MCP 结果和用户项目文件应保留来源类型：
-
-```text
-trusted_system
-application_context
-user_input
-untrusted_external
-model_generated
-```
-
-上下文压缩不能把不可信网页内容总结成系统事实，也不能让工具结果修改权限策略。
-
----
-
-## 5. 系统级执行安全
-
-### 5.1 ExecutionGateway
-
-当前 `shell` 在宿主权限下运行；cwd 在 workspace 不代表进程只能访问 workspace。
-建议统一：
-
-```python
-ExecutionRequest(
-    argv,
-    cwd,
-    env,
-    filesystem_policy,
-    network_policy,
-    timeout,
-    output_policy,
-)
-
-ExecutionResult(
-    exit_code,
-    stdout,
-    stderr,
-    duration,
-    sandbox_backend,
-    audit_id,
-)
-```
-
-所有 Shell、Verifier、远程和子进程执行都必须经过 ExecutionGateway。
-
-### 5.2 跨平台沙箱后端
-
-| 平台 | 建议后端 | 说明 |
-|---|---|---|
-| macOS | Seatbelt / `sandbox-exec` | 精确控制读写路径与网络 |
-| Linux | Bubblewrap，必要时兼容 Landlock | namespace、只读/可写挂载、网络隔离 |
-| Windows | Restricted Token + Job Object；可选提升后端 | 进程树、权限和资源限制 |
-| WSL2 | Linux Bubblewrap | 与 Linux 保持一致 |
-
-策略无法准确落实时 fail closed，不能静默扩大权限。
-
-### 5.3 权限 Amendment
-
-审批结果不再只是布尔值，而是最小权限增量：
-
-```python
-PermissionAmendment(
-    turn_id,
-    action="allow_once",
-    filesystem=[{"path": "build/", "access": "write"}],
-    network=[{"domain": "api.github.com", "access": "connect"}],
-    expires_at_turn_end=True,
-)
-```
-
-用户批准写 `build/` 不等于允许写整个 home；批准一个域名不等于开放全部网络。
-
----
-
-## 6. 事件可靠性与多前端
-
-### 6.1 有界队列与背压
-
-当前 Runtime 直接同步调用 subscriber callback，慢 UI 可能拖慢 Runtime，异常还会被
-吞掉。建议：
-
-- 每个订阅者独立有界队列。
-- Runtime 生产事件不等待 UI 渲染。
-- 队列满返回结构化 `server_overloaded` 或断开慢消费者。
-- 客户端指数退避并从 `after_seq` 重连。
-- 关键事件落 SQLite，可重放。
-
-### 6.2 初始化握手
-
-本地 Server 连接后先执行：
-
-```text
-initialize(client_info, protocol_version, capabilities)
-initialized
-```
-
-握手前拒绝其他请求；客户端声明支持的事件、图片、审批和实验特性。
-
-### 6.3 传输
-
-建议顺序：
-
-1. 进程内 Queue（CLI 迁移）。
-2. HTTP + SSE（Web MVP）。
-3. stdio JSONL（IDE/子进程集成）。
-4. WebSocket（确有双向实时需求后再引入）。
-
----
-
-## 7. AgentLab 分阶段实施路线
-
-本节只描述后续工作；已完成能力统一记录在 7.1 的里程碑中。
-
-### P0：Runtime Protocol 化（已完成）
-
-- Protocol 数据模型、JSON 类型约束、版本化 EventEnvelope、JSONL 编解码和初始化握手。
-- RuntimeService 显式前端边界、进程内 Event Queue、慢消费者处理和游标重放。
-- SQLite append-only Turn/Item/Event 存储；Item/Event 共用 Thread sequence，并原子写入。
-
-剩余边界：独立 stdio 进程 Server 和完整命令 Submission Queue 尚未接入。
-
-### P1：统一 TurnEngine 与交互状态机
-
-- 合并 Legacy Runtime 与 Executor 工具循环。
-- 将 Direct / Task / Loop 统一为同一 TurnEngine 的策略。
-- 增加 `waiting_approval / waiting_user_input / suspended` 和同一 Turn 内 steer/resume。
-- 统一工具结果配对、取消、失败分类、Provider retry 和 circuit breaker。
-
-验收：简单请求不调用 Planner；审批、图片、取消和错误处理只维护一套；503 可取消地退避重试，且不重放已执行工具。
-
-### P1：动态工具与上下文
-
-- 实现 `tool_search` 和按 Turn 的工具集，未授权工具不进入模型上下文。
-- 引入 ContextBundle、Fragment version、World State 和 Provider cache 能力声明。
-- 补齐 Project Knowledge、权限状态和可审计/可恢复的压缩检查点。
-
-验收：普通 Coding Turn 的 Tool Schema token 至少下降 50%；压缩后目标、任务和权限语义不变。
-
-### P1：ExecutionGateway 与沙箱
-
-- 抽出统一执行请求/结果，Shell、Verifier、远程和子进程统一经过 Gateway。
-- 实现 macOS Seatbelt、Linux Bubblewrap/Landlock、Windows Restricted Token/Job Object 的最小安全后端。
-- 增加文件/网络 Permission Amendment；无可用沙箱时按配置 fail closed。
-
-验收：workspace-only Shell 无法读取 home；network-off 命令无法联网；timeout/cancel 能清理子进程树。
-
-### P2：Fork、多 Agent 与后台任务
-
-- `/session fork [turn_id]`、Git worktree 绑定、权限子集和独立 Item 流。
-- Guardian/Verifier 只读审查、后台队列、断点恢复和启动预热。
-
----
-
-### 7.1 已完成里程碑
-
-已完成：
-
-- Protocol v1 数据模型、JSON Schema、JSONL transport 和握手能力协商。
-- RuntimeService 显式边界、进程内有界事件订阅、慢消费者断开和游标重放。
-- SQLite append-only Turn/Item/Event 存储；Item/Event 共用序号并原子写入。
-- Runtime/Loop/上下文事件到规范 TurnItem 的映射，以及未知事件的 `runtime.event` 兜底。
-- Loop 适配器通过显式 Session API 工作，CLI 不直接读取 Router 私有字段。
-- Direct/Task/Loop 本地模式路由；`mode=auto` 的简单请求绕过 Planner。
-- 上下文 token 估算、压缩失败本地兜底、OpenAI Responses 输入字段清理和流式协议错误识别。
-- 内置 RTK 输出压缩与累计统计。
-
-- P0 基础 Protocol 已完成；剩余 P0 边界为独立 stdio Server 和完整命令 Submission Queue。
-- P1 Provider retry/circuit breaker 已有基础实现，尚未接入 retry 事件、配置化策略和所有 Provider 能力。
-- P1 异步 Submission Queue 已有进程内非阻塞 `submit_turn()`，尚未接入 JSONL/stdio 双向命令服务。
-
-验证基线：最近一次专项测试和全量测试将在本阶段完成后更新；`compileall` 与 `git diff --check` 已通过。
-
-下一项：统一 TurnEngine 与交互状态机；随后动态工具暴露、ContextBundle 和 ExecutionGateway。
-
----
-
-## 8. 建议目录结构
-    envelopes.py
-    commands.py
-    events.py
-    items.py
-    errors.py
-    schema.py
-
-  runtime/
-    service.py
-    turn_engine.py
-    mode_router.py
-    thread_manager.py
-    turn_context.py
-    event_bus.py
-    item_store.py
-
-  context/
-    bundle.py
-    fragments.py
-    world_state.py
-    compaction.py
-    provider_cache.py
-
-  execution/
-    gateway.py
-    policy.py
-    result.py
-    macos_seatbelt.py
-    linux_bwrap.py
-    windows_token.py
-
-  providers/
-    capabilities.py
-    retry.py
-    circuit_breaker.py
-```
-
-迁移期间保留旧 import adapter，但新模块不能依赖 CLI。
-
----
-
-## 9. 关键指标
+每项能力都应以本地指标验收：
 
 | 目标 | 指标 |
 |---|---|
-| 简单请求效率 | Direct 请求不调用 Planner，首 token 延迟下降 |
-| Tool Schema 成本 | 常规 Turn 固定工具 token 至少下降 50% |
-| Runtime 可靠性 | Turn 崩溃后可恢复到最后一个已持久化 Item |
-| 多前端一致性 | CLI/Web/TUI 对同一事件流渲染结果一致 |
-| 审批正确性 | waiting 状态下不继续模型调用或执行工具 |
-| Provider 稳定性 | 可重试错误自动退避，取消响应及时 |
-| Shell 安全 | workspace policy 由 OS 沙箱真实执行 |
-| 上下文质量 | 压缩后目标、约束、权限、任务和证据完整保留 |
+| 请求效率 | 简单任务不调用 Planner，首 token 延迟下降 |
+| 工具效率 | Tool Schema token 下降，重复/误调用减少 |
+| 任务完成率 | 修改后相关验证通过率提升，失败能定向修复 |
+| 上下文质量 | 压缩后目标、约束、任务和证据完整 |
+| 可靠性 | Provider 临时错误可恢复，取消及时生效 |
+| 本地安全 | workspace 外访问、危险命令和网络操作受控 |
 
----
+## 6. 参考边界
 
-## 10. 不应照搬的部分
+OpenAI Codex Runtime 主要用于借鉴以下设计思想：稳定的执行边界、清晰的 Turn 生命周期、结构化事件、上下文压缩、任务恢复和工具权限控制。
 
-- 不把 Codex 的 OpenAI 专属认证、模型目录和内部 Extension 体系直接移入 AgentLab。
-- 不要求 AgentLab 改写为 Rust；先通过稳定边界修复架构问题。
-- 不一次性引入所有 App Server API；优先覆盖 Thread/Turn/Approval/Cancel/Event。
-- 不为了形式复制复杂沙箱策略；每个平台先做可验证的最小安全后端。
-- 不把多 Agent 提前到 Protocol、TurnEngine 和 ExecutionGateway 之前。
-
----
-
-## 11. 参考资料
-
-- [OpenAI Codex GitHub](https://github.com/openai/codex)
-- [Codex Core](https://github.com/openai/codex/tree/main/codex-rs/core)
-- [Codex Protocol](https://github.com/openai/codex/tree/main/codex-rs/protocol)
-- [Codex App Server](https://github.com/openai/codex/tree/main/codex-rs/app-server)
-- [Codex Core 沙箱说明](https://github.com/openai/codex/blob/main/codex-rs/core/README.md)
-- [Codex 安装与源码构建](https://github.com/openai/codex/blob/main/docs/install.md)
-
-调研结论基于 2026-08-24 获取的公开仓库内容；上游架构会持续变化，实施时应以固定
-commit/tag 的协议和源码为准。
+AgentLab 不复制 Codex 的 Rust 代码、OpenAI 专属认证、模型目录、App Server 或完整沙箱体系。实现始终以单机本地 Agent 的效率、智能和可维护性为优先。

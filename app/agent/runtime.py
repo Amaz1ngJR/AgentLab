@@ -157,6 +157,7 @@ class AgentSession:
             raise ValueError("mode=auto 需要启用 orchestrate")
         self._last_mode: ExecutionMode | None = None
         self._planner = planner
+        self._dynamic_tools: list[dict[str, Any]] | None = None
         self._on_run_event = on_run_event or (lambda e: None)
         self._orch = None  # 懒构建(见 _ensure_orchestrator)
         # 上下文预算/压缩协调者(可选,§7.3)。交给 Orchestrator 在稳定点调用。
@@ -165,6 +166,12 @@ class AgentSession:
         # 编排 run 的目标与结果状态,供 SessionRouter.persist_current 写 runs 审计
         self.last_goal: str = ""
         self.last_run_status: str = ""
+
+    def _tools_for_task(self, task: str, *, mode: str = "direct") -> list[dict[str, Any]]:
+        selector = getattr(self.tools, "schemas_for_task", None)
+        if callable(selector):
+            return selector(task, mode=mode)
+        return self.tools.schemas()
 
     def subscribe_events(
         self,
@@ -367,7 +374,8 @@ class AgentSession:
             "content": build_user_content(user_input, images),
         })
         # 在每次模型调用前检查，确保当前用户输入和 Responses 顶层 item 都计入预算。
-        tools = self.tools.schemas() or None
+        tools = self._tools_for_task(user_input, mode="direct")
+        self._dynamic_tools = tools
         if self.context_manager is not None:
             self.context_manager.compact_before_model_call(
                 self.messages,
@@ -394,7 +402,7 @@ class AgentSession:
 
                     resp = self.llm.create_message(
                         messages=self.messages,
-                        tools=self.tools.schemas() or None,
+                        tools=tools or None,
                         system=self.system_prompt,
                         on_progress=on_progress,
                         on_text_delta=on_text_delta if raw_on_text else None,
