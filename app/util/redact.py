@@ -70,7 +70,14 @@ def redact_lines(lines: Iterable[str]) -> list[str]:
 
 def format_exception(exc: BaseException) -> str:
     """格式化异常摘要(单行,适合 CLI 提示):'TypeName: message'。已脱敏。"""
-    return redact(f"{type(exc).__name__}: {exc}")
+    summary = redact(f"{type(exc).__name__}: {exc}")
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status in {502, 503, 504}:
+        summary += (
+            "（模型服务暂时不可用且自动重试已耗尽；"
+            "本地 Ollama 请检查 runner、显存或重启服务）"
+        )
+    return summary
 
 
 def format_traceback(exc: BaseException) -> str:

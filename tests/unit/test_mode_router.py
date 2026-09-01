@@ -104,10 +104,17 @@ def test_chinese_and_english_task_markers():
 def test_plain_conversation_stays_direct():
     """普通对话、解释、单步查询应保持 Direct。"""
     assert ModeRouter.select("你好") is ExecutionMode.DIRECT
+    assert ModeRouter.select("请介绍下你自己") is ExecutionMode.DIRECT
     assert ModeRouter.select("这段代码是做什么的") is ExecutionMode.DIRECT
     assert ModeRouter.select("查看 README 文件") is ExecutionMode.DIRECT
     assert ModeRouter.select("搜索 main 函数") is ExecutionMode.DIRECT
     assert ModeRouter.select("解释一下这个错误") is ExecutionMode.DIRECT
+
+
+def test_url_solution_request_stays_direct_and_bypasses_planner():
+    assert ModeRouter.select(
+        "请看https://leetcode.cn/problems/example这个题，给出c++实现和最优解"
+    ) is ExecutionMode.DIRECT
 
 
 def test_english_action_words_match_whole_words_only():

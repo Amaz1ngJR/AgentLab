@@ -5,8 +5,8 @@
 
 实现策略:
   让模型只输出一段 JSON(不调用工具),描述子任务及其依赖;解析成 Task 列表。
-  解析失败或模型判定为简单任务时,退化为"单任务计划"(content = 原始 goal),
-  保证编排路径永远有至少一个任务可跑,绝不因为模型 JSON 不规范而卡死。
+  输出不是合法计划时退化为"单任务计划"(content = 原始 goal)。Provider 异常
+  必须向上传播，避免先把共享熔断器打开、随后只暴露二次 CircuitOpenError。
 
 只依赖 llm.create_message(...).text,因此离线测试用 FakeRouter 返回 JSON 即可。
 """
@@ -23,17 +23,20 @@ PLANNER_SYSTEM = """你是任务规划器。把用户目标拆成可执行的子
 关键要求:
 1. 只输出一个 JSON 对象,不要有任何额外文字、解释、分析或 markdown 代码块。
 2. 不要在 JSON 外添加任何前言、后语、思考过程。
-3. 每个子���务的 content 必须是明确的、可执行的动作，而不是"确认"、"检查"、"分析"等模糊指令。
+3. 每个子任务的 content 必须是明确的、可执行的动作，而不是"确认"、"检查"、"分析"等模糊指令。
 
 输出格式:
 {"tasks": [
-  {"id": "t1", "content": "用 read_file 读取 xxx.py 文件内容", "dependencies": []},
-  {"id": "t2", "content": "用 edit_file 修改 xxx.py 第 N 行，将 A 改为 B", "dependencies": ["t1"]}
+  {"id": "t1", "content": "读取 xxx.py 的相关实现", "dependencies": []},
+  {"id": "t2", "content": "修改 xxx.py 并满足用户要求", "dependencies": ["t1"]}
 ]}
 
 规则:
 - id 用 t1/t2/t3... 顺序编号,稳定唯一。
-- content 是一句话祈使句,描述这一步要做什么。必须包含具体的工具调用（如 read_file、write_file、edit_file、shell 等）。
+- content 是一句话祈使句,描述这一步要达到的结果。只有上下文明确列出的工具名才可引用，
+  不得编造工具、操作系统命令、URL 或实现细节。
+- 网页操作若存在 browser_* 工具，必须使用它们；不得规划 xdg-open、start、shell 打开
+  浏览器或用 JavaScript 注入页面。
 - dependencies 列出必须先完成的子任务 id;没有依赖就写 []。
 - 简单目标(一步能完成)就只给一个任务。
 - 不要拆得过细,通常 2-5 个任务即可。
@@ -106,6 +109,7 @@ class Planner:
         # 最近一次规划的 token 用量,供 Orchestrator 汇总进 run 统计
         self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self.last_actual_model: str | None = None
+        self.last_error: BaseException | None = None
 
     def create_plan(self, goal: str, context: str = "", *, on_progress=None) -> TaskPlan:
         """生成初始计划。context 可放 workspace、已知约束等补充信息。
@@ -115,6 +119,7 @@ class Planner:
         （Skills/MCP/记忆会重复并显著增加 planning 输入 token）。
         """
         self.last_usage = {"input_tokens": 0, "output_tokens": 0}
+        self.last_error = None
         prompt = goal if not context else f"{context}\n\n目标:{goal}"
         try:
             resp = self._llm.create_message(
@@ -129,8 +134,9 @@ class Planner:
                 self.last_actual_model = resp.actual_model
             obj = _extract_json(getattr(resp, "text", "") or "")
             tasks = _parse_tasks(obj) if obj else []
-        except Exception:
-            tasks = []
+        except Exception as exc:
+            self.last_error = exc
+            raise
         if not tasks:
             # 兜底:单任务计划。用简短标题而非整段 goal(避免面板被长问题刷屏)
             summary = goal.strip()[:50].rstrip() + ("…" if len(goal.strip()) > 50 else "")

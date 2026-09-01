@@ -38,6 +38,9 @@ servers:
     args:
       - "-y"
       - "@playwright/mcp@latest"
+      # Windows 上动态使用系统默认浏览器时可取消下面两行注释。
+      # - "--browser"
+      # - "system-default"
       # ── 隔离 profile 示例(默认安全)── 去掉下面 --user-data-dir 两行即为隔离 ──
       # ── Named 持久化 profile 示例 ──────────────────────────────────────────
       - "--user-data-dir"

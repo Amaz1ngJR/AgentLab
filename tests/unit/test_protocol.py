@@ -10,6 +10,7 @@ from app.protocol.envelopes import EventEnvelope
 from app.protocol.errors import RuntimeFailure
 from app.protocol.items import TurnItem
 from app.protocol.models import TurnRecord
+from app.models.provider_retry import CircuitOpenError
 from app.storage import Storage
 
 
@@ -38,6 +39,27 @@ def test_runtime_failure_is_structured_and_serializable():
     )
     assert failure.to_dict()["retryable"] is True
     assert failure.to_dict()["details"]["status"] == 503
+
+
+def test_runtime_failure_preserves_circuit_cause_and_retry_metadata():
+    original = RuntimeError("connection refused; api_key=topsecret")
+    failure = RuntimeFailure.from_exception(CircuitOpenError(12.5, original))
+    payload = failure.to_dict()
+    assert payload["code"] == "provider_circuit_open"
+    assert payload["retryable"] is True
+    assert payload["retry_after_seconds"] == 12.5
+    assert "connection refused" in payload["details"]["last_failure"]
+    assert "topsecret" not in payload["message"]
+
+
+def test_runtime_failure_classifies_http_502_as_retryable_provider_error():
+    class HttpError(RuntimeError):
+        status_code = 502
+
+    payload = RuntimeFailure.from_exception(HttpError("runner exited")).to_dict()
+    assert payload["code"] == "transient_provider_error"
+    assert payload["category"] == "provider"
+    assert payload["retryable"] is True
 
 
 def test_storage_round_trips_turn_items_and_events(tmp_path):

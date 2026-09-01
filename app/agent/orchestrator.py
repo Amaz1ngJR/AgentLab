@@ -191,7 +191,11 @@ class Orchestrator:
                     # Planner 已有独立、严格的 PLANNER_SYSTEM。把完整执行 system
                     # （含 Skills/MCP/记忆，实测可多出数千 token）再塞进 user prompt
                     # 会重复上下文，导致 planning 一开始就显示 3.9k 输入 token。
-                    context="",
+                    context=(
+                        self._tools.planner_context_for_task(goal)
+                        if callable(getattr(self._tools, "planner_context_for_task", None))
+                        else ""
+                    ),
                     on_progress=on_progress,
                 )
         except Cancelled:

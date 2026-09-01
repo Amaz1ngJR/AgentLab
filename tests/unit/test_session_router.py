@@ -6,30 +6,41 @@ from app.agent.approval import AutoApprove
 from app.storage import Storage
 from app.tools.registry import ToolRegistry
 from app.models.protocol import ModelResponse
+from app.protocol.models import TurnRecord
 
 
 class _FakeRouter:
-    model = "fake"
-    provider = "fake"
+    def __init__(self, profile_name="fake"):
+        self.profile_name = profile_name
+        self.model = profile_name
+        self.provider = "fake"
+
     def create_message(self, messages, **kw):
         return ModelResponse(text="ok", tool_calls=[], usage={}, provider_payload=[])
     def format_tool_results(self, results):
         return []
 
 
-def _make_router(storage, profiles):
+def _make_router(storage, profiles, switched=None):
     def factory(profile: AgentProfile, session_id: str) -> AgentSession:
         return AgentSession(
-            llm=_FakeRouter(),
+            llm=_FakeRouter(profile.model_profile),
             tools=ToolRegistry(),
             approval=AutoApprove(),
             system_prompt="test",
         )
+
+    def model_switcher(session, profile_name):
+        if switched is not None:
+            switched.append(profile_name)
+        session.replace_model(_FakeRouter(profile_name))
+
     return SessionRouter(
         storage=storage,
         session_factory=factory,
         profiles=profiles,
         default_profile_id="default",
+        model_switcher=model_switcher,
     )
 
 
@@ -45,6 +56,33 @@ def test_new_creates_and_switches(tmp_path):
     sid = r.new(agent_id="default", title="测试会话")
     assert r.current_id == sid
     assert r.current is not None
+
+
+def test_dynamic_model_profile_uses_auto_mode(tmp_path):
+    """--profile 直接启动时，普通聊天不应因 synthetic profile 落回 Task。"""
+    captured: list[AgentProfile] = []
+
+    def factory(profile: AgentProfile, session_id: str) -> AgentSession:
+        captured.append(profile)
+        return AgentSession(
+            llm=_FakeRouter(profile.model_profile),
+            tools=ToolRegistry(),
+            approval=AutoApprove(),
+            orchestrate=True,
+            mode=profile.mode,
+        )
+
+    db = Storage(tmp_path / "db")
+    router = SessionRouter(db, factory, {}, default_profile_id="local_qwen3_14b")
+    sid = router.new("local_qwen3_14b")
+    assert captured[-1].mode == "auto"
+    assert router.current._select_mode("请介绍下你自己", None, False).value == "direct"
+
+    router.current.messages = [{"role": "user", "content": "你好"}]
+    router.persist_current()
+    restored = SessionRouter(db, factory, {}, default_profile_id="cloud_claude")
+    assert restored.switch(sid)
+    assert captured[-1].mode == "auto"
 
 
 def test_two_sessions_are_isolated(tmp_path):
@@ -153,6 +191,74 @@ def test_resume_or_new_skips_empty_sessions(tmp_path):
     assert r2.current.messages[0]["content"] == "first"
 
 
+def test_resume_or_new_restores_session_with_failed_turn_but_no_messages(tmp_path):
+    """Planner 首次调用失败时 messages 尚未保存，但该 session 已经被使用过。"""
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles())
+    sid = r.new("default", title="local")
+    db.save_runtime_turn(TurnRecord(
+        turn_id="failed-turn",
+        thread_id=sid,
+        status="failed",
+        input_text="你好",
+        failure_code="transient_provider_error",
+    ))
+
+    r2 = _make_router(db, _profiles())
+    resumed_id, resumed = r2.resume_or_new(agent_id="other_startup_profile")
+
+    assert resumed is True
+    assert resumed_id == sid
+    assert len(r2.list_sessions()) == 1
+
+
+def test_resume_or_new_resumes_latest_even_when_startup_profile_differs(tmp_path):
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles())
+    old = r.new("coder")
+    r.current.messages = [{"role": "user", "content": "cloud history"}]
+    r.persist_current()
+    db.update_session_model(old, "other_model")
+
+    r2 = _make_router(db, _profiles())
+    sid, resumed = r2.resume_or_new(agent_id="default")
+    assert resumed is True
+    assert sid == old
+    assert r2.current.llm.profile_name == "other_model"
+    assert r2.current.messages[0]["content"] == "cloud history"
+    assert len(r2.list_sessions()) == 1
+
+
+def test_switch_model_preserves_portable_history_and_updates_storage(tmp_path):
+    db = Storage(tmp_path / "db")
+    switched = []
+    r = _make_router(db, _profiles(), switched)
+    sid = r.new("default")
+    r.current.messages = [
+        {"role": "user", "content": "继续之前的话题"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "文件内容"},
+    ]
+
+    old, new = r.switch_model("local_qwen3_14b")
+
+    assert (old, new) == ("cloud_claude", "local_qwen3_14b")
+    assert switched == ["local_qwen3_14b"]
+    assert r.current.llm.profile_name == "local_qwen3_14b"
+    assert all(m.get("role") in {"user", "assistant"} for m in r.current.messages)
+    assert "历史工具调用" in r.current.messages[1]["content"]
+    assert db.get_session(sid)["model_profile"] == "local_qwen3_14b"
+    assert db.load_messages(sid) == r.current.messages
+
+
 def test_persist_current_touches_updated_at(tmp_path):
     """persist_current 应更新 session 的 updated_at,标记最后活跃时间。"""
     db = Storage(tmp_path / "db")
@@ -216,6 +322,18 @@ def test_rename(tmp_path):
     assert db.get_session(sid)["title"] == "新标题"
 
 
+def test_handle_command_rename_clarifies_title_does_not_switch_model(tmp_path):
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles())
+    r.new("default", "旧标题")
+
+    out = r.handle_command("/session rename local")
+
+    assert "仅修改 Session 标题" in out
+    assert "当前模型:" in out
+    assert "/model switch" in out
+
+
 def test_handle_command_new(tmp_path):
     r = _make_router(Storage(tmp_path / "db"), _profiles())
     out = r.handle_command("/session new default 我的会话")
@@ -228,6 +346,7 @@ def test_handle_command_list(tmp_path):
     r.new("default", "会话A")
     out = r.handle_command("/session list")
     assert "会话A" in out
+    assert "Model" in out
 
 
 def test_handle_command_agents(tmp_path):

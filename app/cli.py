@@ -805,6 +805,15 @@ def _reset_shell_snapshot() -> None:
     _SHELL_TARGETS.clear()
 
 
+def _tool_output_preview(output: str, *, is_error: bool) -> str:
+    """错误结果同时展示标题后的具体原因，避免只看到“### Error”。"""
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    count = 2 if is_error and len(lines) > 1 else 1
+    return " | ".join(lines[:count])[:240]
+
+
 def _print_event(ev: TurnEvent) -> None:
     if ev.kind == "tool_call":
         if ev.tool_name == "write_file":
@@ -815,7 +824,7 @@ def _print_event(ev: TurnEvent) -> None:
             _snapshot_shell_targets(ev.tool_input or {})
         print(_approval_text(f"  ! tool_use {ev.tool_name}({_fmt(ev.tool_input)})"), flush=True)
     elif ev.kind == "tool_result":
-        preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
+        preview = _tool_output_preview(ev.tool_output, is_error=ev.tool_error)
         tag = "ERR" if ev.tool_error else "ok"
         t = f" ({ev.elapsed_seconds * 1000:.0f}ms)" if ev.elapsed_seconds < 1 else f" ({ev.elapsed_seconds:.1f}s)"
         print(f"    [{tag}]{t} {preview}", flush=True)
@@ -868,7 +877,7 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
             detail = f"  ! tool_use {action}: {ev.tool_name}({_fmt(ev.tool_input)})"
             print(_approval_text(detail), flush=True)
     elif kind == run_events.TOOL_COMPLETED:
-        preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
+        preview = _tool_output_preview(ev.tool_output, is_error=ev.tool_error)
         tag = "ERR" if ev.tool_error else "ok"
         t = (f" ({ev.elapsed_seconds * 1000:.0f}ms)" if ev.elapsed_seconds < 1
              else f" ({ev.elapsed_seconds:.1f}s)")
@@ -1157,20 +1166,15 @@ def _handle_model_command(router: SessionRouter, line: str) -> str:
                 available = ", ".join(sorted(profiles.keys()))
                 return f"未找到 profile '{target_profile}'。\n可用: {available}"
 
-            # 切换模型需要重建 session
-            # 这里我们通过设置环境变量并提示用户重启来实现
-            # 因为动态切换模型涉及重建整个 LLM 实例和 session
             import os
-            os.environ["ACTIVE_PROFILE"] = target_profile
+            old_profile, new_profile = router.switch_model(target_profile)
+            os.environ["ACTIVE_PROFILE"] = new_profile
 
             return (
-                f"已设置 ACTIVE_PROFILE={target_profile}\n"
-                f"\n"
-                f"模型切换将在新建 session 时生效。建议:\n"
-                f"  1. /session new      - 新建使用新模型的会话\n"
-                f"  2. 或重启 agentlab   - 全局切换到新模型\n"
-                f"\n"
-                f"注: 当前会话仍使用原有模型。"
+                f"已将当前 session 的模型从 {old_profile or '未知'} "
+                f"切换到 {new_profile}。\n"
+                "现有对话已转换为跨 provider 可回放格式，可以继续对话；"
+                "后续新建 session 也会默认使用该模型。"
             )
         except Exception as e:
             return f"切换模型失败: {e}"
@@ -1250,8 +1254,6 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
 
     # 本地 profile:先 ping Ollama,不通就提前给安装引导(而不是等首次工具调用才报错)
     _check_local_endpoint(cfg)
-
-    llm = build_model_router(cfg)
 
     _print_init(f"== AgentLab v{__version__} ==")
     _print_init(f"provider : {cfg.provider}")
@@ -1357,8 +1359,21 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
                     f"({', '.join(s.skill_id for s in skill_catalog.all())});"
                     f" 默认启用 {len(enabled)} 个 ({enabled_names})")
 
+    def _build_profile_model(profile_name: str):
+        session_cfg = load_config(profile_name=profile_name)
+        if session_cfg.provider == "anthropic" and not (
+            session_cfg.auth_token or session_cfg.api_key
+        ):
+            raise RuntimeError(
+                f"模型 profile '{profile_name}' 缺少 "
+                "ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY"
+            )
+        return session_cfg, build_model_router(session_cfg)
+
     def _session_factory(agent_profile, session_id: str) -> AgentSession:
         """按 AgentProfile 构建一个隔离的 AgentSession:独立工具表 + 任务清单 + 记忆注入。"""
+        session_profile = agent_profile.model_profile or default_profile_id
+        session_cfg, session_llm = _build_profile_model(session_profile)
         task_store = TaskStore()
 
         def _persist_tool_audit(event) -> None:
@@ -1406,11 +1421,15 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         # 按当前模型窗口(profile 声明的 context_size 优先,否则按模型名查表)派生
         # 预算,在编排稳定点接近 85% 时自动压缩旧历史,避免长 run 撞 token 上限。
         ctx_budget = ContextBudget.from_model(
-            model=cfg.model, declared_context_size=cfg.context_size,
+            model=session_cfg.model,
+            declared_context_size=session_cfg.context_size,
         )
         ctx_manager = ContextManager(
             budget=ctx_budget,
-            compressor=ContextCompressor(llm, model_profile=cfg.profile_name or ""),
+            compressor=ContextCompressor(
+                session_llm,
+                model_profile=session_cfg.profile_name or session_profile,
+            ),
             on_event=_print_run_event,
         )
         # ── progress 工厂 + panel_state(任务面板去重状态)────────────────────
@@ -1421,14 +1440,15 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         from functools import partial
         print_run_event_with_state = partial(_print_run_event, panel_state=panel_state)
         sess = AgentSession(
-            llm=llm,
+            llm=session_llm,
             tools=reg,
             approval=shared_approval,
             system_prompt=sys_prompt,
             max_steps=agent_profile.max_steps,
             max_task_steps=agent_profile.max_task_steps,
-            # 编排模式下使用 on_run_event，非编排模式使用 on_event
-            on_event=None if agent_profile.orchestrate else _print_event,
+            # auto profile 会在同一 Session 内逐轮选择 Direct/Task：Direct 使用
+            # TurnEvent，Task 使用 RunEvent，因此两条渲染管道必须同时绑定。
+            on_event=_print_event,
             progress=progress_fn,
             task_store=task_store,
             # PtySessionManager 随会话关闭(close_all 杀掉残留的交互式子进程)。
@@ -1442,7 +1462,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             # 编排模式/本地模式路由：legacy 沿用 profile 的 orchestrate 语义，
             # auto/direct/task 则显式交给 AgentSession。
             orchestrate=agent_profile.orchestrate,
-            planner=Planner(llm),
+            planner=Planner(session_llm),
             mode=(agent_profile.mode if agent_profile.mode != "legacy" else None),
             on_run_event=print_run_event_with_state,
             context_manager=ctx_manager,
@@ -1454,11 +1474,27 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         sess.mem_policy = mem_policy
         return sess
 
+    def _switch_session_model(session: AgentSession, profile_name: str) -> None:
+        session_cfg, session_llm = _build_profile_model(profile_name)
+        context_manager = ContextManager(
+            budget=ContextBudget.from_model(
+                model=session_cfg.model,
+                declared_context_size=session_cfg.context_size,
+            ),
+            compressor=ContextCompressor(
+                session_llm,
+                model_profile=session_cfg.profile_name or profile_name,
+            ),
+            on_event=session.emit_run_event,
+        )
+        session.replace_model(session_llm, context_manager)
+
     router = SessionRouter(
         storage=storage,
         session_factory=_session_factory,
         profiles=agent_profiles,
         default_profile_id=default_profile_id,
+        model_switcher=_switch_session_model,
     )
     # 把 mcp_manager 挂到 router 上,main() 退出时统一关闭
     router.mcp_manager = mcp_manager
@@ -1507,7 +1543,9 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
 
     service = RuntimeService(router, approval_broker=approval_broker)
     # 启动:有未归档历史 session 就恢复最近一个,否则新建(避免每次启动堆积空会话)
-    start_agent = default_profile_id if default_profile_id in agent_profiles else None
+    # 历史会话按它自己持久化的 model_profile 恢复；启动 profile 只作为没有历史
+    # 时新建会话的默认值。
+    start_agent = default_profile_id
     sid, resumed = service.resume_or_new(agent_id=start_agent)
     row = storage.get_session(sid)
     title = row["title"] if row else ""
@@ -2025,6 +2063,37 @@ def _format_pending_attachments(pending_clipboard: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _thread_prompt_text(thread: dict | None) -> str:
+    """构建不混淆标题与模型的 REPL Prompt。"""
+    if not thread:
+        return "▸ "
+    sess_id = str(thread.get("thread_id") or "")
+    title = str(thread.get("title") or "?")
+    model_profile = str(thread.get("model_profile") or "?")
+    if len(title) > 30:
+        title = title[:27] + "..."
+    if len(model_profile) > 30:
+        model_profile = model_profile[:27] + "..."
+    return f"[{sess_id[:6]}·{title}@{model_profile}] ▸ "
+
+
+def _format_session_exception(exc: BaseException, session) -> str:
+    """为 Provider 连接错误补充当前真实模型，避免被 Session 标题误导。"""
+    message = format_exception(exc)
+    exc_name = type(exc).__name__.lower()
+    exc_text = str(exc).lower()
+    if "connection" not in exc_name and "connection" not in exc_text:
+        return message
+    llm = getattr(session, "llm", None)
+    profile = getattr(llm, "profile_name", None) or "未知"
+    provider = getattr(llm, "provider", None) or "未知"
+    return (
+        f"{message}（当前模型 profile={profile}, provider={provider}；"
+        "Session 标题不代表模型。请用 /model current 核对，或用 "
+        "/model switch <profile> 切换。）"
+    )
+
+
 def _repl(router: RuntimeService) -> int:
     """交互式对话。
 
@@ -2052,15 +2121,7 @@ def _repl(router: RuntimeService) -> int:
         _print_input_separator()
         # 动态构建 prompt:通过 RuntimeService 获取当前 Thread 摘要。
         thread = router.current_thread_summary()
-        if thread:
-            sess_id = thread["thread_id"]
-            title = thread.get("title") or "?"
-            # 标题可能很长，截断到合理长度
-            if len(title) > 30:
-                title = title[:27] + "..."
-            prompt_text = f"[{sess_id[:6]}·{title}] ▸ "
-        else:
-            prompt_text = "▸ "
+        prompt_text = _thread_prompt_text(thread)
         prompt_fragments = FormattedText([("class:prompt", prompt_text)])
 
         try:
@@ -2263,7 +2324,7 @@ def _repl(router: RuntimeService) -> int:
                     images=images,
                 )
             except Exception as exc:
-                print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
+                print(f"  !! {_format_session_exception(exc, session)}\n", file=sys.stderr)
                 continue
             _print_stats(session)
             continue
@@ -2276,7 +2337,7 @@ def _repl(router: RuntimeService) -> int:
             _chat_with_cancel(session, line, service=router, images=images)
         except Exception as exc:
             # 脱敏后输出,避免 Authorization / API key 等凭据泄漏到终端
-            print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
+            print(f"  !! {_format_session_exception(exc, session)}\n", file=sys.stderr)
             continue
         _print_stats(session)
 

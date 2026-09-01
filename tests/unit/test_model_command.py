@@ -80,13 +80,14 @@ class TestModelCommand:
         # 获取一个实际存在的 profile
         profiles = load_profiles()
         valid_profile = list(profiles.keys())[0]
+        mock_router.switch_model.return_value = ("old_profile", valid_profile)
 
         result = _handle_model_command(mock_router, f"/model switch {valid_profile}")
 
-        # 应该提示设置成功
-        assert "已设置 ACTIVE_PROFILE" in result
+        mock_router.switch_model.assert_called_once_with(valid_profile)
+        assert "已将当前 session 的模型" in result
         assert valid_profile in result
-        assert "新建 session" in result
+        assert "可以继续对话" in result
 
     def test_model_switch_command_invalid_profile(self):
         """测试 /model switch 命令（无效的 profile）"""

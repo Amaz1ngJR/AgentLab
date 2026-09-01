@@ -25,6 +25,7 @@ agents:
     model_profile: cloud_claude_opus
     memory_policy: none
     orchestrate: true
+    mode: auto
     # max_steps 是一次用户 run 的模型往返总预算（保留旧名称兼容已有配置），
     # max_task_steps 是单个 Planner 子任务最多允许的模型往返次数。
     max_steps: 16
@@ -41,6 +42,7 @@ agents:
     skills: [code-review]   # 显式启用的 Skill;只注入工作流上下文,不授予工具权限
     memory_policy: read_write
     orchestrate: true
+    mode: auto
     max_steps: 100
     max_task_steps: 50
 
@@ -50,5 +52,6 @@ agents:
     model_profile: local_qwen
     memory_policy: none
     orchestrate: true
+    mode: auto
     max_steps: 16
     max_task_steps: 8

@@ -18,7 +18,19 @@ class RetryDecision:
 
 
 class CircuitOpenError(RuntimeError):
-    """Provider 连续失败后进入短暂熔断。"""
+    """Provider 连续瞬时失败后进入短暂熔断，并保留最近一次原始异常。"""
+
+    def __init__(
+        self,
+        retry_after_seconds: float,
+        last_error: BaseException | None = None,
+    ) -> None:
+        self.retry_after = max(0.0, float(retry_after_seconds))
+        self.last_error = last_error
+        message = f"provider circuit open; retry after {self.retry_after:g}s"
+        if last_error is not None:
+            message += f"; last failure: {type(last_error).__name__}: {last_error}"
+        super().__init__(message)
 
 
 class ProviderCircuitBreaker:
@@ -29,6 +41,7 @@ class ProviderCircuitBreaker:
         self.recovery_seconds = recovery_seconds
         self._failures = 0
         self._opened_at: float | None = None
+        self._last_error: BaseException | None = None
         self._lock = threading.RLock()
 
     @property
@@ -39,23 +52,34 @@ class ProviderCircuitBreaker:
             if time.monotonic() - self._opened_at >= self.recovery_seconds:
                 self._opened_at = None
                 self._failures = 0
+                self._last_error = None
                 return False
             return True
 
     def before_call(self) -> None:
         if self.is_open:
-            raise CircuitOpenError(
-                f"provider circuit open; retry after {self.recovery_seconds:g}s"
-            )
+            with self._lock:
+                elapsed = (
+                    time.monotonic() - self._opened_at
+                    if self._opened_at is not None else 0.0
+                )
+                remaining = max(0.0, self.recovery_seconds - elapsed)
+                error = CircuitOpenError(remaining, self._last_error)
+            if error.last_error is not None:
+                raise error from error.last_error
+            raise error
 
     def record_success(self) -> None:
         with self._lock:
             self._failures = 0
             self._opened_at = None
+            self._last_error = None
 
-    def record_failure(self) -> None:
+    def record_failure(self, exc: BaseException | None = None) -> None:
         with self._lock:
             self._failures += 1
+            if exc is not None:
+                self._last_error = exc
             if self._failures >= self.failure_threshold:
                 self._opened_at = time.monotonic()
 
@@ -75,7 +99,13 @@ def _retry_after(exc: BaseException) -> float | None:
 
 def classify_provider_error(exc: BaseException) -> RetryDecision:
     """按 HTTP 状态/网络异常给出是否可安全重试的判断。"""
-    status = getattr(exc, "status_code", None) or getattr(exc, "response", None)
+    # openai/httpx 异常通常暴露 status_code/response；stdlib urllib.HTTPError
+    # 使用 code。Ollama 原生预热走 urllib，因此三种都要识别。
+    status = (
+        getattr(exc, "status_code", None)
+        or getattr(exc, "code", None)
+        or getattr(exc, "response", None)
+    )
     if hasattr(status, "status_code"):
         status = status.status_code
     text = str(exc).lower()
@@ -115,7 +145,11 @@ def call_with_retry(
             return result
         except BaseException as exc:
             decision = classify_provider_error(exc)
-            breaker.record_failure()
+            if decision.retryable:
+                breaker.record_failure(exc)
+            else:
+                # 4xx/参数错误等说明 provider 可达，不应累计到网络/过载熔断。
+                breaker.record_success()
             if not decision.retryable or attempt >= max_retries:
                 raise
             attempt += 1

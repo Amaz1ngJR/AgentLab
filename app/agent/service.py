@@ -44,6 +44,7 @@ _LEGACY_EVENT_KIND = {
     "session_created": "thread.created",
     "session_resumed": "thread.resumed",
     "session_switched": "thread.selected",
+    "session_model_switched": "thread.model_switched",
     "session_images_cleared": "thread.images_cleared",
     "run_started": "turn.started",
     "turn_event": "turn.legacy_event",
@@ -372,6 +373,23 @@ class RuntimeService:
         if switched:
             self.publish("session_switched", session_id=session_id)
         return switched
+
+    def switch_model(self, model_profile: str) -> tuple[str | None, str]:
+        """仅在会话空闲时切换模型，防止流式响应与历史转换并发发生。"""
+        with self._lock:
+            self._ensure_open()
+            target = self.router.current_id
+            if not target:
+                raise RuntimeError("当前无活跃 session")
+            if target in self._session_runs:
+                raise RuntimeError("Session 正在执行，不能切换模型；请先停止当前 run")
+            result = self.router.switch_model(model_profile)
+        self.publish(
+            "session_model_switched",
+            session_id=target,
+            payload={"old_profile": result[0], "model_profile": result[1]},
+        )
+        return result
 
     def resume_or_new(self, agent_id: str | None = None) -> tuple[str, bool]:
         with self._lock:

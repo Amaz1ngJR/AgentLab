@@ -166,6 +166,24 @@ ollama list
 ollama run qwen3:14b
 ```
 
+AgentLab 的 `local_qwen3_14b` profile 按 8192 token 管理上下文。Ollama 在
+24 GiB 以下显存设备上通常默认只分配 4096；可在 Ollama 设置里把 Context
+Length 调成 8192，或在启动服务前设置：
+
+```powershell
+# 先退出当前 ollama serve，再在同一个 PowerShell 中执行
+$env:OLLAMA_CONTEXT_LENGTH = "8192"
+ollama serve
+
+# 模型首次加载后核对 CONTEXT 列
+ollama ps
+```
+
+若首次调用短暂返回 502，通常是 Ollama 模型 runner 冷启动或重载失败；AgentLab
+会先通过 Ollama 原生 API 预热模型，再进入 OpenAI 兼容流式接口，并使用更长的
+自动重试窗口。若仍持续失败，请先用
+`ollama run qwen3:14b` 验证模型本身，再重启 Ollama 服务。
+
 如需将模型保存在项目目录，必须在首次 `pull` 和每次启动 Ollama 服务前设置相同的 `OLLAMA_MODELS`。路径按实际项目位置修改：
 
 ```powershell
@@ -287,7 +305,7 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 | `/model` | 列出所有配置的模型（同 `/model list`） |
 | `/model list` | 列出所有配置的模型，标记当前使用的模型 |
 | `/model current` | 显示当前模型的详细配置和使用统计 |
-| `/model switch <profile>` | 切换到指定模型（新建 session 时生效） |
+| `/model switch <profile>` | 原地切换当前 session 的模型并保留对话 |
 | `/context` | 显示上下文预算 + recent window + 压缩摘要状态 |
 | `/context compact` | 立即压缩当前会话的可压缩历史 |
 | `/context summary` | 查看当前生效的压缩摘要 |
@@ -384,7 +402,7 @@ SQLite 中的历史消息；旧消息仍保留图片路径引用，恢复该会�
 
 **使用提示**：
 - 所有斜杠命令支持 Tab 自动补全；`/model switch` 会补全 `config/models.yaml` 里的 profile 名
-- `/model switch` 只改后续新建 session 的模型，当前会话不受影响；切完接 `/session new` 生效，或重启 `agentlab` 全局切换
+- `/model switch <profile>` 会原地切换当前 session 的模型并保留对话；历史中的 provider 专属 tool-call 结构会转成可跨 OpenAI / Anthropic / Ollama 回放的文本记录，本次运行中后续新建 session 也默认使用新模型
 
 ## 内置 RTK Shell 输出压缩
 

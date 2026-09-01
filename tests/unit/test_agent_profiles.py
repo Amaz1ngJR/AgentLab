@@ -37,6 +37,13 @@ def test_parses_auto_mode(tmp_path):
     assert load_agent_profiles(f)["x"].mode == "auto"
 
 
+def test_shipped_profiles_use_auto_mode():
+    profiles = load_agent_profiles()
+
+    assert profiles
+    assert all(profile.mode == "auto" for profile in profiles.values())
+
+
 def test_rejects_unknown_mode():
     import pytest
     with pytest.raises(ValueError, match="mode"):

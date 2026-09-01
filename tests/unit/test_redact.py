@@ -67,6 +67,15 @@ def test_format_exception_redacts():
     assert "cr_secret_token_value_xxxx" not in out
 
 
+def test_format_exception_explains_transient_provider_failure():
+    class HttpError(RuntimeError):
+        status_code = 502
+
+    out = format_exception(HttpError("Error code: 502"))
+    assert "自动重试已耗尽" in out
+    assert "Ollama" in out
+
+
 def test_format_traceback_redacts():
     try:
         raise RuntimeError("auth_token=cr_xxxxxxxxxxxxxxxxxxxx failed")

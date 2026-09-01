@@ -1,0 +1,19 @@
+- generic [ref=f19e2]:
+  - generic [ref=f19e3]:
+    - generic [ref=f19e6]:
+      - heading "嗯… 无法访问此页面" [level=1] [ref=f19e7]
+      - paragraph [ref=f19e8]:
+        - text: 似乎
+        - strong [ref=f19e9]: leetcode.cn
+        - text: 关闭了连接。
+      - generic [ref=f19e10]:
+        - paragraph [ref=f19e11]: 请尝试：
+        - list [ref=f19e12]:
+          - listitem [ref=f19e13]: •检查连接
+          - listitem [ref=f19e14]:
+            - text: •
+            - link "检查代理和防火墙" [ref=f19e15] [cursor=pointer]:
+              - /url: "#buttons"
+      - generic [ref=f19e16]: ERR_CONNECTION_CLOSED
+    - button "刷新" [ref=f19e19] [cursor=pointer]
+  - generic [ref=f19e20]: Microsoft Edge

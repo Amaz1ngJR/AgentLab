@@ -9,6 +9,7 @@ import pytest
 from app.agent.profiles import AgentProfile
 from app.agent.runtime import AgentSession
 from app.agent.session_router import SessionRouter
+from app.cli import _format_session_exception, _thread_prompt_text
 from app.memory import ReadWriteMemory
 from app.storage import Storage
 
@@ -16,6 +17,31 @@ from app.storage import Storage
 @pytest.fixture
 def storage(tmp_path: Path) -> Storage:
     return Storage(tmp_path / "test.db")
+
+
+def test_prompt_displays_title_and_real_model_profile():
+    prompt = _thread_prompt_text({
+        "thread_id": "db3cf1c7",
+        "title": "local",
+        "model_profile": "cloud_claude",
+    })
+
+    assert prompt == "[db3cf1·local@cloud_claude] ▸ "
+
+
+def test_connection_error_reports_real_provider_instead_of_title():
+    session = MagicMock()
+    session.llm.profile_name = "cloud_claude"
+    session.llm.provider = "anthropic"
+
+    message = _format_session_exception(
+        RuntimeError("APIConnectionError: Connection error"), session,
+    )
+
+    assert "profile=cloud_claude" in message
+    assert "provider=anthropic" in message
+    assert "Session 标题不代表模型" in message
+    assert "/model current" in message
 
 
 def test_agent_profile_attached_to_session(storage: Storage):

@@ -3,7 +3,7 @@
 import pytest
 
 from app.tools.builtin import default_tools
-from app.tools.registry import Tool, ToolDescriptor, ToolRegistry
+from app.tools.registry import Tool, ToolDescriptor, ToolRegistry, extract_web_urls
 
 
 def _descriptor(**overrides):
@@ -177,6 +177,159 @@ def test_schemas_for_task_keeps_simple_requests_small_and_adds_needed_tools():
     assert {"web_search", "web_fetch"} <= web
     assert "shell" not in simple
     assert "web_search" not in coding
+
+
+def test_direct_conversation_does_not_expose_tools():
+    registry = ToolRegistry()
+    for tool in default_tools():
+        registry.register(tool)
+
+    assert registry.schemas_for_task("请介绍下你自己", mode="direct") == []
+
+
+def test_direct_mcp_capability_query_exposes_only_connected_mcp_tools():
+    registry = ToolRegistry()
+    registry.register(_descriptor(name="read_file", origin="builtin"))
+    registry.register(_descriptor(
+        name="browser_snapshot",
+        origin="mcp",
+        description="[MCP server: playwright] inspect page",
+    ))
+    registry.register(_descriptor(name="extension_tool", origin="extension"))
+
+    schemas = registry.schemas_for_task("看下你的 MCP 能力", mode="direct")
+
+    assert [item["name"] for item in schemas] == ["browser_snapshot"]
+    assert "playwright" in schemas[0]["description"]
+
+    context = registry.capability_context_for_task("看下你的 MCP 能力")
+    assert "browser_snapshot" in context
+    assert "server: playwright" in context
+    assert "不要声称未连接" in context
+
+
+def test_mcp_capability_context_reports_no_connection_truthfully():
+    registry = ToolRegistry()
+
+    assert "未连接任何 MCP Server" in registry.capability_context_for_task(
+        "有哪些 Model Context Protocol 工具"
+    )
+    assert registry.capability_context_for_task("请介绍下你自己") == ""
+
+
+def test_direct_web_capability_query_exposes_web_and_browser_tools():
+    registry = ToolRegistry()
+    for tool in default_tools():
+        registry.register(tool)
+    registry.register(_descriptor(
+        name="browser_snapshot",
+        origin="mcp",
+        target_type="browser",
+        host="playwright",
+    ))
+    registry.register(_descriptor(name="unrelated_extension", origin="extension"))
+
+    schemas = registry.schemas_for_task("你当前有能力看到网页内容吗", mode="direct")
+    names = {item["name"] for item in schemas}
+
+    assert names == {"web_search", "web_fetch", "browser_snapshot"}
+    context = registry.capability_context_for_task("你当前有能力看到网页内容吗")
+    assert "当前网页访问能力" in context
+    assert "browser_snapshot" in context
+    assert "不要假设用户已经提供了某个网页" in context
+
+
+def test_direct_browser_action_uses_mcp_instead_of_filesystem_or_shell():
+    registry = ToolRegistry()
+    for tool in default_tools():
+        registry.register(tool)
+    for name in ("browser_navigate", "browser_snapshot", "browser_type", "browser_click"):
+        registry.register(_descriptor(
+            name=name,
+            origin="mcp",
+            target_type="browser",
+            host="playwright",
+        ))
+
+    task = "请直接在本地打开网页，然后在网页里面写入答案"
+    names = {item["name"] for item in registry.schemas_for_task(task, mode="direct")}
+
+    assert {"browser_navigate", "browser_snapshot", "browser_type"} <= names
+    assert "write_file" not in names
+    assert "edit_file" not in names
+    assert "shell" not in names
+    context = registry.capability_context_for_task(task)
+    assert "必须使用 browser_*" in context
+    assert "不得使用 shell" in context
+    planner_context = registry.planner_context_for_task(task)
+    assert "browser_navigate" in planner_context
+    assert "禁止规划 xdg-open" in planner_context
+
+
+def test_specific_url_request_exposes_fetch_and_minimal_browser_tools():
+    registry = ToolRegistry()
+    registry.register(_descriptor(name="web_fetch", origin="builtin"))
+    registry.register(_descriptor(name="web_search", origin="builtin"))
+    registry.register(_descriptor(
+        name="browser_navigate",
+        origin="mcp",
+        target_type="browser",
+    ))
+    registry.register(_descriptor(
+        name="browser_snapshot",
+        origin="mcp",
+        target_type="browser",
+    ))
+    registry.register(_descriptor(
+        name="browser_click",
+        origin="mcp",
+        target_type="browser",
+    ))
+
+    schemas = registry.schemas_for_task(
+        "请查看 https://example.com 并回答问题", mode="direct"
+    )
+    assert {item["name"] for item in schemas} == {
+        "web_fetch", "browser_navigate", "browser_snapshot",
+    }
+    context = registry.capability_context_for_task(
+        "请查看 https://example.com 并回答问题"
+    )
+    assert "尚无网页工具结果" in context
+    assert "不得重复调用同一 URL" in context
+    assert "不得在未调用工具时声称无法查看网页" in context
+
+
+def test_open_url_request_uses_browser_without_fetch_competition():
+    registry = ToolRegistry()
+    registry.register(_descriptor(name="web_fetch", origin="builtin"))
+    for name in ("browser_navigate", "browser_snapshot", "browser_click"):
+        registry.register(_descriptor(
+            name=name,
+            origin="mcp",
+            target_type="browser",
+        ))
+
+    task = "请打开 https://leetcode.cn/problems/example 这个网页，并帮我写答案"
+    schemas = registry.schemas_for_task(task, mode="direct")
+
+    assert {item["name"] for item in schemas} == {
+        "browser_navigate", "browser_snapshot", "browser_click",
+    }
+    context = registry.capability_context_for_task(task)
+    assert "本轮不要调用 web_fetch" in context
+    assert "先调用 browser_navigate" in context
+
+
+def test_url_extraction_stops_before_adjacent_chinese_request_text():
+    text = (
+        "请看https://leetcode.cn/problems/example/description/?envType=daily-question"
+        "这个力扣题，给出c++答案"
+    )
+
+    assert extract_web_urls(text) == (
+        "https://leetcode.cn/problems/example/description/?envType=daily-question",
+    )
 
 
 def test_schemas_for_stage_can_explicitly_include_a_tool():

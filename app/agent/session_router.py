@@ -13,6 +13,7 @@ CLI 命令族：
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from typing import Any, Callable, Optional
 
 from app.agent.profiles import AgentProfile
@@ -29,11 +30,13 @@ class SessionRouter:
         session_factory: Callable[[AgentProfile, str], AgentSession],
         profiles: dict[str, AgentProfile],
         default_profile_id: str = "default",
+        model_switcher: Optional[Callable[[AgentSession, str], None]] = None,
     ):
         self._storage = storage
         self._factory = session_factory
         self._profiles = profiles
         self._default_profile_id = default_profile_id
+        self._model_switcher = model_switcher
         self._sessions: dict[str, AgentSession] = {}
         self.current_id: Optional[str] = None
         # 由 CLI 注入的全局共享资源(如 MCPManager),在 close_all 时统一关闭。
@@ -69,9 +72,9 @@ class SessionRouter:
         aid = agent_id or self._default_profile_id
         profile = self._profiles.get(aid)
         if profile is None:
-            # 没有 agents.yaml 时 fallback 到占位 profile
+            # 没有 agents.yaml 时，agent_id 本身就是 models.yaml 的 profile 名。
             profile = AgentProfile(agent_id=aid, name=aid,
-                                   model_profile=self._default_profile_id)
+                                   model_profile=aid, mode="auto")
         session_id = str(uuid.uuid4())[:8]
         session = self._factory(profile, session_id)
         self._sessions[session_id] = session
@@ -97,7 +100,13 @@ class SessionRouter:
                     agent_id=row["agent_id"],
                     name=row["agent_id"],
                     model_profile=row["model_profile"],
+                    # --profile 直接启动的动态 Agent 也应启用本地模式路由，
+                    # 否则 legacy 会把普通寒暄强制送进 Task Planner。
+                    mode="auto",
                 )
+            elif profile.model_profile != row["model_profile"]:
+                # /model switch 可让单个会话偏离静态 AgentProfile；恢复时以会话记录为准。
+                profile = replace(profile, model_profile=row["model_profile"])
             session = self._factory(profile, session_id)
             session.messages = self._storage.load_messages(session_id)
             # 恢复任务快照(若有):让 /session switch 后任务面板与编排状态接上
@@ -112,14 +121,39 @@ class SessionRouter:
         """启动时调用:有未归档且非空的历史 session 就恢复最近一个,否则新建。
 
         返回 (session_id, resumed):resumed=True 表示恢复了历史会话。
-        "最近"按 list_sessions 的 updated_at DESC 顺序;跳过 0 消息的空会话,
-        避免恢复到一个从未对话过的空壳(否则用户会以为"历史丢了")。
+        "最近"按 list_sessions 的 updated_at DESC 顺序；有持久化消息或至少一次
+        runtime turn 都视为用过。仅跳过既无消息也无 turn 的真正空壳。
+
+        agent_id 只用于“没有可恢复会话时”创建新会话。已有会话必须按自身
+        持久化的 agent_id / model_profile 恢复；不能用本次启动 profile 过滤，
+        否则用户切过模型或换启动参数后会无故堆出新 session。
         """
         rows = self._storage.list_sessions()  # 已过滤 archived,按 updated_at DESC
         for row in rows:
-            if self._storage.count_messages(row["id"]) > 0 and self.switch(row["id"]):
+            used = (
+                self._storage.count_messages(row["id"]) > 0
+                or self._storage.count_runtime_turns(row["id"]) > 0
+            )
+            if used and self.switch(row["id"]):
                 return row["id"], True
         return self.new(agent_id=agent_id), False
+
+    def switch_model(self, model_profile: str) -> tuple[str | None, str]:
+        """给当前会话原地切换模型，保留可移植历史并更新持久化元数据。"""
+        session = self.current
+        if session is None or self.current_id is None:
+            raise RuntimeError("当前无活跃 session")
+        if self._model_switcher is None:
+            raise RuntimeError("当前运行时不支持动态模型切换")
+        old_profile = getattr(session.llm, "profile_name", None)
+        self._model_switcher(session, model_profile)
+        self._storage.update_session_model(self.current_id, model_profile)
+        agent_profile = getattr(session, "agent_profile", None)
+        if agent_profile is not None:
+            agent_profile.model_profile = model_profile
+        self._default_profile_id = model_profile
+        self.persist(self.current_id)
+        return old_profile, model_profile
 
     def rename(self, title: str) -> None:
         if self.current_id:
@@ -287,7 +321,12 @@ class SessionRouter:
             if not arg:
                 return "用法: /session rename <新标题>"
             self.rename(arg)
-            return f"已重命名为: {arg}"
+            row = self._storage.get_session(self.current_id) if self.current_id else None
+            model_profile = row["model_profile"] if row else "未知"
+            return (
+                f"已重命名为: {arg}（仅修改 Session 标题；当前模型: {model_profile}。"
+                "切换模型请使用 /model switch <profile>）"
+            )
         if sub == "archive":
             old = self.current_id
             self.archive()
@@ -308,17 +347,25 @@ class SessionRouter:
         row = self._storage.get_session(self.current_id)
         title = row["title"] if row else ""
         msgs = len(self.current.messages) if self.current else 0
-        return f"session: {self.current_id}  {title}  消息数: {msgs}"
+        agent_id = row["agent_id"] if row else ""
+        model_profile = row["model_profile"] if row else ""
+        return (
+            f"session: {self.current_id}  {title}  agent: {agent_id}  "
+            f"model: {model_profile}  消息数: {msgs}"
+        )
 
     def _cmd_list(self) -> str:
         rows = self.list_sessions()
         if not rows:
             return "暂无活跃 session。"
-        lines = ["ID       Agent     消息数  标题"]
+        lines = ["ID       Agent     Model                 消息数  标题"]
         for r in rows:
             marker = "▸" if r["id"] == self.current_id else " "
             msg_count = self._storage.count_messages(r["id"])
-            lines.append(f"{marker} {r['id']:<8} {r['agent_id']:<9} {msg_count:<7} {r['title']}")
+            lines.append(
+                f"{marker} {r['id']:<8} {r['agent_id']:<9} "
+                f"{r['model_profile']:<21} {msg_count:<7} {r['title']}"
+            )
         return "\n".join(lines)
 
     def _cmd_agents(self) -> str:

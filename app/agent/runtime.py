@@ -15,7 +15,7 @@ from app.agent.tasks import TaskStore
 from app.attachments import ImageAttachment, build_user_content
 from app.models.protocol import ToolResult
 from app.models.router import ModelRouter
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolRegistry, extract_web_urls
 
 DEFAULT_SYSTEM_PROMPT = """你是 AgentLab,一个本地编码助手。
 
@@ -47,6 +47,16 @@ DEFAULT_SYSTEM_PROMPT = """你是 AgentLab,一个本地编码助手。
 【常规约定】
 - 用户用中文对话时,回复也用中文。
 - 写代码时简洁优先,不要过度解释。
+- 在 AgentLab 语境中,MCP 默认指 Model Context Protocol（模型上下文协议），不是
+  Machine Check Exception。用户询问“你的 MCP 能力”“有哪些 MCP 工具”时，必须
+  根据本轮实际提供的 MCP 工具 Schema 回答；若没有 MCP 工具，则明确说明当前未连接
+  MCP Server，不要回答硬件异常相关内容，也不要虚构能力。
+- 用户询问能否查看网页、联网或使用浏览器时，根据本轮注入的“当前网页访问能力”回答。
+  这是能力查询，不代表已经给出了某个网页；不要凭历史臆测网页、题目或编程语言。
+- 用户消息包含 http:// 或 https:// URL 且要求查看、分析或回答时，必须先调用可用的
+  web_fetch；正文不完整或依赖 JavaScript 时再使用 browser_navigate 和 browser_snapshot。
+  未实际尝试工具前，不得声称无法访问网页或要求用户粘贴内容；一旦本轮已有成功的网页
+  tool_result，必须直接基于结果回答，不得重复抓取同一 URL。
 - 任务复杂(需要 3 步以上,或涉及多个文件)时,先用 todo_write 列出子任务清单,
   然后边做边把任务从 pending → in_progress → completed,让用户看见进度。简单任务不必用。
 - 如果工具返回"User denied execution",说明用户拒绝了这次操作,不要立即重试,
@@ -79,6 +89,10 @@ def build_system_prompt(workspace: str | None = None) -> str:
 DENIED_MESSAGE = (
     "User denied execution of this tool. Do not retry without first confirming with the user."
 )
+
+_INTERNAL_TOOL_RETRY_PREFIX = "注意：你只输出了文字说明，但没有调用任何工具。"
+_INTERNAL_TASK_DIRECTIVE_PREFIX = "【当前子任务】"
+_INTERNAL_MESSAGE_KINDS = {"task_directive", "tool_retry", "empty_response_retry"}
 
 ProgressFn = Callable[[str], ContextManager[Any]]
 
@@ -173,6 +187,140 @@ class AgentSession:
             return selector(task, mode=mode)
         return self.tools.schemas()
 
+    def _system_prompt_for_task(self, task: str) -> str:
+        context_builder = getattr(self.tools, "capability_context_for_task", None)
+        if not callable(context_builder):
+            return self.system_prompt
+        capability_context = context_builder(task)
+        if not capability_context:
+            return self.system_prompt
+        return f"{self.system_prompt}\n\n{capability_context}"
+
+    def _prefetch_web_context(self, task: str) -> tuple[str, bool, bool]:
+        """URL 请求在模型作答前确定性抓取，返回上下文、已尝试、成功状态。"""
+        urls = extract_web_urls(task)
+        if not urls:
+            return "", False, False
+        # “打开/操作网页”是浏览器控制请求，不应先被轻量 HTTP 抓取截获。
+        # 否则 web_fetch 的 TLS/403/JS 错误很容易让小模型直接拒绝，而不是
+        # 调用已经连接的 browser_navigate/browser_snapshot。
+        browser_action_detector = getattr(
+            self.tools, "has_browser_action_intent", None,
+        )
+        if callable(browser_action_detector):
+            has_browser_action = browser_action_detector(task)
+        else:
+            has_browser_action = False
+        if (
+            has_browser_action
+            and self.tools.get("browser_navigate") is not None
+            and self.tools.get("browser_snapshot") is not None
+        ):
+            return "", False, False
+        tool = self.tools.get("web_fetch")
+        if tool is None:
+            return "", False, False
+        args = {"url": urls[0]}
+        # 非默认扩展若要求审批，仍走正常模型工具循环，不能在预取阶段绕过策略。
+        if tool.approval_action(args):
+            return "", False, False
+
+        self._emit_turn_event(TurnEvent(
+            kind="tool_call",
+            tool_name="web_fetch",
+            tool_input=args,
+        ))
+        output, registry_error = self.tools.execute("web_fetch", args)
+        semantic_error = output.lstrip().lower().startswith(("error:", "refused:"))
+        is_error = registry_error or semantic_error
+        self._emit_turn_event(TurnEvent(
+            kind="tool_result",
+            tool_name="web_fetch",
+            tool_output=output,
+            tool_error=is_error,
+        ))
+        status = "失败" if is_error else "成功"
+        context = (
+            f"【Runtime URL 预取结果】web_fetch 已对 {urls[0]} 执行一次，状态：{status}。\n"
+            f"{output}\n"
+            "不得再次调用 web_fetch 抓取同一 URL。若状态成功，直接基于以上正文完成用户"
+            "要求；若状态失败且有 browser_navigate/browser_snapshot 工具，则使用浏览器回退。"
+        )
+        if not is_error:
+            context += (
+                " 状态成功表示 AgentLab 已实际读取该网页；回答中不得声称无法访问、不能访问"
+                "或要求用户再次粘贴题目。"
+            )
+        return context, True, not is_error
+
+    def _remove_stale_web_refusals(self, task: str) -> None:
+        """成功读取 URL 后移除同一 URL 的历史拒绝对，避免小模型机械复述。"""
+        current_urls = set(extract_web_urls(task))
+        if not current_urls:
+            return
+        refusal_markers = (
+            "无法访问", "无法直接访问", "不能访问", "无法查看", "不能查看",
+            "无法浏览", "cannot access", "can't access", "unable to access",
+        )
+        cleaned: list[dict[str, Any]] = []
+        for message in self.messages:
+            content = message.get("content")
+            lower_content = content.lower() if isinstance(content, str) else ""
+            is_refusal = (
+                message.get("role") == "assistant"
+                and any(marker in lower_content for marker in refusal_markers)
+            )
+            if is_refusal and cleaned and cleaned[-1].get("role") == "user":
+                previous_content = cleaned[-1].get("content")
+                previous_text = previous_content if isinstance(previous_content, str) else ""
+                if current_urls & set(extract_web_urls(previous_text)):
+                    cleaned.pop()
+                    continue
+            cleaned.append(message)
+        self.messages[:] = cleaned
+
+    def _remove_internal_retry_noise(self) -> None:
+        """移除失败执行器留下的内部提示和无内容 assistant 回合。"""
+        cleaned: list[dict[str, Any]] = []
+        in_internal_task_span = False
+        for message in self.messages:
+            internal = message.get("internal")
+            content = message.get("content")
+            starts_internal_task = (
+                internal == "task_directive"
+                or (
+                    message.get("role") == "user"
+                    and isinstance(content, str)
+                    and content.startswith(_INTERNAL_TASK_DIRECTIVE_PREFIX)
+                )
+            )
+            if starts_internal_task:
+                in_internal_task_span = True
+                continue
+            if internal in _INTERNAL_MESSAGE_KINDS:
+                continue
+            if (
+                message.get("role") == "user"
+                and isinstance(content, str)
+                and content.startswith(_INTERNAL_TOOL_RETRY_PREFIX)
+            ):
+                # 兼容修复前已写入 SQLite、尚未带 internal 标记的旧提示。
+                continue
+            if in_internal_task_span:
+                # Task directive 后面的 assistant/tool/correction 都是执行器内部
+                # 轨迹；直到下一条真实用户消息才重新进入可回放对话。
+                if message.get("role") != "user":
+                    continue
+                in_internal_task_span = False
+            if (
+                message.get("role") == "assistant"
+                and not content
+                and not message.get("tool_calls")
+            ):
+                continue
+            cleaned.append(message)
+        self.messages[:] = cleaned
+
     def subscribe_events(
         self,
         *,
@@ -221,6 +369,12 @@ class AgentSession:
                 except Exception:
                     pass
         self._closeables = []
+        close_llm = getattr(self.llm, "close", None)
+        if callable(close_llm):
+            try:
+                close_llm()
+            except Exception:
+                pass
 
     def reset(self) -> None:
         # 就地清空 messages(而非重新赋值),保持 Orchestrator 共享的引用有效
@@ -233,6 +387,26 @@ class AgentSession:
         self.last_run_status = ""
         self._last_mode = None
         self.task_store.clear()
+
+    def replace_model(self, llm: ModelRouter, context_manager: Any = None) -> None:
+        """在稳定点原地更换模型，同时保留可跨 provider 回放的会话历史。"""
+        from app.agent.planner import Planner
+        from app.models.history import make_history_portable
+
+        old_llm = self.llm
+        self.messages[:] = make_history_portable(self.messages)
+        self.llm = llm
+        self.context_manager = context_manager
+        self._planner = Planner(llm)
+        self._orch = None
+        self._dynamic_tools = None
+        self.last_actual_model = None
+        close = getattr(old_llm, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     def _ensure_orchestrator(self):
         """懒构建 Orchestrator,并让它与本 session 共享 messages / task_store。
@@ -309,6 +483,11 @@ class AgentSession:
             payload={"mode": mode.value},
         ))
         if mode is ExecutionMode.DIRECT:
+            # 新的 Direct 请求代表用户已转向当前问题；不要让上一次失败的 Task
+            # 继续出现在 thinking spinner。显式 /resume 会先选 Task，不走这里。
+            if not resume and not self.task_store.is_empty():
+                self.task_store.clear()
+            self._remove_internal_retry_noise()
             return self._chat_legacy(user_input, images=images)
         # AUTO 模式的 Task/Loop 仍使用现有 Orchestrator；Loop 的完整生命周期
         # 由 LoopCommandHandler 驱动，这里只负责普通目标的规划执行。
@@ -375,16 +554,27 @@ class AgentSession:
         })
         # 在每次模型调用前检查，确保当前用户输入和 Responses 顶层 item 都计入预算。
         tools = self._tools_for_task(user_input, mode="direct")
+        turn_system_prompt = self._system_prompt_for_task(user_input)
+        prefetch_context, prefetched, prefetch_succeeded = self._prefetch_web_context(user_input)
+        if prefetch_succeeded:
+            self._remove_stale_web_refusals(user_input)
+        if prefetch_context:
+            turn_system_prompt = f"{turn_system_prompt}\n\n{prefetch_context}"
+        if prefetched:
+            # 预取无论成功或失败都只做一次；失败时模型可转用浏览器工具。
+            tools = [schema for schema in tools if schema.get("name") != "web_fetch"]
         self._dynamic_tools = tools
         if self.context_manager is not None:
             self.context_manager.compact_before_model_call(
                 self.messages,
-                system=self.system_prompt,
+                system=turn_system_prompt,
                 tools=tools,
             )
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
         turn_start = time.monotonic()
+        empty_response_retries = 0
+        browser_failures = 0
 
         try:
             for _ in range(self.max_steps):
@@ -403,7 +593,7 @@ class AgentSession:
                     resp = self.llm.create_message(
                         messages=self.messages,
                         tools=tools or None,
-                        system=self.system_prompt,
+                        system=turn_system_prompt,
                         on_progress=on_progress,
                         on_text_delta=on_text_delta if raw_on_text else None,
                         on_thinking_delta=raw_on_thinking,
@@ -428,7 +618,17 @@ class AgentSession:
                     self._emit_turn_event(TurnEvent(kind="text", text=resp.text))
 
                 if not resp.tool_calls:
-                    return resp.text
+                    if resp.text.strip():
+                        return resp.text
+                    if empty_response_retries < 1:
+                        empty_response_retries += 1
+                        self.messages.append({
+                            "role": "user",
+                            "content": "上一轮没有可见答案。请直接回答当前用户问题，不要返回空内容。",
+                            "internal": "empty_response_retry",
+                        })
+                        continue
+                    raise RuntimeError("模型连续两次返回空内容，请重试或重置会话")
 
                 tool_results: list[ToolResult] = []
                 resulted_ids: set[str] = set()
@@ -508,6 +708,25 @@ class AgentSession:
                                 call.arguments,
                                 approved_action=approval_action,
                             )
+                            if call.name.startswith("browser_") and is_error:
+                                browser_failures += 1
+                                if browser_failures < 2:
+                                    if call.name == "browser_snapshot":
+                                        output += (
+                                            "\n\nbrowser_snapshot 本身失败。不要用相同参数重试；"
+                                            "读取整个当前页面时应使用空参数 {}，不得虚构 "
+                                            "[ref=page] 或 filename。"
+                                        )
+                                    else:
+                                        output += (
+                                            "\n\n不要猜测或更换页面 ref 继续点击；请先调用 "
+                                            "browser_snapshot，依据最新快照中的有效 ref 再操作。"
+                                        )
+                                else:
+                                    output += (
+                                        "\n\n连续浏览器操作失败，已触发本轮熔断；不要继续调用"
+                                        "浏览器工具。请向用户说明最后一条具体错误。"
+                                    )
                             # 进入历史前截断超大输出(与编排路径一致,见 executor)。
                             from app.agent.executor import _truncate_tool_output
                             output = _truncate_tool_output(output)
@@ -535,6 +754,13 @@ class AgentSession:
                 # 工具结果的回传格式由 adapter 决定(Anthropic / OpenAI Chat /
                 # OpenAI Responses 三家不一样),Runtime 不关心
                 self.messages.extend(self.llm.format_tool_results(tool_results))
+
+                if browser_failures >= 2:
+                    last_error = next(
+                        (result.output for result in reversed(tool_results) if result.is_error),
+                        "浏览器工具连续失败",
+                    )
+                    return f"浏览器操作连续失败，已停止自动重试。最后错误：\n{last_error}"
 
             return "(达到最大步数仍未给出最终答案)"
         finally:

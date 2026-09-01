@@ -35,6 +35,13 @@ def test_maps_tools_to_registry_tools():
     assert names == {"browser_navigate", "browser_click"}
 
 
+def test_schema_description_identifies_mcp_server():
+    mgr = FakeManager([_info("browser_snapshot")])
+    tool = build_mcp_tools(mgr, [MCPServerConfig(name="playwright")])[0]
+
+    assert tool.to_schema()["description"].startswith("[MCP server: playwright]")
+
+
 def test_skips_name_collision_with_builtin():
     mgr = FakeManager([_info("read_file"), _info("browser_navigate")])
     tools = build_mcp_tools(mgr, [MCPServerConfig(name="playwright")],
@@ -78,6 +85,29 @@ def test_executor_forwards_to_manager():
     out = tool.executor({"url": "http://example.com"})
     assert out == "navigated to example.com"
     assert mgr.calls[0][:3] == ("playwright", "browser_navigate", {"url": "http://example.com"})
+
+
+def test_executor_normalizes_snapshot_ref_wrapper():
+    mgr = FakeManager([_info("browser_click")])
+    tool = build_mcp_tools(mgr, [MCPServerConfig(name="playwright")])[0]
+
+    tool.executor({"target": "[ref=e178]"})
+
+    assert mgr.calls[0][2] == {"target": "e178"}
+
+
+def test_full_page_snapshot_drops_invented_page_ref_and_filename():
+    mgr = FakeManager([_info("browser_snapshot")])
+    tool = build_mcp_tools(mgr, [MCPServerConfig(name="playwright")])[0]
+
+    tool.executor({
+        "target": "[ref=page]",
+        "filename": ".playwright-mcp/page-generated.yml",
+    })
+
+    assert mgr.calls[0][2] == {}
+    assert "empty object {}" in tool.description
+    assert "[ref=page]" in tool.description
 
 
 def test_executor_marks_mcp_error():

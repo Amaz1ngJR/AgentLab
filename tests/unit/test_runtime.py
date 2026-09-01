@@ -5,6 +5,7 @@ from app.agent.approval import ApprovalResult, AutoApprove, DenyAll
 from app.agent.runtime import (
     DEFAULT_SYSTEM_PROMPT,
     DENIED_MESSAGE,
+    _INTERNAL_TOOL_RETRY_PREFIX,
     AgentSession,
     build_system_prompt,
 )
@@ -28,6 +29,12 @@ def test_system_prompt_defines_web_verification_and_untrusted_content_rules():
     assert "不能扩大权限" in DEFAULT_SYSTEM_PROMPT
 
 
+def test_system_prompt_disambiguates_mcp_capability_queries():
+    assert "MCP 默认指 Model Context Protocol" in DEFAULT_SYSTEM_PROMPT
+    assert "不是\n  Machine Check Exception" in DEFAULT_SYSTEM_PROMPT
+    assert "当前未连接" in DEFAULT_SYSTEM_PROMPT
+
+
 def test_build_system_prompt_without_workspace_is_default():
     """workspace 为空/None 时退回纯默认 prompt(向后兼容)。"""
     assert build_system_prompt(None) == DEFAULT_SYSTEM_PROMPT
@@ -40,6 +47,7 @@ class FakeRouter:
     def __init__(self, responses: list[ModelResponse]):
         self._responses = list(responses)
         self.calls: list[list[dict]] = []
+        self.call_options: list[dict] = []
 
     @property
     def model(self) -> str:
@@ -62,6 +70,7 @@ class FakeRouter:
     ) -> ModelResponse:
         # 拷贝 messages 快照,避免被后续修改污染
         self.calls.append([dict(m) for m in messages])
+        self.call_options.append({"tools": tools, "system": system})
         if not self._responses:
             return ModelResponse(text="(no more responses)", tool_calls=[],
                                  usage={"input_tokens": 0, "output_tokens": 0},
@@ -304,6 +313,43 @@ def test_max_steps_reached():
     assert len(router.calls) == 3
 
 
+def test_repeated_browser_errors_stop_after_two_attempts():
+    attempts = []
+
+    def fail_click(args):
+        attempts.append(args)
+        raise RuntimeError("element not found")
+
+    browser_click = Tool(
+        name="browser_click",
+        description="click",
+        input_schema={"type": "object", "properties": {"target": {"type": "string"}}},
+        executor=fail_click,
+        origin="mcp",
+        target_type="browser",
+        requires_approval=False,
+    )
+    router = FakeRouter([
+        _resp_tool("click_1", "browser_click", {"target": "e1"}),
+        _resp_tool("click_2", "browser_click", {"target": "e2"}),
+        _resp_tool("click_3", "browser_click", {"target": "e3"}),
+    ])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(browser_click),
+        max_steps=8,
+    )
+
+    answer = session.chat("点击页面元素")
+
+    assert "已停止自动重试" in answer
+    assert len(attempts) == 2
+    assert len(router.calls) == 2
+    first_error = router.calls[1][-1]["content"][0]
+    assert first_error["is_error"] is True
+    assert "browser_snapshot" in first_error["content"]
+
+
 def test_progress_and_text_callbacks_invoked():
     seen_progress: list[dict] = []
     seen_text: list[str] = []
@@ -393,6 +439,242 @@ def test_auto_mode_bypasses_planner_for_simple_request():
     assert session.chat("解释一下这个函数") == "直接回答"
     assert session.execution_mode.value == "direct"
     assert len(router.calls) == 1
+
+
+def test_fresh_direct_request_clears_stale_task_panel():
+    from app.agent.tasks import Task
+
+    router = FakeRouter([_resp_text("直接回答")])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+    )
+    session.task_store.add(Task(id="old", content="上次失败的任务"))
+
+    assert session.chat("请介绍下你自己") == "直接回答"
+    assert session.execution_mode.value == "direct"
+    assert session.task_store.is_empty()
+
+
+def test_direct_request_removes_internal_tool_retry_noise():
+    router = FakeRouter([_resp_text("我是 AgentLab")])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+    )
+    session.messages = [
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "【当前子任务】执行错误的 echo"},
+        {"role": "assistant", "content": "Hello, I am a task planner."},
+        {"role": "user", "content": _INTERNAL_TOOL_RETRY_PREFIX + "\n请调用工具"},
+        {"role": "user", "content": "保留的真实消息"},
+    ]
+
+    assert session.chat("请介绍下你自己") == "我是 AgentLab"
+    sent = router.calls[0]
+    assert all(
+        not str(message.get("content", "")).startswith(_INTERNAL_TOOL_RETRY_PREFIX)
+        for message in sent
+    )
+    assert not any(
+        message.get("role") == "assistant" and not message.get("content")
+        for message in sent
+    )
+    assert not any("task planner" in str(message.get("content", "")) for message in sent)
+
+
+def test_direct_request_retries_one_empty_response():
+    router = FakeRouter([_resp_text(""), _resp_text("现在有答案")])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+    )
+
+    assert session.chat("你好") == "现在有答案"
+    assert len(router.calls) == 2
+    assert router.calls[1][-1]["internal"] == "empty_response_retry"
+
+
+def test_direct_mcp_query_injects_runtime_capability_inventory():
+    router = FakeRouter([_resp_text("已连接 browser_snapshot")])
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="browser_snapshot",
+        description="[MCP server: playwright] inspect page",
+        input_schema={"type": "object", "properties": {}},
+        executor=lambda _: "snapshot",
+        origin="mcp",
+        host="playwright",
+    ))
+    session = AgentSession(
+        llm=router,
+        tools=registry,
+        orchestrate=True,
+        mode="auto",
+    )
+
+    assert session.chat("看下你的 MCP 能力") == "已连接 browser_snapshot"
+    assert router.call_options[0]["tools"][0]["name"] == "browser_snapshot"
+    assert "不要声称未连接" in router.call_options[0]["system"]
+
+
+def test_direct_web_capability_query_does_not_infer_an_old_web_task():
+    router = FakeRouter([_resp_text("可以读取和操作网页")])
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="browser_snapshot",
+        description="inspect page",
+        input_schema={"type": "object", "properties": {}},
+        executor=lambda _: "snapshot",
+        origin="mcp",
+        target_type="browser",
+        host="playwright",
+    ))
+    session = AgentSession(
+        llm=router,
+        tools=registry,
+        orchestrate=True,
+        mode="auto",
+    )
+
+    assert session.chat("你当前有能力看到网页内容") == "可以读取和操作网页"
+    assert router.call_options[0]["tools"][0]["name"] == "browser_snapshot"
+    assert "不要假设用户已经提供了某个网页" in router.call_options[0]["system"]
+
+
+def test_direct_url_request_requires_a_real_fetch_attempt():
+    router = FakeRouter([_resp_text("我会先读取题目")])
+    registry = ToolRegistry()
+    fetched = []
+    registry.register(Tool(
+        name="web_fetch",
+        description="fetch URL",
+        input_schema={"type": "object", "properties": {"url": {"type": "string"}}},
+        executor=lambda args: fetched.append(args["url"]) or "题目正文",
+        origin="builtin",
+    ))
+    session = AgentSession(
+        llm=router,
+        tools=registry,
+        orchestrate=True,
+        mode="auto",
+    )
+
+    answer = session.chat("看下 https://leetcode.cn/problems/example 并给出 C++ 答案")
+
+    assert answer == "我会先读取题目"
+    assert fetched == ["https://leetcode.cn/problems/example"]
+    assert router.call_options[0]["tools"] is None
+    assert "Runtime URL 预取结果" in router.call_options[0]["system"]
+    assert "题目正文" in router.call_options[0]["system"]
+    assert "尚无网页工具结果" in router.call_options[0]["system"]
+    assert "不得重复调用同一 URL" in router.call_options[0]["system"]
+
+
+def test_failed_url_prefetch_keeps_browser_fallback_but_removes_fetch():
+    router = FakeRouter([_resp_text("改用浏览器")])
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="web_fetch",
+        description="fetch URL",
+        input_schema={"type": "object", "properties": {"url": {"type": "string"}}},
+        executor=lambda _: "error: JavaScript required",
+        origin="builtin",
+    ))
+    for name in ("browser_navigate", "browser_snapshot"):
+        registry.register(Tool(
+            name=name,
+            description=name,
+            input_schema={"type": "object", "properties": {}},
+            executor=lambda _: "ok",
+            origin="mcp",
+            target_type="browser",
+        ))
+    session = AgentSession(
+        llm=router,
+        tools=registry,
+        orchestrate=True,
+        mode="auto",
+    )
+
+    assert session.chat("查看 https://example.com 给出结论") == "改用浏览器"
+    names = {schema["name"] for schema in router.call_options[0]["tools"]}
+    assert names == {"browser_navigate", "browser_snapshot"}
+    assert "状态：失败" in router.call_options[0]["system"]
+
+
+def test_explicit_open_url_skips_fetch_and_offers_browser_directly():
+    router = FakeRouter([_resp_text("已通过浏览器读取")])
+    registry = ToolRegistry()
+    fetched = []
+    registry.register(Tool(
+        name="web_fetch",
+        description="fetch URL",
+        input_schema={"type": "object", "properties": {"url": {"type": "string"}}},
+        executor=lambda args: fetched.append(args["url"]) or "不应执行",
+        origin="builtin",
+    ))
+    for name in ("browser_navigate", "browser_snapshot"):
+        registry.register(Tool(
+            name=name,
+            description=name,
+            input_schema={"type": "object", "properties": {}},
+            executor=lambda _: "ok",
+            origin="mcp",
+            target_type="browser",
+        ))
+    session = AgentSession(
+        llm=router,
+        tools=registry,
+        orchestrate=True,
+        mode="auto",
+    )
+
+    answer = session.chat("请打开 https://example.com 这个网页并回答")
+
+    assert answer == "已通过浏览器读取"
+    assert fetched == []
+    assert {item["name"] for item in router.call_options[0]["tools"]} == {
+        "browser_navigate", "browser_snapshot",
+    }
+    assert "本轮不要调用 web_fetch" in router.call_options[0]["system"]
+
+
+def test_successful_prefetch_removes_same_url_historical_refusals():
+    router = FakeRouter([_resp_text("已读取题目并给出答案")])
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="web_fetch",
+        description="fetch URL",
+        input_schema={"type": "object", "properties": {"url": {"type": "string"}}},
+        executor=lambda _: "题目正文",
+        origin="builtin",
+    ))
+    session = AgentSession(
+        llm=router,
+        tools=registry,
+        orchestrate=True,
+        mode="auto",
+    )
+    url = "https://leetcode.cn/problems/example"
+    session.messages = [
+        {"role": "user", "content": f"查看 {url}"},
+        {"role": "assistant", "content": "我无法直接访问该网页，请粘贴题目。"},
+        {"role": "user", "content": "保留的其它真实对话"},
+    ]
+
+    assert session.chat(f"请再查看 {url} 并回答") == "已读取题目并给出答案"
+    sent = router.calls[0]
+    assert not any("无法直接访问" in str(message.get("content")) for message in sent)
+    assert not any(message.get("content") == f"查看 {url}" for message in sent)
+    assert any(message.get("content") == "保留的其它真实对话" for message in sent)
+    assert "已实际读取该网页" in router.call_options[0]["system"]
 
 
 def test_auto_mode_uses_planner_for_multi_step_request():

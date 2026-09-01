@@ -159,8 +159,9 @@ def test_planner_does_not_receive_full_execution_system():
     )
     orch.run("简单目标")
     planning_prompt = router.calls[0][0]["content"]
-    assert planning_prompt == "简单目标"
+    assert planning_prompt.endswith("目标:简单目标")
     assert "SKILL-WORKFLOW" not in planning_prompt
+    assert len(planning_prompt) < 300
 
 
     router = FakeRouter([_resp_text("这不是 JSON,只是闲聊")])
@@ -169,12 +170,12 @@ def test_planner_does_not_receive_full_execution_system():
     assert plan.tasks[0].content == "做点什么"
 
 
-def test_planner_falls_back_when_model_raises():
+def test_planner_propagates_provider_error_instead_of_hiding_it():
     class Boom(FakeRouter):
         def create_message(self, *a, **k):
             raise RuntimeError("model down")
-    plan = Planner(Boom([])).create_plan("目标")
-    assert len(plan.tasks) == 1
+    with pytest.raises(RuntimeError, match="model down"):
+        Planner(Boom([])).create_plan("目标")
 
 
 def test_extract_json_handles_fenced_and_prose():
@@ -309,6 +310,21 @@ def test_executor_stops_repeated_identical_tool_requests():
     out = ex.run_task(Task("t1", "loop"), [], system="", max_steps=3)
     assert out.status == FAILED
     assert "未完成" in out.error
+
+
+def test_executor_stops_after_one_no_tool_correction():
+    router = FakeRouter([
+        _resp_text("我准备打开网页"),
+        _resp_text("我仍然只描述计划"),
+        _resp_text("不应执行到这里"),
+    ])
+    ex = Executor(router, _registry(_echo_tool()))
+
+    out = ex.run_task(Task("t1", "打开网页并填写答案"), [], system="", max_steps=50)
+
+    assert out.status == FAILED
+    assert "纠正提示后仍未调用工具" in out.error
+    assert len(router.calls) == 2
 
 
 # ── Replanner 单元 ─────────────────────────────────────────────────────────────

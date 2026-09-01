@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import re
 import sys
 from typing import Optional
 
@@ -20,10 +21,38 @@ from app.tools.registry import Tool, ToolExecutionError
 DEFAULT_CALL_TIMEOUT = 60.0
 
 
+def _normalize_mcp_args(tool_name: str, args: dict) -> dict:
+    """规范化本地模型常生成的 Playwright ref 包装格式。"""
+    normalized = dict(args or {})
+    if not tool_name.startswith("browser_"):
+        return normalized
+    for key in ("target", "ref"):
+        value = normalized.get(key)
+        if not isinstance(value, str):
+            continue
+        match = re.fullmatch(r"\s*\[ref=([^\]]+)]\s*", value)
+        if match:
+            normalized[key] = match.group(1).strip()
+    if tool_name == "browser_snapshot":
+        target = normalized.get("target")
+        if isinstance(target, str) and target.strip().lower() in {
+            "page", "root", "document", "body", "html", "current-page", "whole-page",
+        }:
+            # 全页快照的正确调用是省略 target；page/root 并不是 DOM ref。
+            normalized.pop("target", None)
+            # 本地模型经常同时虚构一个临时文件名。filename 会让 MCP 只保存文件、
+            # 不把快照正文返回给模型，因此在这种全页误调用中一并移除。
+            normalized.pop("filename", None)
+    return normalized
+
+
 def _make_executor(manager: MCPManager, server: str, tool_name: str):
     """生成同步 executor 闭包:把 (args) 转发给 manager.call_tool。"""
     def _execute(args: dict) -> str:
-        text, is_error = manager.call_tool(server, tool_name, args, timeout=DEFAULT_CALL_TIMEOUT)
+        wire_args = _normalize_mcp_args(tool_name, args)
+        text, is_error = manager.call_tool(
+            server, tool_name, wire_args, timeout=DEFAULT_CALL_TIMEOUT,
+        )
         # MCP 协议错误抛成预期工具错误,Registry 会把 is_error 标为 True,
         # 同时将消息回灌模型并写入统一审计。
         if is_error:
@@ -69,7 +98,16 @@ def build_mcp_tools(
         )
         tools.append(Tool(
             name=info.name,
-            description=info.description or f"(MCP tool from {info.server})",
+            description=(
+                f"[MCP server: {info.server}] "
+                f"{info.description or info.name}"
+                + (
+                    " For a full-page snapshot call with an empty object {}. "
+                    "Do not invent target='[ref=page]' or filename; target is only "
+                    "for a real element ref returned by an earlier snapshot."
+                    if info.name == "browser_snapshot" else ""
+                )
+            ),
             input_schema=info.input_schema or {"type": "object", "properties": {}},
             executor=_make_executor(manager, info.server, info.name),
             risk=risk,

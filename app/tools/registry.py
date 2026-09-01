@@ -11,6 +11,7 @@ schema,Descriptor 还携带 risk / target / scope / origin 等安全元数据,�
 from __future__ import annotations
 
 import json
+import re
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -68,6 +69,66 @@ def _json_summary(value: Any) -> str:
     except (TypeError, ValueError):
         text = repr(value)
     return redact(_clip(text))
+
+
+def _asks_mcp_capabilities(text: str) -> bool:
+    normalized = (text or "").lower()
+    return any(marker in normalized for marker in (
+        "mcp", "model context protocol", "模型上下文协议",
+    ))
+
+
+def _asks_web_capabilities(text: str) -> bool:
+    normalized = (text or "").lower()
+    web_terms = (
+        "网页", "网站", "浏览器", "上网", "联网", "互联网",
+        "website", "web page", "browser", "browse", "internet",
+    )
+    ability_terms = (
+        "能力", "你能", "你可以", "你是否", "你会", "你的", "能否", "能不能",
+        "是否支持", "can you", "are you able", "do you support", "your ability",
+    )
+    return (
+        any(term in normalized for term in web_terms)
+        and any(term in normalized for term in ability_terms)
+        and not _contains_web_url(normalized)
+    )
+
+
+def _contains_web_url(text: str) -> bool:
+    return bool(extract_web_urls(text))
+
+
+def extract_web_urls(text: str) -> tuple[str, ...]:
+    """提取用户文本中的 HTTP(S) URL，并在紧邻的中文说明前正确停止。"""
+    matches = re.findall(
+        r"https?://[^\s<>\u3400-\u9fff]+",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    trailing = ".,;:!?)]}'\"，。；：！？）】》"
+    return tuple(url.rstrip(trailing) for url in matches if url.rstrip(trailing))
+
+
+def _without_web_urls(text: str) -> str:
+    """移除 URL 后再做自然语言关键词判断，避免 leetcode 命中 code 等子串。"""
+    cleaned = text or ""
+    for url in extract_web_urls(cleaned):
+        cleaned = cleaned.replace(url, " ")
+    return cleaned
+
+
+def _has_browser_action_intent(text: str) -> bool:
+    normalized = (text or "").lower()
+    browser_terms = ("网页", "网站", "浏览器", "page", "website", "browser")
+    action_terms = (
+        "打开", "访问", "点击", "输入", "填写", "写入", "提交", "登录", "选择",
+        "open", "navigate", "click", "type", "fill", "submit", "login", "select",
+    )
+    return (
+        any(term in normalized for term in browser_terms)
+        and any(term in normalized for term in action_terms)
+    )
 
 # 审批结果不能放进模型可控的 args。Runtime 在 ToolRegistry.execute() 调用时
 # 传入已批准 action，Registry 用 ContextVar 只在当前 executor 调用期间授予。
@@ -222,6 +283,11 @@ class ToolRegistry:
         """按名称查找工具。未注册时返回 None。"""
         return self._tools.get(name)
 
+    @staticmethod
+    def has_browser_action_intent(task: str) -> bool:
+        """判断用户是否明确要求打开或操作网页。"""
+        return _has_browser_action_intent(task)
+
     def all(self) -> list[ToolDescriptor]:
         """返回所有已注册的工具列表。"""
         return list(self._tools.values())
@@ -257,18 +323,31 @@ class ToolRegistry:
         mode: str = "direct",
         include: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """按任务文本选择最小工具集合；未识别时保守返回核心只读工具。"""
+        """按任务文本选择最小工具集合；纯聊天的 Direct 请求不暴露工具。"""
         text = (task or "").lower()
-        selected = {"read_file", "code_search", "list_dir"}
-        # 第三方/MCP 工具没有统一名称，保留其显式注册能力；内置高成本工具仍按需加入。
-        selected.update(
-            tool.name for tool in self._tools.values()
-            if tool.origin != "builtin"
-        )
-        if any(word in text for word in (
+        intent_text = _without_web_urls(text)
+        core_read = {"read_file", "code_search", "list_dir"}
+        selected = set() if mode == "direct" else set(core_read)
+        asks_mcp_capabilities = _asks_mcp_capabilities(text)
+        asks_web_capabilities = _asks_web_capabilities(text)
+        contains_web_url = _contains_web_url(text)
+        has_browser_action = _has_browser_action_intent(text)
+        needs_inspect = any(word in intent_text for word in (
+            "项目", "代码", "文件", "目录", "函数", "源码", "报错", "错误",
+            "读取", "查看", "分析", "搜索", "readme", "repository", "repo",
+            "code", "file", "directory", "function", "error", "inspect", "search",
+        ))
+        if needs_inspect:
+            selected.update(core_read)
+        needs_write = any(word in intent_text for word in (
             "写", "改", "编辑", "删除", "创建", "修复", "实现", "修改",
             "write", "edit", "delete", "create", "fix", "implement", "modify",
-        )):
+        ))
+        has_filesystem_subject = any(word in intent_text for word in (
+            "文件", "代码", "源码", "目录", "file", "code", "source", "directory",
+        ))
+        if needs_write and (not has_browser_action or has_filesystem_subject):
+            selected.update(core_read)
             selected.update({"write_file", "edit_file"})
         if any(word in text for word in (
             "测试", "运行", "构建", "lint", "test", "run", "build", "pytest",
@@ -276,11 +355,147 @@ class ToolRegistry:
             selected.add("shell")
         if any(word in text for word in (
             "最新", "联网", "网页", "新闻", "文档", "搜索", "latest", "web", "news",
-        )):
+        )) or asks_web_capabilities:
             selected.update({"web_search", "web_fetch"})
+        if contains_web_url:
+            selected.add("web_fetch")
+        # Task/Loop 仍保留第三方工具；Direct 在用户点名具体工具或询问 MCP
+        # 能力时暴露对应 Schema，既避免普通寒暄被诱导成空 tool call，也让模型
+        # 能基于真实连接状态回答能力查询。
+        selected.update(
+            tool.name for tool in self._tools.values()
+            if tool.origin != "builtin" and (
+                mode != "direct"
+                or tool.name.lower() in text
+                or (tool.origin == "mcp" and asks_mcp_capabilities)
+                or (
+                    tool.origin == "mcp"
+                    and asks_web_capabilities
+                    and (tool.target_type == "browser" or tool.name.startswith("browser_"))
+                )
+                or (
+                    tool.origin == "mcp"
+                    and contains_web_url
+                    and tool.name in {"browser_navigate", "browser_snapshot"}
+                )
+                or (
+                    tool.origin == "mcp"
+                    and has_browser_action
+                    and tool.name in {
+                        "browser_navigate", "browser_snapshot", "browser_type",
+                        "browser_fill_form", "browser_click", "browser_select_option",
+                    }
+                )
+            )
+        )
+        # 用户明确要求打开/操作网页且浏览器 MCP 可用时，避免同时暴露
+        # web_fetch。对于小型本地模型，两个相近工具会显著增加误选概率；
+        # 普通的“读取 URL”请求仍保留 web_fetch + 最小浏览器回退集合。
+        if has_browser_action and "browser_navigate" in self._tools:
+            selected.discard("web_fetch")
+            selected.discard("web_search")
         if include is not None:
             selected.update(include)
         return self.schemas(include=selected)
+
+    def capability_context_for_task(self, task: str) -> str:
+        """为能力查询生成可信的运行时清单，避免小模型靠 Schema 猜连接状态。"""
+        asks_mcp = _asks_mcp_capabilities(task)
+        asks_web = _asks_web_capabilities(task)
+        contains_web_url = _contains_web_url(task)
+        has_browser_action = _has_browser_action_intent(task)
+        if not asks_mcp and not asks_web and not contains_web_url and not has_browser_action:
+            return ""
+        if has_browser_action:
+            browser_tools = [
+                tool for tool in self._tools.values()
+                if tool.origin == "mcp" and (
+                    tool.target_type == "browser" or tool.name.startswith("browser_")
+                )
+            ]
+            if not browser_tools:
+                return (
+                    "【当前浏览器操作能力】未连接可用的浏览器 MCP 工具。不得用 shell、"
+                    "xdg-open 或注入 JavaScript 冒充浏览器控制。"
+                )
+            names = "、".join(tool.name for tool in browser_tools)
+            return (
+                f"【当前浏览器操作】已连接的浏览器 MCP 工具：{names}。用户明确要求打开或"
+                "操作网页，本轮不要调用 web_fetch，必须使用 browser_* 工具：先调用 "
+                "browser_navigate 打开用户给出的 "
+                "URL，再调用 browser_snapshot 读取页面。不得在浏览器工具实际返回错误之前声称"
+                "无法访问；不得使用 shell、xdg-open、start 或 document.body.innerHTML。"
+            )
+        if contains_web_url:
+            url_tools = [
+                tool for tool in self._tools.values()
+                if tool.name in {"web_fetch", "browser_navigate", "browser_snapshot"}
+            ]
+            if not url_tools:
+                return (
+                    "【当前 URL 请求】用户提供了一个 URL，但当前没有可用的网页读取工具。"
+                    "如实说明工具未配置，不要笼统声称模型不能访问网页。"
+                )
+            names = "、".join(tool.name for tool in url_tools)
+            return (
+                f"【当前 URL 请求】用户提供了一个需要读取的 URL。当前可用工具：{names}。"
+                "若本轮尚无网页工具结果，必须先实际调用 web_fetch；如果正文不完整或站点依赖 "
+                "JavaScript，再依次调用 browser_navigate 和 browser_snapshot。若本轮历史中已经有"
+                "成功的 web_fetch 或 browser tool_result，必须直接基于结果完成用户要求，不得重复"
+                "调用同一 URL。只有工具实际返回错误后，才能说明具体访问限制；不得在未调用工具"
+                "时声称无法查看网页。"
+            )
+        if asks_web:
+            web_tools = [
+                tool for tool in self._tools.values()
+                if tool.name in {"web_search", "web_fetch"}
+                or tool.target_type == "browser"
+                or tool.name.startswith("browser_")
+            ]
+            if not web_tools:
+                return (
+                    "【当前网页访问能力】当前没有可用的网页搜索、读取或浏览器工具。"
+                    "这是对当前能力的询问，不要假设用户提供了某个网页、题目或编程任务。"
+                )
+            lines = [
+                "【当前网页访问能力】可以通过以下已注册工具搜索、读取或操作网页。"
+                "这是对当前能力的询问：直接说明能做什么和必要限制，不要声称无法访问，"
+                "不要假设用户已经提供了某个网页、题目或编程任务："
+            ]
+            for tool in web_tools:
+                source = tool.host or (
+                    tool.scope.removeprefix("mcp_server:")
+                    if tool.origin == "mcp" else tool.origin
+                )
+                description = " ".join((tool.description or "").split())
+                lines.append(f"- {tool.name}（source: {source}）：{description[:200]}")
+            return "\n".join(lines)
+        mcp_tools = [tool for tool in self._tools.values() if tool.origin == "mcp"]
+        if not mcp_tools:
+            return "【当前 MCP 连接状态】未连接任何 MCP Server，也没有可用的 MCP 工具。"
+        lines = [
+            "【当前 MCP 连接状态】以下 MCP 工具已连接并可用；请据此回答，"
+            "不要声称未连接："
+        ]
+        for tool in mcp_tools:
+            server = tool.host or tool.scope.removeprefix("mcp_server:") or "unknown"
+            description = " ".join((tool.description or "").split())
+            lines.append(f"- {tool.name}（server: {server}）：{description[:200]}")
+        return "\n".join(lines)
+
+    def planner_context_for_task(self, task: str) -> str:
+        """向 Planner 提供有界的真实工具名，防止它编造平台命令。"""
+        schemas = self.schemas_for_task(task, mode="task")
+        names = [str(schema.get("name")) for schema in schemas if schema.get("name")]
+        if not names:
+            return "当前没有可用工具；计划只能描述结果，不得编造工具或系统命令。"
+        context = "当前可用工具名称（只能引用这些名称）：" + "、".join(names)
+        if _has_browser_action_intent(task):
+            context += (
+                "。网页操作必须使用 browser_* MCP 工具；当前是 Windows，禁止规划 "
+                "xdg-open、shell 打开网页或 JavaScript 注入。"
+            )
+        return context
 
     def schemas_for_stage(
         self,

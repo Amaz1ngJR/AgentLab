@@ -48,6 +48,7 @@ class _Router:
         self._sessions = sessions
         self.current_id = next(iter(sessions), None)
         self.persisted = []
+        self.switched_models = []
         self.closed = False
 
     @property
@@ -65,6 +66,10 @@ class _Router:
             return False
         self.current_id = session_id
         return True
+
+    def switch_model(self, model_profile):
+        self.switched_models.append(model_profile)
+        return "old", model_profile
 
     def resume_or_new(self, agent_id=None):
         if self.current_id:
@@ -107,6 +112,21 @@ def test_images_require_vision_capability():
     service = RuntimeService(_Router({"s1": _Session()}))
     with pytest.raises(RuntimeError, match="vision"):
         service.send_message("看图", images=[object()])
+
+
+def test_switch_model_uses_runtime_guard_and_publishes_event():
+    router = _Router({"s1": _Session()})
+    service = RuntimeService(router)
+    events = []
+    service.subscribe(events.append)
+
+    assert service.switch_model("local") == ("old", "local")
+    assert router.switched_models == ["local"]
+    assert events[-1].kind == "session_model_switched"
+
+    service._session_runs["s1"] = "run-active"
+    with pytest.raises(RuntimeError, match="正在执行"):
+        service.switch_model("other")
 
 
 def test_images_forwarded_to_vision_session():

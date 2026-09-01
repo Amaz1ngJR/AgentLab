@@ -70,6 +70,19 @@ _WINDOWS_RUNTIME_ENV_VARS = (
 _WINDOWS_EXECUTABLE_EXTENSIONS = (".cmd", ".exe", ".bat", ".com")
 
 
+def _format_connect_error(exc: BaseException) -> str:
+    """展开 ExceptionGroup，避免 MCP 启动只显示无信息的外层错误。"""
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        details = "; ".join(_format_connect_error(item) for item in nested)
+        return f"{type(exc).__name__}: {details}"
+    cause = exc.__cause__ or exc.__context__
+    current = format_exception(exc)
+    if cause is not None and cause is not exc:
+        return f"{current} <- {_format_connect_error(cause)}"
+    return current
+
+
 def _resolve_stdio_command(command: str | None, system: str | None = None) -> str:
     """把 MCP stdio 命令解析为可直接启动的可执行文件。
 
@@ -86,7 +99,13 @@ def _resolve_stdio_command(command: str | None, system: str | None = None) -> st
     if (system or platform.system()) == "Windows":
         lower = expanded.lower()
         if not lower.endswith(_WINDOWS_EXECUTABLE_EXTENSIONS):
-            candidates.extend(f"{expanded}{ext}" for ext in _WINDOWS_EXECUTABLE_EXTENSIONS)
+            # Node/npm 在 Windows 同时安装无扩展名的 Unix shell shim 和 .cmd。
+            # shutil.which("npx") 可能先返回不可由 CreateProcess 直接启动的 npx，
+            # 导致 WinError 5/193；必须优先解析 Windows 可执行扩展名。
+            candidates = [
+                *(f"{expanded}{ext}" for ext in _WINDOWS_EXECUTABLE_EXTENSIONS),
+                expanded,
+            ]
 
     for candidate in candidates:
         resolved = shutil.which(candidate)
@@ -97,6 +116,78 @@ def _resolve_stdio_command(command: str | None, system: str | None = None) -> st
     if raw.lower() in {"npx", "npx.cmd"}:
         hint = " 请安装 Node.js LTS，并重新打开终端以刷新 PATH。"
     raise FileNotFoundError(f"找不到 MCP 启动命令 '{raw}'。{hint}".rstrip())
+
+
+def _resolve_stdio_launch(
+    command: str | None,
+    args: list[str],
+    system: str | None = None,
+) -> tuple[str, list[str]]:
+    """把 Windows npm/npx shim 展开为 node.exe + CLI JS，避免 WinError 5。"""
+    resolved = _resolve_stdio_command(command, system=system)
+    if (system or platform.system()) != "Windows":
+        return resolved, list(args)
+    path = Path(resolved)
+    shim = path.name.lower()
+    cli_names = {
+        "npx.cmd": "npx-cli.js",
+        "npm.cmd": "npm-cli.js",
+    }
+    cli_name = cli_names.get(shim)
+    if cli_name is None:
+        return resolved, list(args)
+    node = path.parent / "node.exe"
+    cli = path.parent / "node_modules" / "npm" / "bin" / cli_name
+    if not node.is_file() or not cli.is_file():
+        raise FileNotFoundError(
+            f"无法展开 Windows {shim}: 缺少 {node if not node.is_file() else cli}"
+        )
+    return str(node), [str(cli), *args]
+
+
+def _windows_default_browser_progid() -> str:
+    """读取当前用户 HTTPS 关联的默认浏览器 ProgId。"""
+    import winreg
+
+    key_path = (
+        r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations"
+        r"\https\UserChoice"
+    )
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+        value, _ = winreg.QueryValueEx(key, "ProgId")
+    return str(value or "")
+
+
+def _playwright_channel_for_progid(progid: str) -> str:
+    """把 Windows 默认浏览器 ProgId 映射为 Playwright MCP channel。"""
+    normalized = (progid or "").lower()
+    if "edge" in normalized:
+        return "msedge"
+    if "chrome" in normalized or "chromium" in normalized:
+        return "chrome"
+    if "firefox" in normalized:
+        return "firefox"
+    raise RuntimeError(
+        f"默认浏览器 ProgId '{progid or 'unknown'}' 暂不能映射到 Playwright；"
+        "请在 MCP 配置中显式使用 chrome/firefox/webkit/msedge"
+    )
+
+
+def _resolve_playwright_browser_args(
+    args: list[str],
+    system: str | None = None,
+) -> list[str]:
+    """把配置中的 system-default 动态解析为当前系统默认浏览器 channel。"""
+    resolved = list(args)
+    for index, value in enumerate(resolved[:-1]):
+        if value != "--browser" or resolved[index + 1] not in {"default", "system-default"}:
+            continue
+        if (system or platform.system()) != "Windows":
+            raise RuntimeError("--browser system-default 当前仅支持 Windows")
+        resolved[index + 1] = _playwright_channel_for_progid(
+            _windows_default_browser_progid()
+        )
+    return resolved
 
 
 def _build_stdio_env(
@@ -137,6 +228,15 @@ class MCPToolInfo:
     input_schema: dict[str, Any]
 
 
+def _mcp_tool_input_schema(tool: Any) -> dict[str, Any]:
+    """兼容 MCP SDK 1.x inputSchema 与 2.x input_schema。"""
+    return dict(
+        getattr(tool, "input_schema", None)
+        or getattr(tool, "inputSchema", None)
+        or {}
+    )
+
+
 def _content_to_text(result: Any) -> tuple[str, bool]:
     """把 MCP CallToolResult 转成 (文本, 是否错误)。
 
@@ -144,7 +244,13 @@ def _content_to_text(result: Any) -> tuple[str, bool]:
     二进制给模型);其它类型回 repr 兜底。输出整体过 redact()。
     is_error 取 result.isError(SDK 字段),取不到则按无错误处理。
     """
-    is_error = bool(getattr(result, "isError", False))
+    # MCP Python SDK 的 Pydantic 模型使用 snake_case 属性 is_error，旧版或
+    # 其它实现可能仍暴露 JSON 字段名 isError。两者都要兼容，否则服务端已经
+    # 标记失败的结果会在 CLI 中错误显示为 [ok]。
+    raw_is_error = getattr(result, "is_error", None)
+    if raw_is_error is None:
+        raw_is_error = getattr(result, "isError", False)
+    is_error = bool(raw_is_error)
     blocks = getattr(result, "content", None) or []
     parts: list[str] = []
     for block in blocks:
@@ -164,6 +270,9 @@ def _content_to_text(result: Any) -> tuple[str, bool]:
         else:
             parts.append(str(block))
     text = "\n".join(p for p in parts if p) or "(empty result)"
+    # 少数 MCP server 把错误仅写进文本而没有设置协议错误位。
+    if text.lstrip().lower().startswith(("### error", "error:", "[error]")):
+        is_error = True
     return redact(text), is_error
 
 
@@ -207,7 +316,7 @@ class MCPManager:
                 fut = asyncio.run_coroutine_threadsafe(self._connect(server), self.loop)
                 session, tools, shutdown, task = fut.result(timeout=self.connect_timeout)
             except Exception as exc:  # 连接/初始化失败
-                print(f"⚠ MCP server '{server.name}' 连接失败: {format_exception(exc)}",
+                print(f"⚠ MCP server '{server.name}' 连接失败: {_format_connect_error(exc)}",
                       file=sys.stderr)
                 continue
             self._sessions[server.name] = session
@@ -232,11 +341,12 @@ class MCPManager:
         from mcp.client.stdio import stdio_client
 
         try:
-            command = _resolve_stdio_command(server.command)
+            server_args = _resolve_playwright_browser_args(server.args)
+            command, command_args = _resolve_stdio_launch(server.command, server_args)
             env = _build_stdio_env(server)
             params = StdioServerParameters(
                 command=command,
-                args=server.args,
+                args=command_args,
                 env=env,
                 cwd=_resolve_stdio_cwd(server.cwd),
             )
@@ -250,7 +360,9 @@ class MCPManager:
                         server=server.name,
                         name=t.name,
                         description=t.description or "",
-                        input_schema=dict(t.inputSchema or {}),
+                        # MCP SDK 1.x 使用 inputSchema；2.x 的 Python 属性改为
+                        # input_schema（序列化 alias 仍可能是 inputSchema）。
+                        input_schema=_mcp_tool_input_schema(t),
                     )
                     for t in listed.tools
                 ]

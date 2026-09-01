@@ -18,7 +18,12 @@ from app.mcp.manager import (
     MCPManager,
     _build_stdio_env,
     _content_to_text,
+    _format_connect_error,
+    _mcp_tool_input_schema,
+    _playwright_channel_for_progid,
+    _resolve_playwright_browser_args,
     _resolve_stdio_command,
+    _resolve_stdio_launch,
     _resolve_stdio_cwd,
 )
 
@@ -54,9 +59,43 @@ def test_error_flag_propagates():
     assert "boom" in text
 
 
+def test_snake_case_error_flag_propagates():
+    r = types.SimpleNamespace(
+        content=[_block(type="text", text="boom")],
+        is_error=True,
+    )
+    _, is_error = _content_to_text(r)
+    assert is_error is True
+
+
+def test_error_heading_is_treated_as_error_without_protocol_flag():
+    r = _result([_block(type="text", text="### Error\nElement not found")])
+    _, is_error = _content_to_text(r)
+    assert is_error is True
+
+
 def test_empty_content():
     text, is_error = _content_to_text(_result([]))
     assert text == "(empty result)"
+
+
+def test_connect_error_expands_exception_group():
+    error = ExceptionGroup("outer", [PermissionError("denied"), RuntimeError("boom")])
+
+    text = _format_connect_error(error)
+
+    assert "PermissionError: denied" in text
+    assert "RuntimeError: boom" in text
+
+
+def test_mcp_tool_info_accepts_sdk_v2_input_schema_name():
+    tool = types.SimpleNamespace(
+        name="browser_snapshot",
+        description="snapshot",
+        input_schema={"type": "object", "properties": {}},
+    )
+
+    assert _mcp_tool_input_schema(tool) == {"type": "object", "properties": {}}
 
 
 def test_secret_redacted_in_result():
@@ -82,7 +121,49 @@ def test_windows_resolves_npx_cmd(monkeypatch):
     resolved = _resolve_stdio_command("npx", system="Windows")
 
     assert resolved == r"C:\Program Files\nodejs\npx.cmd"
-    assert seen[:2] == ["npx", "npx.cmd"]
+    assert seen[0] == "npx.cmd"
+
+
+def test_windows_expands_npx_cmd_to_node_cli(monkeypatch, tmp_path):
+    node_root = tmp_path / "nodejs"
+    cli = node_root / "node_modules" / "npm" / "bin" / "npx-cli.js"
+    cli.parent.mkdir(parents=True)
+    (node_root / "node.exe").write_bytes(b"")
+    cli.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "app.mcp.manager._resolve_stdio_command",
+        lambda command, system=None: str(node_root / "npx.cmd"),
+    )
+
+    command, args = _resolve_stdio_launch(
+        "npx", ["-y", "@playwright/mcp@latest"], system="Windows",
+    )
+
+    assert command == str(node_root / "node.exe")
+    assert args == [str(cli), "-y", "@playwright/mcp@latest"]
+
+
+@pytest.mark.parametrize(("progid", "channel"), [
+    ("MSEdgeHTM", "msedge"),
+    ("ChromeHTML", "chrome"),
+    ("FirefoxURL-308046B0AF4A39CB", "firefox"),
+])
+def test_maps_windows_default_browser_progid(progid, channel):
+    assert _playwright_channel_for_progid(progid) == channel
+
+
+def test_resolves_system_default_browser_argument(monkeypatch):
+    monkeypatch.setattr(
+        "app.mcp.manager._windows_default_browser_progid",
+        lambda: "MSEdgeHTM",
+    )
+
+    args = _resolve_playwright_browser_args(
+        ["-y", "@playwright/mcp@latest", "--browser", "system-default"],
+        system="Windows",
+    )
+
+    assert args[-2:] == ["--browser", "msedge"]
 
 
 def test_windows_keeps_explicit_executable_extension(monkeypatch):

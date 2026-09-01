@@ -116,6 +116,7 @@ _TASK_DIRECTIVE = (
     "执行要求:\n"
     "- 先判断任务是否确实需要读取文件、修改代码、执行命令或联网查询。\n"
     "- 需要外部操作时，立即调用最相关的工具，不要只描述计划。\n"
+    "- 网页操作必须使用 browser_* 工具；禁止用 shell/xdg-open/start 或 JavaScript 注入代替。\n"
     "- 纯对话、介绍、解释、总结或无需外部信息的问题，直接回答，不要调用工具。\n"
     "- 完成后直接给出结果，避免重复调用工具或重复回答。"
 )
@@ -181,12 +182,17 @@ class Executor:
         usage_acc 若传入,会把每轮 token 用量累加进去(供 run 级统计)。
         on_actual_model 在拿到服务器真实模型 ID 时回调一次(揭穿代理静默映射)。
         """
-        messages.append({"role": "user", "content": _TASK_DIRECTIVE.format(content=task.content)})
+        messages.append({
+            "role": "user",
+            "content": _TASK_DIRECTIVE.format(content=task.content),
+            "internal": "task_directive",
+        })
 
         last_text = ""
         tool_calls_made = 0
         model_rounds = 0
         no_progress_rounds = 0
+        tool_retry_sent = False
         seen_tool_signatures: set[tuple[str, str]] = set()
 
         for _ in range(max(1, max_steps)):
@@ -252,8 +258,19 @@ class Executor:
                    not _looks_like_completion_message(last_text):
                     # 这是第一轮，任务看起来需要工具操作，模型只输出了文字且不像完成消息
                     # 给模型一次纠正机会，明确提示必须调用工具
+                    if tool_retry_sent:
+                        return TaskOutcome(
+                            status=FAILED,
+                            error="模型在工具纠正提示后仍未调用工具，任务无进展",
+                            evidence=last_text.strip(),
+                            text=last_text.strip(),
+                            tool_calls_made=tool_calls_made,
+                            model_rounds=model_rounds,
+                        )
+                    tool_retry_sent = True
                     messages.append({
                         "role": "user",
+                        "internal": "tool_retry",
                         "content": (
                             "注意：你只输出了文字说明，但没有调用任何工具。\n"
                             "请立即调用相关工具完成任务，而不是只描述要做什么。\n"
@@ -262,6 +279,8 @@ class Executor:
                             "- 需要写文件 → 调用 write_file 或 edit_file\n"
                             "- 需要执行命令 → 调用 shell\n"
                             "- 需要搜索代码 → 调用 code_search\n\n"
+                            "- 需要操作网页 → 调用 browser_navigate/browser_snapshot/"
+                            "browser_type 等 browser_* 工具，禁止使用 shell 打开网页\n\n"
                             "现在请立即调用工具完成任务。"
                         )
                     })

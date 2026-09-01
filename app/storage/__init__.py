@@ -276,6 +276,14 @@ class Storage:
                 (title, _now(), session_id),
             )
 
+    def update_session_model(self, session_id: str, model_profile: str) -> None:
+        """记录会话当前模型；历史消息保留，由运行时负责跨 provider 规范化。"""
+        with self._tx() as con:
+            con.execute(
+                "UPDATE sessions SET model_profile=?, updated_at=? WHERE id=?",
+                (model_profile, _now(), session_id),
+            )
+
     def touch_session(self, session_id: str) -> None:
         """更新 session 的 updated_at 为当前时间(标记"最后活跃")。
 
@@ -364,6 +372,14 @@ class Storage:
         """返回某 session 的消息条数。供 resume_or_new 跳过空会话。"""
         row = self._con.execute(
             "SELECT COUNT(*) AS c FROM messages WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def count_runtime_turns(self, session_id: str) -> int:
+        """统计 session 已尝试的 turn；失败的首次请求也算实际使用过。"""
+        row = self._con.execute(
+            "SELECT COUNT(*) AS c FROM runtime_turns WHERE thread_id=?",
             (session_id,),
         ).fetchone()
         return int(row["c"]) if row else 0
