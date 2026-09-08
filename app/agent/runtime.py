@@ -166,6 +166,12 @@ class AgentSession:
         self.last_goal: str = ""
         self.last_run_status: str = ""
 
+    def _tools_for_task(self, task: str, *, mode: str = "direct") -> list[dict[str, Any]]:
+        selector = getattr(self.tools, "schemas_for_task", None)
+        if callable(selector):
+            return selector(task, mode=mode)
+        return self.tools.schemas()
+
     def subscribe_events(
         self,
         *,
@@ -367,7 +373,7 @@ class AgentSession:
             "content": build_user_content(user_input, images),
         })
         # 在每次模型调用前检查，确保当前用户输入和 Responses 顶层 item 都计入预算。
-        tools = self.tools.schemas() or None
+        tools = self._tools_for_task(user_input, mode="direct")
         if self.context_manager is not None:
             self.context_manager.compact_before_model_call(
                 self.messages,
@@ -394,7 +400,7 @@ class AgentSession:
 
                     resp = self.llm.create_message(
                         messages=self.messages,
-                        tools=self.tools.schemas() or None,
+                        tools=tools or None,
                         system=self.system_prompt,
                         on_progress=on_progress,
                         on_text_delta=on_text_delta if raw_on_text else None,

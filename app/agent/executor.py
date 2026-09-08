@@ -157,6 +157,13 @@ class Executor:
         self._progress: ProgressFn = progress or (lambda label: nullcontext())
         self._ctx = context_manager  # 任务内压缩用
 
+    def _tools_for_task(self, task: str, *, mode: str = "task") -> list[dict[str, Any]]:
+        """按任务文本为 Executor 提供动态工具 Schema。"""
+        selector = getattr(self._tools, "schemas_for_task", None)
+        if callable(selector):
+            return selector(task, mode=mode)
+        return self._tools.schemas()
+
     def run_task(
         self,
         task: Task,
@@ -187,7 +194,7 @@ class Executor:
             if cancel is not None:
                 cancel.raise_if_cancelled()
 
-            tools = self._tools.schemas() or None
+            tools = self._tools_for_task(task.content, mode="task") or None
             text_streamed = False
             with self._progress("thinking") as handle:
                 on_progress = getattr(handle, "update", None)

@@ -1396,7 +1396,9 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
                 reg.register(t)
         # Context Builder:按 memory_policy 把检索到的记忆注入 system prompt
         mem_policy = build_memory_policy(agent_profile.memory_policy, storage)
-        recent = mem_policy.retrieve("", agent_profile.agent_id, limit=10)
+        recent = mem_policy.retrieve(
+            "", agent_profile.agent_id, limit=10, workspace=str(ws),
+        )
         base_prompt = agent_profile.system_prompt or build_system_prompt(str(ws))
         # 先注入 Skill 工作流（按 AgentProfile.skills 显式启用），再注入记忆。
         # Skill 只加上下文，不放宽工具授权：上面 reg 注册的工具集才是实际可用集。

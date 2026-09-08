@@ -158,7 +158,9 @@ def test_read_write_memory_save_writes_to_storage(storage: Storage):
     )
 
     # 检查是否写入了 memory
-    rows = storage.search_memories("", agent_id="test_agent", limit=10)
+    rows = storage.search_memories(
+        "", agent_id="test_agent", workspace="/tmp/test", limit=10,
+    )
     assert len(rows) == 1
     assert "user:" in rows[0]["content"]
     assert "assistant:" in rows[0]["content"]

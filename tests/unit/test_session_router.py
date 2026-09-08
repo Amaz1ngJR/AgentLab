@@ -17,14 +17,18 @@ class _FakeRouter:
         return []
 
 
-def _make_router(storage, profiles):
+def _make_router(storage, profiles, memory_policy=None):
     def factory(profile: AgentProfile, session_id: str) -> AgentSession:
-        return AgentSession(
+        session = AgentSession(
             llm=_FakeRouter(),
             tools=ToolRegistry(),
             approval=AutoApprove(),
             system_prompt="test",
         )
+        if memory_policy is not None:
+            session.mem_policy = memory_policy
+            session.agent_profile = profile
+        return session
     return SessionRouter(
         storage=storage,
         session_factory=factory,
@@ -40,7 +44,43 @@ def _profiles():
     }
 
 
-def test_new_creates_and_switches(tmp_path):
+def test_lifecycle_saves_read_write_summary_once(tmp_path, monkeypatch):
+    from app.memory import ReadWriteMemory
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles(), ReadWriteMemory(db))
+    sid = r.new("default")
+    r.current.messages = [{"role": "user", "content": "hello"}]
+    second = r.new("default")
+    assert len(db.search_memories("", agent_id="default", workspace=str(tmp_path / "workspace"))) == 1
+    r.switch(sid)
+    r.current.messages.append({"role": "assistant", "content": "updated"})
+    r.switch(second)
+    rows = db.search_memories("", agent_id="default", workspace=str(tmp_path / "workspace"))
+    assert len(rows) == 1
+    assert "updated" in rows[0]["content"]
+    r.close_all()
+    assert len(db.search_memories("", agent_id="default", workspace=str(tmp_path / "workspace"))) == 1
+
+
+def test_archive_and_delete_save_summary_before_removal(tmp_path, monkeypatch):
+    from app.memory import ReadWriteMemory
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    db = Storage(tmp_path / "db")
+    r = _make_router(db, _profiles(), ReadWriteMemory(db))
+    sid = r.new("default")
+    r.current.messages = [{"role": "user", "content": "archive me"}]
+    r.archive()
+    assert len(db.search_memories("", agent_id="default", workspace=str(tmp_path / "workspace"))) == 1
+
+    sid = r.new("default")
+    r.current.messages = [{"role": "user", "content": "delete me"}]
+    r.delete(sid)
+    rows = db.search_memories("delete me", agent_id="default", workspace=str(tmp_path / "workspace"))
+    assert len(rows) == 1
+
+
+
     r = _make_router(Storage(tmp_path / "db"), _profiles())
     sid = r.new(agent_id="default", title="测试会话")
     assert r.current_id == sid

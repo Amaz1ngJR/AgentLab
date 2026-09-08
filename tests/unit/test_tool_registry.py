@@ -142,6 +142,79 @@ def test_registry_audits_executor_error():
     assert events[0].is_error is True
 
 
+
+
+def test_registry_filters_visible_schemas_without_restricting_execution():
+    registry = ToolRegistry()
+    registry.register(_descriptor(name="inspect", capabilities={"inspect"}))
+    registry.register(_descriptor(name="verify", capabilities={"verify"}))
+
+    assert [item["name"] for item in registry.schemas(capabilities={"inspect"})] == ["inspect"]
+    assert [item["name"] for item in registry.schemas(exclude={"verify"})] == ["inspect"]
+    output, is_error = registry.execute("verify", {})
+    assert (output, is_error) == ("ok:", False)
+
+
+def test_registry_assigns_default_capabilities_to_builtin_tools():
+    tools = {tool.name: tool for tool in default_tools()}
+    assert "inspect" in tools["read_file"].capabilities
+    assert "filesystem_write" in tools["edit_file"].capabilities
+    assert "verify" in tools["shell"].capabilities
+    assert "network" in tools["web_search"].capabilities
+
+
+LOCAL_TOOL_NAMES = {
+    "read_file", "write_file", "list_dir", "edit_file", "code_search", "shell",
+}
+
+
+def _registry_with_defaults() -> ToolRegistry:
+    registry = ToolRegistry()
+    for tool in default_tools():
+        registry.register(tool)
+    return registry
+
+
+def test_schemas_for_task_always_exposes_local_tools():
+    """本地能力不按关键词收敛：问"看下当前改动"也得能跑 git diff。"""
+    registry = _registry_with_defaults()
+
+    for task in ("解释这个函数", "看下当前改动", "修改代码并运行测试"):
+        names = {item["name"] for item in registry.schemas_for_task(task)}
+        assert LOCAL_TOOL_NAMES <= names, task
+        assert "web_search" not in names, task
+        assert "web_fetch" not in names, task
+
+
+def test_schemas_for_task_gates_web_tools_behind_explicit_intent():
+    registry = _registry_with_defaults()
+
+    web = {item["name"] for item in registry.schemas_for_task("查一下最新的官方 changelog")}
+    assert {"web_search", "web_fetch"} <= web
+
+    # "文档"/"搜索"/"web" 在普通写码请求里太常见，不能触发联网。
+    for task in ("看下这个函数的文档", "搜索代码里的 retry 逻辑", "起一个 web server"):
+        names = {item["name"] for item in registry.schemas_for_task(task)}
+        assert "web_search" not in names, task
+
+
+def test_schemas_for_task_keeps_used_tools_visible():
+    """调用过的工具必须常驻：历史里留着它的 tool_use。"""
+    registry = _registry_with_defaults()
+    registry.execute("web_search", {"query": "x"})
+
+    names = {item["name"] for item in registry.schemas_for_task("解释这个函数")}
+    assert "web_search" in names
+
+
+def test_schemas_for_stage_can_explicitly_include_a_tool():
+    registry = ToolRegistry()
+    registry.register(_descriptor(name="custom", capabilities={"custom"}))
+    assert [item["name"] for item in registry.schemas_for_stage(
+        "inspect", include={"custom"}
+    )] == ["custom"]
+
+
 def test_custom_audit_redactor_hides_payload():
     events = []
 

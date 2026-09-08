@@ -6,6 +6,7 @@ import pytest
 
 from app.agent.cancel import CancelToken
 from app.agent.service import RuntimeService
+from app.protocol.handshake import ClientInfo
 
 
 class _Session:
@@ -201,7 +202,20 @@ def test_submit_turn_returns_immediately_and_publishes_completion():
     service.close()
 
 
-def test_submission_worker_survives_failed_turn():
+def test_runtime_service_protocol_commands_cover_submission_and_event_queue():
+    gate = threading.Event()
+    service = RuntimeService(_Router({"s1": _Session(gate)}))
+    client = service.initialize_client(ClientInfo.create("test", "1", ["jsonl"]))
+    subscription = service.open_event_subscription(client.client_id, thread_id="s1")
+    turn_id = service.start_turn("s1", "hello", turn_id="turn-1")
+    assert turn_id == "turn-1"
+    while "turn-1" not in service.active_runs():
+        time.sleep(0.001)
+    assert service.interrupt_turn("turn-1")
+    gate.set()
+    assert subscription.get(timeout=1).kind == "turn.started"
+    service.close()
+
     class FailingSession(_Session):
         def chat(self, message, **kwargs):
             if message == "fail":

@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 from app.agent.profiles import AgentProfile
 from app.agent.runtime import AgentSession
+from app.config.loader import workspace_root
 from app.storage import Storage
 
 
@@ -66,6 +67,11 @@ class SessionRouter:
 
     def new(self, agent_id: Optional[str] = None, title: str = "") -> str:
         """创建并切换到新 session，返回 session_id。"""
+        if self.current_id:
+            try:
+                self._save_session_state(self.current_id)
+            except Exception:
+                pass
         aid = agent_id or self._default_profile_id
         profile = self._profiles.get(aid)
         if profile is None:
@@ -86,6 +92,13 @@ class SessionRouter:
 
     def switch(self, session_id: str) -> bool:
         """切换到已有 session（内存或 SQLite 恢复），返回是否成功。"""
+        if session_id == self.current_id:
+            return True
+        if self.current_id:
+            try:
+                self._save_session_state(self.current_id)
+            except Exception:
+                pass
         if session_id not in self._sessions:
             # 尝试从 SQLite 恢复
             row = self._storage.get_session(session_id)
@@ -127,8 +140,13 @@ class SessionRouter:
 
     def archive(self) -> None:
         if self.current_id:
-            self._storage.archive_session(self.current_id)
-            session = self._sessions.pop(self.current_id, None)
+            sid = self.current_id
+            try:
+                self._save_session_state(sid)
+            except Exception:
+                pass
+            self._storage.archive_session(sid)
+            session = self._sessions.pop(sid, None)
             if session:
                 session.close()
             self.current_id = None
@@ -140,8 +158,13 @@ class SessionRouter:
         """
         if self._storage.get_session(session_id) is None:
             return False
-        session = self._sessions.pop(session_id, None)
+        session = self._sessions.get(session_id)
         if session:
+            try:
+                self._save_session_state(session_id)
+            except Exception:
+                pass
+            self._sessions.pop(session_id, None)
             session.close()
         self._storage.delete_session(session_id)
         try:
@@ -216,30 +239,41 @@ class SessionRouter:
             sess.last_goal = ""
             sess.last_run_status = ""
 
+    def _save_session_state(self, session_id: str) -> None:
+        """保存消息、任务、上下文及 read_write 记忆，供所有离开路径复用。"""
+        sess = self._sessions.get(session_id)
+        if sess is None:
+            return
+        self.persist(session_id)
+        self._save_memory_summary(session_id, sess)
+
+    def _save_memory_summary(self, session_id: str, session: AgentSession) -> None:
+        """保存 session 摘要；workspace 缺失时不允许访问记忆。"""
+        workspace_id = str(workspace_root())
+        mem_policy = getattr(session, "mem_policy", None)
+        agent_profile = getattr(session, "agent_profile", None)
+        if not (mem_policy and agent_profile and hasattr(mem_policy, "save")):
+            return
+        mem_policy.save(
+            agent_id=agent_profile.agent_id,
+            session_id=session_id,
+            messages=session.messages,
+            workspace=workspace_id,
+        )
+
     def close_all(self) -> None:
-        """关闭所有 session + 共享资源(MCP server),退出前调用。
-
-        read_write 记忆策略的 session 会在此时写入会话摘要(§6.2)。
-        """
-        from app.config.loader import workspace_root
-        ws = str(workspace_root())
-
-        for sid, sess in self._sessions.items():
-            # read_write 策略的会话结束时写摘要到 memories
-            mem_policy = getattr(sess, "mem_policy", None)
-            agent_profile = getattr(sess, "agent_profile", None)
-            if mem_policy and agent_profile and hasattr(mem_policy, "save"):
-                try:
-                    mem_policy.save(
-                        agent_id=agent_profile.agent_id,
-                        session_id=sid,
-                        messages=sess.messages,
-                        workspace=ws,
-                    )
-                except Exception:
-                    # 写摘要失败不应阻断退出,静默吞掉
-                    pass
-            sess.close()
+        """关闭所有 session + 共享资源(MCP server),退出前调用。"""
+        for sid in list(self._sessions):
+            try:
+                self._save_session_state(sid)
+            except Exception:
+                # 持久化/摘要失败不应阻断其他 session 的退出收尾。
+                pass
+            sess = self._sessions[sid]
+            try:
+                sess.close()
+            except Exception:
+                pass
         self._sessions.clear()
         # 关闭全局共享资源(MCP server 进程等)
         if self.mcp_manager is not None:

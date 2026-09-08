@@ -13,8 +13,8 @@ from __future__ import annotations
 import json
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Optional
 
 from app.util.redact import redact
 
@@ -35,9 +35,40 @@ TOOL_RISKS = frozenset({
     "destructive",
 })
 
+# 能力标签只用于决定模型看到哪些工具；ToolRegistry.execute() 始终使用完整注册表。
+TOOL_CAPABILITIES = frozenset({
+    "inspect",
+    "filesystem_read",
+    "filesystem_write",
+    "code_search",
+    "execute",
+    "verify",
+    "web_search",
+    "web_fetch",
+    "network",
+    "custom",
+})
+
 # 未显式覆盖 requires_approval 时按风险决定。read 是本地无副作用读取;
 # observe/network 需要按目标确认;其余会改变环境或执行代码,默认逐次审批。
 _APPROVAL_REQUIRED_RISKS = TOOL_RISKS - {"read"}
+
+# 只有对外发请求或会打开浏览器的工具按关键词收敛。本地能力(读写、执行、终端、
+# MCP)一律常驻:少暴露一个 shell 会让模型改用它唯一看得见的动作工具去开网页,
+# 代价远高于多暴露一个本地工具。
+_GATED_TOOL_NAMES = frozenset({"web_search", "web_fetch"})
+
+# 命中即暴露 web_search/web_fetch。刻意不含"文档""搜索""web"——它们在普通写码
+# 请求里太常见("搜索这个函数""看下文档""web server"),会把本地任务推上公网。
+_WEB_HINTS = (
+    "最新", "联网", "上网", "网上", "新闻", "官网", "查一下网上",
+    "latest", "news", "changelog", "release notes", "search online",
+)
+
+_BROWSER_HINTS = (
+    "打开网页", "浏览器", "点击网页", "网页截图", "登录网站", "访问网站",
+    "open webpage", "open website", "browser", "click webpage", "website login",
+)
 
 
 class ToolExecutionError(Exception):
@@ -110,6 +141,8 @@ class ToolDescriptor:
     host: Optional[str] = None
     requires_observation: bool = False
     audit_redactor: Optional[AuditRedactor] = None
+    # 工具能力标签：只影响模型可见集合，不影响 registry 的实际执行查找。
+    capabilities: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         if self.risk not in TOOL_RISKS:
@@ -117,6 +150,32 @@ class ToolDescriptor:
             raise ValueError(
                 f"unknown tool risk '{self.risk}' for {self.name}; expected one of: {allowed}"
             )
+        capabilities = set(self.capabilities)
+        if not capabilities:
+            if self.name in {"read_file", "list_dir"}:
+                capabilities.update({"inspect", "filesystem_read"})
+            elif self.name == "code_search":
+                capabilities.update({"inspect", "code_search", "filesystem_read"})
+            elif self.name in {"write_file", "edit_file"}:
+                capabilities.update({"filesystem_write"})
+            elif self.name == "shell":
+                capabilities.update({"execute", "verify"})
+            elif self.name == "web_search":
+                capabilities.update({"web_search", "network"})
+            elif self.name == "web_fetch":
+                capabilities.update({"web_fetch", "network"})
+            elif self.risk == "read":
+                capabilities.add("inspect")
+            else:
+                capabilities.add("custom")
+        unknown = capabilities - TOOL_CAPABILITIES
+        if unknown:
+            allowed = ", ".join(sorted(TOOL_CAPABILITIES))
+            raise ValueError(
+                f"unknown tool capability '{sorted(unknown)[0]}' for {self.name}; "
+                f"expected one of: {allowed}"
+            )
+        self.capabilities = frozenset(capabilities)
 
     def approval_action(self, args: dict[str, Any]) -> Optional[str]:
         """返回本次调用需要批准的动作名,无需审批则返回 None。"""
@@ -171,6 +230,8 @@ class ToolRegistry:
         # 用字典存储,key 是工具名,方便按名称 O(1) 查找
         self._tools: dict[str, ToolDescriptor] = {}
         self._audit_sink = audit_sink
+        # 本会话已被模型调用过的工具。动态暴露必须对它们单调:历史里已有 tool_use。
+        self._used_tools: set[str] = set()
 
     def register(self, tool: ToolDescriptor) -> None:
         """注册一个工具。同名工具会覆盖旧的。"""
@@ -184,9 +245,96 @@ class ToolRegistry:
         """返回所有已注册的工具列表。"""
         return list(self._tools.values())
 
-    def schemas(self) -> list[dict[str, Any]]:
-        """返回所有工具的描述字典列表,直接传给模型的 tools 参数。"""
-        return [t.to_schema() for t in self._tools.values()]
+    def schemas(
+        self,
+        *,
+        capabilities: Iterable[str] | None = None,
+        include: Iterable[str] | None = None,
+        exclude: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """返回当前上下文需要暴露给模型的工具 Schema。
+
+        默认保持旧行为返回全部工具；传入 capabilities/include/exclude 后只筛选
+        模型可见集合，execute() 仍可查找完整注册表，避免动态暴露破坏历史调用。
+        """
+        selected = list(self._tools.values())
+        if capabilities is not None:
+            wanted = set(capabilities)
+            selected = [tool for tool in selected if tool.capabilities & wanted]
+        if include is not None:
+            names = set(include)
+            selected = [tool for tool in selected if tool.name in names]
+        if exclude is not None:
+            names = set(exclude)
+            selected = [tool for tool in selected if tool.name not in names]
+        return [tool.to_schema() for tool in selected]
+
+    def schemas_for_task(
+        self,
+        task: str,
+        *,
+        mode: str = "direct",
+        include: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """按任务文本选择工具集合：本地能力常驻，只收敛对外/浏览器工具。
+
+        mode 保留给调用方标注阶段，当前不再用它增删本地工具——任务文本无法可靠
+        预测模型中途需要什么(问"看下当前改动"也要 shell 跑 git diff)。
+        """
+        text = (task or "").lower()
+        # 本地能力全部常驻：读写、执行、终端、todo、非浏览器 MCP。
+        selected = {
+            tool.name for tool in self._tools.values()
+            if tool.name not in _GATED_TOOL_NAMES and tool.target_type != "browser"
+        }
+        if any(word in text for word in _WEB_HINTS):
+            selected.update(_GATED_TOOL_NAMES)
+        if any(word in text for word in _BROWSER_HINTS):
+            selected.update(
+                tool.name for tool in self._tools.values()
+                if tool.target_type == "browser"
+            )
+        # 已经调用过的工具必须继续可见：历史里留着它的 tool_use，中途从 tools
+        # 数组消失会让后续每轮请求都带着模型无法解释的调用记录。
+        selected.update(self._used_tools)
+        if include is not None:
+            selected.update(include)
+        return self.schemas(include=selected)
+
+    def schemas_for_stage(
+        self,
+        stage: str,
+        *,
+        task: str = "",
+        include: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """按执行阶段选择工具；阶段规则优先于模糊任务关键词。"""
+        normalized = (stage or "direct").lower()
+        stage_tools = {
+            "inspect": {"read_file", "list_dir", "code_search"},
+            "analysis": {"read_file", "list_dir", "code_search"},
+            "plan": set(),
+            "direct": None,
+            "task": None,
+            "loop": None,
+            "verify": {"shell", "read_file", "code_search"},
+        }
+        selected = stage_tools.get(normalized)
+        if selected is None:
+            return self.schemas_for_task(task, mode=normalized, include=include)
+        # 空集合是"这个阶段刻意不给工具"(如 plan),不要被 sticky 集合破坏。
+        if selected:
+            selected = set(selected) | self._used_tools
+        else:
+            selected = set(selected)
+        if include is not None:
+            selected |= set(include)
+        return self.schemas(include=selected)
+
+    def schema_names(self, *, capabilities: Iterable[str] | None = None) -> tuple[str, ...]:
+        """返回模型当前可见工具名称，便于事件和调试记录。"""
+        selected = self.schemas(capabilities=capabilities)
+        return tuple(str(item["name"]) for item in selected)
 
     def record_denied(
         self,
@@ -199,6 +347,8 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return
+        # 模型已经发出过这次 tool_use，后续轮次必须继续看见这个工具。
+        self._used_tools.add(tool.name)
         self._emit_audit(
             tool,
             args,
@@ -263,6 +413,8 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return f"unknown tool: {name}", True
+        # 记在审批之前:即使这次被拦下,历史里也已经有了对应的 tool_use。
+        self._used_tools.add(tool.name)
         required_action = tool.approval_action(args or {})
         if required_action is not None and approved_action != required_action:
             result = f"approval required: {required_action}"

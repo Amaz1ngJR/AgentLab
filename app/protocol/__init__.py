@@ -12,6 +12,7 @@ from app.protocol.subscription import EventQueueOverloaded, EventSubscription
 from app.protocol.transport import (
     InitializeRequest,
     JsonlProtocolServer,
+    StdioJsonlServer,
     ProtocolTransportError,
     decode_events,
     encode_event,
@@ -35,6 +36,7 @@ __all__ = [
     "protocol_schemas",
     "InitializeRequest",
     "JsonlProtocolServer",
+    "StdioJsonlServer",
     "ProtocolTransportError",
     "decode_events",
     "encode_event",

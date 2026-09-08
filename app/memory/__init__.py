@@ -16,8 +16,9 @@ if TYPE_CHECKING:
 class MemoryPolicy:
     """记忆策略接口。"""
 
-    def retrieve(self, query: str, agent_id: str, limit: int = 5) -> list[str]:
-        """返回与 query 相关的记忆文本列表，注入到 system prompt 末尾。"""
+    def retrieve(self, query: str, agent_id: str,
+                 limit: int = 5, *, workspace: Optional[str] = None) -> list[str]:
+        """返回当前 workspace 内与 query 相关的记忆；缺失 workspace 时为空。"""
         return []
 
     def save(self, agent_id: str, session_id: str,
@@ -35,8 +36,19 @@ class ReadMemory(MemoryPolicy):
     def __init__(self, storage: "Storage"):
         self._store = storage
 
-    def retrieve(self, query: str, agent_id: str, limit: int = 5) -> list[str]:
-        rows = self._store.search_memories(query, agent_id=agent_id, limit=limit)
+    def retrieve(self, query: str, agent_id: str,
+                 limit: int = 5, *, workspace: Optional[str] = None) -> list[str]:
+        if not workspace:
+            return []
+        # 空 query 只读取当前 workspace 的近期记忆。
+        if not query:
+            rows = self._store.get_recent_memories(
+                agent_id=agent_id, workspace=workspace, limit=limit,
+            )
+        else:
+            rows = self._store.search_memories(
+                query, agent_id=agent_id, workspace=workspace, limit=limit,
+            )
         return [r["content"] for r in rows]
 
 
@@ -45,6 +57,8 @@ class ReadWriteMemory(ReadMemory):
 
     def save(self, agent_id: str, session_id: str,
              messages: list[dict], workspace: Optional[str] = None) -> None:
+        if not workspace:
+            return
         # 取最后几条用户/assistant 消息作为摘要
         turns = [m for m in messages if m.get("role") in ("user", "assistant")][-6:]
         if not turns:
@@ -59,9 +73,8 @@ class ReadWriteMemory(ReadMemory):
                 )
             lines.append(f"{role}: {str(content)[:200]}")
         summary = "\n".join(lines)
-        self._store.write_memory(
+        self._store.upsert_session_memory(
             content=summary,
-            scope="session",
             agent_id=agent_id,
             session_id=session_id,
             workspace=workspace,

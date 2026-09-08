@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import queue
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, TextIO
@@ -87,8 +88,10 @@ class JsonlProtocolServer:
         self.runtime = runtime
         self.client_id: str | None = None
         self.initialized = False
+        self._subscription = None
 
-    def handle_line(self, line: str) -> dict[str, JsonValue]:
+    def handle_line(self, line: str) -> dict[str, JsonValue] | None:
+        """处理一条 JSONL 请求；事件通过 ``poll_event`` 单独读取。"""
         try:
             value = json.loads(line)
         except json.JSONDecodeError as exc:
@@ -108,14 +111,98 @@ class JsonlProtocolServer:
             return initialized_response(result, request_id=request_id)
         if value.get("method") == "initialize":
             raise ProtocolTransportError("client is already initialized")
-        # Transport MVP 只承载握手；未知业务请求明确报错而不是静默丢弃。
-        raise ProtocolTransportError(f"unsupported method: {value.get('method', '')}")
+        result = self._dispatch(value)
+        if request_id is None:
+            return None
+        return {"id": to_json_value(request_id), "result": to_json_value(result)}
+
+    def _dispatch(self, value: dict[str, Any]) -> dict[str, Any]:
+        method = value.get("method")
+        params = value.get("params") or {}
+        if not isinstance(method, str) or not isinstance(params, dict):
+            raise ProtocolTransportError("method and params must be valid")
+        if method == "events.subscribe":
+            if not hasattr(self.runtime, "open_event_subscription"):
+                raise ProtocolTransportError("unsupported method: events.subscribe")
+            self._subscription = self.runtime.open_event_subscription(
+                self.client_id,
+                thread_id=params.get("thread_id"),
+                after_sequence=int(params.get("after_sequence", 0)),
+                max_queue_size=int(params.get("max_queue_size", 256)),
+            )
+            return {"subscribed": True}
+        if method in ("turn.start", "start_turn"):
+            return {"turn_id": self.runtime.start_turn(
+                str(params["thread_id"]), str(params.get("input", "")),
+                images=params.get("images"), resume=bool(params.get("resume", False)),
+                turn_id=params.get("turn_id"),
+            )}
+        if method in ("turn.interrupt", "interrupt_turn"):
+            return {"accepted": self.runtime.interrupt_turn(str(params["turn_id"]))}
+        if method in ("turn.resume", "resume_turn"):
+            return {"turn_id": self.runtime.resume_turn(
+                str(params["thread_id"]), str(params.get("input", "继续上一轮任务")),
+                turn_id=params.get("turn_id"),
+            )}
+        if method in ("turn.steer", "steer_turn"):
+            return {"accepted": self.runtime.steer_turn(
+                str(params["turn_id"]), str(params["input"]),
+            )}
+        if method in ("request.answer", "answer_request"):
+            return {"accepted": self.runtime.answer_request(
+                str(params["request_id"]), params.get("response", params.get("decision")),
+            )}
+        if method == "events.poll":
+            if self._subscription is None:
+                raise ProtocolTransportError("events.subscribe is required")
+            timeout = params.get("timeout")
+            try:
+                event = self._subscription.get(timeout=float(timeout) if timeout is not None else 0)
+            except (StopIteration, queue.Empty):
+                return {"event": None}
+            return {"event": event.to_dict()}
+        raise ProtocolTransportError(f"unsupported method: {method or ''}")
+
+    def poll_event(self, timeout: float | None = None) -> EventEnvelope | None:
+        """从当前客户端事件队列取一条事件，供 stdio writer 使用。"""
+        if self._subscription is None:
+            return None
+        try:
+            return self._subscription.get(timeout=timeout)
+        except (StopIteration, queue.Empty):
+            return None
 
     @property
     def runtime_protocol_version(self) -> int:
         from app.protocol.envelopes import PROTOCOL_VERSION
         return PROTOCOL_VERSION
 
+
+class StdioJsonlServer(JsonlProtocolServer):
+    """独立 stdio 传输适配器：请求从 stdin 读取，响应和事件写入 stdout。"""
+
+    def serve(self, input_stream: TextIO, output_stream: TextIO) -> None:
+        for line in input_stream:
+            if not line.strip():
+                continue
+            try:
+                response = self.handle_line(line)
+                if response is not None:
+                    output_stream.write(json.dumps(
+                        response, ensure_ascii=False, separators=(",", ":"),
+                    ) + "\n")
+                    output_stream.flush()
+                while True:
+                    event = self.poll_event(timeout=0)
+                    if event is None:
+                        break
+                    write_event(output_stream, event)
+            except ProtocolTransportError as exc:
+                output_stream.write(json.dumps(
+                    {"id": None, "error": {"code": "invalid_request", "message": str(exc)}},
+                    ensure_ascii=False, separators=(",", ":"),
+                ) + "\n")
+                output_stream.flush()
 
 def encode_request(request: InitializeRequest, *, request_id: Any = None) -> str:
     value = request.to_dict()

@@ -171,6 +171,8 @@ CREATE TABLE IF NOT EXISTS runtime_sequences (
 CREATE INDEX IF NOT EXISTS idx_runtime_turns_thread ON runtime_turns(thread_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runtime_items_turn ON runtime_items(turn_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_runtime_events_thread_seq ON runtime_events(thread_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_memories_workspace_agent
+    ON memories(workspace, agent_id, scope, updated_at);
 """
 
 _TOOL_EXECUTION_MIGRATIONS = {
@@ -187,6 +189,13 @@ _TOOL_EXECUTION_MIGRATIONS = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_workspace_id(workspace: Optional[str]) -> str:
+    """把 workspace 路径规范化成稳定隔离键；缺失时拒绝访问记忆。"""
+    if workspace is None or not str(workspace).strip():
+        raise ValueError("workspace_id is required for memory access")
+    return str(Path(workspace).expanduser().resolve())
 
 
 def _truncate(text: str, max_len: int = 500) -> str:
@@ -375,23 +384,106 @@ class Storage:
                      session_id: Optional[str] = None,
                      workspace: Optional[str] = None,
                      confidence: float = 1.0) -> int:
+        workspace_id = _normalize_workspace_id(workspace)
         now = _now()
         with self._tx() as con:
             cur = con.execute(
                 """INSERT INTO memories(scope,agent_id,session_id,workspace,
                    content,confidence,created_at,updated_at)
                    VALUES(?,?,?,?,?,?,?,?)""",
-                (scope, agent_id, session_id, workspace,
+                (scope, agent_id, session_id, workspace_id,
                  redact(content), confidence, now, now),
             )
             return cur.lastrowid
 
+    def upsert_session_memory(self, content: str, agent_id: str,
+                              session_id: str, workspace: str,
+                              confidence: float = 1.0) -> int:
+        """按 session + workspace 更新摘要，避免生命周期事件重复插入。"""
+        workspace_id = _normalize_workspace_id(workspace)
+        now = _now()
+        safe_content = redact(content)
+        with self._tx() as con:
+            row = con.execute(
+                """SELECT id FROM memories
+                   WHERE scope='session' AND agent_id=? AND session_id=? AND workspace=?
+                   ORDER BY id DESC LIMIT 1""",
+                (agent_id, session_id, workspace_id),
+            ).fetchone()
+            if row:
+                con.execute(
+                    """UPDATE memories SET content=?, confidence=?, updated_at=?
+                       WHERE id=? AND workspace=?""",
+                    (safe_content, confidence, now, row["id"], workspace_id),
+                )
+                return int(row["id"])
+            cur = con.execute(
+                """INSERT INTO memories(scope,agent_id,session_id,workspace,
+                   content,confidence,created_at,updated_at)
+                   VALUES('session',?,?,?,?,?,?,?)""",
+                (agent_id, session_id, workspace_id,
+                 safe_content, confidence, now, now),
+            )
+            return cur.lastrowid
+
+    def get_memory(self, memory_id: int, workspace: Optional[str] = None) -> Optional[dict]:
+        """读取单条记忆；workspace 缺失或不匹配时视为不存在。"""
+        if not workspace:
+            return None
+        workspace_id = _normalize_workspace_id(workspace)
+        row = self._con.execute(
+            "SELECT * FROM memories WHERE id=? AND workspace=?",
+            (memory_id, workspace_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_memory(self, memory_id: int, content: str,
+                      workspace: Optional[str] = None,
+                      confidence: Optional[float] = None) -> bool:
+        """更新当前 workspace 的记忆，禁止通过 ID 跨 workspace 修改。"""
+        if not workspace:
+            return False
+        workspace_id = _normalize_workspace_id(workspace)
+        with self._tx() as con:
+            if confidence is None:
+                cur = con.execute(
+                    """UPDATE memories SET content=?, updated_at=?
+                       WHERE id=? AND workspace=?""",
+                    (redact(content), _now(), memory_id, workspace_id),
+                )
+            else:
+                cur = con.execute(
+                    """UPDATE memories SET content=?, confidence=?, updated_at=?
+                       WHERE id=? AND workspace=?""",
+                    (redact(content), confidence, _now(), memory_id, workspace_id),
+                )
+            return cur.rowcount == 1
+
+    def delete_memory(self, memory_id: int, workspace: Optional[str] = None) -> bool:
+        """删除当前 workspace 的记忆，禁止通过 ID 跨 workspace 删除。"""
+        if not workspace:
+            return False
+        workspace_id = _normalize_workspace_id(workspace)
+        with self._tx() as con:
+            cur = con.execute(
+                "DELETE FROM memories WHERE id=? AND workspace=?",
+                (memory_id, workspace_id),
+            )
+            return cur.rowcount == 1
+
     def search_memories(self, query: str, agent_id: Optional[str] = None,
                         scope: Optional[str] = None,
-                        limit: int = 10) -> list[dict]:
-        """简单的 LIKE 全文搜索（无向量索引）。足够 MVP 使用。"""
-        conds = ["content LIKE ?"]
-        params: list[Any] = [f"%{query}%"]
+                        limit: int = 10,
+                        workspace: Optional[str] = None) -> list[dict]:
+        """按内容、Agent、scope 和 workspace 检索记忆。
+
+        workspace 必须由调用方显式传入；缺失时不返回任何记忆，避免跨项目泄漏。
+        """
+        if not workspace:
+            return []
+        workspace_id = _normalize_workspace_id(workspace)
+        conds = ["content LIKE ?", "workspace=?"]
+        params: list[Any] = [f"%{query}%", workspace_id]
         if agent_id:
             conds.append("agent_id=?")
             params.append(agent_id)
@@ -407,16 +499,21 @@ class Storage:
         return [dict(r) for r in rows]
 
     def get_recent_memories(self, agent_id: Optional[str] = None,
-                            limit: int = 20) -> list[dict]:
-        conds = []
-        params: list[Any] = []
+                            limit: int = 20,
+                            workspace: Optional[str] = None) -> list[dict]:
+        """返回当前 workspace 的最近记忆；缺失 workspace 时安全返回空。"""
+        if not workspace:
+            return []
+        workspace_id = _normalize_workspace_id(workspace)
+        conds = ["workspace=?"]
+        params: list[Any] = [workspace_id]
         if agent_id:
             conds.append("agent_id=?")
             params.append(agent_id)
-        where = f"WHERE {' AND '.join(conds)}" if conds else ""
         params.append(limit)
         rows = self._con.execute(
-            f"SELECT * FROM memories {where} ORDER BY updated_at DESC LIMIT ?",
+            f"SELECT * FROM memories WHERE {' AND '.join(conds)} "
+            f"ORDER BY updated_at DESC LIMIT ?",
             params,
         ).fetchall()
         return [dict(r) for r in rows]

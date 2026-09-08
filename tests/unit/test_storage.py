@@ -121,17 +121,52 @@ def test_save_messages_overwrites(tmp_path):
 
 def test_write_and_search_memory(tmp_path):
     s = _store(tmp_path)
-    s.write_memory("用户喜欢简洁代码", scope="agent", agent_id="coder")
-    s.write_memory("用户在北京", scope="user")
-    results = s.search_memories("简洁", agent_id="coder")
+    s.write_memory("用户喜欢简洁代码", scope="agent", agent_id="coder", workspace="/workspace")
+    s.write_memory("用户在北京", scope="user", workspace="/workspace")
+    results = s.search_memories("简洁", agent_id="coder", workspace="/workspace")
     assert len(results) == 1
     assert "简洁" in results[0]["content"]
 
 
+def test_write_memory_requires_workspace(tmp_path):
+    import pytest
+
+    s = _store(tmp_path)
+    with pytest.raises(ValueError, match="workspace_id"):
+        s.write_memory("unsafe")
+
+
+def test_memory_crud_isolated_by_workspace(tmp_path):
+    s = _store(tmp_path)
+    first = s.write_memory("workspace one", agent_id="coder", workspace="/one")
+    second = s.write_memory("workspace two", agent_id="coder", workspace="/two")
+
+    assert [r["id"] for r in s.search_memories("workspace", agent_id="coder", workspace="/one")] == [first]
+    assert s.search_memories("workspace", agent_id="coder") == []
+    assert s.get_memory(first, workspace="/two") is None
+    assert not s.update_memory(first, "changed", workspace="/two")
+    assert not s.delete_memory(first, workspace="/two")
+    assert s.update_memory(first, "changed", workspace="/one")
+    assert s.get_memory(first, workspace="/one")["content"] == "changed"
+    assert s.delete_memory(first, workspace="/one")
+    assert s.get_memory(first, workspace="/one") is None
+    assert s.get_memory(second, workspace="/two") is not None
+
+
+def test_memory_workspace_is_normalized(tmp_path):
+    s = _store(tmp_path)
+    memory_id = s.write_memory("normalized", workspace=str(tmp_path / "a" / ".."))
+    assert s.get_memory(memory_id, workspace=str(tmp_path.resolve())) is not None
+
+
 def test_memory_secret_redacted(tmp_path):
     s = _store(tmp_path)
-    s.write_memory("api_key=sk-abcdefghijklmnopqrstuvwxyz0123", scope="session")
-    results = s.search_memories("sk-")
+    s.write_memory(
+        "api_key=sk-abcdefghijklmnopqrstuvwxyz0123",
+        scope="session",
+        workspace="/workspace",
+    )
+    results = s.search_memories("sk-", workspace="/workspace")
     # redact 处理后不应有原始密钥
     for r in results:
         assert "sk-abcdefghij" not in r["content"]
