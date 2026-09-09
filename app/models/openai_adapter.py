@@ -350,12 +350,46 @@ def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
     result = []
 
     for msg in messages:
-        # 如果已经是 Responses API 格式 (有 type 字段), 清理并保留
+        # 如果已经是 Responses API 格式 (有 type 字段), 清理并验证
         if "type" in msg:
-            # 移除不支持的字段（如 parsed_arguments, status 等内部字段）
-            # Responses API 只接受其规范中定义的字段
-            cleaned = {k: v for k, v in msg.items() if k not in ('parsed_arguments', 'status')}
-            result.append(cleaned)
+            msg_type = msg.get("type")
+
+            # reasoning: 推理过程，丢弃（Responses API 不接受作为输入）
+            if msg_type == "reasoning":
+                continue
+
+            # function_call: 工具调用，保留必需字段
+            if msg_type == "function_call":
+                cleaned = {
+                    "type": "function_call",
+                    "call_id": msg.get("call_id", ""),
+                    "name": msg.get("name", ""),
+                    "arguments": msg.get("arguments", "{}"),
+                }
+                result.append(cleaned)
+                continue
+
+            # function_call_output: 工具结果，保留必需字段
+            if msg_type == "function_call_output":
+                cleaned = {
+                    "type": "function_call_output",
+                    "call_id": msg.get("call_id", ""),
+                    "output": msg.get("output", ""),
+                }
+                result.append(cleaned)
+                continue
+
+            # message: 用户或助手消息，保留
+            if msg_type == "message":
+                # 移除内部字段
+                cleaned = {k: v for k, v in msg.items()
+                          if k not in ('parsed_arguments', 'status', 'namespace',
+                                      'internal_chat_message_metadata_passthrough',
+                                      'metadata', 'id', 'summary', 'encrypted_content')}
+                result.append(cleaned)
+                continue
+
+            # 其他未知类型：跳过
             continue
 
         role = msg.get("role")

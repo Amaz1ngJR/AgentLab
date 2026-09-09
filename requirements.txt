@@ -9,6 +9,9 @@ pathspec>=0.12
 # 1.27.2 includes Windows executable resolution and process-tree cleanup.
 mcp>=1.27.2
 
+# Code syntax highlighting
+pygments>=2.17.0
+
 # Web search (optional, for web_search tool)
 ddgs>=9.0.0
 requests>=2.31.0

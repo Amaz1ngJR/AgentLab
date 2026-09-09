@@ -22,7 +22,6 @@ import shutil
 import sys
 import threading
 import time
-import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -67,7 +66,9 @@ from app.tools.builtin.interactive import PtySessionManager, make_terminal_tools
 from app.tools.builtin.todo import make_todo_write_tool
 from app.tools.rtk_builtin import BuiltinRTK, format_status as format_rtk_status
 from app.tools.registry import ToolRegistry
+from app.util import markdown as md
 from app.util.redact import format_exception, format_traceback
+from app.util.text import display_width as _display_width, strip_ansi as _strip_ansi
 from app.version import __version__, version_text
 
 _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -80,22 +81,6 @@ def _term_width(default: int = 80) -> int:
         return default
     # 某些 PTY (例如 script 命令) 会返回 0,需要兜底为合理默认
     return cols if cols > 0 else default
-
-
-def _display_width(text: str) -> int:
-    """终端显示宽度：东亚宽字符算 2，其他算 1。
-
-    先剥掉 ANSI 转义(dim 思考流 / 任务面板高亮都带颜色码),否则会把不可见的
-    控制字符算进宽度,导致 footer 擦除时上移行数算错、出现重影。
-    """
-    text = _strip_ansi(text)
-    width = 0
-    for ch in text:
-        if unicodedata.east_asian_width(ch) in ("W", "F"):
-            width += 2
-        else:
-            width += 1
-    return width
 
 
 def _count_visual_lines(text: str, term_width: int) -> int:
@@ -163,8 +148,14 @@ def _colorize(text: str, ansi: str, *, stream=None) -> str:
 
 
 def _model_text(text: str, *, stream=None) -> str:
-    """正式模型输出使用白色，与灰色思考过程区分。"""
-    return _colorize(text, _ANSI_WHITE, stream=stream)
+    """把模型输出按 markdown 渲染成终端文本（正文白色，代码块 VS Code Dark+）。
+
+    非流式路径用；流式路径由 _Spinner 持有的 MarkdownRenderer 增量渲染，两者
+    共用 app.util.markdown 的同一套实现。
+    """
+    if not _supports_color(stream):
+        return text
+    return md.render(text, width_fn=_term_width)
 
 
 def _thinking_text(text: str, *, stream=None) -> str:
@@ -212,6 +203,48 @@ def _truncate_task_reason(reason: str, max_chars: int = 160) -> str:
     return compact
 
 
+def _format_progress_bar(completed: int, total: int, width: int = 20) -> str:
+    """生成进度条字符串。
+
+    Args:
+        completed: 已完成任务数
+        total: 总任务数
+        width: 进度条宽度（字符数）
+
+    Returns:
+        进度条字符串，例如：██████░░░░ 60% (3/5)
+    """
+    if total == 0:
+        return "░" * width + " 0% (0/0)"
+
+    percentage = completed / total
+    filled = int(percentage * width)
+    bar = "█" * filled + "░" * (width - filled)
+    pct_text = f"{int(percentage * 100)}%"
+    count_text = f"({completed}/{total})"
+
+    return f"{bar} {pct_text} {count_text}"
+
+
+def _generate_task_signature(tasks: list) -> str:
+    """生成任务列表的签名，只基于稳定字段（ID、状态、内容），排除时间等变化字段。
+
+    用于去重判断：只有任务真正变化（新增/删除/状态改变）时才重新打印面板。
+    """
+    if not tasks:
+        return ""
+
+    sig_parts = []
+    for t in tasks:
+        task_id = _task_field(t, "id") or ""
+        status = _task_field(t, "status") or "pending"
+        content = _task_field(t, "content") or ""
+        # 只用 id + status + content 前100字符
+        sig_parts.append(f"{task_id}:{status}:{content[:100]}")
+
+    return "|".join(sig_parts)
+
+
 def _format_task_lines(tasks) -> list[str]:
     """把任务列表渲染成多行字符串(已包含 ANSI 颜色)。
 
@@ -220,11 +253,13 @@ def _format_task_lines(tasks) -> list[str]:
 
     格式参考 Claude Code 的任务面板:
         4 tasks (1 done, 1 in progress, 2 open)
-          ✓ workspace 路径限制         (灰色,已完成)
-          ❯ 错误脱敏                    (蓝色加粗,进行中)
-          ○ 工具能力声明                (普通色,待办)
+          ✓ workspace 路径限制         (2.1s)   (灰色,已完成)
+          ❯ 错误脱敏                    (running) (蓝色加粗,进行中)
+          ○ 工具能力声明                (pending) (普通色,待办)
           ⊘ 被阻塞的任务                (黄色,blocked)
           ✗ 失败的任务                  (红色,failed)
+
+        Progress: ██████░░░░ 60% (3/5)
 
         失败/阻塞任务下一行显示有界的 error 原因；未记录时明确提示。
 
@@ -258,10 +293,21 @@ def _format_task_lines(tasks) -> list[str]:
         st = _task_field(t, "status")
         content = _task_field(t, "content")
         content = _truncate_task_content(content)
-        if st == "completed":
-            lines.append(f"  {_ANSI_DIM}✓ {content}{_ANSI_RESET}")
+
+        # 获取任务耗时（如果有）
+        elapsed = _task_field(t, "elapsed_seconds")
+        time_str = ""
+        if elapsed and isinstance(elapsed, (int, float)) and elapsed > 0:
+            time_str = f" ({_fmt_duration(elapsed)})"
         elif st == "in_progress":
-            lines.append(f"  {_ANSI_BLUE_BOLD}❯ {content}{_ANSI_RESET}")
+            time_str = " (running)"
+        elif st == "pending":
+            time_str = " (pending)"
+
+        if st == "completed":
+            lines.append(f"  {_ANSI_DIM}✓ {content}{time_str}{_ANSI_RESET}")
+        elif st == "in_progress":
+            lines.append(f"  {_ANSI_BLUE_BOLD}❯ {content}{time_str}{_ANSI_RESET}")
         elif st == "blocked":
             reason = _truncate_task_reason(_task_field(t, "error"))
             lines.append(f"  {_ANSI_YELLOW}⊘ {content}{_ANSI_RESET}")
@@ -271,15 +317,16 @@ def _format_task_lines(tasks) -> list[str]:
             lines.append(f"  {_ANSI_RED}✗ {content}{_ANSI_RESET}")
             lines.append(f"    {_ANSI_RED}原因: {reason}{_ANSI_RESET}")
         else:
-            lines.append(f"  ○ {content}")
+            lines.append(f"  ○ {content}{time_str}")
+
+    # 添加进度条（仅当有多个任务时）
+    if len(tasks) > 1:
+        completed = counts["completed"]
+        total = len(tasks)
+        progress_bar = _format_progress_bar(completed, total, width=20)
+        lines.append(f"\n  {_ANSI_BOLD}Progress:{_ANSI_RESET} {progress_bar}")
 
     return lines
-
-
-def _strip_ansi(s: str) -> str:
-    """计算显示宽度时要先去掉 ANSI 转义,否则会把控制字符当成可见字符宽度。"""
-    import re
-    return re.sub(r"\033\[[0-9;]*m", "", s)
 
 
 class _Spinner:
@@ -315,6 +362,10 @@ class _Spinner:
         self._tasks_committed = False  # 任务面板每步只提交一次
         self._frame_idx = 0
         self._footer_rows = 0          # 当前 footer 占用的屏幕行数(0 = 未绘制)
+        # 流式 markdown 渲染器：跨 delta 保留代码块/表格/半截行的状态
+        self._md = md.MarkdownRenderer(
+            color=_supports_color(), width_fn=_term_width,
+        )
 
     def __enter__(self) -> "_Spinner":
         self._t0 = time.monotonic()
@@ -326,6 +377,11 @@ class _Spinner:
         self._thread.join(timeout=1.0)
         with self._lock:
             self._erase_footer()
+            # 模型末尾常常不带换行，按行缓冲的最后一行要在这里补出来。
+            trailing = self.flush_pending()
+            if trailing:
+                sys.stdout.write(trailing)
+                self._line_buf += trailing
             self._commit_tasks()
             if self._any_text:
                 # 正文已逐段 append 到历史:补足结尾换行 + 一个空行,不再打摘要
@@ -371,17 +427,28 @@ class _Spinner:
                 sys.stdout.write("\n")
                 self._line_buf = ""
             self._any_text = True
-            styled = _model_text(delta)
-            sys.stdout.write(styled)
-            # 维护"当前未换行尾行":有换行则取最后一段,否则累加到现有尾行。
-            # _line_buf 要保留颜色,因为 footer 重绘时会重新输出这段正文。
-            if "\n" in delta:
-                tail = delta.rsplit("\n", 1)[1]
-                self._line_buf = _model_text(tail) if tail else ""
-            else:
-                self._line_buf += styled
+
+            # 流式语法高亮：可能缓冲整行后才吐出，写出去的长度与 delta 不等
+            styled = self._process_streaming_highlight(delta)
+            if styled:
+                sys.stdout.write(styled)
+                # _line_buf 必须与"屏幕上当前这条未换行的正文"逐字一致 —— footer
+                # 擦除后要靠它原样复原。所以只能按实际写出的 styled 记账；按原始
+                # delta 记会和缓冲错位，重画时把内容重复打一遍。
+                if "\n" in styled:
+                    self._line_buf = styled.rsplit("\n", 1)[1]
+                else:
+                    self._line_buf += styled
             self._draw_footer()
             sys.stdout.flush()
+
+    def _process_streaming_highlight(self, delta: str) -> str:
+        """把流式增量交给共享的 markdown 渲染器。"""
+        return self._md.feed(delta)
+
+    def flush_pending(self) -> str:
+        """吐出渲染器里缓冲的残留（未闭合的表格/代码块、最后一行）。"""
+        return self._md.flush()
 
     def on_thinking(self, delta: str) -> None:
         """流式打印思考(推理)过程,用暗色与正式答案区分。
@@ -450,8 +517,10 @@ class _Spinner:
         if not task_lines:
             return
         # 跨 spinner 去重:面板签名与上次相同则不重复提交
+        # 签名只基于任务状态和内容，排除会变化的时间字段
         if self._panel_state is not None:
-            signature = "\n".join(task_lines)
+            tasks = self._task_store.all() if self._task_store else []
+            signature = _generate_task_signature(tasks)
             if signature == self._panel_state.get("last"):
                 return
             self._panel_state["last"] = signature
@@ -813,7 +882,7 @@ def _print_event(ev: TurnEvent) -> None:
             _render_edit_file(ev.tool_input or {})
         elif ev.tool_name == "shell":
             _snapshot_shell_targets(ev.tool_input or {})
-        print(_approval_text(f"  ! tool_use {ev.tool_name}({_fmt(ev.tool_input)})"), flush=True)
+        # 不在这里打印 tool_use，审批对话框会显示详细信息
     elif ev.kind == "tool_result":
         preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
         tag = "ERR" if ev.tool_error else "ok"
@@ -863,10 +932,8 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
             _snapshot_shell_targets(ev.tool_input or {})
     elif kind == run_events.APPROVAL_REQUIRED:
         action = ev.payload.get("approval_action") or ev.tool_name
-        # write_file/edit_file 已经显示了 diff，不需要再打印 tool_use 信息
-        if ev.tool_name not in ("write_file", "edit_file"):
-            detail = f"  ! tool_use {action}: {ev.tool_name}({_fmt(ev.tool_input)})"
-            print(_approval_text(detail), flush=True)
+        # 审批对话框会显示详细信息，这里不再重复打印
+        pass
     elif kind == run_events.TOOL_COMPLETED:
         preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
         tag = "ERR" if ev.tool_error else "ok"
@@ -1043,17 +1110,104 @@ def _handle_context_command(session: AgentSession, line: str) -> str:
             "disable-auto-compact / enable-auto-compact").format(sub)
 
 
+# 可调采样参数的元数据。补全提示、/model param 列表、/model current 详情三处
+# 共用这一份，避免各写一份说明之后慢慢分叉。
+_MODEL_PARAM_SPECS = {
+    "temperature": {
+        "summary": "采样温度 0.0-2.0：越低越确定、越高越发散",
+        "detail": (
+            "控制每一步挑选下一个词时的随机程度。调低会让模型总是选它最有把握的\n"
+            "     词，同一个问题反复问答案基本一致，适合写代码、翻译、抽取结构化数据；\n"
+            "     调高会让低概率的词也有机会被选中，适合起名、头脑风暴、创意写作。"
+        ),
+        "values": [
+            ("0.0", "确定性输出，适合代码/翻译/数据抽取"),
+            ("0.2", "严谨，少发挥（推荐写代码）"),
+            ("0.5", "平衡"),
+            ("0.7", "偏创造性，措辞更多变"),
+            ("1.0", "发散，适合头脑风暴"),
+        ],
+        "describe": lambda v: (
+            "几乎确定性，同问题答案高度一致" if v <= 0.1 else
+            "严谨保守，少自由发挥" if v <= 0.35 else
+            "平衡" if v <= 0.6 else
+            "偏创造性，措辞更多变" if v <= 0.9 else
+            "发散，输出随机性高"
+        ),
+    },
+    "top_p": {
+        "summary": "核采样 0.0-1.0：每步只从累计概率前 p 的候选里选",
+        "detail": (
+            "先把候选词按概率从高到低排，累加到 p 为止，只在这个集合里采样，剩下的\n"
+            "     长尾直接排除。0.9 表示只考虑累计概率前 90% 的候选。和 temperature\n"
+            "     作用相近（都在控制多样性），官方建议二选一调，同时调容易叠加、效果难预期。"
+        ),
+        "values": [
+            ("0.5", "只保留最有把握的少数候选，非常保守"),
+            ("0.9", "裁掉长尾（常用默认）"),
+            ("0.95", "略放开"),
+            ("1.0", "不裁剪，全部候选参与"),
+        ],
+        "describe": lambda v: (
+            "不裁剪，全部候选参与" if v >= 0.999 else
+            "略放开" if v >= 0.94 else
+            "裁掉长尾（常用）" if v >= 0.85 else
+            "只保留少数高概率候选，很保守"
+        ),
+    },
+    "reasoning_effort": {
+        "summary": "推理强度：越高思考越充分，也越慢越贵",
+        "detail": (
+            "OpenAI Responses API 的 reasoning.effort。调高会让模型在给出答案前做更多\n"
+            "     内部推理，复杂任务正确率更高，代价是延迟和 token 消耗显著上升；简单问答\n"
+            "     调低更划算。具体支持范围随网关/模型版本变化。"
+        ),
+        "values": [
+            ("none", "不做额外推理，最快最省"),
+            ("minimal", "极少推理"),
+            ("low", "少量推理，适合简单问答"),
+            ("medium", "中等推理（平衡）"),
+            ("high", "推理充分，适合复杂任务"),
+            ("xhigh", "极高推理，明显更慢"),
+            ("max", "最大推理，最慢最贵"),
+        ],
+        "describe": lambda v: dict(
+            none="不做额外推理，最快最省",
+            minimal="极少推理",
+            low="少量推理，适合简单问答",
+            medium="中等推理（平衡）",
+            high="推理充分，适合复杂任务",
+            xhigh="极高推理，明显更慢",
+            max="最大推理，最慢最贵",
+        ).get(str(v), ""),
+    },
+}
+
+
+def _describe_param(key: str, value) -> str:
+    """把参数当前值翻译成一句人话，说明它对输出的实际影响。"""
+    spec = _MODEL_PARAM_SPECS.get(key)
+    if spec is None or value is None:
+        return ""
+    try:
+        return spec["describe"](value)
+    except Exception:
+        return ""
+
+
 def _handle_model_command(router: SessionRouter, line: str) -> str:
     """处理 /model 命令族。
 
-      /model                  列出所有配置的模型
-      /model list             列出所有配置的模型
-      /model current          显示当前使用的模型详情
-      /model switch <profile> 切换到指定模型
+      /model                       列出所有配置的模型
+      /model list                  列出所有配置的模型
+      /model current               显示当前使用的模型详情
+      /model switch <profile>      切换到指定模型
+      /model param <key> <value>   调整当前会话的模型参数
+      /model param                 显示可调参数列表
     """
-    from app.config.loader import load_profiles
+    from app.config.loader import load_profiles, load_config
 
-    parts = line.split(maxsplit=2)
+    parts = line.split(maxsplit=3)
     sub = parts[1].strip() if len(parts) > 1 else "list"
 
     # /model 或 /model list - 列出所有配置的模型
@@ -1113,25 +1267,32 @@ def _handle_model_command(router: SessionRouter, line: str) -> str:
         llm = session.llm
         lines = ["当前模型配置:"]
         lines.append("")
-        lines.append(f"  profile    : {getattr(llm, 'profile_name', '未知')}")
-        lines.append(f"  provider   : {getattr(llm, 'provider', '未知')}")
-        lines.append(f"  model      : {getattr(llm, 'model', '未知')}")
+        lines.append(f"  profile    : {getattr(llm, 'profile_name', None) or '未知'}")
+        lines.append(f"  provider   : {getattr(llm, 'provider', None) or '未知'}")
+        lines.append(f"  model      : {getattr(llm, 'model', None) or '未知'}")
 
         base_url = getattr(llm, 'base_url', None)
         if base_url:
             lines.append(f"  base_url   : {base_url}")
 
-        temperature = getattr(llm, 'temperature', None)
-        if temperature is not None:
-            lines.append(f"  temperature: {temperature}")
-
-        reasoning_effort = getattr(llm, 'reasoning_effort', None)
-        if reasoning_effort:
-            lines.append(f"  reasoning  : {reasoning_effort}")
-
         context_size = getattr(llm, 'context_size', None)
         if context_size:
             lines.append(f"  context    : {context_size} tokens")
+
+        # 采样参数：带上"这个值意味着什么"，否则光看数字判断不了要不要调
+        sampling = [
+            ("temperature", getattr(llm, 'temperature', None)),
+            ("top_p", getattr(llm, 'top_p', None)),
+            ("reasoning_effort", getattr(llm, 'reasoning_effort', None)),
+        ]
+        shown = [(key, value) for key, value in sampling if value is not None]
+        if shown:
+            lines.append("")
+            lines.append("采样参数 (可用 /model param 调整):")
+            for key, value in shown:
+                note = _describe_param(key, value)
+                suffix = f"  — {note}" if note else ""
+                lines.append(f"  {key:<16} = {value}{suffix}")
 
         # 显示使用统计
         if hasattr(session, 'cumulative_usage'):
@@ -1157,26 +1318,153 @@ def _handle_model_command(router: SessionRouter, line: str) -> str:
                 available = ", ".join(sorted(profiles.keys()))
                 return f"未找到 profile '{target_profile}'。\n可用: {available}"
 
-            # 切换模型需要重建 session
-            # 这里我们通过设置环境变量并提示用户重启来实现
-            # 因为动态切换模型涉及重建整个 LLM 实例和 session
+            # 立即切换当前会话的模型
+            if router.current is None:
+                # 没有活跃会话，只设置环境变量
+                import os
+                os.environ["ACTIVE_PROFILE"] = target_profile
+                return (
+                    f"已设置 ACTIVE_PROFILE={target_profile}\n"
+                    f"\n"
+                    f"模型切换将在新建 session 时生效。建议:\n"
+                    f"  /session new - 新建使用新模型的会话"
+                )
+
+            # 有活跃会话，立即切换
+            from app.agent.context_budget import ContextBudget
+            from app.agent.context import ContextCompressor
+            from app.agent.planner import Planner
+
+            # 加载目标 profile 的完整配置（包括认证信息）
+            target_cfg = load_config(profile_name=target_profile)
+
+            # 构建新的 ModelRouter
+            new_llm = build_model_router(target_cfg)
+
+            # 构建新的 Planner（如果当前会话启用了编排）
+            new_planner = None
+            if router.current._orchestrate:
+                new_planner = Planner(new_llm)
+
+            # 切换模型
+            router.current.switch_model(new_llm, new_planner)
+
+            # 更新上下文管理器的预算和压缩器
+            if router.current.context_manager is not None:
+                new_budget = ContextBudget.from_model(
+                    model=target_cfg.model,
+                    declared_context_size=target_cfg.context_size,
+                )
+                new_compressor = ContextCompressor(
+                    new_llm,
+                    model_profile=target_cfg.profile_name or ""
+                )
+                router.current.context_manager.budget = new_budget
+                router.current.context_manager._compressor = new_compressor
+
+            # 更新环境变量，影响后续新建的会话
             import os
             os.environ["ACTIVE_PROFILE"] = target_profile
 
+            # 持久化当前会话状态
+            router.persist_current()
+
             return (
-                f"已设置 ACTIVE_PROFILE={target_profile}\n"
+                f"✓ 已将当前会话切换到 {target_profile}\n"
+                f"  模型: {target_cfg.model}\n"
+                f"  提供商: {target_cfg.provider}\n"
                 f"\n"
-                f"模型切换将在新建 session 时生效。建议:\n"
-                f"  1. /session new      - 新建使用新模型的会话\n"
-                f"  2. 或重启 agentlab   - 全局切换到新模型\n"
-                f"\n"
-                f"注: 当前会话仍使用原有模型。"
+                f"历史消息已转换为跨模型兼容格式，可以继续对话。"
             )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return f"切换模型失败: {e}"
 
+    # /model param [<key> <value>] - 查看或调整当前会话的模型参数
+    elif sub == "param":
+        if not router.current:
+            return "当前无活跃 session。用 /session new 创建。"
+
+        if not hasattr(router.current, 'llm'):
+            return "当前 session 没有 LLM 配置。"
+
+        llm = router.current.llm
+        adapter = llm._adapter
+        if not hasattr(adapter, "_cfg"):
+            return "当前 LLM 不支持动态参数调整。"
+
+        cfg = adapter._cfg
+
+        # 无参数：显示可调参数列表
+        if len(parts) < 3:
+            current = {
+                "temperature": cfg.temperature,
+                "top_p": cfg.top_p,
+                "reasoning_effort": cfg.reasoning_effort,
+            }
+            lines = ["可调整的模型参数（只影响当前会话，不写回 models.yaml）:"]
+            for key, spec in _MODEL_PARAM_SPECS.items():
+                value = current.get(key)
+                lines.append("")
+                shown = "（未设置）" if value is None else value
+                note = _describe_param(key, value)
+                suffix = f"  — {note}" if note else ""
+                lines.append(f"  {key} = {shown}{suffix}")
+                lines.append(f"     {spec['summary']}")
+                lines.append(f"     {spec['detail']}")
+            lines.append("")
+            lines.append("用法: /model param <key> <value>    例: /model param temperature 0.2")
+            return "\n".join(lines)
+
+        # 有参数：解析并更新
+        if len(parts) < 4:
+            return (
+                f"缺少取值。用法: /model param {parts[2].strip()} <value>\n"
+                f"用 /model param 查看每个参数的取值范围和含义。"
+            )
+
+        key = parts[2].strip().lower()
+        value_str = parts[3].strip()
+        if key not in _MODEL_PARAM_SPECS:
+            return f"未知参数: {key}。可用: {', '.join(_MODEL_PARAM_SPECS)}"
+
+        def _applied(name: str, value) -> str:
+            note = _describe_param(name, value)
+            old = describe_before or "未设置"
+            tail = f"\n  {note}" if note else ""
+            return f"✓ {name}: {old} → {value}{tail}"
+
+        if key == "reasoning_effort":
+            allowed = [v for v, _ in _MODEL_PARAM_SPECS[key]["values"]]
+            value = value_str.lower()
+            if value not in allowed:
+                return f"无效的 reasoning_effort。可用: {', '.join(allowed)}"
+            describe_before = cfg.reasoning_effort
+            cfg.reasoning_effort = value
+            router.persist_current()
+            return _applied(key, value)
+
+        try:
+            value = float(value_str)
+        except ValueError:
+            return f"无效的数值: {value_str}"
+
+        if key == "temperature":
+            if not 0.0 <= value <= 2.0:
+                return "temperature 必须在 0.0 到 2.0 之间。"
+            describe_before = cfg.temperature
+            cfg.temperature = value
+        else:  # top_p
+            if not 0.0 <= value <= 1.0:
+                return "top_p 必须在 0.0 到 1.0 之间。"
+            describe_before = cfg.top_p
+            cfg.top_p = value
+        router.persist_current()
+        return _applied(key, value)
+
     else:
-        return f"未知子命令: {sub}。可用: list / current / switch"
+        return f"未知子命令: {sub}。可用: list / current / switch / param"
 
 
 def _check_local_endpoint(cfg) -> None:
@@ -1538,6 +1826,14 @@ def _normalize_model_id(name: str | None) -> str:
     return name.lower().replace(".", "-").replace("_", "-")
 
 
+def _print_turn_separator() -> None:
+    """打印对话轮次之间的分隔线。"""
+    width = _term_width()
+    # 使用细线字符和暗色
+    separator = _ANSI_DIM + "─" * width + _ANSI_RESET
+    print(separator, flush=True)
+
+
 def _print_stats(session: AgentSession) -> None:
     t, c = session.last_turn_usage, session.cumulative_usage
     print(
@@ -1558,6 +1854,8 @@ def _print_stats(session: AgentSession) -> None:
             f"代理可能把请求的模型名映射到了别的真实模型。",
             file=sys.stderr,
         )
+    # 打印轮次分隔线
+    _print_turn_separator()
 
 
 _PROMPT_STYLE = Style.from_dict({
@@ -1627,6 +1925,7 @@ _MODEL_SUBCOMMANDS = {
     "list": "列出所有配置的模型",
     "current": "显示当前使用的模型详情",
     "switch": "切换到指定模型",
+    "param": "调整当前会话的模型参数",
 }
 
 
@@ -1719,6 +2018,25 @@ class _SlashCompleter(Completer):
                                            display_meta=desc)
                 except Exception:
                     pass
+            # ── 第三级:/model param <key> [<value>] 的参数 ──
+            elif len(parts) >= 2 and parts[1] == "param":
+                # 参数名与取值说明都取自 _MODEL_PARAM_SPECS，与 /model param
+                # 的输出共用一份，避免补全提示和实际说明对不上。
+                if len(parts) == 2 or (len(parts) == 3 and not text.endswith(" ")):
+                    param_prefix = parts[2] if len(parts) == 3 else ""
+                    for name, spec in _MODEL_PARAM_SPECS.items():
+                        if name.startswith(param_prefix):
+                            yield Completion(name, start_position=-len(param_prefix),
+                                             display_meta=spec["summary"])
+                elif len(parts) >= 3:
+                    spec = _MODEL_PARAM_SPECS.get(parts[2].strip().lower())
+                    if spec is None:
+                        return
+                    value_prefix = parts[3] if (len(parts) == 4 and not text.endswith(" ")) else ""
+                    for value, desc in spec["values"]:
+                        if value.startswith(value_prefix):
+                            yield Completion(value, start_position=-len(value_prefix),
+                                             display_meta=desc)
             return
 
         # ── 第二级:/session 子命令 ──

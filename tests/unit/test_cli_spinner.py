@@ -85,11 +85,20 @@ def test_format_task_lines_summary_and_items():
     assert "1 done" in _strip_ansi(lines[0])
     assert "1 in progress" in _strip_ansi(lines[0])
     assert "1 open" in _strip_ansi(lines[0])
-    # 后续是各任务,1 个 + 3 个 = 4 行
-    assert len(lines) == 4
+    # 汇总 1 行 + 任务 3 行 + 进度条 1 行
+    assert len(lines) == 5
     assert "✓ first" in _strip_ansi(lines[1])
     assert "❯ second" in _strip_ansi(lines[2])
     assert "○ third" in _strip_ansi(lines[3])
+    # 多任务时末尾带进度条，单任务不带(见下一个用例)
+    assert "Progress:" in _strip_ansi(lines[4])
+    assert "(1/3)" in _strip_ansi(lines[4])
+
+
+def test_format_task_lines_omits_progress_bar_for_single_task():
+    """单任务画进度条只是噪音，面板要保持安静。"""
+    lines = _format_task_lines([Task("1", "only", IN_PROGRESS)])
+    assert not any("Progress:" in _strip_ansi(line) for line in lines)
 
 
 def test_failed_and_blocked_tasks_show_reason():

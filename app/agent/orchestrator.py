@@ -35,6 +35,42 @@ from app.tools.registry import ToolRegistry
 ProgressFn = Callable[[str], ContextManager[Any]]
 
 
+def _extract_skill_context(system_prompt: str) -> str:
+    """从完整 system prompt 中提取 skill 相关片段，供 Planner 使用。
+
+    只提取 skill/workflow 部分，过滤掉 MCP 服务器列表、记忆等其他内容，
+    避免 Planner 接收到重复的基础指令和大量无关上下文。
+    """
+    if not system_prompt:
+        return ""
+
+    # 查找 skill 相关的标记性片段（根据 SkillCatalog.build_skill_context 的输出格式）
+    lines = system_prompt.split("\n")
+    skill_lines = []
+    in_skill_section = False
+
+    for line in lines:
+        # 检测 skill 章节开始（典型标记：## Available skills / # User-invocable skills）
+        if any(marker in line.lower() for marker in [
+            "available skills", "user-invocable skills", "技能列表", "可用技能"
+        ]):
+            in_skill_section = True
+            skill_lines.append(line)
+            continue
+
+        # 如果在 skill 章节内
+        if in_skill_section:
+            # 检测章节结束（遇到新的一级/二级标题，但不是 skill 相关的）
+            if line.startswith("#") and not any(marker in line.lower() for marker in [
+                "skill", "workflow", "技能", "工作流"
+            ]):
+                in_skill_section = False
+                continue
+            skill_lines.append(line)
+
+    return "\n".join(skill_lines).strip()
+
+
 class Orchestrator:
     """编排一次(或多次)目标的规划—执行—重规划。"""
 
@@ -187,12 +223,12 @@ class Orchestrator:
             self._maybe_compact(self._tools_for_task(goal))
             with self._progress("planning") as handle:
                 on_progress = getattr(handle, "update", None)
+                # 提取 skill 相关内容传给 Planner，让它能按 skill 指示拆任务。
+                # 只传 skill 片段，避免重复传递 MCP 服务器列表、记忆等完整 system。
+                skill_context = _extract_skill_context(self._system)
                 plan = self._planner.create_plan(
                     goal,
-                    # Planner 已有独立、严格的 PLANNER_SYSTEM。把完整执行 system
-                    # （含 Skills/MCP/记忆，实测可多出数千 token）再塞进 user prompt
-                    # 会重复上下文，导致 planning 一开始就显示 3.9k 输入 token。
-                    context="",
+                    context=skill_context,
                     on_progress=on_progress,
                 )
         except Cancelled:

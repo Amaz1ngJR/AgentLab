@@ -73,20 +73,39 @@ class TestModelCommand:
         # 应该提示没有活跃 session
         assert "当前无活跃" in result or "无活跃 session" in result
 
-    def test_model_switch_command_valid_profile(self):
-        """测试 /model switch 命令（有效的 profile）"""
+    def test_model_switch_without_session_sets_env_only(self):
+        """没有活跃 session 时只能设 ACTIVE_PROFILE，留给下一个新建的会话生效。"""
         mock_router = Mock()
+        mock_router.current = None
 
-        # 获取一个实际存在的 profile
         profiles = load_profiles()
         valid_profile = list(profiles.keys())[0]
 
         result = _handle_model_command(mock_router, f"/model switch {valid_profile}")
 
-        # 应该提示设置成功
         assert "已设置 ACTIVE_PROFILE" in result
         assert valid_profile in result
-        assert "新建 session" in result
+        assert "session new" in result
+
+    def test_model_switch_swaps_model_in_current_session(self):
+        """有活跃 session 时当场换掉模型，不再要求用户重启或新建会话。"""
+        mock_router = Mock()
+        mock_router.current._orchestrate = False
+        mock_router.current.context_manager = None
+
+        profiles = load_profiles()
+        valid_profile = list(profiles.keys())[0]
+
+        with patch("app.cli.build_model_router") as build_router:
+            result = _handle_model_command(
+                mock_router, f"/model switch {valid_profile}",
+            )
+
+        build_router.assert_called_once()
+        mock_router.current.switch_model.assert_called_once()
+        mock_router.persist_current.assert_called_once()
+        assert valid_profile in result
+        assert "当前会话" in result
 
     def test_model_switch_command_invalid_profile(self):
         """测试 /model switch 命令（无效的 profile）"""

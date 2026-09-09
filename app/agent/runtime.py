@@ -221,6 +221,46 @@ class AgentSession:
                     pass
         self._closeables = []
 
+    def switch_model(self, new_llm: ModelRouter, new_planner: Optional[Any] = None) -> None:
+        """在当前会话中切换到新模型，转换历史消息格式以保证兼容性。
+
+        Args:
+            new_llm: 新的 ModelRouter 实例
+            new_planner: 新的 Planner 实例（如果启用了编排模式）
+        """
+        from app.models.history import make_history_portable
+
+        # 转换历史消息为跨模型兼容的格式
+        if self.messages:
+            self.messages[:] = make_history_portable(self.messages)
+
+        # 关闭旧的 LLM 客户端
+        old_llm = self.llm
+        close_fn = getattr(old_llm, "close", None)
+        if close_fn is not None:
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+        # 更新 LLM 和 Planner
+        self.llm = new_llm
+        if new_planner is not None:
+            self._planner = new_planner
+
+        # 如果已有编排器，重建它以使用新的 LLM 和 Planner
+        if self._orch is not None:
+            self._orch = None  # 下次调用时会用新的 llm/planner 重建
+
+        # 重置上下文管理器（如果有）以避免缓存旧模型的 token 计数
+        if self.context_manager is not None:
+            reset_fn = getattr(self.context_manager, "reset", None)
+            if reset_fn is not None:
+                try:
+                    reset_fn()
+                except Exception:
+                    pass
+
     def reset(self) -> None:
         # 就地清空 messages(而非重新赋值),保持 Orchestrator 共享的引用有效
         self.messages.clear()

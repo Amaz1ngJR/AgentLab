@@ -4,18 +4,35 @@
 # 启动后用 /session new <agent_id> 创建该 Agent 的会话。
 # 文件不存在时程序照常启动（使用默认 Agent）。
 #
+# 配置说明：
+#
+# model_profile:
+#   对应 config/models.yaml 中定义的模型 profile，例如：
+#   - cloud_claude_opus（Claude Opus 5，适合复杂任务）
+#   - local_qwen3_14b（本地 Qwen3 14B，快速响应）
+#   - siliconflow（硅基流动，多种云端模型）
+#   - gpt_official（OpenAI GPT）
+#
 # memory_policy:
 #   none        - 不使用长期记忆（默认，最安全）
 #   read        - 会话开始时检索相关记忆注入上下文，不写入
 #   read_write  - 会话结束时将摘要写入记忆，下次可检索
-
+#
 # orchestrate:
-#   true  - 使用 Planner + Executor + Replanner 编排（默认）
-#   false - 使用传统单轮模型/工具循环
+#   true  - 使用 Planner + Executor + Replanner 编排，自动拆分复杂任务（推荐）
+#   false - 使用传统单轮模型/工具循环，适合简单对话
 #
 # max_steps / max_task_steps:
-#   max_steps      - 一次用户 run 的模型往返总预算
-#   max_task_steps - 单个 Planner 子任务的模型往返上限
+#   max_steps      - 一次用户请求的模型往返总预算
+#   max_task_steps - 单个子任务的模型往返上限（仅编排模式有效）
+#
+# skills:
+#   显式启用的 Skill 列表（对应 skills/ 目录下的 skill）
+#   例如：[code-review, git-commit]
+#   只注入工作流上下文，不授予额外工具权限
+#
+# system_prompt:
+#   覆盖默认的 system prompt，可定制 Agent 的行为风格
 
 agents:
 
@@ -25,30 +42,57 @@ agents:
     model_profile: cloud_claude_opus
     memory_policy: none
     orchestrate: true
-    # max_steps 是一次用户 run 的模型往返总预算（保留旧名称兼容已有配置），
-    # max_task_steps 是单个 Planner 子任务最多允许的模型往返次数。
     max_steps: 16
     max_task_steps: 8
+    skills: []
 
-  # 代码助手——专注于代码阅读、搜索和修改
+  # 代码助手——专注于代码审查、重构和测试
   coder:
     name: 代码助手
-    model_profile: cloud_claude
+    model_profile: cloud_claude_opus
     system_prompt: |
-      你是一个专注于代码的助手。优先用 code_search 定位代码，read_file 精读，
-      shell 运行测试。写代码简洁优先，改动最小化，不要过度重构。
-    tools: []          # 空列表 = 使用全部内置工具
-    skills: [code-review]   # 显式启用的 Skill;只注入工作流上下文,不授予工具权限
+      你是一个专注于代码质量的助手。工作原则：
+      1. 优先用搜索工具定位相关代码，精读后再修改
+      2. 改动最小化，不做无关重构
+      3. 修改后立即运行测试验证
+      4. 代码风格与项目现有代码保持一致
+    skills: [code-review, git-commit]
     memory_policy: read_write
     orchestrate: true
     max_steps: 100
     max_task_steps: 50
 
-  # 本地轻量助手——使用本地模型，不发数据到云端
+  # 本地助手——使用本地模型，数据不出本机
   local:
     name: 本地助手
-    model_profile: local_qwen
+    model_profile: local_qwen3_14b
     memory_policy: none
     orchestrate: true
     max_steps: 16
     max_task_steps: 8
+    skills: []
+
+  # 研究助手——擅长信息检索和分析
+  researcher:
+    name: 研究助手
+    model_profile: cloud_claude_opus
+    system_prompt: |
+      你是一个研究助手。工作流程：
+      1. 先阅读项目相关文档和代码，理解背景
+      2. 使用搜索工具查找相关资料
+      3. 整理信息，给出结构化的分析报告
+      4. 引用来源，保持客观
+    skills: []
+    memory_policy: read_write
+    orchestrate: true
+    max_steps: 32
+    max_task_steps: 16
+
+  # 快速助手——简单任务，快速响应
+  quick:
+    name: 快速助手
+    model_profile: siliconflow
+    memory_policy: none
+    orchestrate: false  # 不拆分任务，直接执行
+    max_steps: 8
+    skills: []

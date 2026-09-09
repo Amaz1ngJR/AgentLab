@@ -42,6 +42,18 @@ class ModelRouter:
         return getattr(getattr(self._adapter, "_cfg", None), "reasoning_effort", None)
 
     @property
+    def top_p(self) -> float | None:
+        return getattr(getattr(self._adapter, "_cfg", None), "top_p", None)
+
+    @property
+    def profile_name(self) -> str | None:
+        return getattr(getattr(self._adapter, "_cfg", None), "profile_name", None)
+
+    @property
+    def context_size(self) -> int | None:
+        return getattr(getattr(self._adapter, "_cfg", None), "context_size", None)
+
+    @property
     def capabilities(self) -> list[str]:
         return list(getattr(getattr(self._adapter, "_cfg", None), "capabilities", []) or [])
 

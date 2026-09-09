@@ -1,15 +1,6 @@
 models:
 
   # ── 本地模型（Ollama）────────────────────────────────────────────────────────
-  local_qwen:
-    provider: ollama
-    model: qwen2.5-coder:7b-instruct
-    base_url: http://127.0.0.1:11434/v1
-    capabilities: [chat, tools]
-    params:
-      temperature: 0.2
-      context_size: 8192
-
   local_qwen3_14b:
     provider: ollama
     model: qwen3:14b
@@ -19,39 +10,11 @@ models:
       temperature: 0.6
       context_size: 8192
 
-  local_deepseek:
-    provider: ollama
-    model: deepseek-r1:7b
-    base_url: http://127.0.0.1:11434/v1
-    capabilities: [chat]
-    params:
-      temperature: 0.6
-      context_size: 8192
-
-  # 局域网 GPU 主机（5060Ti）：把 base_url 改成主机 IP
-  lan_qwen:
-    provider: ollama
-    model: qwen2.5-coder:7b-instruct
-    base_url: http://192.168.1.20:11434/v1
-    capabilities: [chat, tools]
-    params:
-      temperature: 0.2
-      context_size: 8192
 
   # ── 云端模型（Anthropic Claude）──────────────────────────────────────────────
   # 凭据从环境变量读取，不写在这里。
   # 走自建代理时设置 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL；
   # 直连官方时设置 ANTHROPIC_API_KEY。
-  cloud_claude:
-    provider: anthropic
-    model: ${ANTHROPIC_MODEL:-claude-sonnet-4-6}
-    auth_token_env: ANTHROPIC_AUTH_TOKEN
-    api_key_env: ANTHROPIC_API_KEY
-    base_url_env: ANTHROPIC_BASE_URL
-    capabilities: [chat, tools, vision]
-    params:
-      temperature: 0.2
-
   cloud_claude_opus:
     provider: anthropic
     model: ${ANTHROPIC_MODEL:-claude-opus-5}
@@ -76,23 +39,6 @@ models:
     params:
       temperature: 0.2
 
-  # ── 阿里云百炼 DashScope（OpenAI 兼容）────────────────────────────────────────
-  # 协议同 OpenAI Chat Completions，走 openai_compatible adapter，无需改代码。
-  # 凭据：把 API Key 放进 .env 的 DASHSCOPE_API_KEY，不要写在这里。
-  # base_url 用百炼控制台给出的 compatible-mode 端点（每个部署的子域名不同）。
-  # 模型 ID 可用 DASHSCOPE_MODEL 覆盖（如 qwen3.7-max / qwen-max / qwen-plus）。
-  # enable_thinking: 深度思考模型在作答前会先流式输出推理过程（reasoning_content），
-  #   CLI 会用暗色实时展示；可用 LLM_ENABLE_THINKING=false 临时关闭。
-  aliyun_qwen:
-    provider: openai_compatible
-    model: ${DASHSCOPE_MODEL:-qwen3.7-max}
-    base_url: https://llm-65vyj4p0lgbyd0vp.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
-    api_key_env: DASHSCOPE_API_KEY
-    capabilities: [chat, tools]
-    params:
-      temperature: 0.2
-      enable_thinking: true
-
   # ── OpenAI 官方 GPT 模型（GPT-3.5 （gpt-3.5-turbo）/ GPT-5 （gpt-5））────────────────────────────────────
   gpt_official:
     provider: openai
@@ -105,7 +51,7 @@ models:
       temperature: 0.2
 
   # ── CRS 网关 GPT 模型（gpt-5.6-sol）──────────────────────────────────────────
-  # 使用内部 CRS 网关访问 GPT-5.6-sol 模型，采用 OpenAI Responses API 格式
+  # 使用内部 CRS 网关访问 GPT-5.6-sol/claude-fable-5 模型，采用 OpenAI Responses API 格式
   crs_gpt:
     provider: openai
     model: gpt-5.6-sol

@@ -19,6 +19,78 @@ from app.models.token_progress import StreamingTokenProgress
 from app.models.stream_normalizer import StreamDeltaNormalizer
 from app.models.protocol import (
     ModelResponse,
+    ToolCall,
+    ToolResult,
+    ProgressCallback,
+    TextDeltaCallback,
+    ThinkingDeltaCallback,
+)
+
+
+def _clean_messages_for_openai_compatible(messages: list[dict]) -> list[dict]:
+    """清理消息，确保跨模型会话兼容（处理从 Anthropic/OpenAI Responses API 切换过来的历史）。
+
+    兼容策略：
+    - 跳过 OpenAI Responses API 特有格式（type: reasoning/function_call/function_call_output）
+    - 保留标准 OpenAI Chat Completions 格式（role: user/assistant/system/tool）
+    - 处理 Anthropic 格式的 content blocks
+    """
+    result = []
+    for msg in messages:
+        # 如果有 type 字段，说明是 OpenAI Responses API 格式或其他非标准格式
+        if "type" in msg:
+            msg_type = msg.get("type")
+            # reasoning/function_call/function_call_output 等都跳过
+            # message 类型需要转换为标准 Chat Completions 格式
+            if msg_type == "message":
+                # 提取 role 和 content
+                role = msg.get("role")
+                content = msg.get("content", [])
+                if isinstance(content, list) and content:
+                    # 提取文本内容
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get("type") in ("output_text", "input_text"):
+                                text_parts.append(item.get("text", ""))
+                            elif item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                    if text_parts:
+                        result.append({"role": role, "content": " ".join(text_parts)})
+            continue
+
+        # 标准格式：有 role 字段
+        role = msg.get("role")
+        if not role:
+            continue
+
+        # 处理 Anthropic content blocks 格式
+        content = msg.get("content")
+        if isinstance(content, list):
+            # Anthropic 格式的 content blocks
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "image":
+                        # 图片转为 data URL
+                        try:
+                            data_url = image_block_to_data_url(block)
+                            text_parts.append(f"[Image: {data_url[:50]}...]")
+                        except Exception:
+                            text_parts.append("[Image]")
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            if text_parts:
+                result.append({"role": role, "content": " ".join(text_parts)})
+        else:
+            # 简单文本格式，直接保留
+            result.append(msg)
+
+    return result
+
+    ModelResponse,
     ProgressCallback,
     TextDeltaCallback,
     ThinkingDeltaCallback,
@@ -175,8 +247,11 @@ class OpenAICompatibleAdapter:
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
     ) -> ModelResponse:
+        # 清理历史消息，确保跨模型会话兼容
+        cleaned_messages = _clean_messages_for_openai_compatible(messages)
+
         # OpenAI-compatible 接口把 system 放在 messages 里（role=system）
-        all_messages = list(messages)
+        all_messages = list(cleaned_messages)
         if system and not any(m.get("role") == "system" for m in all_messages):
             all_messages = [{"role": "system", "content": system}] + all_messages
 
