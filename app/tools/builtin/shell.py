@@ -4,7 +4,7 @@
   Agent 需要跑测试、查 git 状态、构建项目等"系统命令"时调用。
 
 安全约束:
-  - requires_approval=True,每次执行前用户必须显式同意(默认行为;-y 模式跳过)
+  - requires_approval=True,首次执行需同意;交互策略可按安全命令前缀记住到 Session
   - cwd 默认是 workspace;指定外部 cwd 时使用独立的越界审批
   - timeout 默认 30s,超时后子进程被杀掉
   - 输出先经过 AgentLab 内置 RTK 风格过滤器（无需外部二进制），失败时回退原文
@@ -164,7 +164,7 @@ SHELL = Tool(
     target_type="process",
     scope="workspace_or_approved_external",
     origin="builtin",
-    requires_approval=True,  # shell 命令属于高风险操作,默认强制审批
+    requires_approval=True,  # 默认审批；会话策略可在执行前匹配已授权的安全前缀
     approval_resolver=lambda args: _outside_workspace_approval(
         "shell",
         args,

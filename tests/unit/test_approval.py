@@ -86,6 +86,39 @@ def test_interactive_header_includes_tool_context():
     assert [c[1] for c in captured["choices"]] == ["yes", "always", "modify", "no"]
 
 
+def test_terminal_send_approval_shows_complete_input_without_truncation():
+    captured = {}
+    command = "pid=$(pgrep -xo MediaServer); " + "echo complete-command; " * 30
+
+    def fake_menu(choices, header_lines, title, **_):
+        captured["header_lines"] = header_lines
+        return "no"
+
+    descriptor = ToolDescriptor(
+        name="terminal_send",
+        description="send",
+        input_schema={"type": "object", "properties": {}},
+        executor=lambda _: "ok",
+        risk="execute",
+        target_type="terminal_session",
+        scope="session",
+        origin="builtin",
+        requires_approval=True,
+    )
+    with patch("app.util.menu.select_menu", side_effect=fake_menu):
+        InteractivePolicy().request_tool(
+            descriptor,
+            "terminal_send",
+            {"session_id": "term-1", "input": command, "enter": True, "idle": 1},
+        )
+
+    preview = "\n".join(captured["header_lines"])
+    assert command in preview
+    assert "..." not in preview
+    assert "session_id: \"term-1\"" in preview
+    assert "enter: true" in preview
+
+
 def test_outside_workspace_approval_cannot_be_remembered():
     captured = {}
 
@@ -116,6 +149,8 @@ def test_clear_session_images_approval_cannot_be_remembered():
     assert [choice[1] for choice in captured["choices"]] == ["yes", "modify", "no"]
 
 
+    # legacy request() 没有 ToolDescriptor 和动态 workspace action，不能获得
+    # shell 前缀授权；只有 request_tool() 的结构化 shell 路径可以。
     for action in ("shell", "terminal_open", "terminal_send"):
         captured = {}
 
@@ -127,6 +162,91 @@ def test_clear_session_images_approval_cannot_be_remembered():
             assert InteractivePolicy().request(action, {"command": "pwd"})
 
         assert [c[1] for c in captured["choices"]] == ["yes", "modify", "no"]
+
+
+def _shell_descriptor():
+    return ToolDescriptor(
+        name="shell",
+        description="shell",
+        input_schema={"type": "object", "properties": {}},
+        executor=lambda _: "ok",
+        risk="execute",
+        requires_approval=True,
+    )
+
+
+def test_workspace_shell_can_remember_safe_command_prefixes(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    policy = InteractivePolicy()
+    captured = {}
+
+    def approve_prefix(choices, **_):
+        captured["choices"] = choices
+        return "auto_approve"
+
+    command = "nl -ba app.py | sed -n '1,20p'; echo done"
+    with patch("app.util.menu.select_menu", side_effect=approve_prefix) as menu:
+        first = policy.request_tool(
+            _shell_descriptor(),
+            "shell",
+            {"command": command, "cwd": "."},
+        )
+    assert first.approved is True
+    assert [choice[1] for choice in captured["choices"]] == [
+        "yes", "auto_approve", "modify", "no",
+    ]
+    assert "nl -ba" in captured["choices"][1][0]
+    assert "sed -n" in captured["choices"][1][0]
+
+    with patch("app.util.menu.select_menu") as second_menu:
+        second = policy.request_tool(
+            _shell_descriptor(),
+            "shell",
+            {"command": "nl -ba other.py | sed -n '20,40p'; echo next", "cwd": "."},
+        )
+    assert second.approved is True
+    second_menu.assert_not_called()
+    assert menu.call_count == 1
+
+
+def test_shell_rule_does_not_cover_an_unapproved_segment(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    policy = InteractivePolicy()
+    with patch("app.util.menu.select_menu", return_value="auto_approve"):
+        policy.request_tool(
+            _shell_descriptor(), "shell", {"command": "git status", "cwd": "."},
+        )
+
+    with patch("app.util.menu.select_menu", return_value="no") as menu:
+        result = policy.request_tool(
+            _shell_descriptor(),
+            "shell",
+            {"command": "git status; rg TODO", "cwd": "."},
+        )
+    assert result.approved is False
+    menu.assert_called_once()
+
+
+def test_complex_and_outside_shell_cannot_remember_approval(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    policy = InteractivePolicy()
+
+    for action, command in (
+        ("shell", "echo ok > output.txt"),
+        ("shell_outside_workspace", "git status"),
+    ):
+        captured = {}
+
+        def approve_once(choices, **_):
+            captured["choices"] = choices
+            return "yes"
+
+        with patch("app.util.menu.select_menu", side_effect=approve_once):
+            result = policy.request_tool(
+                _shell_descriptor(), action, {"command": command, "cwd": "."},
+            )
+        assert result.approved is True
+        assert [choice[1] for choice in captured["choices"]] == ["yes", "modify", "no"]
 
 
 def test_structured_approval_shows_risk_and_target():

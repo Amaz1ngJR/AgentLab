@@ -1549,25 +1549,139 @@ end
 @enduml
 ```
 
-### 7.8 工具风险分类
+### 7.8 工具风险、沙箱与审批
+
+安全设计采用彼此独立的三层，而不是把所有风险都压成一个“是否弹窗”：
+
+1. **能力策略（Capability Policy）**：根据工具、参数、用户目标和风险等级判断动作是否允许、需要确认或必须拒绝。
+2. **执行沙箱（Execution Sandbox）**：在操作系统层限制进程能读取、写入和联网的范围；即使模型或命令判断出错，也不能突破边界。
+3. **审批策略（Approval Policy）**：只在动作需要扩大当前沙箱能力、命中 `prompt` 规则或属于敏感副作用时打断用户。
+
+用户已明确要求在 workspace 内编辑代码时，这一意图可以视为对可逆项目修改的授权，
+不应对每一次小编辑重复弹窗；但用户意图不能自动扩大到 workspace 外、网络、凭据、
+发布、删除或远程设备。审批负责表达授权，沙箱负责强制执行边界，两者不能互相替代。
 
 | 等级 | 示例 | 默认策略 |
 |---|---|---|
 | `read` | 读取当前 workspace 文件、列目录、搜索代码 | 可自动允许，并记录日志 |
 | `observe` | 截图、读取网页标题/DOM、获取远程主机基本信息 | 首次按目标确认；云端模型会接收截图/页面内容时必须提示 |
 | `network` | HTTP 请求、远程 MCP 查询 | 首次按 server/域名确认 |
-| `write` | 写文件、修改配置、创建目录 | 每次确认或用户授予会话级权限 |
+| `write` | 写文件、修改配置、创建目录 | 受信 workspace 的可逆编辑可自动执行；无系统沙箱时至少首次确认并支持 workspace 会话授权 |
 | `browser_control` | 点击网页、输入文本、下载/上传文件、提交表单 | 按 origin + 动作确认；登录、支付、发布、删除前二次确认 |
 | `desktop_control` | 截屏后坐标点击、键盘输入、启动/切换应用 | 默认禁用；启用后每次确认，并提供紧急停止 |
 | `remote_execute` | SSH 到其他设备执行命令、传输文件、启动远程浏览器 | 按 host + workspace + 命令确认，禁止未知 host |
-| `execute` | 运行命令、Python 代码、启动进程 | 每次确认，限制工作目录与超时 |
+| `execute` | 运行测试、构建、格式化、启动进程 | 沙箱内常规命令可自动执行；越界、联网、命中 `prompt` 规则或无法安全分析时确认 |
 | `destructive` | 删除、覆盖大量文件、修改系统设置 | 默认阻止，明确二次确认后才执行 |
 
 工具 registry 需要为内置工具和 MCP 工具使用同一套风险元数据。模型不能自行提升权限。
-workspace 是默认工作范围与信任边界，而不是绝对沙箱：workspace 内只读动作可
-自动允许；目标路径越界时必须切换为独立审批动作，批准后才执行。越界审批与
-普通工具审批使用不同 action，且不得提供会话级“总是允许”，避免普通授权被
-扩展成任意文件系统访问。
+
+#### 7.8.1 权限配置档
+
+| Profile | 文件权限 | 命令 | 网络 | 典型用途 |
+|---|---|---|---|---|
+| `read-only` | workspace 只读 | 只在只读沙箱中运行 | 默认关闭 | 分析、审查、规划 |
+| `workspace` | workspace 可写，受保护目录只读 | 在 workspace 沙箱内运行 | 默认关闭 | 默认本地 Agent 开发模式 |
+| `full-access` | 主机权限 | 主机权限 | 可用 | 用户显式选择的高级模式，不作为默认值 |
+
+`workspace` 是默认工作范围和信任边界。workspace 内只读、可逆文件编辑和常规
+开发命令应低摩擦执行；目标越界时必须生成独立审批动作，批准后只为本次动作
+增加最小文件或网络权限。`full-access` 必须显式启用并持续展示状态，不能由模型
+自行切换。
+
+workspace 中的 `.git`、`.agentlab`、`.codex`、凭据文件和项目声明的 protected
+paths 默认只读。修改这些位置、跟随符号链接越界或访问额外 writable root，均按
+独立目标重新授权。
+
+#### 7.8.2 授权作用域
+
+审批结果必须是结构化对象，不只保存一个工具名：
+
+| Scope | 含义 | 生命周期 |
+|---|---|---|
+| `once` | 只允许当前参数对应的单次动作 | 当前 tool call |
+| `session_workspace_tool` | 允许当前 Agent Session 在指定 workspace 使用某个工具 | Session 结束即失效 |
+| `session_command_prefix` | 允许当前 Session 中匹配参数前缀的命令 | Session 结束即失效 |
+| `project_rule` | 受信项目下的 `allow/prompt/forbidden` 规则 | 项目配置有效期 |
+| `user_rule` | 用户明确保存的全局规则 | 用户删除规则前有效 |
+
+授权键至少包含 `agent_session_id + workspace_id + tool + risk + origin + host +
+target_scope`。子 Agent、其他 `/session` 会话和其他 workspace 默认不继承；普通
+workspace 授权也不能命中 `*_outside_workspace`、远程、浏览器提交或破坏性动作。
+
+#### 7.8.3 命令前缀规则
+
+命令授权参考 Codex execpolicy 的参数前缀模型，使用 token 数组而不是字符串包含
+或正则模糊匹配：
+
+```yaml
+pattern: ["npm", "run", "test"]
+decision: allow        # allow | prompt | forbidden
+scope: session         # session | project | user
+workspace: /path/to/project
+justification: "允许运行本项目测试"
+```
+
+规则要求：
+
+- `pattern` 必须从可执行程序开始按参数顺序精确匹配；多个规则命中时取最严格结果：`forbidden > prompt > allow`。
+- `git status`、`npm run test` 等应使用有语义的最小前缀；不得建议仅包含 `bash`、`sh`、`powershell`、`python`、`node`、`sudo`、`rm` 等可泛化为任意执行或破坏行为的前缀。
+- `|`、`;`、`&&`、`||` 组成的简单线性命令必须拆成独立 segment，所有 segment 均被允许后才能自动执行；任何一个 segment 需要确认，整条调用都需要确认。
+- 含重定向、命令替换、环境变量赋值、通配符、here-document 或控制流的脚本，在没有可靠 AST 解析器时不得生成可复用规则，只能单次批准。
+- 前缀授权只减少重复审批，不改变文件、网络、进程和远程目标的沙箱边界。
+- 项目规则只在项目被标记为 trusted 后加载；规则文件支持 `match/not_match` 示例并提供离线检查命令，避免误写宽规则。
+
+#### 7.8.4 审批决策流程
+
+```plantuml
+@startuml
+title 工具调用的沙箱与审批决策
+skinparam shadowing false
+skinparam linetype ortho
+top to bottom direction
+
+start
+:接收 ToolDescriptor + args;
+:规范化 workspace、目标与命令 segments;
+if (命中 forbidden 或破坏性禁令?) then (是)
+  :拒绝并审计;
+  stop
+endif
+if (动作已在当前沙箱能力内?) then (是)
+  if (命中 prompt 或敏感副作用?) then (是)
+    :请求单次审批;
+  else (否)
+    :自动执行并审计;
+  endif
+else (否)
+  if (存在匹配的 allow 规则?) then (是)
+    :授予本次最小附加权限;
+  else (否)
+    :展示原因、目标和可选安全前缀;
+    if (用户允许?) then (是)
+      :单次授权或保存限定规则;
+    else (否)
+      :拒绝或取消;
+      stop
+    endif
+  endif
+endif
+:在沙箱中执行;
+:记录规则、权限、结果与副作用证据;
+stop
+@enduml
+```
+
+#### 7.8.5 跨平台执行沙箱
+
+| 平台 | 目标实现 | 最低保证 |
+|---|---|---|
+| macOS | Seatbelt profile / `sandbox-exec` 适配层 | workspace 可写、protected paths 只读、网络默认关闭 |
+| Linux | bubblewrap + seccomp，必要时兼容 Landlock | mount namespace 限定可写根、危险 syscall 收敛、网络默认关闭 |
+| Windows | AppContainer 或受限 Token + Job Object + ACL/网络策略 | workspace ACL、子进程树回收、网络默认关闭 |
+
+如果平台缺少可用的系统级沙箱，Runtime 必须显式降级为 `approval-only`，在界面
+显示“未启用系统沙箱”，并对文件写入和命令执行采用更保守的首次或逐次审批，
+不得把命令前缀规则描述成安全隔离。
 
 ### 7.9 能力层与电脑控制详细图
 

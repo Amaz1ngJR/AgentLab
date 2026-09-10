@@ -31,19 +31,24 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
    - 将关键 Turn/Item/Event 写入 append-only store，并补进程重启后的恢复测试。
    - **验收**：CLI 不直接依赖 SessionRouter 内部字段；Protocol 事件可 JSONL 编解码、按游标重放；两个 Session 并发不串事件。
 
-2. **P1：建立 ComputerControlGateway 并接入 browser Verifier**（见 6.6、6.7）
+2. **P0：实现 workspace 系统沙箱与结构化执行策略**（见 6.4）
+   - 把当前 approval-only 边界升级为 macOS Seatbelt、Linux bubblewrap/seccomp、Windows 受限 Token/Job Object 适配器。
+   - 将会话级命令前缀提升为统一 `allow/prompt/forbidden` ExecPolicy，支持安全分段、项目/用户规则和离线检查。
+   - **验收**：workspace 内常规编辑、测试和构建无需重复审批；越界、联网、复杂脚本和危险命令不能借已有前缀绕过；三平台有隔离回归测试。
+
+3. **P1：建立 ComputerControlGateway 并接入 browser Verifier**（见 6.6、6.7）
    - 先包装现有 Playwright MCP，将 snapshot/click/type/navigation 规范化为 Observation 和 Action，不让 Runtime 依赖 MCP 工具的原始返回结构。
    - 在网关统一执行目标校验、风险分级、审批、敏感字段处理、截图/DOM 限长、审计和取消。
    - 基于 Observation 实现 browser Verifier，支持 URL、可见文本、元素状态和截图证据检查。
    - **验收**：浏览器写动作无法绕过 Approval Broker；页面内容不能修改权限或 GoalSpec；使用本地测试页面完成离线端到端验证。
 
-2. **P1：实现 FastAPI Server MVP 与 SSE 事件流**（见 6.10）
+4. **P1：实现 FastAPI Server MVP 与 SSE 事件流**（见 6.10）
    - 基于 Runtime Service 提供 session、message/run、approval、cancel、loop evidence API，以及可重连的 SSE 事件端点。
    - 增加 `agentlab serve`，仅默认监听 loopback；定义请求 ID、错误模型、事件序号、断线与关闭语义。
    - 先提供最小管理页验证聊天、工具进度和审批交互，不在此阶段扩展完整 Web UI/TUI。
    - **验收**：CLI 与 API 复用同一 runtime 路径；两个 session 并发不串上下文/审批；API、SSE 重连、取消和安全默认值有集成测试。
 
-3. **P1：实现受控互联网检索与引用骨架**（见 6.15）
+5. **P1：实现受控互联网检索与引用骨架**（见 6.15）
    - 抽出 `WebRetrievalService`、可替换 `SearchProvider`、受控 Fetcher、Source/Document Store 和 `CitationManager`；现有 `web_search/web_fetch` 降为薄工具适配器。
    - 统一 URL 规范化、SSRF 防护、重定向检查、缓存、来源去重、获取时间、正文定位、截断和 prompt injection 数据边界。
    - 为最终回答提供可校验 citation，禁止引用未实际抓取或无法映射到 source/document 的链接。
@@ -62,14 +67,14 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - CLI REPL：交互模式、单次 `-p/--prompt`、`--profile`、`-y` 自动审批；prompt_toolkit 输入框、spinner 进度（`✻ thinking… (3.2s · ↓ 42 tokens)`）、token/耗时统计。
 - 模型层：Anthropic Messages、OpenAI Responses、OpenAI-compatible 三种 adapter；内部协议统一 `ModelResponse / ToolCall / ToolResult`；OpenAI-compatible 具备 JSON tool call fallback；实际模型 ID 规范化 + 代理静默映射提示。
 - Runtime：同步多轮"模型 → 工具 → 模型"循环；工具审批、工具错误回灌、流式文本回调；`max_steps` 作为 run 级模型往返总预算，`max_task_steps` 限制单个子任务，二者共同防止空转与单任务独占。
-- 审批：`AutoApprove / InteractivePolicy(方向键菜单) / DenyAll`。
+- 审批：`AutoApprove / InteractivePolicy(方向键菜单) / DenyAll`；工作区内安全、可分析的 shell 命令可由用户按 token 前缀授权到当前 AgentSession，复合命令逐段匹配。
 - 安全基础：workspace 内按风险执行、越界使用不可持久化的独立审批动作、错误/工具输出脱敏（`redact`）、MCP env allowlist。
 - 图片附件：CLI 支持 `/image`、`/paste-image` 和输入框 Ctrl+V/Shift+Insert 直接粘贴；`AttachmentStore` 校验 MIME/大小/像素/workspace 审批并落到 `data/attachments/<session>`，消息历史只存 file/hash 元数据，OpenAI Responses、Anthropic 与 Chat Completions adapter 在请求前分别物化为对应图片 block；profile 必须声明 `vision`。
 - 内置 RTK 输出压缩：`shell` 执行后按 git/test/grep/listing/diagnostics/container 类别过滤、分组、截断和去重；无需外部 RTK 二进制，失败或收益不足自动回退原始输出，保留审批、cwd、timeout、stderr 和退出码；`/rtk` 查看状态。
 
 ### 3.2 内置工具
 
-- `read_file / write_file / list_dir`：workspace 是默认信任边界；workspace 内只读免审批，写入按原风险审批，越界改用独立且不可记忆的审批动作。`shell` 默认 cwd 为 workspace、每次审批，指定外部 cwd 时使用独立越界审批。`todo_write` 提供 CLI 任务面板 `✓/❯/○`。
+- `read_file / write_file / list_dir`：workspace 是默认信任边界；workspace 内只读免审批，写入可单次批准或按工具授权当前 Session，越界改用独立且不可记忆的审批动作。`shell` 默认 cwd 为 workspace；安全线性命令可保存当前 Session 的参数前缀，复杂语法、危险命令和外部 cwd 仍逐次审批。`todo_write` 提供 CLI 任务面板 `✓/❯/○`。
 - `code_search`（`app/tools/builtin/code_search.py`）：text/regex/file/symbol 四种模式，优先 `rg --json`，无 rg 时 Python fallback；遵守 `.gitignore`、命中行密钥脱敏；workspace 内只读免审批，外部搜索逐次审批。
 - `web_search`（`app/tools/builtin/web_search.py`）：互联网搜索工具，返回结构化结果（标题/URL/摘要）。优先用 `duckduckgo_search` 库，失败时退化为 requests + BeautifulSoup 解析 DuckDuckGo HTML；结果脱敏、超时保护、输出 32KB 硬截断；只读免审批；依赖（`duckduckgo-search` / `requests` / `beautifulsoup4`）未安装时优雅降级返回安装提示。完全跨平台（无路径操作/subprocess/POSIX 特定功能）。22 个单元测试（16 passed + 6 skipped，跳过项为可选依赖未装）。
 - `web_fetch`（`app/tools/builtin/web_fetch.py`）：给定 URL 抓取网页正文并转 Markdown。HTTP GET 抓 HTML → 正文抽取（trafilatura 最优 → readability → BeautifulSoup 兜底）→ Markdown 转换；只允许公网 http/https，拒绝 URL 凭据、本机/私网/链路本地/保留地址和解析到非公网 IP 的域名；关闭自动重定向并逐跳重新校验，阻断重定向 SSRF；响应体 5MB 上限 + 正文 20K 字符截断；只读免审批；依赖未装时优雅降级。30 个单元测试全通过。
@@ -118,7 +123,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **547 个 unit tests**（全离线），覆盖：runtime（含动态审批、编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、ToolDescriptor/九级风险/结构化审批/统一审计/旧数据库迁移、MCP（config/adapter/manager，含 Windows `npx.cmd`、最小运行环境和 cwd）、CLI 全局入口与 workspace 参数、code_search（含外部目录审批）、web_search、web_fetch（公网地址校验、DNS/重定向 SSRF、正文抽取、截断、脱敏）、shell（含外部 cwd 审批）、交互式终端会话、workspace path、存储、记忆、session_router、Skill loader/catalog、Loop Engineering（真实多轮编排、Verifier 审批、worktree 相对路径/未跟踪文件/审批提交与合并边界、执行异常终止）。
+- **724 个 unit tests**（全离线），覆盖：runtime（含动态审批、编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、ToolDescriptor/九级风险/结构化审批/Session 命令前缀/统一审计/旧数据库迁移、MCP（config/adapter/manager，含 Windows `npx.cmd`、最小运行环境和 cwd）、CLI 全局入口与 workspace 参数、code_search（含外部目录审批）、web_search、web_fetch（公网地址校验、DNS/重定向 SSRF、正文抽取、截断、脱敏）、shell（含复合命令与外部 cwd 审批）、交互式终端会话、workspace path、存储、记忆、session_router、Skill loader/catalog、Loop Engineering（真实多轮编排、Verifier 审批、worktree 相对路径/未跟踪文件/审批提交与合并边界、执行异常终止）。
 - `.github/workflows/mcp-cross-platform.yml` 在 Windows、Linux、macOS
   runner 安装 Node.js 后真实验证 `npx` 解析，并运行 MCP 专项测试。
 
@@ -168,7 +173,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `app/agent/approval_broker.py`：新增结构化 `ApprovalRequest`、稳定 request ID、pending 查询、订阅、approve/deny、超时安全拒绝与 close 唤醒；首个前端决定生效，后续重复回应不会覆盖。
 - `BrokerApprovalPolicy` 保留现有同步 `ApprovalPolicy` 接口：CLI 方向键菜单和 `-y` 作为 fallback 经过 Broker 执行，未来 HTTP/TUI 可不设 fallback，异步回应 pending request。
 - CLI 主消息路径、`/resume`、单次 `-p`、session 命令和退出清理已迁移到 RuntimeService；`SessionRouter.persist(session_id)` 避免不同 session 并发完成时写错持久化目标。
-- 新增 `test_approval_broker.py` 与 `test_runtime_service.py`，覆盖并发 session、同 session 互斥、取消、超时、首决定生效、asyncio 非阻塞桥和资源关闭；同时修正 `web_search` 对新版 `ddgs` 与旧版 `duckduckgo_search` 的兼容测试，当前 547 项 unit tests 全部通过。
+- 新增 `test_approval_broker.py` 与 `test_runtime_service.py`，覆盖并发 session、同 session 互斥、取消、超时、首决定生效、asyncio 非阻塞桥和资源关闭；同时修正 `web_search` 对新版 `ddgs` 与旧版 `duckduckgo_search` 的兼容测试。
 
 ### 3.13 Runtime Protocol v1 与 append-only Turn/Item 事件流
 
@@ -177,7 +182,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `RuntimeService` 保留旧 `RuntimeEvent` callback 兼容层，同时发布带序号的 Protocol v1 事件；支持 `subscribe_protocol()`、`replay_events(thread_id, after_sequence=...)`。
 - SQLite 新增 `runtime_turns / runtime_items / runtime_events` append-only 表和游标查询；消息、工具审计和旧 Session 数据保持兼容；Session 硬删除同步清理 Runtime 记录。
 - 每个新 Turn 记录用户 Item、运行状态、完成 token、失败 code，并将兼容事件映射为 `thread.* / turn.* / item.*` 命名空间事件。
-- 新增 Protocol、JSONL、SQLite round-trip、事件重放和不可序列化 payload 测试；当前 `619` 项 unit tests 全部通过。
+- 新增 Protocol、JSONL、SQLite round-trip、事件重放和不可序列化 payload 测试。
 
 ### 3.14 Runtime Protocol 初始化、TurnItem 映射与事件背压
 
@@ -186,12 +191,12 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `RuntimeService` 新增 `initialize_client / open_event_subscription / close_client`，在现有 callback 兼容层之外提供队列式协议消费。
 - `TurnEvent / RunEvent` 的常用事件已规范映射为 `agent.message / tool.call / tool.result / approval.request / task.execution / plan.created / turn.result` TurnItem；尚未覆盖的上下文与 Loop 事件继续走 legacy 兼容通道。
 - CLI 首批移除对 `router._storage` 和 `loop_handler` 的直接访问，改用 `current_thread_summary / handle_goal_command / handle_loop_command` 显式 Service API。
-- 新增握手、能力协商、未初始化拒绝、有界队列 overload、TurnItem 映射和 Thread 摘要测试；当前 `623` 项 unit tests 全部通过。
+- 新增握手、能力协商、未初始化拒绝、有界队列 overload、TurnItem 映射和 Thread 摘要测试。
 
 ### 3.15 ToolDescriptor、分级审批与统一工具审计
 
 - 九级风险分类已落地：`read / observe / network / write / browser_control / desktop_control / remote_execute / execute / destructive`。工具未显式覆盖 `requires_approval` 时由风险等级决定默认审批；workspace 越界仍由参数级 `approval_resolver` 提升为独立审批动作。
-- `InteractivePolicy` 已能展示风险、目标、来源和 host；browser/desktop/remote/execute/destructive、shell/terminal 以及 workspace 越界动作不可使用“本会话总是允许”。旧 `ApprovalPolicy.request(action,args)` 通过兼容适配继续可用。
+- `InteractivePolicy` 已能展示风险、目标、来源和 host；workspace 内 shell 支持受限的 Session 命令前缀授权，按 `| / ; / && / ||` 拆段并要求全部命中，拒绝为重定向、变量替换、通配符、解释器和破坏性命令生成宽规则。授权按 AgentSession 与 workspace 隔离；browser/desktop/remote/destructive、交互终端和 workspace 越界动作仍不可持久化。旧 `ApprovalPolicy.request(action,args)` 通过兼容适配继续可用。
 - 内置文件、代码搜索、Web、Shell、Todo、交互式终端和 MCP 工具均声明风险与目标元数据。MCP 工具继承 Server risk，并标注 `origin=mcp`、server host 和 browser observation 要求。
 - `ToolRegistry` 对 completed/error/denied/approval_required 统一产出 `ToolAuditEvent`；CLI 为每个 Session 注入审计 sink，写入 SQLite `tool_executions`。表已补风险、目标、来源、host、审批动作、结果状态和 observation 字段，并可自动迁移旧数据库。
 - 文件内容、代码搜索结果和网页正文使用工具级 `audit_redactor` 只记录有界摘要；MCP 协议错误不再伪装成功，而是作为工具错误回灌模型并进入审计。
@@ -206,7 +211,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - `loop_store` 新增有界且脱敏的 `loop_artifacts` 制品表，并补齐 iteration/artifact/evidence/diff/list API；旧数据库启动时自动迁移 `termination_reason` 字段。
 - `/loop evidence [loop_id]` 可回看状态、预算、终止原因、逐轮验证和制品；`/loop diff [loop_id]` 可读取持久化 diff；`/loop resume [loop_id]` 可恢复 cancelled 或进程中断留下的未完成 Loop，并继承迭代与工具预算。
 - Verifier 新增经过审批的 API 检查（method/status/response contains）和真正可交互的 Human 检查；无交互器或无审批策略时安全返回 blocked。
-- 新增 `test_loop_evidence.py` 并扩展 Verifier 测试，覆盖成功证据、任务快照、预算、脱敏/限长制品、diff 查询、恢复状态、API 审批和 Human 决策；当前 553 项 unit tests 全部通过。
+- 新增 `test_loop_evidence.py` 并扩展 Verifier 测试，覆盖成功证据、任务快照、预算、脱敏/限长制品、diff 查询、恢复状态、API 审批和 Human 决策。
 
 
 | 模块 | 当前进展 | 关键文件 |
@@ -363,15 +368,22 @@ AgentLab/
 ### 6.4 工具与审批
 
 当前状态：统一 `ToolDescriptor`、九级风险、参数级 `approval_resolver`、
-结构化交互审批和 `ToolAuditEvent` 已完成（见 3.12）。workspace 越界和高风险
-动作不可持久化授权；内置工具与 MCP 均声明风险/目标/来源元数据，并由 CLI
-Session 统一写入 `tool_executions`。`web_search` / `web_fetch` 标为
-`network`，当前通过显式只读策略免逐次审批。
+结构化交互审批和 `ToolAuditEvent` 已完成（见 3.12）。文件编辑可授权到当前
+Session；workspace 内安全线性 shell 可保存参数前缀，复合命令逐段取严格结果，
+规则按 AgentSession + workspace 隔离；越界、复杂 shell、危险命令和高风险控制
+动作不可复用授权。内置工具与 MCP 均声明风险/目标/来源元数据，并由 CLI Session
+统一写入 `tool_executions`。`web_search` / `web_fetch` 标为 `network`，当前通过
+显式只读策略免逐次审批。当前仍是 application-level approval，没有 OS-level sandbox。
 
 接下来要做：
 
-- 在 Runtime Service 的 Approval Broker 中实现结构化会话授权，授权键绑定
-  `tool + risk + origin + host + scope`，不能只按 action 字符串记忆。
+- **P0：实现跨平台 workspace 沙箱**：macOS Seatbelt、Linux bubblewrap/seccomp、
+  Windows 受限 Token/Job Object；网络默认关闭，`.git/.agentlab/.codex` 等控制目录只读。
+- 将 Session 前缀规则升级为统一 ExecPolicy：`allow/prompt/forbidden`、项目/用户
+  持久规则、规则来源和 `match/not_match` 自测；复杂脚本后续接 AST 解析器。
+- 在 Runtime Service 的 Approval Broker 中返回结构化授权结果，授权键绑定
+  `session + workspace + tool + risk + origin + host + target_scope`，并把采用的
+  rule/permission amendment 写入 Protocol 与审计，不能只按 action 字符串记忆。
 - 增加敏感动作分类器：删除、支付、发布、上传、授权、部署等动作提升为
   `destructive` 或二次确认，普通 browser/write 授权不能绕过。
 - 增加审计查询与回放接口，按 session/run/tool/risk/outcome 过滤，并让 Loop

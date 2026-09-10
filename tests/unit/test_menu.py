@@ -5,7 +5,13 @@ select_menu 在 TTY 下会弹方向键交互界面,无法在 pytest 里直接测
 """
 from unittest.mock import patch
 
-from app.util.menu import _select_menu_fallback, select_menu
+from app.util.menu import (
+    _select_menu_fallback,
+    _wrap_display_line,
+    _wrap_display_lines,
+    select_menu,
+)
+from app.util.text import display_width
 
 
 def test_fallback_returns_choice_value():
@@ -51,6 +57,30 @@ def test_fallback_eof_returns_none():
 def test_select_menu_empty_choices_returns_none():
     """空 choices 列表直接返回 None,不弹 UI。"""
     assert select_menu(choices=[]) is None
+
+
+def test_wrap_display_line_keeps_every_row_within_terminal_width():
+    rows = _wrap_display_line(
+        "  export GIT_SSH_COMMAND='ssh -i ~/.ssh/gitlab_deploy' --long-option=value",
+        32,
+    )
+
+    assert len(rows) > 1
+    assert all(display_width(row) <= 32 for row in rows)
+    assert rows[1].startswith("    ")
+
+
+def test_wrap_display_line_counts_chinese_as_double_width():
+    rows = _wrap_display_line("  当前命令包含一段很长的中文说明文字", 16)
+
+    assert len(rows) > 1
+    assert all(display_width(row) <= 16 for row in rows)
+
+
+def test_wrap_display_lines_expands_embedded_newlines():
+    rows = _wrap_display_lines(["first\nsecond", "third"], 80)
+
+    assert rows == ["first", "second", "third"]
 
 
 def test_select_menu_routes_to_fallback_when_not_tty():

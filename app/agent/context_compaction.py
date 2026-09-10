@@ -55,7 +55,8 @@ COMPRESSION_SYSTEM = """你是上下文压缩器。把下面这段较早的对�
 _SUMMARY_MESSAGE_TEMPLATE = (
     "【上下文摘要 · 早期历史已压缩】\n"
     "以下是本会话较早部分的结构化摘要(原始消息已从模型输入中省略,但仍保留在审计记录中)。"
-    "请把它当作已经发生的事实继续推进,不要重复已完成的工作。\n\n{body}"
+    "请把它当作已经发生的事实继续推进,不要重复已完成的工作。\n\n{body}\n\n"
+    "{skills_reminder}"
 )
 
 # 摘要必填字段:缺这些视为无效摘要,触发兜底(不压缩)。
@@ -76,8 +77,12 @@ class ContextSummary:
     token_count_after: int = 0
     compression_model_profile: str = ""
 
-    def to_message_text(self) -> str:
-        """渲染成注入历史的摘要消息正文(人读 + 模型读都友好的紧凑文本)。"""
+    def to_message_text(self, available_skills: list[str] | None = None) -> str:
+        """渲染成注入历史的摘要消息正文(人读 + 模型读都友好的紧凑文本)。
+
+        Args:
+            available_skills: 可用的 skill 列表，压缩后重新提醒模型
+        """
         s = self.summary
         lines: list[str] = []
 
@@ -107,7 +112,21 @@ class ContextSummary:
         _add("失败尝试", s.get("failed_attempts"))
         _add("授权与风险", s.get("approvals_and_risks"))
         _add("交接说明", s.get("handoff_note"))
-        return _SUMMARY_MESSAGE_TEMPLATE.format(body="\n".join(lines))
+
+        # 生成 skills 提醒
+        skills_reminder = ""
+        if available_skills:
+            skills_list = ", ".join(f"/{s}" for s in available_skills)
+            skills_reminder = (
+                f"【可用技能】\n"
+                f"本项目配置了以下 skills：{skills_list}\n"
+                f"执行相关任务时，优先查看对应的 skill 定义。"
+            )
+
+        return _SUMMARY_MESSAGE_TEMPLATE.format(
+            body="\n".join(lines),
+            skills_reminder=skills_reminder
+        )
 
     def to_record(self) -> dict[str, Any]:
         """供 storage 持久化的纯数据记录(审计用)。"""
@@ -339,11 +358,13 @@ class ContextCompressor:
     """选段 → 调模型摘要 → 校验/脱敏 → 产出摘要消息并就地替换旧历史。"""
 
     def __init__(self, llm, system: str = COMPRESSION_SYSTEM,
-                 model_profile: str = "", allow_local_fallback: bool = True):
+                 model_profile: str = "", allow_local_fallback: bool = True,
+                 available_skills: list[str] | None = None):
         self._llm = llm
         self._system = system
         self._model_profile = model_profile
         self._allow_local_fallback = allow_local_fallback
+        self._available_skills = available_skills or []
         self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
 
     def compact(
@@ -413,7 +434,8 @@ class ContextCompressor:
             token_count_before=token_before,
             compression_model_profile=self._model_profile,
         )
-        summary_msg = {"role": "user", "content": summary.to_message_text()}
+        # 传入 skills 列表，在压缩摘要中重新提醒模型
+        summary_msg = {"role": "user", "content": summary.to_message_text(self._available_skills)}
         summary.token_count_after = estimate_messages_tokens([summary_msg])
 
         # 兜底:若摘要并不比被压缩的原前缀短(短前缀 + 结构化摘要骨架开销可能反而

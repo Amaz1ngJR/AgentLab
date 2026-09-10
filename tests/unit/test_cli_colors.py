@@ -23,9 +23,10 @@ class _TTY:
 
 def test_output_color_helpers_use_requested_palette():
     tty = _TTY()
-    assert _model_text("answer", stream=tty).startswith(_ANSI_WHITE)
-    assert _thinking_text("reasoning", stream=tty).startswith(_ANSI_DIM)
-    assert _approval_text("tool_use", stream=tty).startswith(_ANSI_YELLOW_BOLD)
+    with patch.dict("os.environ", {"TERM": "xterm-256color"}, clear=True):
+        assert _model_text("answer", stream=tty).startswith(_ANSI_WHITE)
+        assert _thinking_text("reasoning", stream=tty).startswith(_ANSI_DIM)
+        assert _approval_text("tool_use", stream=tty).startswith(_ANSI_YELLOW_BOLD)
 
 
 def test_output_color_helpers_disable_ansi_for_non_tty():
@@ -43,7 +44,7 @@ def test_approval_menu_keeps_blue_selection_and_yellow_content():
     assert "#ffd75f" in styles["title"]
 
 
-def test_approval_required_event_uses_tool_use_label(capsys):
+def test_approval_required_event_defers_details_to_menu(capsys):
     event = RunEvent(
         kind=run_events.APPROVAL_REQUIRED,
         tool_name="shell",
@@ -52,5 +53,4 @@ def test_approval_required_event_uses_tool_use_label(capsys):
     )
     _print_run_event(event)
     output = capsys.readouterr().out
-    assert "tool_use shell" in output
-    assert "pwd" in output
+    assert output == ""

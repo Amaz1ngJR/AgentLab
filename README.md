@@ -236,7 +236,7 @@ workspace: /Users/you/AgentLab
   [stats] turn 12.3s in=1234 out=456 | session 12.3s in=1234 out=456
 ```
 
-写文件 / 执行 shell 命令 / 浏览器动作时会弹出方向键菜单：
+写文件 / 执行 shell 命令 / 浏览器动作会按风险弹出方向键菜单：
 
 ```
 工具: write_file
@@ -244,11 +244,17 @@ workspace: /Users/you/AgentLab
 
 是否允许执行?
 ❯ 1. 允许这次
-  2. 本会话总是允许 write_file
-  3. 拒绝
+  2. 本会话在当前工作区允许 write_file
+  3. 修改建议
+  4. 拒绝
 
 ↑↓ 移动 · Enter 确认 · 1-9 快捷键 · Esc 取消
 ```
+
+工作区内可安全分析的 shell 命令还会提供“本会话允许命令前缀”，例如
+`git status`、`npm run test`。规则按参数 token 精确匹配并限定在当前 Agent
+Session 和 workspace；管道或命令链会逐段检查。越界目录、重定向、变量替换、
+通配符、解释器和破坏性命令不会生成可复用授权，仍需逐次确认。
 
 ## 命令行参数
 

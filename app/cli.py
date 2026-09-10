@@ -29,6 +29,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
@@ -926,7 +927,7 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         # APPROVAL_REQUIRED 统一输出，免审批工具不冒充审批内容。
         if ev.tool_name == "write_file":
             _render_write_file(ev.tool_input or {})
-        elif ev.tool_name == "edit_file":
+        elif ev.tool_name in ("edit_file", "edit_file_outside_workspace"):
             _render_edit_file(ev.tool_input or {})
         elif ev.tool_name == "shell":
             _snapshot_shell_targets(ev.tool_input or {})
@@ -1355,9 +1356,12 @@ def _handle_model_command(router: SessionRouter, line: str) -> str:
                     model=target_cfg.model,
                     declared_context_size=target_cfg.context_size,
                 )
+                # 获取可用的 skills 列表
+                available_skills = [s.skill_id for s in skill_catalog.all()]
                 new_compressor = ContextCompressor(
                     new_llm,
-                    model_profile=target_cfg.profile_name or ""
+                    model_profile=target_cfg.profile_name or "",
+                    available_skills=available_skills
                 )
                 router.current.context_manager.budget = new_budget
                 router.current.context_manager._compressor = new_compressor
@@ -1569,7 +1573,10 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
 
     _print_init(f"工具     : {' / '.join(tool_display)}")
     _print_init(f"RTK      : {('enabled' if BuiltinRTK().config.enabled else 'disabled')} (built-in)")
-    _print_init("审批     : AUTO (-y)" if auto_approve else "审批     : 修改类工具会方向键菜单确认 (允许这次 / 总是允许 / 拒绝)")
+    _print_init(
+        "审批     : AUTO (-y)" if auto_approve else
+        "审批     : 支持单次允许、工作区工具授权和 Session 命令前缀授权"
+    )
     _print_init("输入 /version 查看版本; /rtk 查看内置输出压缩; /image 或 Ctrl+V 附加图片; /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
     _print_init("执行中按 Esc 或 Ctrl-C 可中断,停下后直接输入新指令即可调整方向。\n")
 
@@ -1627,10 +1634,12 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     # ── Storage + SessionRouter ───────────────────────────────────────────────
     storage = Storage()
     approval_broker = ApprovalBroker()
-    # CLI 继续使用原有同步菜单，但审批先进入 Broker；未来 HTTP/TUI 可不设置
-    # fallback，通过 request_id 异步调用 RuntimeService.approve/deny。
-    fallback_approval = AutoApprove() if auto_approve else InteractivePolicy()
-    shared_approval = BrokerApprovalPolicy(approval_broker, fallback=fallback_approval)
+    # Broker 是进程级协调器；fallback policy 必须按 AgentSession 创建，避免
+    # /session 切换后把“本会话允许”的工具或命令前缀泄漏给另一个 Agent。
+    # 未来 HTTP/TUI 可不设置 fallback，通过 request_id 异步回应审批。
+    def _new_session_approval() -> BrokerApprovalPolicy:
+        fallback = AutoApprove() if auto_approve else InteractivePolicy()
+        return BrokerApprovalPolicy(approval_broker, fallback=fallback)
     agent_profiles = load_agent_profiles()
     default_profile_id = cfg.profile_name or "default"
 
@@ -1698,9 +1707,15 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         ctx_budget = ContextBudget.from_model(
             model=cfg.model, declared_context_size=cfg.context_size,
         )
+        # 获取可用的 skills 列表（skill_id）
+        available_skills = [s.skill_id for s in skill_catalog.all()]
         ctx_manager = ContextManager(
             budget=ctx_budget,
-            compressor=ContextCompressor(llm, model_profile=cfg.profile_name or ""),
+            compressor=ContextCompressor(
+                llm,
+                model_profile=cfg.profile_name or "",
+                available_skills=available_skills
+            ),
             on_event=_print_run_event,
         )
         # ── progress 工厂 + panel_state(任务面板去重状态)────────────────────
@@ -1713,7 +1728,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         sess = AgentSession(
             llm=llm,
             tools=reg,
-            approval=shared_approval,
+            approval=_new_session_approval(),
             system_prompt=sys_prompt,
             max_steps=agent_profile.max_steps,
             max_task_steps=agent_profile.max_task_steps,
@@ -2302,6 +2317,21 @@ def _clipboard_key_bindings(
             return
         # 非图片剪贴板必须保留 prompt_toolkit 原有的文本粘贴体验。
         if clipboard.text:
+            # 检测多行粘贴并显示提示（调试版本）
+            import sys
+            print(f"\n[DEBUG] Clipboard text length: {len(clipboard.text)}", file=sys.stderr)
+            print(f"[DEBUG] Contains newline: {repr(clipboard.text[:100])}", file=sys.stderr)
+            sys.stderr.flush()
+
+            if "\n" in clipboard.text:
+                lines = clipboard.text.split("\n")
+                line_count = len(lines)
+                # 获取或初始化粘贴计数器
+                paste_count = pending_clipboard.get("paste_counter", 0) + 1
+                pending_clipboard["paste_counter"] = paste_count
+                # 直接打印到标准输出
+                print(f"\n{_ANSI_YELLOW}[Pasted text #{paste_count} +{line_count} lines]{_ANSI_RESET}")
+                sys.stdout.flush()
             event.current_buffer.insert_text(clipboard.text)
 
     bindings.add("c-v")(_paste)
@@ -2332,6 +2362,31 @@ def _extract_pasted_images(
     return text, selected
 
 
+def _extract_pasted_text(
+    line: str,
+    pending_clipboard: dict[str, object],
+) -> str:
+    """提取粘贴文本占位符，替换为实际内容。
+
+    占位符格式：[Pasted text #N +X lines]
+    实际内容存储在：pending_clipboard["paste_N"]
+    """
+    import re
+
+    def replace(match: re.Match) -> str:
+        paste_num = match.group(1)
+        paste_id = f"paste_{paste_num}"
+        actual_text = pending_clipboard.get(paste_id, "")
+        if actual_text:
+            # 清除已使用的粘贴内容
+            pending_clipboard.pop(paste_id, None)
+        return actual_text or match.group(0)  # 找不到就保留占位符
+
+    # 匹配 [Pasted text #N +X lines]
+    text = re.sub(r'\[Pasted text #(\d+) \+\d+ lines\]', replace, line)
+    return text
+
+
 def _format_pending_attachments(pending_clipboard: dict[str, object]) -> str:
     images = list((pending_clipboard.get("images") or {}).values())
     if not images:
@@ -2356,17 +2411,49 @@ def _repl(router: RuntimeService) -> int:
     输入 `/` 时弹出命令补全(由 _SlashCompleter 提供)。
     """
     attachment_store = AttachmentStore()
-    pending_clipboard: dict[str, object] = {"images": {}}
+    pending_clipboard: dict[str, object] = {"images": {}, "paste_counter": 0}
+
+    # 创建 key_bindings
+    key_bindings = _clipboard_key_bindings(
+        pending_clipboard,
+        attachment_store,
+        lambda: router.current_id,
+    )
+
+    # 添加 bracketed paste 处理
+    @key_bindings.add(Keys.BracketedPaste)
+    def _handle_bracketed_paste(event):
+        """处理终端的 bracketed paste mode（真正的粘贴检测）"""
+        data = event.data
+        if "\n" in data or "\r" in data:
+            # 检测到多行粘贴
+            lines = data.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            line_count = len(lines)
+            paste_count = pending_clipboard.get("paste_counter", 0) + 1
+            pending_clipboard["paste_counter"] = paste_count
+
+            # 保存粘贴的完整内容
+            paste_id = f"paste_{paste_count}"
+            pending_clipboard[paste_id] = data
+
+            # 显示折叠的粘贴提示，而不是完整内容
+            placeholder = f"[Pasted text #{paste_count} +{line_count} lines]"
+            event.current_buffer.insert_text(placeholder)
+        else:
+            # 单行粘贴，正常插入
+            event.current_buffer.insert_text(data)
+
     pt_session: PromptSession = PromptSession(
         history=InMemoryHistory(),
         completer=_SlashCompleter(router),
         complete_while_typing=True,   # 边打边弹,不用按 Tab
-        key_bindings=_clipboard_key_bindings(
-            pending_clipboard,
-            attachment_store,
-            lambda: router.current_id,
-        ),
+        enable_open_in_editor=False,
+        multiline=False,
+        key_bindings=key_bindings,
     )
+
+    # 粘贴计数器，用于显示 [Pasted text #N +X lines]
+    paste_counter = 0
 
     while True:
         _print_input_separator()
@@ -2385,6 +2472,12 @@ def _repl(router: RuntimeService) -> int:
 
         try:
             line = pt_session.prompt(prompt_fragments, style=_PROMPT_STYLE).strip()
+
+            # 检测粘贴的多行文本并显示提示
+            # 注意：prompt_toolkit 默认将多行粘贴转换为单行（用空格替换换行符）
+            # 我们需要在粘贴时就检测，而不是在 prompt 返回后
+            # 但如果用户在输入框内输入了很长的文本，也可以提示
+
         except KeyboardInterrupt:
             # Ctrl-C: 清空当前行后继续
             continue
@@ -2554,6 +2647,9 @@ def _repl(router: RuntimeService) -> int:
             if out:
                 print(out)
             continue
+
+        # 提取粘贴文本占位符，替换为实际内容
+        line = _extract_pasted_text(line, pending_clipboard)
 
         line, pasted_images = _extract_pasted_images(line, pending_clipboard)
         images = direct_images + pasted_images
