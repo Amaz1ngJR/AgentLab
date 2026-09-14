@@ -166,6 +166,28 @@ class AgentSession:
         self.last_goal: str = ""
         self.last_run_status: str = ""
 
+    def _prepare_skill_context(self, user_input: str) -> None:
+        """每轮仅激活规则明确命中的 L1 正文；L0 目录由会话初始 prompt 持有。"""
+        catalog = getattr(self, "skill_catalog", None)
+        profile_skills = getattr(self, "profile_skills", None)
+        base_prompt = getattr(self, "base_system_prompt", self.system_prompt)
+        if catalog is None:
+            return
+        activated = catalog.match(user_input, profile_skills)
+        loaded = [
+            skill for skill in (catalog.load_skill(s.skill_id) for s in activated) if skill
+        ]
+        workflow = catalog.build_skill_context(loaded)
+        skill_index = catalog.build_skill_index(profile_skills)
+        catalog.record_disclosure(
+            catalog.index(profile_skills), loaded, len(skill_index), len(workflow),
+        )
+        self.system_prompt = (
+            f"{base_prompt}\n\n{workflow}" if workflow else base_prompt
+        )
+        if self._orch is not None:
+            self._orch._system = self.system_prompt
+
     def _tools_for_task(self, task: str, *, mode: str = "direct") -> list[dict[str, Any]]:
         selector = getattr(self.tools, "schemas_for_task", None)
         if callable(selector):
@@ -339,6 +361,7 @@ class AgentSession:
         否则走 legacy 单轮循环。cancel 仅编排路径生效(legacy 路径忽略)。
         resume=True 时继续上一轮未完成的任务(失败任务重置为 pending),仅编排路径生效。
         """
+        self._prepare_skill_context(user_input)
         mode = self._select_mode(user_input, images, resume)
         self._last_mode = mode
         # 每条路径都发事件：Direct 也要让 CLI/协议订阅方知道这轮没有走 Planner。

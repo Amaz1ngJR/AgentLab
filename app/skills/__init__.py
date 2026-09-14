@@ -6,5 +6,6 @@
 """
 from app.skills.catalog import SkillCatalog
 from app.skills.loader import Skill, load_skills, parse_skill
+from app.skills.tools import make_load_skill_tool
 
-__all__ = ["Skill", "load_skills", "parse_skill", "SkillCatalog"]
+__all__ = ["Skill", "load_skills", "parse_skill", "SkillCatalog", "make_load_skill_tool"]

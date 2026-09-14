@@ -342,8 +342,10 @@ class InteractivePolicy:
         # ── 构造 header：简洁风格，参考 Claude Code ──
         header_lines = []
 
-        # 格式化参数：关键参数单独成行，便于阅读
-        formatted_args = self._format_tool_args(tool_name, tool_input)
+        # action 可能是 shell_outside_workspace 等审批动作名；参数展示必须使用
+        # 实际工具名，否则会落入默认的 100 字符摘要分支而截断命令。
+        display_tool_name = tool.name if tool is not None else tool_name
+        formatted_args = self._format_tool_args(display_tool_name, tool_input)
         header_lines.extend(formatted_args)
         if tool is not None:
             target = f"{tool.target_type} / {tool.scope}"

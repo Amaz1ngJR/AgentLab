@@ -126,6 +126,122 @@ def test_load_skills_skips_invalid(tmp_path):
     assert "bad" not in skills
 
 
+def test_load_skills_builds_lightweight_index(tmp_path):
+    _write_skill(tmp_path, "code-review")
+    skill = load_skills(tmp_path)["code-review"]
+    assert skill.workflow == ""
+    assert skill.skill_file == (tmp_path / "code-review" / "SKILL.md").resolve()
+
+
+def test_catalog_skill_index_has_metadata_not_workflow(tmp_path):
+    cat = _catalog(tmp_path)
+    context = cat.build_skill_index(["code-review"])
+    assert "code-review" in context
+    assert "Review changes." in context
+    assert "SKILL.md" in context
+    assert "Read changed files" not in context
+
+
+def test_catalog_prepare_context_loads_only_trigger_match(tmp_path):
+    cat = _catalog(tmp_path)
+    unrelated = cat.prepare_context(["code-review"], query="写个函数")
+    assert "Read changed files" not in unrelated
+    matched = cat.prepare_context(["code-review"], query="请 review 代码")
+    assert "Read changed files" in matched
+
+
+def test_catalog_index_budget_truncates_descriptions(tmp_path):
+    _write_skill(
+        tmp_path,
+        "large",
+        content="---\nname: large\ndescription: " + "x" * 200 + "\nenabled: true\n---\nbody",
+    )
+    cat = SkillCatalog.from_dir(tmp_path, index_budget=140, description_budget=20)
+    context = cat.build_skill_index()
+    assert len(context) <= 140
+    assert "body" not in context
+
+
+def test_load_skill_tool_lists_resources_without_reading_them(tmp_path):
+    import json
+    from app.skills import make_load_skill_tool
+
+    skill_dir = _write_skill(tmp_path, "code-review", with_ref=True)
+    scripts = skill_dir / "scripts"
+    scripts.mkdir()
+    (scripts / "check.py").write_text("print('secret body')", encoding="utf-8")
+    cat = SkillCatalog.from_dir(tmp_path)
+    tool = make_load_skill_tool(cat, ["code-review"])
+    result = json.loads(tool.executor({"skill_id": "code-review"}))
+    assert "Read changed files" in result["workflow"]
+    assert result["resources"]["references"]
+    assert result["resources"]["scripts"]
+    assert "secret body" not in json.dumps(result)
+    assert tool.requires_approval is False
+
+
+def test_load_skill_tool_rejects_disabled_skill(tmp_path):
+    import json
+    from app.skills import make_load_skill_tool
+
+    _write_skill(
+        tmp_path,
+        "disabled",
+        content="---\nname: disabled\ndescription: d\n---\nprivate workflow",
+    )
+    cat = SkillCatalog.from_dir(tmp_path)
+    tool = make_load_skill_tool(cat, [])
+    result = json.loads(tool.executor({"skill_id": "disabled"}))
+    assert result["error"] == "unknown or disabled skill"
+
+
+def test_skill_context_audit_records_candidates_and_cost(tmp_path):
+    events = []
+    _write_skill(tmp_path, "code-review")
+    cat = SkillCatalog.from_dir(tmp_path, audit_sink=events.append)
+    cat.prepare_context(profile_skills=["code-review"], query="review")
+    assert events[0]["candidate_skills"] == ["code-review"]
+    assert events[0]["activated_skills"] == ["code-review"]
+    assert events[0]["index_chars"] > 0
+    assert events[0]["loaded_chars"] > 0
+
+
+def test_runtime_activates_skill_workflow_only_on_matching_turn(tmp_path):
+    from app.skills import SkillCatalog
+
+    _write_skill(tmp_path, "code-review")
+    cat = SkillCatalog.from_dir(tmp_path)
+
+    class _LLM:
+        model = "fake"
+        provider = "fake"
+
+        def __init__(self):
+            self.systems = []
+
+        def create_message(self, messages, **kwargs):
+            from app.models.protocol import ModelResponse
+            self.systems.append(kwargs.get("system", ""))
+            return ModelResponse(text="ok", tool_calls=[], usage={}, provider_payload=[])
+
+        def format_tool_results(self, results):
+            return []
+
+    from app.agent.runtime import AgentSession
+    from app.tools.registry import ToolRegistry
+
+    llm = _LLM()
+    base = "base\n\n" + cat.build_skill_index(["code-review"])
+    session = AgentSession(llm, ToolRegistry(), system_prompt=base)
+    session.skill_catalog = cat
+    session.profile_skills = ["code-review"]
+    session.base_system_prompt = base
+    session.chat("写个函数")
+    session.chat("请 review 代码")
+    assert "Read changed files" not in llm.systems[0]
+    assert "Read changed files" in llm.systems[1]
+
+
 # ── Skill.matches ───────────────────────────────────────────────────────────
 
 def test_skill_matches_trigger():
@@ -203,7 +319,7 @@ def test_catalog_resolve_dedupes(tmp_path):
 
 def test_catalog_build_context_includes_workflow_and_guard(tmp_path):
     cat = _catalog(tmp_path)
-    skills = cat.resolve(profile_skills=["code-review"], query="")
+    skills = [cat.load_skill("code-review")]
     ctx = cat.build_skill_context(skills)
     assert "不授予" in ctx                  # 安全声明
     assert "code-review" in ctx
@@ -216,14 +332,16 @@ def test_catalog_build_context_empty():
     assert cat.build_skill_context([]) == ""
 
 
-def test_catalog_inject_appends(tmp_path):
+def test_catalog_inject_appends_index_without_workflow(tmp_path):
     cat = _catalog(tmp_path)
     out = cat.inject("你是助手", profile_skills=["code-review"], query="")
     assert out.startswith("你是助手")
-    assert "Skill: code-review" in out
+    assert "code-review" in out
+    assert "SKILL.md" in out
+    assert "Read changed files" not in out
 
 
 def test_catalog_inject_no_skills_unchanged(tmp_path):
     cat = _catalog(tmp_path)
-    # 没有 profile skills，且 query 不命中任何 trigger → 原样返回
+    cat.disable("code-review")
     assert cat.inject("你是助手", profile_skills=[], query="无关") == "你是助手"

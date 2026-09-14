@@ -59,8 +59,8 @@ from app.mcp.adapter import build_mcp_tools
 from app.mcp.config import enabled_servers
 from app.mcp.manager import MCPManager
 from app.memory import build_memory_policy, inject_memories
+from app.skills import SkillCatalog, make_load_skill_tool
 from app.models.router import build_model_router
-from app.skills import SkillCatalog
 from app.storage import Storage
 from app.tools.builtin import default_tools
 from app.tools.builtin.interactive import PtySessionManager, make_terminal_tools
@@ -1680,6 +1680,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         for t in default_tools():
             reg.register(t)
         reg.register(make_todo_write_tool(task_store))
+        reg.register(make_load_skill_tool(skill_catalog, agent_profile.skills))
         # 交互式终端会话:每个 session 一个 PtySessionManager(子进程随会话生死),
         # 注册 terminal_open/send/close/list。cwd 锁 workspace,跟 shell 一致。
         pty_manager = PtySessionManager(cwd=str(ws))
@@ -1691,14 +1692,15 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
                                         reserved_names={t.name for t in reg.all()})
             for t in mcp_tools:
                 reg.register(t)
-        # Context Builder:按 memory_policy 把检索到的记忆注入 system prompt
+        # Skill 渐进披露：启动仅注入 L0 目录；规则明确命中的正文由 Runtime
+        # 在每轮按 query 激活，不确定时模型可调用 load_skill。
         mem_policy = build_memory_policy(agent_profile.memory_policy, storage)
         recent = mem_policy.retrieve(
             "", agent_profile.agent_id, limit=10, workspace=str(ws),
         )
         base_prompt = agent_profile.system_prompt or build_system_prompt(str(ws))
-        # 先注入 Skill 工作流（按 AgentProfile.skills 显式启用），再注入记忆。
-        # Skill 只加上下文，不放宽工具授权：上面 reg 注册的工具集才是实际可用集。
+        # 先注入 Skill 的 L0 目录（不含正文），再注入记忆。明确命中的 L1
+        # 工作流在每轮 chat 开始时按 query 临时加入 system prompt。
         with_skills = skill_catalog.inject(base_prompt, agent_profile.skills)
         sys_prompt = inject_memories(with_skills, recent)
         # ── 上下文预算 + 压缩(§7.3)──────────────────────────────────────────
@@ -1752,6 +1754,10 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             on_run_event=print_run_event_with_state,
             context_manager=ctx_manager,
         )
+        # 附加 Skill catalog，Runtime 每轮按 query 激活规则明确命中的 L1 正文。
+        sess.skill_catalog = skill_catalog
+        sess.profile_skills = list(agent_profile.skills)
+        sess.base_system_prompt = sys_prompt
         # 附加 agent_profile 供 CLI prompt 显示用(非 AgentSession 核心属性)
         sess.agent_profile = agent_profile
         sess.session_id = session_id

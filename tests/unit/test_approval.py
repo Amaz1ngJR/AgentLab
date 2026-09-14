@@ -227,6 +227,28 @@ def test_shell_rule_does_not_cover_an_unapproved_segment(monkeypatch, tmp_path):
     menu.assert_called_once()
 
 
+def test_outside_workspace_shell_displays_full_command(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    policy = InteractivePolicy()
+    command = "echo " + "long-command-part " * 20
+    captured = {}
+
+    def approve_once(choices, **kwargs):
+        captured["header_lines"] = kwargs["header_lines"]
+        return "yes"
+
+    with patch("app.util.menu.select_menu", side_effect=approve_once):
+        result = policy.request_tool(
+            _shell_descriptor(),
+            "shell_outside_workspace",
+            {"command": command, "cwd": "/tmp"},
+        )
+
+    assert result.approved
+    assert f"  {command}" in captured["header_lines"]
+    assert not any("..." in line for line in captured["header_lines"][:2])
+
+
 def test_complex_and_outside_shell_cannot_remember_approval(monkeypatch, tmp_path):
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
     policy = InteractivePolicy()

@@ -57,9 +57,11 @@ class Skill:
     allowed_tools         - 声明所需工具，是"上限/需求"而非授权（见模块 docstring）
     optional_mcp_servers  - 声明可选 MCP server 需求
     triggers              - 触发关键词，用于 query 匹配做自动推荐
+    tags                  - L0 目录标签，不参与授权
     enabled               - 是否默认启用；未知来源 Skill 缺省 False
     references            - references/ 下附带的参考资料文件路径
     source_dir            - Skill 目录绝对路径
+    skill_file            - SKILL.md 绝对路径；workflow 为空时可按需加载
     """
     skill_id: str
     name: str
@@ -68,9 +70,11 @@ class Skill:
     allowed_tools: list[str] = field(default_factory=list)
     optional_mcp_servers: list[str] = field(default_factory=list)
     triggers: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
     enabled: bool = False
     references: list[Path] = field(default_factory=list)
     source_dir: Optional[Path] = None
+    skill_file: Optional[Path] = None
 
     def matches(self, query: str) -> bool:
         """query 是否命中该 Skill 的触发关键词（大小写不敏感）。"""
@@ -112,8 +116,8 @@ def _as_str_list(value) -> list[str]:
     return [str(value)]
 
 
-def parse_skill(skill_dir: Path) -> Optional[Skill]:
-    """解析单个 Skill 目录，返回 Skill；目录非法或缺 metadata 时返回 None。
+def parse_skill(skill_dir: Path, *, load_workflow: bool = True) -> Optional[Skill]:
+    """解析单个 Skill 目录，默认加载正文；目录扫描可只构建轻量索引。
 
     校验规则：
       - 必须有 SKILL.md
@@ -138,13 +142,15 @@ def parse_skill(skill_dir: Path) -> Optional[Skill]:
         skill_id=skill_dir.name,
         name=name or skill_dir.name,
         description=description,
-        workflow=body.strip(),
+        workflow=body.strip() if load_workflow else "",
         allowed_tools=_as_str_list(meta.get("allowed_tools")),
         optional_mcp_servers=_as_str_list(meta.get("optional_mcp_servers")),
         triggers=_as_str_list(meta.get("triggers")),
+        tags=_as_str_list(meta.get("tags")),
         enabled=bool(meta.get("enabled", False)),
         references=refs,
-        source_dir=skill_dir,
+        source_dir=skill_dir.resolve(),
+        skill_file=md.resolve(),
     )
 
 
@@ -161,7 +167,7 @@ def load_skills(skills_dir: Optional[Path] = None) -> dict[str, Skill]:
     for child in sorted(base.iterdir()):
         if not child.is_dir():
             continue
-        skill = parse_skill(child)
+        skill = parse_skill(child, load_workflow=False)
         if skill is not None:
             skills[skill.skill_id] = skill
     return skills
