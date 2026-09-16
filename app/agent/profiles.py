@@ -31,7 +31,7 @@ class AgentProfile:
     max_steps       - 一次 run 的模型往返总上限（兼容旧配置名，默认 8）
     max_task_steps  - 单个子任务的模型往返上限（默认 min(8, max_steps)）
     orchestrate     - 是否启用编排能力（False 强制 Direct，默认 True）
-    mode            - auto/direct/task；未设置时兼容 orchestrate 的旧语义
+    mode            - auto/direct/task/legacy；配置未设置时按 orchestrate 选择
     """
     agent_id: str
     name: str
@@ -69,6 +69,7 @@ def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
     profiles: dict[str, AgentProfile] = {}
     for agent_id, body in (raw.get("agents") or {}).items():
         body = body or {}
+        orchestrate = _parse_bool(body.get("orchestrate"), default=True)
         profiles[agent_id] = AgentProfile(
             agent_id=agent_id,
             name=body.get("name", agent_id),
@@ -83,18 +84,20 @@ def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
                 int(body["max_task_steps"])
                 if body.get("max_task_steps") is not None else None
             ),
-            orchestrate=_parse_bool(body.get("orchestrate"), default=True),
-            mode=_parse_mode(body.get("mode")),
+            orchestrate=orchestrate,
+            mode=_parse_mode(body.get("mode"), orchestrate=orchestrate),
         )
     return profiles
 
 
-def _parse_mode(value) -> str:
-    """解析 profile 模式；legacy 表示沿用 orchestrate 布尔开关。"""
+def _parse_mode(value, *, orchestrate: bool = True) -> str:
+    """新配置默认自动路由；显式 legacy 保留旧的强制编排语义。"""
     if value is None:
-        return "legacy"
-    if not isinstance(value, str) or value.strip().lower() not in {"auto", "direct", "task"}:
-        raise ValueError(f"mode 必须是 auto/direct/task，当前值: {value!r}")
+        return "auto" if orchestrate else "direct"
+    if not isinstance(value, str) or value.strip().lower() not in {
+        "auto", "direct", "task", "legacy",
+    }:
+        raise ValueError(f"mode 必须是 auto/direct/task/legacy，当前值: {value!r}")
     return value.strip().lower()
 
 

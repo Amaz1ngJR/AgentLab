@@ -224,11 +224,18 @@ def test_runtime_service_protocol_commands_cover_submission_and_event_queue():
 
     session = FailingSession()
     service = RuntimeService(_Router({"s1": session}))
+    failed = threading.Event()
     completed = threading.Event()
-    service.subscribe(lambda event: completed.set() if event.kind == "run_completed" else None)
+    def capture(event):
+        if event.kind == "run_failed" and event.run_id == "bad":
+            failed.set()
+        elif event.kind == "run_completed" and event.run_id == "good":
+            completed.set()
+
+    service.subscribe(capture)
     service.submit_turn("s1", "fail", turn_id="bad")
-    deadline = time.time() + 1
-    while service.active_runs() and time.time() < deadline:
+    assert failed.wait(1)
+    while "bad" in service.active_runs():
         time.sleep(0.001)
     service.submit_turn("s1", "ok", turn_id="good")
     assert completed.wait(1)

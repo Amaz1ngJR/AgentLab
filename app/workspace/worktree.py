@@ -129,39 +129,50 @@ class WorktreeManager:
             is_dirty=False,
         )
 
+    def current_commit(self) -> str:
+        """获取当前主工作区 HEAD，用于检测子 Agent 运行期间的分支漂移。"""
+        return self._get_current_commit()
+
+    def changed_files(self, worktree: WorktreeInfo) -> list[str]:
+        """返回相对 base_commit 的已提交和未提交文件路径，稳定去重排序。"""
+        if not worktree.path.exists():
+            return []
+        changed: set[str] = set()
+        committed = self._run_git(
+            "-C", str(worktree.path), "diff", "--name-only", worktree.base_commit,
+            check=False,
+        )
+        if committed.returncode == 0:
+            changed.update(line.strip() for line in committed.stdout.splitlines() if line.strip())
+        status = self._run_git(
+            "-C", str(worktree.path), "status", "--porcelain", "--untracked-files=all",
+            check=False,
+        )
+        if status.returncode == 0:
+            for line in status.stdout.splitlines():
+                if len(line) < 4:
+                    continue
+                # porcelain v1 的前两列是状态；rename 行后半段是新路径。
+                path = line[3:]
+                if " -> " in path:
+                    path = path.rsplit(" -> ", 1)[1]
+                changed.add(path.strip().strip('"'))
+        return sorted(changed)
+
     def get_diff_summary(self, worktree: WorktreeInfo) -> str:
-        """生成 worktree 的 diff 摘要。
-
-        Args:
-            worktree: WorktreeInfo
-
-        Returns:
-            diff 摘要文本（统计 + 文件列表）
-        """
+        """生成 worktree 的 diff 摘要（统计 + 文件列表）。"""
         if not worktree.path.exists():
             return f"Worktree 不存在: {worktree.path}"
-
         try:
-            # 统计改动
-            stat_result = self._run_git(
-                "-C", str(worktree.path),
-                "diff", "--stat", worktree.base_commit,
-            )
-            stat = stat_result.stdout.strip()
-
-            # status 同时覆盖已跟踪、已暂存和未跟踪文件；单纯 git diff 会漏掉
-            # Agent 新建但尚未 git add 的文件。
-            status_result = self._run_git(
-                "-C", str(worktree.path),
-                "status", "--short",
-            )
-            status = status_result.stdout.strip()
-
+            stat = self._run_git(
+                "-C", str(worktree.path), "diff", "--stat", worktree.base_commit,
+            ).stdout.strip()
+            status = self._run_git(
+                "-C", str(worktree.path), "status", "--short",
+            ).stdout.strip()
             if not stat and not status:
                 return "无改动"
-
-            stat_text = stat or "(仅包含未跟踪文件，暂无 diff 统计)"
-            return f"改动统计:\n{stat_text}\n\n工作区状态:\n{status}"
+            return f"改动统计:\n{stat or '(仅包含未跟踪文件，暂无 diff 统计)'}\n\n工作区状态:\n{status}"
         except subprocess.CalledProcessError as exc:
             return f"获取 diff 失败: {exc.stderr}"
 

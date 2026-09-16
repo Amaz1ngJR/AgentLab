@@ -25,11 +25,15 @@ from app.agent import events
 from app.agent.approval import ApprovalPolicy, AutoApprove
 from app.agent.cancel import Cancelled, CancelToken
 from app.agent.events import RunEvent
-from app.agent.executor import Executor
+from app.agent.executor import Executor, TaskOutcome
 from app.agent.planner import Planner
 from app.agent.replanner import Replanner
-from app.agent.tasks import COMPLETED, TaskStore
-from app.models.router import ModelRouter
+from app.agent.tasks import BLOCKED, COMPLETED, FAILED, TaskStore
+from app.agent.execution_plan import ExecutionPlan
+from app.agent.subagent_runtime import SubagentRuntimeFactory
+from app.agent.subagents import SubagentCoordinator, SubagentResult, SubagentSpec
+from app.config.loader import workspace_root
+from app.workspace.worktree import WorktreeManager
 from app.tools.registry import ToolRegistry
 
 ProgressFn = Callable[[str], ContextManager[Any]]
@@ -127,6 +131,9 @@ class Orchestrator:
         # 本轮 run() 累计的真实工具调用次数(供 Loop 模式累加进预算)。每次 run() 重置。
         self.last_run_tool_calls: int = 0
         self.last_run_error: str = ""
+        self.subagent_results: dict[str, SubagentResult] = {}
+        self.subagent_merge_plan: list[dict[str, Any]] = []
+        self._planned_subagents: dict[str, SubagentSpec] = {}
 
     def _namespace_tasks(self, tasks: list) -> list:
         """给一批新计划的任务 id 加 run 前缀,并同步重映射其 dependencies。
@@ -197,6 +204,9 @@ class Orchestrator:
         self.last_run_status = ""
         self.last_run_error = ""
         self.last_run_tool_calls = 0
+        self.subagent_results = {}
+        self.subagent_merge_plan = []
+        self._planned_subagents = {}
         if not resume:
             # 非 resume 模式:清空旧任务,只展示本轮计划
             self.store.clear()
@@ -240,6 +250,12 @@ class Orchestrator:
         if self._planner.last_actual_model:
             self.last_actual_model = self._planner.last_actual_model
         self.store.extend(self._namespace_tasks(plan.tasks))
+        if plan.execution_plan is not None:
+            self._planned_subagents = {
+                item.task.id: item.subagent
+                for item in plan.execution_plan.tasks
+                if item.executor == "subagent" and item.subagent is not None
+            }
         self._emit(RunEvent(kind=events.PLAN_CREATED,
                             payload={"tasks": self.store.snapshot()}))
         # 规划后是第一个稳定点:此时只追加了 goal,通常还不到阈值,但若上一轮 run
@@ -262,11 +278,15 @@ class Orchestrator:
                 # 每个任务只获得独立的模型往返上限；全局预算由 rounds_left 控制。
                 # 不能把全部剩余额度一次性交给首个任务，否则多任务计划会饿死。
                 budget = max(1, min(rounds_left, self._max_task_steps))
-                outcome = self._executor.run_task(
-                    task, self.messages,
-                    system=self._system, max_steps=budget, cancel=cancel,
-                    usage_acc=self.last_run_usage, on_actual_model=_record_model,
-                )
+                spec = self._planned_subagents.get(task.id)
+                if spec is not None:
+                    outcome = self._run_subagent_task(spec, task, cancel)
+                else:
+                    outcome = self._executor.run_task(
+                        task, self.messages,
+                        system=self._system, max_steps=budget, cancel=cancel,
+                        usage_acc=self.last_run_usage, on_actual_model=_record_model,
+                    )
                 rounds_left -= max(1, outcome.model_rounds)
                 self.last_run_tool_calls += outcome.tool_calls_made
 
@@ -309,6 +329,35 @@ class Orchestrator:
         self._emit(RunEvent(kind=events.RUN_COMPLETED, text=last_text,
                             payload={"tasks": snapshot}))
         return last_text or "已完成。"
+
+    def _run_subagent_task(self, spec: SubagentSpec, task, cancel: CancelToken) -> TaskOutcome:
+        """执行一个已通过 Planner 校验的子 Agent 任务。"""
+        def _delegate(spec: SubagentSpec, workspace, child_cancel):
+            return factory.delegate(spec, workspace, child_cancel)
+
+        try:
+            if not spec.read_only:
+                manager = WorktreeManager(workspace_root())
+                coordinator = SubagentCoordinator(
+                    manager, _delegate, max_workers=1, on_event=self._emit,
+                )
+                results = coordinator.run([spec], cancel=cancel)
+                self.subagent_results.update(results)
+                self.subagent_merge_plan.extend(coordinator.merge_plan(results))
+            else:
+                result = factory.delegate(spec, workspace_root(), cancel)
+                self.subagent_results[spec.subagent_id] = result
+        except Cancelled:
+            raise
+        except (ValueError, RuntimeError) as exc:
+            return TaskOutcome(FAILED, error=str(exc), text=str(exc))
+        except Exception as exc:
+            return TaskOutcome(FAILED, error=f"{type(exc).__name__}: {exc}", text=str(exc))
+
+        result = self.subagent_results[spec.subagent_id]
+        status = COMPLETED if result.status == "succeeded" else FAILED
+        evidence = result.output or result.error
+        return TaskOutcome(status, evidence=evidence, error=result.error, text=result.output)
 
     def all_completed(self) -> bool:
         """是否所有任务都成功完成(无 failed/blocked)。供测试/UI 判定。"""

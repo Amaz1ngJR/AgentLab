@@ -8,6 +8,7 @@ OpenAI Responses API 的关键差异需要 mock 反映:
   - output item 类型: type=message 含 content (output_text part 列表),
     或 type=function_call (call_id, name, arguments JSON 字符串)
 """
+import pytest
 from unittest.mock import MagicMock, patch
 
 from app.config.schemas import LLMConfig
@@ -58,6 +59,20 @@ def _message_item(text: str) -> MagicMock:
     return item
 
 
+def _refusal_item(text: str) -> MagicMock:
+    part = MagicMock()
+    part.type = "refusal"
+    part.refusal = text
+    item = MagicMock()
+    item.type = "message"
+    item.content = [part]
+    item.model_dump.return_value = {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "refusal", "refusal": text}],
+    }
+    return item
+
+
 def _function_call_item(call_id: str, name: str, arguments_json: str) -> MagicMock:
     """构造 type=function_call 的 output item。"""
     item = MagicMock()
@@ -71,6 +86,13 @@ def _function_call_item(call_id: str, name: str, arguments_json: str) -> MagicMo
         "name": name,
         "arguments": arguments_json,
     }
+    return item
+
+
+def _reasoning_item() -> MagicMock:
+    item = MagicMock()
+    item.type = "reasoning"
+    item.model_dump.return_value = {"type": "reasoning", "summary": []}
     return item
 
 
@@ -90,6 +112,21 @@ def _reasoning_delta_event(text: str, *, summary: bool = False) -> MagicMock:
     )
     ev.delta = text
     return ev
+
+
+def _output_item_done_event(item: MagicMock, index: int = 0) -> MagicMock:
+    event = MagicMock()
+    event.type = "response.output_item.done"
+    event.item = item
+    event.output_index = index
+    return event
+
+
+def _completed_event(final: MagicMock) -> MagicMock:
+    event = MagicMock()
+    event.type = "response.completed"
+    event.response = final
+    return event
 
 
 def _function_args_delta_event(text: str) -> MagicMock:
@@ -170,6 +207,147 @@ def test_reasoning_parameter_omitted_when_not_configured():
         adapter = OpenAIAdapter(_cfg())
         params = adapter._base_params([], temperature=None, system=None)
     assert "reasoning" not in params
+
+
+def test_reasoning_only_response_retries_with_lower_effort():
+    cfg = _cfg()
+    cfg.reasoning_effort = "high"
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.side_effect = [
+            _FakeStream([], _build_final([_reasoning_item()], out_tokens=89)),
+            _FakeStream([], _build_final([_message_item("OK")], out_tokens=6)),
+        ]
+        response = OpenAIAdapter(cfg).create_message(
+            messages=[{"role": "user", "content": "只回复 OK"}],
+            max_tokens=512,
+        )
+
+    assert response.text == "OK"
+    assert response.usage == {"input_tokens": 24, "output_tokens": 95}
+    assert response.provider_payload[0]["type"] == "message"
+    assert client.responses.stream.call_args_list[0].kwargs["reasoning"] == {"effort": "high"}
+    assert client.responses.stream.call_args_list[1].kwargs["reasoning"] == {"effort": "low"}
+
+
+def test_empty_final_output_recovers_completed_stream_item():
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.return_value = _FakeStream(
+            [_output_item_done_event(_message_item("OK"))], _build_final([], out_tokens=9),
+        )
+        response = OpenAIAdapter(_cfg()).create_message(
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+    assert response.text == "OK"
+    assert response.provider_payload[0]["type"] == "message"
+    assert client.responses.stream.call_count == 1
+
+
+def test_empty_final_output_recovers_structured_tool_call():
+    tool_item = _function_call_item("call-1", "edit_file", '{"path":"a.py"}')
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.return_value = _FakeStream(
+            [_output_item_done_event(tool_item)], _build_final([], out_tokens=12),
+        )
+        response = OpenAIAdapter(_cfg()).create_message(
+            messages=[{"role": "user", "content": "修复代码"}],
+            tools=[{
+                "name": "edit_file", "description": "Edit a file",
+                "input_schema": {"type": "object", "properties": {}},
+            }],
+        )
+
+    assert response.tool_calls[0].name == "edit_file"
+    assert response.tool_calls[0].arguments == {"path": "a.py"}
+    assert response.provider_payload[0]["type"] == "function_call"
+    assert client.responses.stream.call_count == 1
+
+
+def test_empty_final_output_with_reasoning_usage_retries_lower_effort():
+    cfg = _cfg()
+    cfg.reasoning_effort = "high"
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.side_effect = [
+            _FakeStream([_reasoning_delta_event("思考中")], _build_final([], out_tokens=99)),
+            _FakeStream([], _build_final([_message_item("OK")], out_tokens=8)),
+        ]
+        response = OpenAIAdapter(cfg).create_message(
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+    assert response.text == "OK"
+    assert response.usage["output_tokens"] == 107
+    assert client.responses.stream.call_args_list[1].kwargs["reasoning"] == {"effort": "none"}
+
+
+def test_empty_final_output_still_empty_after_fallback_reports_state():
+    cfg = _cfg()
+    cfg.reasoning_effort = "high"
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.side_effect = [
+            _FakeStream([], _build_final([], out_tokens=99)),
+            _FakeStream([], _build_final([], out_tokens=30)),
+        ]
+        with pytest.raises(ProviderStreamError, match="空输出") as exc:
+            OpenAIAdapter(cfg).create_message(messages=[{"role": "user", "content": "test"}])
+
+    assert "output_types=[]" in str(exc.value)
+    assert client.responses.stream.call_count == 2
+
+
+def test_streamed_text_survives_missing_final_message_item():
+    cfg = _cfg()
+    cfg.reasoning_effort = "high"
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.return_value = _FakeStream(
+            [_delta_event("OK")], _build_final([_reasoning_item()]),
+        )
+        response = OpenAIAdapter(cfg).create_message(
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+    assert response.text == "OK"
+    assert response.provider_payload[-1]["content"][0]["text"] == "OK"
+    assert client.responses.stream.call_count == 1
+
+
+def test_persistently_reasoning_only_response_reports_provider_state():
+    cfg = _cfg()
+    cfg.reasoning_effort = "high"
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.side_effect = [
+            _FakeStream([], _build_final([_reasoning_item()])),
+            _FakeStream([], _build_final([_reasoning_item()])),
+        ]
+        with pytest.raises(ProviderStreamError, match="仅返回推理内容") as exc:
+            OpenAIAdapter(cfg).create_message(messages=[{"role": "user", "content": "test"}])
+
+    assert "status=completed" in str(exc.value)
+    assert "output_types=['reasoning']" in str(exc.value)
+    assert client.responses.stream.call_count == 2
+
+
+def test_refusal_is_returned_as_visible_text_without_reasoning_retry():
+    cfg = _cfg()
+    cfg.reasoning_effort = "high"
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.return_value = _FakeStream(
+            [], _build_final([_reasoning_item(), _refusal_item("无法协助")]),
+        )
+        response = OpenAIAdapter(cfg).create_message(
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+    assert response.text == "无法协助"
+    assert client.responses.stream.call_count == 1
 
 
 def test_create_message_text_only():
@@ -367,8 +545,8 @@ def test_repair_responses_tool_pairs_keeps_complete_pairs_unchanged():
     assert _repair_responses_tool_pairs(items) == items
 
 
-def test_stream_protocol_order_error_is_not_reported_as_success():
-    """SDK 事件顺序异常应抛出 ProviderStreamError，不能伪造正常 ModelResponse。"""
+def test_codex_metadata_before_created_falls_back_to_raw_stream():
+    """网关的 codex.* 前置事件绕过 SDK 状态机，由原始流兼容解析。"""
     class BrokenStream:
         def __enter__(self):
             return self
@@ -378,7 +556,7 @@ def test_stream_protocol_order_error_is_not_reported_as_success():
 
         def __iter__(self):
             raise RuntimeError(
-                "Expected to have received `response.created` before `codex.rate_limits`"
+                "Expected to have received `response.created` before `codex.response.metadata`"
             )
             yield  # pragma: no cover
 
@@ -386,11 +564,43 @@ def test_stream_protocol_order_error_is_not_reported_as_success():
         client = MagicMock()
         MockOpenAI.return_value = client
         client.responses.stream.return_value = BrokenStream()
+        final = _build_final([_message_item("OK")])
+        metadata = MagicMock()
+        metadata.type = "codex.response.metadata"
+        client.responses.create.return_value = iter([
+            metadata,
+            _output_item_done_event(_message_item("OK")),
+            _completed_event(final),
+        ])
         adapter = OpenAIAdapter(_cfg())
 
-        import pytest
+        response = adapter.create_message(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.text == "OK"
+    assert client.responses.create.call_args.kwargs["stream"] is True
+
+
+def test_standard_stream_order_error_is_not_hidden():
+    class BrokenStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def __iter__(self):
+            raise RuntimeError(
+                "Expected to have received `response.created` before `response.output_item.added`"
+            )
+            yield  # pragma: no cover
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.return_value = BrokenStream()
         with pytest.raises(ProviderStreamError, match="流式协议异常"):
-            adapter.create_message(messages=[{"role": "user", "content": "hello"}])
+            OpenAIAdapter(_cfg()).create_message(
+                messages=[{"role": "user", "content": "hello"}],
+            )
 
 
 def test_convert_messages_filters_unsupported_fields():

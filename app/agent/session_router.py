@@ -77,7 +77,8 @@ class SessionRouter:
         if profile is None:
             # 没有 agents.yaml 时 fallback 到占位 profile
             profile = AgentProfile(agent_id=aid, name=aid,
-                                   model_profile=self._default_profile_id)
+                                   model_profile=self._default_profile_id,
+                                   mode="auto")
         session_id = str(uuid.uuid4())[:8]
         session = self._factory(profile, session_id)
         self._sessions[session_id] = session
@@ -110,6 +111,7 @@ class SessionRouter:
                     agent_id=row["agent_id"],
                     name=row["agent_id"],
                     model_profile=row["model_profile"],
+                    mode="auto",
                 )
             session = self._factory(profile, session_id)
             session.messages = self._storage.load_messages(session_id)

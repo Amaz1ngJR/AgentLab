@@ -110,13 +110,14 @@ def _looks_like_completion_message(text: str) -> bool:
 ProgressFn = Callable[[str], ContextManager[Any]]
 
 # 注入到 messages 的任务指令模板：工具仅用于确实需要外部操作的任务，
-# 纯对话、解释、总结等任务应直接回答，避免模型为了满足形式要求反复调用无意义工具。
+# 无需外部信息的任务应直接回答；项目相关问题需要先核实工作区内容。
 _TASK_DIRECTIVE = (
     "【当前子任务】{content}\n\n"
     "执行要求:\n"
     "- 先判断任务是否确实需要读取文件、修改代码、执行命令或联网查询。\n"
     "- 需要外部操作时，立即调用最相关的工具，不要只描述计划。\n"
-    "- 纯对话、介绍、解释、总结或无需外部信息的问题，直接回答，不要调用工具。\n"
+    "- 介绍项目、文件或代码时，先读取相关资料，再基于实际内容回答。\n"
+    "- 自我介绍、纯对话或无需外部信息的问题，直接回答，不要调用工具。\n"
     "- 完成后直接给出结果，避免重复调用工具或重复回答。"
 )
 
@@ -196,6 +197,7 @@ class Executor:
 
             tools = self._tools_for_task(task.content, mode="task") or None
             text_streamed = False
+            streamed_parts: list[str] = []
             with self._progress("thinking") as handle:
                 on_progress = getattr(handle, "update", None)
                 raw_on_text = getattr(handle, "on_text", None)
@@ -215,6 +217,7 @@ class Executor:
                 def on_text_delta(delta: str) -> None:
                     nonlocal text_streamed
                     text_streamed = True
+                    streamed_parts.append(delta)
                     if raw_on_text is not None:
                         raw_on_text(delta)
 
@@ -235,17 +238,44 @@ class Executor:
 
             messages.extend(resp.provider_payload)
 
-            if resp.text:
-                last_text = resp.text
+            response_text = resp.text or "".join(streamed_parts)
+            if response_text:
+                last_text = response_text
                 # 文本若已被 spinner 流式打印过,就不再发 message_delta(避免重复)
                 if not text_streamed:
-                    self._emit(RunEvent(kind=events.MESSAGE_DELTA, text=resp.text,
+                    self._emit(RunEvent(kind=events.MESSAGE_DELTA, text=response_text,
                                         task_id=task.id))
 
             # 没有工具调用 = 模型认为这个子任务已经做完
             if not resp.tool_calls:
+                if not response_text.strip():
+                    no_progress_rounds += 1
+                    if no_progress_rounds == 1 and model_rounds < max_steps:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "上一轮没有返回正文，也没有调用工具，任务尚未完成。"
+                                "请直接回答当前任务，或调用必要的工具；不要只输出推理内容。"
+                            ),
+                        })
+                        continue
+                    output_types = [
+                        item.get("type", "unknown")
+                        for item in (resp.provider_payload or [])
+                        if isinstance(item, dict)
+                    ]
+                    return TaskOutcome(
+                        status=FAILED,
+                        error=(
+                            "模型未返回正文或工具调用，任务未完成"
+                            f" (status={resp.finish_reason or 'unknown'}, "
+                            f"output_types={output_types})"
+                        ),
+                        tool_calls_made=tool_calls_made,
+                        model_rounds=model_rounds,
+                    )
                 # 模型输出新的完成文本，说明本轮有进展；只有首次空转才给一次纠正机会。
-                no_progress_rounds = 0 if resp.text.strip() else no_progress_rounds + 1
+                no_progress_rounds = 0
                 # 空转检测：第一轮就没调用工具，且任务描述明显需要工具操作时，给予提示
                 # 但如果模型给出的文本说明了不需要操作（如"已完成"、"无需修改"等），则接受
                 if tool_calls_made == 0 and _looks_like_action_task(task.content) and \
@@ -275,6 +305,7 @@ class Executor:
                     model_rounds=model_rounds,
                 )
 
+            no_progress_rounds = 0
             tool_results: list[ToolResult] = []
             denied_any = False
             # 记录本轮已产出结果的 tool_call id;取消/早返回时据此给剩余的补合成结果,

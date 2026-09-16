@@ -936,7 +936,17 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         # 审批对话框会显示详细信息，这里不再重复打印
         pass
     elif kind == run_events.TOOL_COMPLETED:
-        preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
+        # 最多显示 3 行，每行限 120 字符；超过 3 行时最后一行末尾加省略号
+        lines = (ev.tool_output or "").splitlines()
+        if not lines:
+            preview_lines = [""]
+        elif len(lines) <= 3:
+            preview_lines = [line[:120] for line in lines[:3]]
+        else:
+            preview_lines = [line[:120] for line in lines[:2]]
+            third_line = lines[2][:117] + "..." if len(lines[2]) > 117 else lines[2] + "..."
+            preview_lines.append(third_line)
+        preview = "\n    ".join(preview_lines)  # 保持缩进对齐
         tag = "ERR" if ev.tool_error else "ok"
         t = (f" ({ev.elapsed_seconds * 1000:.0f}ms)" if ev.elapsed_seconds < 1
              else f" ({ev.elapsed_seconds:.1f}s)")
@@ -1357,7 +1367,15 @@ def _handle_model_command(router: SessionRouter, line: str) -> str:
                     declared_context_size=target_cfg.context_size,
                 )
                 # 获取可用的 skills 列表
-                available_skills = [s.skill_id for s in skill_catalog.all()]
+                available_skills = []
+                catalog = getattr(router.current, "skill_catalog", None)
+                if catalog is None:
+                    # 如果 session 没有 skill_catalog，尝试重新加载
+                    from app.skills import SkillCatalog
+                    catalog = SkillCatalog.from_dir()
+                if catalog is not None:
+                    available_skills = [s.skill_id for s in catalog.all()]
+                
                 new_compressor = ContextCompressor(
                     new_llm,
                     model_profile=target_cfg.profile_name or "",
@@ -1734,8 +1752,8 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             system_prompt=sys_prompt,
             max_steps=agent_profile.max_steps,
             max_task_steps=agent_profile.max_task_steps,
-            # 编排模式下使用 on_run_event，非编排模式使用 on_event
-            on_event=None if agent_profile.orchestrate else _print_event,
+            # auto 可逐轮选择 Direct；两种路径使用不同事件，不会重复渲染。
+            on_event=_print_event,
             progress=progress_fn,
             task_store=task_store,
             # PtySessionManager 随会话关闭(close_all 杀掉残留的交互式子进程)。
@@ -2179,7 +2197,8 @@ class _EscWatcher:
 
     def _run(self) -> None:
         import select
-        fired = False
+        last_esc_time = 0.0
+        debounce_seconds = 0.5  # 防抖窗口:同一次按键产生的多个事件只触发一次
         while not self._stop.is_set():
             if self._paused.is_set():
                 # 暂停期间不碰 stdin(前台菜单在用),睡一小会儿再看
@@ -2197,12 +2216,14 @@ class _EscWatcher:
                 break
             if not data:
                 continue
-            if not fired and _scan_for_esc(data):
-                fired = True  # 只触发一次,避免连发
-                try:
-                    self._on_esc()
-                except Exception:
-                    pass
+            if _scan_for_esc(data):
+                now = time.time()
+                if now - last_esc_time > debounce_seconds:
+                    last_esc_time = now
+                    try:
+                        self._on_esc()
+                    except Exception:
+                        pass
 
 
 def _chat_with_cancel(

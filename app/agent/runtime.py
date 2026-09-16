@@ -1,6 +1,7 @@
 """Agent Runtime —— 驱动"模型 → 工具 → 模型"的多轮对话循环。"""
 from __future__ import annotations
 
+import re
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -81,6 +82,30 @@ DENIED_MESSAGE = (
 )
 
 ProgressFn = Callable[[str], ContextManager[Any]]
+
+
+def _requires_tool_execution(user_input: str) -> bool:
+    """只对明确要求实际改动/执行的请求阻止纯文字冒充工具执行。"""
+    text = user_input.strip().splitlines()[0].lower() if user_input.strip() else ""
+    if text.startswith(("如何", "怎么", "为什么", "how ", "why ")):
+        return False
+    chinese_actions = (
+        "帮我修复", "请修复", "直接修复", "修复代码",
+        "帮我修改", "请修改", "直接修改", "修改代码",
+        "编辑文件", "运行测试", "执行命令", "创建文件", "删除文件", "实现功能",
+    )
+    if any(marker in text for marker in chinese_actions):
+        return True
+    return bool(re.search(r"\b(fix|edit|modify|implement|execute)\b", text))
+
+
+def _looks_like_pseudo_tool_call(text: str, *, action_request: bool) -> bool:
+    """识别模型正文中冒充工具调用的行；绝不从文字反序列化并执行。"""
+    if re.search(r"(?m)^\s*\\?\[历史工具调用\s+\w+\]", text):
+        return True
+    return action_request and bool(re.search(
+        r"(?m)^\s*(?:edit_file|write_file|shell)\s*\(", text,
+    ))
 
 
 @dataclass
@@ -448,8 +473,16 @@ class AgentSession:
         turn_start = time.monotonic()
 
         try:
-            for _ in range(self.max_steps):
+            empty_rounds = 0
+            action_request = _requires_tool_execution(user_input)
+            inspect_text_before_display = action_request or (
+                "[pasted text" in user_input.lower() or "历史工具调用" in user_input
+            )
+            has_tool_call = False
+            corrected_no_tool = False
+            for step_index in range(self.max_steps):
                 text_streamed = False
+                streamed_parts: list[str] = []
                 with self._progress("thinking") as handle:
                     on_progress = getattr(handle, "update", None)
                     raw_on_text = getattr(handle, "on_text", None)
@@ -458,6 +491,7 @@ class AgentSession:
                     def on_text_delta(delta: str) -> None:
                         nonlocal text_streamed
                         text_streamed = True
+                        streamed_parts.append(delta)
                         if raw_on_text is not None:
                             raw_on_text(delta)
 
@@ -466,7 +500,12 @@ class AgentSession:
                         tools=tools or None,
                         system=self.system_prompt,
                         on_progress=on_progress,
-                        on_text_delta=on_text_delta if raw_on_text else None,
+                        on_text_delta=(
+                            on_text_delta if raw_on_text and (
+                                not inspect_text_before_display or has_tool_call
+                            )
+                            else None
+                        ),
                         on_thinking_delta=raw_on_thinking,
                     )
 
@@ -484,13 +523,65 @@ class AgentSession:
                 #  OpenAI Responses 可能把 text 块和 function_call 块拆成多条)
                 self.messages.extend(resp.provider_payload)
 
-                # 文本未被流式打印过才补发 text 事件，避免重复
-                if resp.text and not text_streamed:
-                    self._emit_turn_event(TurnEvent(kind="text", text=resp.text))
+                # 明确要求执行的请求先核实是否真有工具调用，不能把文字里的伪调用显示为结果。
+                response_text = resp.text or "".join(streamed_parts)
 
                 if not resp.tool_calls:
-                    return resp.text
+                    if not response_text.strip():
+                        empty_rounds += 1
+                        if empty_rounds == 1 and step_index + 1 < self.max_steps:
+                            self.messages.append({
+                                "role": "user",
+                                "content": (
+                                    "上一轮没有返回正文，也没有调用工具。请直接回答，"
+                                    "或调用必要工具；不要只输出推理内容。"
+                                ),
+                            })
+                            continue
+                        output_types = [
+                            item.get("type", "unknown")
+                            for item in (resp.provider_payload or [])
+                            if isinstance(item, dict)
+                        ]
+                        raise RuntimeError(
+                            "模型未返回正文或工具调用，任务未完成"
+                            f" (status={resp.finish_reason or 'unknown'}, "
+                            f"output_types={output_types})"
+                        )
+                    if action_request and not has_tool_call:
+                        if not corrected_no_tool and step_index + 1 < self.max_steps:
+                            corrected_no_tool = True
+                            self.messages.append({
+                                "role": "user",
+                                "content": (
+                                    "你尚未实际执行请求。文字中的 edit_file/shell 等调用不是工具调用，"
+                                    "不能宣称已经修改或运行。请现在通过提供的结构化工具接口"
+                                    "读取必要上下文并执行；不要输出伪工具调用。"
+                                ),
+                            })
+                            continue
+                        raise RuntimeError("模型只输出了文字，未进行结构化工具调用；请求未执行")
+                    if _looks_like_pseudo_tool_call(response_text, action_request=action_request):
+                        if not corrected_no_tool and step_index + 1 < self.max_steps:
+                            corrected_no_tool = True
+                            self.messages.append({
+                                "role": "user",
+                                "content": (
+                                    "你的正文包含模拟的工具调用，但本轮没有结构化工具调用。"
+                                    "不要把历史记录或文字当作实际执行；若需操作，请通过工具接口调用。"
+                                    "若只是解释粘贴的日志，请明确说明未执行并直接给出分析。"
+                                ),
+                            })
+                            continue
+                        raise RuntimeError("模型只在正文中模拟工具调用；本轮未执行任何操作")
+                    if not text_streamed:
+                        self._emit_turn_event(TurnEvent(kind="text", text=response_text))
+                    return response_text
 
+                if response_text and not text_streamed:
+                    self._emit_turn_event(TurnEvent(kind="text", text=response_text))
+                has_tool_call = True
+                empty_rounds = 0
                 tool_results: list[ToolResult] = []
                 resulted_ids: set[str] = set()
 

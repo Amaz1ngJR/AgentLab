@@ -26,6 +26,7 @@ def test_parses_profile(tmp_path):
     assert p.max_steps == 12
     assert p.max_task_steps == 5
     assert p.orchestrate is True
+    assert p.mode == "auto"
 
 
 def test_parses_auto_mode(tmp_path):
@@ -50,6 +51,16 @@ def test_parses_orchestrate_false(tmp_path):
         encoding="utf-8",
     )
     assert load_agent_profiles(f)["x"].orchestrate is False
+    assert load_agent_profiles(f)["x"].mode == "direct"
+
+
+def test_explicit_legacy_mode_preserves_forced_task_routing(tmp_path):
+    f = tmp_path / "a.yaml"
+    f.write_text(
+        "agents:\n  x:\n    model_profile: local_qwen\n    mode: legacy\n",
+        encoding="utf-8",
+    )
+    assert load_agent_profiles(f)["x"].mode == "legacy"
 
 
 

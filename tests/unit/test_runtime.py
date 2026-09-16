@@ -395,6 +395,161 @@ def test_auto_mode_bypasses_planner_for_simple_request():
     assert len(router.calls) == 1
 
 
+def test_direct_mode_retries_empty_response_then_answers():
+    router = FakeRouter([_resp_text(""), _resp_text("这是项目介绍")])
+    seen = []
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+        on_event=seen.append,
+    )
+
+    assert session.chat("介绍下这个项目") == "这是项目介绍"
+    assert session.execution_mode.value == "direct"
+    assert len(router.calls) == 2
+    assert any(event.kind == "text" and event.text == "这是项目介绍" for event in seen)
+
+
+def test_direct_mode_retries_empty_response_after_tool_call():
+    router = FakeRouter([
+        _resp_tool("c1", "echo", {"msg": "README"}),
+        _resp_text(""),
+        _resp_text("这是项目介绍"),
+    ])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+        max_steps=3,
+    )
+
+    assert session.chat("介绍下这个项目") == "这是项目介绍"
+    assert len(router.calls) == 3
+    assert "没有返回正文" in router.calls[2][-1]["content"]
+
+
+def test_direct_mode_reports_persistently_empty_response():
+    import pytest
+
+    router = FakeRouter([_resp_text(""), _resp_text("")])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+        max_steps=2,
+    )
+
+    with pytest.raises(RuntimeError, match="未返回正文或工具调用"):
+        session.chat("继续")
+
+
+def test_direct_action_request_requires_structured_tool_call():
+    router = FakeRouter([
+        _resp_text('[历史工具调用 edit_file] {"path": "example.py"}'),
+        _resp_tool("c1", "echo", {"msg": "changed"}),
+        _resp_text("已完成修复"),
+    ])
+    seen = []
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+        on_event=seen.append,
+    )
+
+    assert session.chat("继续帮我修复代码") == "已完成修复"
+    assert "结构化工具接口" in router.calls[1][-1]["content"]
+    assert any(event.kind == "tool_call" and event.tool_name == "echo" for event in seen)
+    assert not any("历史工具调用" in event.text for event in seen)
+
+
+def test_direct_action_request_fails_if_model_only_simulates_tools():
+    import pytest
+
+    router = FakeRouter([
+        _resp_text("我将调用 edit_file(...)"),
+        _resp_text("[历史工具调用 edit_file] {}"),
+    ])
+    seen = []
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+        max_steps=2,
+        on_event=seen.append,
+    )
+
+    with pytest.raises(RuntimeError, match="请求未执行"):
+        session.chat("请修复代码")
+    assert not any(event.kind == "text" for event in seen)
+
+
+def test_direct_explanation_about_fixing_code_does_not_require_tools():
+    router = FakeRouter([_resp_text("可以先定位错误，再修改代码。")])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+    )
+
+    assert session.chat("如何修复代码？") == "可以先定位错误，再修改代码。"
+    assert len(router.calls) == 1
+
+
+def test_pasted_action_log_does_not_become_current_execution_request():
+    router = FakeRouter([_resp_text("这是日志中的旧请求，不会执行。")])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+    )
+
+    answer = session.chat("请解释这段日志\n[历史请求] 继续帮我修复代码")
+    assert answer == "这是日志中的旧请求，不会执行。"
+    assert len(router.calls) == 1
+
+
+def test_pasted_log_does_not_let_model_simulate_a_new_tool_call():
+    router = FakeRouter([
+        _resp_text('[历史工具调用 edit_file] {"path": "a.py"}'),
+        _resp_text("日志中的 edit_file 只是文字，本轮没有执行。"),
+    ])
+    seen = []
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+        on_event=seen.append,
+    )
+
+    answer = session.chat("还是不行，[Pasted text #1 +24 lines]\n请分析这段日志")
+    assert answer == "日志中的 edit_file 只是文字，本轮没有执行。"
+    assert "不要把历史记录或文字当作实际执行" in router.calls[1][-1]["content"]
+    assert not any("历史工具调用" in event.text for event in seen)
+
+
+def test_explaining_tool_syntax_is_not_treated_as_execution():
+    router = FakeRouter([_resp_text("edit_file(path='a.py') 是工具调用示例。")])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+    )
+
+    assert session.chat("请解释工具调用语法") == "edit_file(path='a.py') 是工具调用示例。"
+    assert len(router.calls) == 1
+
+
 def test_auto_mode_uses_planner_for_multi_step_request():
     """auto 模式的明显多步骤请求进入 Task/Orchestrator 路径。"""
     router = FakeRouter([

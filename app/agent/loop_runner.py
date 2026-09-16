@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable
+from typing import Any, Callable
 
 from app.agent.approval import ApprovalPolicy
 from app.agent.cancel import CancelToken
@@ -47,6 +47,8 @@ from app.agent.orchestrator import Orchestrator
 from app.agent.planner import Planner
 from app.agent.tasks import TaskStore
 from app.agent.verifier import Verifier, VerificationResult
+from app.agent.subagents import SubagentCoordinator, SubagentResult, SubagentSpec
+from app.agent.subagent_runtime import SubagentRuntimeFactory
 from app.config.loader import use_workspace_root
 from app.workspace.worktree import WorktreeInfo, WorktreeManager
 
@@ -111,8 +113,40 @@ class LoopRunner:
         self.commit_error: str = ""
         self.diff_artifact_id: str | None = None
         self.termination_reason: str = ""
+        self.subagent_coordinator: SubagentCoordinator | None = None
 
     def _now(self) -> str:
+        return datetime.utcnow().isoformat()
+
+    def run_subagents(
+        self,
+        specs: list[SubagentSpec],
+        delegate: Callable,
+        *,
+        max_workers: int = 2,
+        cancel: CancelToken | None = None,
+    ) -> dict[str, SubagentResult]:
+        """在当前 Loop 中受控并行委托子 Agent；不自动合并结果。"""
+        if self.goal.workspace_mode != "git_worktree":
+            raise ValueError("子 Agent 写入隔离要求 workspace_mode=git_worktree")
+        if self.worktree_manager is None:
+            raise ValueError("并行子 Agent 需要 WorktreeManager")
+        self.subagent_coordinator = SubagentCoordinator(
+            self.worktree_manager,
+            delegate,
+            max_workers=max_workers,
+            on_event=self.on_event,
+            storage=self.storage,
+            loop_id=self.loop_id,
+        )
+        return self.subagent_coordinator.run(specs, cancel=cancel)
+
+    def subagent_merge_plan(self, results: dict[str, SubagentResult]) -> list[dict]:
+        """返回子 Agent 交付计划；调用方必须单独审批后才能合并。"""
+        if self.subagent_coordinator is None:
+            return []
+        return self.subagent_coordinator.merge_plan(results)
+
         return datetime.utcnow().isoformat()
 
     def _budget_dict(self) -> dict:

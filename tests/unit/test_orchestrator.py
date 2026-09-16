@@ -207,8 +207,47 @@ def test_executor_completes_task_without_tools():
     assert out.model_rounds == 1
 
 
+def test_executor_retries_empty_response_then_returns_real_answer():
+    router = FakeRouter([_resp_text(""), _resp_text("项目介绍")])
+    ex = Executor(router, _registry(_echo_tool()))
+
+    out = ex.run_task(Task("t1", "介绍项目"), [], system="", max_steps=3)
+
+    assert out.status == COMPLETED
+    assert out.text == "项目介绍"
+    assert out.model_rounds == 2
+    assert "没有返回正文" in router.calls[1][-1]["content"]
+
+
+def test_executor_retries_empty_response_after_tool_call():
+    router = FakeRouter([
+        _resp_tool("c1", "echo", {"msg": "README"}),
+        _resp_text(""),
+        _resp_text("项目介绍"),
+    ])
+    ex = Executor(router, _registry(_echo_tool()))
+
+    out = ex.run_task(Task("t1", "介绍项目"), [], system="", max_steps=3)
+
+    assert out.status == COMPLETED
+    assert out.text == "项目介绍"
+    assert out.tool_calls_made == 1
+    assert "没有返回正文" in router.calls[2][-1]["content"]
+
+
+def test_executor_empty_response_never_marks_task_completed():
+    router = FakeRouter([_resp_text(""), _resp_text("")])
+    ex = Executor(router, _registry(_echo_tool()))
+
+    out = ex.run_task(Task("t1", "介绍项目"), [], system="", max_steps=2)
+
+    assert out.status == FAILED
+    assert "未返回正文或工具调用" in out.error
+    assert out.text == ""
+
+
 def test_executor_pure_conversation_does_not_force_tool_call():
-    """介绍、解释等纯对话应直接完成，任务指令不能强迫模型调用无意义工具。"""
+    """无需外部信息的自我介绍应直接完成。"""
     router = FakeRouter([_resp_text("我是 AgentLab，本地编码助手。")])
     ex = Executor(router, _registry(_echo_tool()))
 
@@ -218,7 +257,8 @@ def test_executor_pure_conversation_does_not_force_tool_call():
     assert out.tool_calls_made == 0
     assert len(router.calls) == 1
     directive = router.calls[0][-1]["content"]
-    assert "纯对话、介绍、解释、总结" in directive
+    assert "介绍项目、文件或代码时，先读取相关资料" in directive
+    assert "自我介绍、纯对话或无需外部信息的问题" in directive
     assert "直接回答，不要调用工具" in directive
     assert "禁止只输出文字说明" not in directive
 

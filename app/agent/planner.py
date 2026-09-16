@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 
 from app.agent.tasks import PENDING, Task
+from app.agent.execution_plan import ExecutionPlan, PlannedTask, parse_execution_plan, validate_execution_plan
 
 PLANNER_SYSTEM = """你是任务规划器。把用户目标拆成可执行的子任务清单。
 
@@ -35,9 +36,18 @@ PLANNER_SYSTEM = """你是任务规划器。把用户目标拆成可执行的子
 - id 用 t1/t2/t3... 顺序编号,稳定唯一。
 - content 是一句话祈使句,描述这一步要做什么。必须包含具体的工具调用（如 read_file、write_file、edit_file、shell 等）。
 - dependencies 列出必须先完成的子任务 id;没有依赖就写 []。
+- executor 可选 main_agent 或 subagent；省略时使用 main_agent。
+- 只有确实适合隔离执行的复杂任务才使用 subagent，并同时填写 subagent 对象。
+- subagent 对象格式为 {"id":"sa1","role":"research|reviewer|verifier|executor","instruction":"...","read_only":true,"tools":["read_file"]}。
+- research/reviewer/verifier 必须只读；写入任务只能 role=executor，系统会在独立 worktree 中执行。
+- 子 Agent 不得请求 delegate_subagent、spawn_subagent、merge_worktree 或 force_push。
+- 不要把普通任务全部拆成子 Agent；简单目标只给一个 main_agent 任务。
 - 简单目标(一步能完成)就只给一个任务。
 - 不要拆得过细,通常 2-5 个任务即可。
 - 避免"确认"、"检查上下文"、"分析"等空泛任务，直接写具体操作。
+
+复杂任务示例:
+{"version":1,"execution":{"mode":"hybrid","max_parallel":2,"merge_policy":"manual"},"tasks":[{"id":"t1","content":"调查认证模块","executor":"subagent","subagent":{"id":"sa1","role":"research","instruction":"读取认证模块和测试并输出摘要","read_only":true,"tools":["code_search","read_file"]}}]}
 """
 
 
@@ -46,6 +56,7 @@ class TaskPlan:
     """Planner 产出的初始计划。tasks 顺序即建议执行顺序(实际按依赖 claim)。"""
     goal: str
     tasks: list[Task] = field(default_factory=list)
+    execution_plan: ExecutionPlan | None = None
 
 
 def _extract_json(text: str) -> dict | None:
@@ -128,11 +139,24 @@ class Planner:
             if getattr(resp, "actual_model", None):
                 self.last_actual_model = resp.actual_model
             obj = _extract_json(getattr(resp, "text", "") or "")
-            tasks = _parse_tasks(obj) if obj else []
+            execution_plan = parse_execution_plan(obj, goal) if obj else None
+            if execution_plan is not None:
+                errors = validate_execution_plan(execution_plan)
+                tasks = [item.task for item in execution_plan.tasks] if not errors else []
+            else:
+                errors = []
+                tasks = []
         except Exception:
+            execution_plan = None
+            errors = []
             tasks = []
         if not tasks:
             # 兜底:单任务计划。用简短标题而非整段 goal(避免面板被长问题刷屏)
             summary = goal.strip()[:50].rstrip() + ("…" if len(goal.strip()) > 50 else "")
             tasks = [Task(id="t1", content=summary or "完成用户请求", status=PENDING)]
-        return TaskPlan(goal=goal, tasks=tasks)
+            execution_plan = ExecutionPlan(
+                version=0,
+                goal=goal,
+                tasks=[PlannedTask(task=tasks[0])],
+            )
+        return TaskPlan(goal=goal, tasks=tasks, execution_plan=execution_plan)

@@ -18,9 +18,11 @@
 #   read        - 会话开始时检索相关记忆注入上下文，不写入
 #   read_write  - 会话结束时将摘要写入记忆，下次可检索
 #
-# orchestrate:
-#   true  - 使用 Planner + Executor + Replanner 编排，自动拆分复杂任务（推荐）
-#   false - 使用传统单轮模型/工具循环，适合简单对话
+# mode（省略时 orchestrate: true 对应 auto，false 对应 direct）：
+#   auto   - 简单请求直接执行，复杂任务使用 Planner + Executor + Replanner
+#   direct - 直接使用模型/工具循环
+#   task   - 所有请求都使用任务编排
+#   legacy - 沿用旧式 orchestrate 开关（true 强制编排，false 直接执行）
 #
 # max_steps / max_task_steps:
 #   max_steps      - 一次用户请求的模型往返总预算

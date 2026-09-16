@@ -146,9 +146,13 @@ class OpenAIAdapter:
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
+        reasoning_effort_override: Optional[str] = None,
+        _use_raw_stream: bool = False,
     ) -> ModelResponse:
         """带工具调用的完整对话,供 Agent 循环使用。"""
         params = self._base_params(messages, temperature, system)
+        if reasoning_effort_override is not None:
+            params["reasoning"] = {"effort": reasoning_effort_override}
         params["max_output_tokens"] = max_tokens
         if tools:
             # Responses API 的工具定义是扁平结构,直接 name / parameters,不嵌套 function
@@ -162,54 +166,94 @@ class OpenAIAdapter:
         out_tokens = 0
         progress = StreamingTokenProgress(on_progress, in_tokens)
         normalizer = StreamDeltaNormalizer()
+        streamed_text_parts: list[str] = []
+        completed_items: dict[int, Any] = {}
+        saw_reasoning_delta = False
         progress.emit(force=True)
 
         # 流式事件中累计正文、reasoning summary 和 function arguments。厂商通常只在
         #结束时返回真实 usage，期间用增量估算让 spinner 持续变化。
-        try:
-            with self._client.responses.stream(**params) as stream:
-                for event in stream:
-                    etype = getattr(event, "type", None)
-                    delta_text = getattr(event, "delta", "") or ""
-                    response = getattr(event, "response", None)
-                    event_usage = getattr(response, "usage", None) if response is not None else None
-                    if event_usage is not None:
-                        event_input = getattr(event_usage, "input_tokens", None)
-                        event_output = getattr(event_usage, "output_tokens", None)
-                        if event_input is not None:
-                            in_tokens = event_input
-                        progress.set_usage(
-                            input_tokens=event_input,
-                            output_tokens=event_output,
-                        )
-                    if etype == "response.output_text.delta":
-                        delta_text = normalizer.normalize("output_text", delta_text)
-                        if delta_text:
-                            if on_text_delta:
-                                on_text_delta(delta_text)
-                            progress.add_text(delta_text)
-                    elif etype in {
-                        "response.reasoning_text.delta",
-                        "response.reasoning_summary_text.delta",
-                    }:
-                        delta_text = normalizer.normalize("reasoning", delta_text)
-                        if delta_text:
-                            if on_thinking_delta:
-                                on_thinking_delta(delta_text)
-                            progress.add_reasoning(delta_text)
-                    elif etype in {
-                        "response.function_call_arguments.delta",
-                        "response.custom_tool_call_input.delta",
-                    }:
-                        delta_text = normalizer.normalize("tool_arguments", delta_text)
-                        progress.add_text(delta_text)
+        def consume_event(event: Any) -> Any | None:
+            nonlocal in_tokens, out_tokens, saw_reasoning_delta
+            etype = getattr(event, "type", None)
+            delta_text = getattr(event, "delta", "") or ""
+            response = getattr(event, "response", None)
+            event_usage = getattr(response, "usage", None) if response is not None else None
+            if event_usage is not None:
+                event_input = getattr(event_usage, "input_tokens", None)
+                event_output = getattr(event_usage, "output_tokens", None)
+                if event_input is not None:
+                    in_tokens = event_input
+                if event_output is not None:
+                    out_tokens = event_output
+                progress.set_usage(input_tokens=event_input, output_tokens=event_output)
+            if etype == "response.output_text.delta":
+                delta_text = normalizer.normalize("output_text", delta_text)
+                if delta_text:
+                    streamed_text_parts.append(delta_text)
+                    if on_text_delta:
+                        on_text_delta(delta_text)
+                    progress.add_text(delta_text)
+            elif etype in {
+                "response.reasoning_text.delta", "response.reasoning_summary_text.delta",
+            }:
+                saw_reasoning_delta = True
+                delta_text = normalizer.normalize("reasoning", delta_text)
+                if delta_text:
+                    if on_thinking_delta:
+                        on_thinking_delta(delta_text)
+                    progress.add_reasoning(delta_text)
+            elif etype in {
+                "response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
+            }:
+                progress.add_text(normalizer.normalize("tool_arguments", delta_text))
+            elif etype == "response.output_item.done":
+                item = getattr(event, "item", None)
+                index = getattr(event, "output_index", None)
+                if item is not None and isinstance(index, int):
+                    completed_items[index] = item
+            return response if etype == "response.completed" else None
 
-                # 仍在 with 内取最终响应：stream 关闭后 SDK 不保证还能取到。
-                final = stream.get_final_response()
+        try:
+            if _use_raw_stream:
+                final = None
+                raw_stream = self._client.responses.create(**params, stream=True)
+                try:
+                    for event in raw_stream:
+                        completed = consume_event(event)
+                        if completed is not None:
+                            final = completed
+                finally:
+                    close = getattr(raw_stream, "close", None)
+                    if callable(close):
+                        close()
+                if final is None:
+                    raise ProviderStreamError(
+                        "OpenAI Responses 原始流缺少 response.completed，网关协议不完整"
+                    )
+            else:
+                with self._client.responses.stream(**params) as stream:
+                    for event in stream:
+                        consume_event(event)
+                    # 仍在 with 内取最终响应：stream 关闭后 SDK 不保证还能取到。
+                    final = stream.get_final_response()
         except RuntimeError as exc:
             # SDK 状态机异常通常来自代理的事件顺序不兼容；不能返回空的正常响应，
             # 否则 Orchestrator 会误判为任务完成并停止继续处理。
             message = str(exc)
+            if "Expected to have received `response.created` before `codex." in message:
+                return self.create_message(
+                    messages=messages,
+                    tools=tools,
+                    system=system,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    on_progress=on_progress,
+                    on_text_delta=on_text_delta,
+                    on_thinking_delta=on_thinking_delta,
+                    reasoning_effort_override=reasoning_effort_override,
+                    _use_raw_stream=True,
+                )
             if "Expected to have received" in message or "rate_limit" in message.lower():
                 raise ProviderStreamError(
                     f"OpenAI Responses 流式协议异常: {message}"
@@ -223,7 +267,8 @@ class OpenAIAdapter:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
 
-        for item in final.output:
+        final_items = final.output or [completed_items[i] for i in sorted(completed_items)]
+        for item in final_items:
             item_type = getattr(item, "type", None)
             item_dict = item.model_dump() if hasattr(item, "model_dump") else dict(item)
             output_items.append(item_dict)
@@ -233,6 +278,8 @@ class OpenAIAdapter:
                 for part in getattr(item, "content", []) or []:
                     if getattr(part, "type", None) == "output_text":
                         text_parts.append(getattr(part, "text", "") or "")
+                    elif getattr(part, "type", None) == "refusal":
+                        text_parts.append(getattr(part, "refusal", "") or "")
             elif item_type == "function_call":
                 # 工具调用项:call_id 用于回传结果时对应,arguments 是 JSON 字符串
                 call_id = getattr(item, "call_id", "")
@@ -243,6 +290,17 @@ class OpenAIAdapter:
                 except json.JSONDecodeError:
                     args = {}
                 tool_calls.append(ToolCall(id=call_id, name=name, arguments=args))
+
+        # 如果流式输出了文本但 final.output 没有对应的 message item，恢复文本。
+        # 某些推理模型在高推理强度下可能 status 不是 "completed" 但确实输出了文本。
+        if not text_parts and streamed_text_parts:
+            recovered_text = "".join(streamed_text_parts)
+            text_parts.append(recovered_text)
+            output_items.append({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": recovered_text}],
+            })
 
         # 真实 usage 覆盖估算值(若 SDK 提供)
         usage_obj = getattr(final, "usage", None)
@@ -259,6 +317,48 @@ class OpenAIAdapter:
             )
         else:
             out_tokens = progress.output_tokens
+
+        output_types = [item.get("type", "unknown") for item in output_items]
+        empty_result = not text_parts and not tool_calls
+        if empty_result:
+            effort = reasoning_effort_override or self._cfg.reasoning_effort
+            if reasoning_effort_override is None and effort not in (None, "none"):
+                # 网关可能返回 completed + 空 output；仅在无结果时降档重试一次。
+                fallback_effort = (
+                    "low" if output_types and effort in ("medium", "high", "xhigh", "max")
+                    else "none"
+                )
+                retry = self.create_message(
+                    messages=messages,
+                    tools=tools,
+                    system=system,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    on_progress=on_progress,
+                    on_text_delta=on_text_delta,
+                    on_thinking_delta=on_thinking_delta,
+                    reasoning_effort_override=fallback_effort,
+                )
+                if not retry.text.strip() and not retry.tool_calls:
+                    retry_types = [
+                        item.get("type", "unknown") for item in retry.provider_payload
+                    ]
+                    raise ProviderStreamError(
+                        "OpenAI Responses 降低推理强度后仍无正文或工具调用"
+                        f" (status={retry.finish_reason}, output_types={retry_types})"
+                    )
+                retry.usage["input_tokens"] += in_tokens
+                retry.usage["output_tokens"] += out_tokens
+                return retry
+            status = getattr(final, "status", None)
+            details = getattr(final, "incomplete_details", None)
+            reason = getattr(details, "reason", None) if details is not None else None
+            if reasoning_effort_override is not None or saw_reasoning_delta or "reasoning" in output_types:
+                raise ProviderStreamError(
+                    "OpenAI Responses 仅返回推理内容或空输出、没有正文或工具调用"
+                    f" (status={status}, reason={reason}, output_types={output_types}, "
+                    f"reasoning_delta={saw_reasoning_delta})"
+                )
 
         return ModelResponse(
             text="".join(text_parts),

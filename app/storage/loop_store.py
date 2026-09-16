@@ -370,7 +370,45 @@ def save_verification_result(conn: sqlite3.Connection, result: dict[str, Any]) -
     conn.commit()
 
 
-def save_worktree(conn: sqlite3.Connection, worktree: dict[str, Any]) -> None:
+def save_subagent_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
+    """保存子 Agent 的 running 记录。"""
+    conn.execute("""
+        INSERT OR REPLACE INTO subagent_runs
+        (id, loop_id, role, session_id, status, input_summary, output_summary,
+         result_summary_ref, started_at, finished_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        run["id"], run["loop_id"], run["role"], run.get("session_id"),
+        run.get("status", "running"), redact(str(run.get("input_summary", "")))[:2000],
+        redact(str(run.get("output_summary", "")))[:8000], run.get("result_summary_ref"),
+        run.get("started_at", datetime.utcnow().isoformat()), run.get("finished_at"),
+    ))
+    conn.commit()
+
+
+def finish_subagent_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    status: str,
+    output_summary: str = "",
+    finished_at: str | None = None,
+) -> None:
+    """更新子 Agent 完成状态；状态值由调度器限制。"""
+    if status not in {"succeeded", "failed", "blocked", "cancelled", "conflict"}:
+        raise ValueError(f"非法子 Agent 状态: {status}")
+    conn.execute("""
+        UPDATE subagent_runs
+        SET status=?, output_summary=?, finished_at=?
+        WHERE id=?
+    """, (
+        status, redact(str(output_summary))[:8000],
+        finished_at or datetime.utcnow().isoformat(), run_id,
+    ))
+    conn.commit()
+
+
+
     """保存 Worktree 元数据。"""
     conn.execute("""
         INSERT OR REPLACE INTO worktrees
