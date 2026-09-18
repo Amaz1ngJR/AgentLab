@@ -38,6 +38,9 @@ class LLMConfig:
     context_size: Optional[int]
     timeout_seconds: float
     stream: bool
+    # 单轮输出上限。4096 对开启扩展思考的模型偏小——推理内容会先吃掉整个预算，
+    # 导致 stop_reason=max_tokens 时正文/工具调用还没开始写。默认给足余量。
+    max_tokens: int = 16384
     enable_thinking: bool = False  # 深度思考模型：是否请求并展示推理过程
     reasoning_effort: Optional[str] = None  # OpenAI Responses: low/medium/high 等推理强度
     profile_name: Optional[str] = None   # 激活的 profile 名称（如 "cloud_claude"）

@@ -91,7 +91,7 @@ class AnthropicAdapter:
             "model": self._cfg.model,
             "messages": converted,
             "temperature": self._cfg.temperature if temperature is None else temperature,
-            "max_tokens": 4096,
+            "max_tokens": self._cfg.max_tokens,
         }
         if system_text:
             params["system"] = system_text
@@ -106,7 +106,7 @@ class AnthropicAdapter:
         tools: Optional[list[dict]] = None,
         system: Optional[str] = None,
         temperature: Optional[float] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
@@ -119,7 +119,7 @@ class AnthropicAdapter:
             "model": self._cfg.model,
             "messages": converted,
             "temperature": self._cfg.temperature if temperature is None else temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": max_tokens or self._cfg.max_tokens,
         }
         if system_text:
             params["system"] = system_text

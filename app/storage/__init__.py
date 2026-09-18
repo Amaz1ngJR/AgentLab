@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     model_profile TEXT NOT NULL,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
-    archived    INTEGER NOT NULL DEFAULT 0
+    archived    INTEGER NOT NULL DEFAULT 0,
+    workspace   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -232,6 +233,7 @@ class Storage:
         self._runtime_lock = threading.RLock()
         self._con.executescript(_SCHEMA)
         self._migrate_tool_executions()
+        self._migrate_sessions_workspace()
         self._con.commit()
         # Loop Engineering 相关表(goal_specs/loop_runs/loop_iterations/
         # verification_results/worktrees/subagent_runs)。与上面的核心表共用同一连接,
@@ -258,6 +260,17 @@ class Storage:
                     f"ALTER TABLE tool_executions ADD COLUMN {name} {declaration}"
                 )
 
+    def _migrate_sessions_workspace(self) -> None:
+        """为已有数据库的 sessions 表添加 workspace 列。"""
+        existing = {
+            row["name"]
+            for row in self._con.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "workspace" not in existing:
+            self._con.execute(
+                "ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT ''"
+            )
+
     @contextmanager
     def _tx(self):
         try:
@@ -270,12 +283,17 @@ class Storage:
     # ── sessions ─────────────────────────────────────────────────────────────
 
     def create_session(self, session_id: str, agent_id: str,
-                       model_profile: str, title: str = "") -> None:
+                       model_profile: str, title: str = "",
+                       workspace: str = "") -> None:
         now = _now()
+        # workspace 统一规范化,保证写入与 list_sessions 过滤用同一把钥匙。
+        ws = str(Path(workspace).expanduser().resolve()) if workspace else ""
         with self._tx() as con:
             con.execute(
-                "INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,0)",
-                (session_id, agent_id, title, model_profile, now, now),
+                "INSERT OR REPLACE INTO sessions"
+                " (id,agent_id,title,model_profile,created_at,updated_at,archived,workspace)"
+                " VALUES (?,?,?,?,?,?,0,?)",
+                (session_id, agent_id, title, model_profile, now, now, ws),
             )
 
     def update_session_title(self, session_id: str, title: str) -> None:
@@ -321,13 +339,26 @@ class Storage:
             con.execute("DELETE FROM context_summaries WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM sessions WHERE id=?", (session_id,))
 
-    def list_sessions(self, include_archived: bool = False) -> list[dict]:
+    def list_sessions(self, include_archived: bool = False,
+                      workspace: Optional[str] = None) -> list[dict]:
         q = "SELECT * FROM sessions"
+        clauses = []
+        params: list[Any] = []
         if not include_archived:
-            q += " WHERE archived=0"
+            clauses.append("archived=0")
+        if workspace is not None:
+            clauses.append("workspace=?")
+            params.append(str(Path(workspace).expanduser().resolve()))
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
         q += " ORDER BY updated_at DESC"
-        rows = self._con.execute(q).fetchall()
+        rows = self._con.execute(q, params).fetchall()
         return [dict(r) for r in rows]
+
+    def find_latest_session(self, workspace: str) -> Optional[dict]:
+        """返回指定 workspace 下最近活跃的 session(用于启动时恢复)。"""
+        rows = self.list_sessions(workspace=workspace)
+        return rows[0] if rows else None
 
     def get_session(self, session_id: str) -> Optional[dict]:
         row = self._con.execute(

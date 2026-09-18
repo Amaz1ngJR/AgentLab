@@ -97,10 +97,15 @@ def _reasoning_item() -> MagicMock:
 
 
 def _delta_event(text: str) -> MagicMock:
-    """构造 response.output_text.delta 流式事件。"""
+    """构造 response.output_text.delta 流式事件。
+
+    SDK 的 delta 类事件不带 response 外壳（只有 created/completed 带），显式置
+    None，否则 MagicMock 会自动造出 response.usage 污染真实 usage 断言。
+    """
     ev = MagicMock()
     ev.type = "response.output_text.delta"
     ev.delta = text
+    ev.response = None
     return ev
 
 
@@ -111,6 +116,7 @@ def _reasoning_delta_event(text: str, *, summary: bool = False) -> MagicMock:
         if summary else "response.reasoning_text.delta"
     )
     ev.delta = text
+    ev.response = None
     return ev
 
 
@@ -119,6 +125,7 @@ def _output_item_done_event(item: MagicMock, index: int = 0) -> MagicMock:
     event.type = "response.output_item.done"
     event.item = item
     event.output_index = index
+    event.response = None
     return event
 
 
@@ -133,6 +140,7 @@ def _function_args_delta_event(text: str) -> MagicMock:
     ev = MagicMock()
     ev.type = "response.function_call_arguments.delta"
     ev.delta = text
+    ev.response = None
     return ev
 
 
@@ -580,7 +588,81 @@ def test_codex_metadata_before_created_falls_back_to_raw_stream():
     assert client.responses.create.call_args.kwargs["stream"] is True
 
 
-def test_standard_stream_order_error_is_not_hidden():
+def test_standard_event_before_created_falls_back_to_raw_stream():
+    """标准事件乱序（缺 response.created）与 codex.* 同根因，同样降级 raw stream。
+
+    网关漏发 response.created 时，紧接着的事件名可能是私有 codex.*，也可能是
+    标准增量事件；SDK 状态机一视同仁地报错，因此重试策略也必须一视同仁。
+    """
+    class BrokenStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def __iter__(self):
+            raise RuntimeError(
+                "Expected to have received `response.created` before `response.output_text.delta`"
+            )
+            yield  # pragma: no cover
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MagicMock()
+        MockOpenAI.return_value = client
+        client.responses.stream.return_value = BrokenStream()
+        final = _build_final([_message_item("OK")])
+        client.responses.create.return_value = iter([
+            _delta_event("OK"),
+            _output_item_done_event(_message_item("OK")),
+            _completed_event(final),
+        ])
+        adapter = OpenAIAdapter(_cfg())
+
+        response = adapter.create_message(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.text == "OK"
+    assert client.responses.create.call_args.kwargs["stream"] is True
+
+
+def test_raw_stream_without_completed_recovers_accumulated_content():
+    """网关连 response.completed 都不发时，用已收到的内容兜底，不能丢掉输出。"""
+    class BrokenStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def __iter__(self):
+            raise RuntimeError(
+                "Expected to have received `response.created` before `response.output_text.delta`"
+            )
+            yield  # pragma: no cover
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MagicMock()
+        MockOpenAI.return_value = client
+        client.responses.stream.return_value = BrokenStream()
+        # 只有增量事件与 output_item.done，没有 response.completed
+        client.responses.create.return_value = iter([
+            _delta_event("你好"),
+            _output_item_done_event(_message_item("你好")),
+        ])
+
+        response = OpenAIAdapter(_cfg()).create_message(
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+    assert response.text == "你好"
+    assert response.finish_reason == "incomplete"
+    # usage 回落到流式累计值，不能是 mock 对象混进真实 token 计数。
+    assert isinstance(response.usage["input_tokens"], int)
+    assert isinstance(response.usage["output_tokens"], int)
+
+
+def test_raw_stream_without_any_content_still_raises():
+    """降级后既无终止事件也无任何内容时必须报错，不能静默返回空响应。"""
     class BrokenStream:
         def __enter__(self):
             return self
@@ -597,7 +679,8 @@ def test_standard_stream_order_error_is_not_hidden():
     with patch("openai.OpenAI") as MockOpenAI:
         client = MockOpenAI.return_value
         client.responses.stream.return_value = BrokenStream()
-        with pytest.raises(ProviderStreamError, match="流式协议异常"):
+        client.responses.create.return_value = iter([])
+        with pytest.raises(ProviderStreamError, match="网关协议不完整"):
             OpenAIAdapter(_cfg()).create_message(
                 messages=[{"role": "user", "content": "hello"}],
             )
@@ -648,3 +731,55 @@ def test_convert_messages_filters_unsupported_fields():
     # 验证普通消息正确转换
     assert converted[2]["type"] == "message"
     assert converted[2]["role"] == "user"
+
+
+def test_convert_messages_normalizes_string_content_to_array():
+    """修复 'content: Input should be a valid array' 错误。
+
+    当历史消息中的 type=message 项的 content 是字符串时（可能来自旧版本
+    或跨 provider 转换），应规范化为数组格式，避免 API 验证失败。
+    """
+    messages = [
+        # 用户消息，content 是字符串（应该是数组）
+        {
+            "type": "message",
+            "role": "user",
+            "content": "请帮我检查代码",  # 字符串，应转为 [{"type": "input_text", "text": "..."}]
+        },
+        # 助手消息，content 是字符串
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": "好的，我来看一下",  # 字符串，应转为 [{"type": "output_text", "text": "..."}]
+        },
+        # 正常的数组格式（不应改变）
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "继续"}],
+        },
+    ]
+
+    converted = _convert_messages_to_responses_format(messages)
+
+    # 验证字符串被转为数组
+    assert converted[0]["type"] == "message"
+    assert converted[0]["role"] == "user"
+    assert isinstance(converted[0]["content"], list)
+    assert len(converted[0]["content"]) == 1
+    assert converted[0]["content"][0]["type"] == "input_text"
+    assert converted[0]["content"][0]["text"] == "请帮我检查代码"
+
+    assert converted[1]["type"] == "message"
+    assert converted[1]["role"] == "assistant"
+    assert isinstance(converted[1]["content"], list)
+    assert len(converted[1]["content"]) == 1
+    assert converted[1]["content"][0]["type"] == "output_text"
+    assert converted[1]["content"][0]["text"] == "好的，我来看一下"
+
+    # 验证已经是数组的保持不变
+    assert converted[2]["type"] == "message"
+    assert converted[2]["role"] == "user"
+    assert isinstance(converted[2]["content"], list)
+    assert converted[2]["content"][0]["type"] == "input_text"
+    assert converted[2]["content"][0]["text"] == "继续"

@@ -87,6 +87,7 @@ class SessionRouter:
             agent_id=aid,
             model_profile=profile.model_profile,
             title=title or f"{profile.name} #{session_id}",
+            workspace=str(workspace_root()),
         )
         self.current_id = session_id
         return session_id
@@ -124,13 +125,14 @@ class SessionRouter:
         return True
 
     def resume_or_new(self, agent_id: Optional[str] = None) -> tuple[str, bool]:
-        """启动时调用:有未归档且非空的历史 session 就恢复最近一个,否则新建。
+        """启动时调用:当前 workspace 下有未归档且非空的历史 session 就恢复最近一个,否则新建。
 
         返回 (session_id, resumed):resumed=True 表示恢复了历史会话。
         "最近"按 list_sessions 的 updated_at DESC 顺序;跳过 0 消息的空会话,
         避免恢复到一个从未对话过的空壳(否则用户会以为"历史丢了")。
+        只恢复与当前 workspace 匹配的 session,不同目录的历史互相隔离。
         """
-        rows = self._storage.list_sessions()  # 已过滤 archived,按 updated_at DESC
+        rows = self._storage.list_sessions(workspace=str(workspace_root()))
         for row in rows:
             if self._storage.count_messages(row["id"]) > 0 and self.switch(row["id"]):
                 return row["id"], True
@@ -196,8 +198,11 @@ class SessionRouter:
         file_count = AttachmentStore().delete_session(target)
         return {"references": reference_count, "files": file_count}
 
-    def list_sessions(self) -> list[dict]:
-        return self._storage.list_sessions()
+    def list_sessions(self, include_archived: bool = False) -> list[dict]:
+        """列出当前 workspace 下的 session,不同目录的历史互相隔离。"""
+        return self._storage.list_sessions(
+            include_archived=include_archived, workspace=str(workspace_root()),
+        )
 
     def list_profiles(self) -> dict[str, AgentProfile]:
         return self._profiles

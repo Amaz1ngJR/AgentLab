@@ -36,8 +36,8 @@ def workspace_root() -> Path:
 
     优先级:
       0. use_workspace_root() 设置的临时覆盖(Loop worktree 隔离)
-      1. WORKSPACE_ROOT 环境变量(由 .env 注入或显式 export)
-      2. 项目根目录 —— 为开发期默认行为
+      1. WORKSPACE_ROOT 环境变量(由 .env 注入或显式 --workspace 参数)
+      2. 启动时的当前工作目录(os.getcwd())
 
     使用场景:
       文件工具(read_file / write_file / list_dir)在执行前调用此函数,
@@ -49,7 +49,8 @@ def workspace_root() -> Path:
     raw = os.getenv("WORKSPACE_ROOT")
     if raw and raw.strip():
         return Path(raw.strip()).expanduser().resolve()
-    return PROJECT_ROOT
+    # 默认使用启动时的当前工作目录，而非项目根目录
+    return Path.cwd().resolve()
 
 
 @contextmanager
@@ -154,6 +155,11 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
     top_p = _env_float("LLM_TOP_P") or params.get("top_p")
     context_size = _env_int("LLM_CONTEXT_SIZE") or params.get("context_size")
 
+    # 单轮输出上限：profile.params.max_tokens 默认值，LLM_MAX_TOKENS 可覆盖。
+    # 小于等于 0 或未设置时回落到 16384。开启扩展思考的模型建议 >= 16384，
+    # 因为推理内容与正文共用同一份预算（见 Anthropic max_tokens 语义）。
+    max_tokens = _env_int("LLM_MAX_TOKENS") or params.get("max_tokens") or 16384
+
     # 深度思考开关：profile.params.enable_thinking 默认值，LLM_ENABLE_THINKING 可覆盖。
     # 仅 Qwen3 / DeepSeek-R1 等支持 reasoning_content 的模型需要;其他模型留 False。
     env_thinking = _env("LLM_ENABLE_THINKING")
@@ -189,6 +195,7 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
         context_size=context_size,
         timeout_seconds=float(_env("LLM_TIMEOUT_SECONDS") or "120"),
         stream=_env_bool("LLM_STREAM", default=False),
+        max_tokens=max_tokens,
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort,
         profile_name=active_profile,

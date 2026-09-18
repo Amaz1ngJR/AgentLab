@@ -40,6 +40,28 @@ class ProviderStreamError(RuntimeError):
     """Provider 流式协议异常，不能伪装成正常模型响应。"""
 
 
+# SDK 状态机要求首个事件必须是 response.created，否则抛这个前缀的 RuntimeError。
+# 部分网关（Codex 风格代理、自建转发）会跳过它直接推标准增量事件，事件名各不相同，
+# 因此只匹配前缀、不绑定 before 后面挂的是哪一个。
+_MISSING_CREATED_MARKER = "Expected to have received `response.created` before"
+
+
+class _SynthesizedResponse:
+    """原始流缺少 response.completed 时，用已累积内容拼出的等价响应。
+
+    网关只推增量事件、不发终止事件时，不能把已经流式收到的正文和工具调用丢掉
+    ——那会让上层误判成"模型没有输出"。这里把累积到的事件封装成正常解析逻辑
+    能直接消费的最终响应，status 标为 incomplete 以如实反映协议不完整。
+    """
+
+    def __init__(self, items: list[Any], usage: Any, model: Optional[str]):
+        self.output = items
+        self.usage = usage
+        self.status = "incomplete"
+        self.incomplete_details = None
+        self.model = model
+
+
 _MISSING_TOOL_OUTPUT = "[历史中的工具结果缺失，状态未知，请勿假设工具已执行]"
 
 
@@ -142,7 +164,7 @@ class OpenAIAdapter:
         tools: Optional[list[dict]] = None,
         system: Optional[str] = None,
         temperature: Optional[float] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
@@ -150,6 +172,7 @@ class OpenAIAdapter:
         _use_raw_stream: bool = False,
     ) -> ModelResponse:
         """带工具调用的完整对话,供 Agent 循环使用。"""
+        max_tokens = max_tokens or self._cfg.max_tokens
         params = self._base_params(messages, temperature, system)
         if reasoning_effort_override is not None:
             params["reasoning"] = {"effort": reasoning_effort_override}
@@ -217,19 +240,36 @@ class OpenAIAdapter:
         try:
             if _use_raw_stream:
                 final = None
+                last_response = None
                 raw_stream = self._client.responses.create(**params, stream=True)
                 try:
                     for event in raw_stream:
                         completed = consume_event(event)
                         if completed is not None:
                             final = completed
+                        # 有些网关只在增量事件上带 response 外壳，没有 completed。
+                        # 记下最后见到的一个，供兜底取 usage / model。
+                        candidate = getattr(event, "response", None)
+                        if candidate is not None:
+                            last_response = candidate
                 finally:
                     close = getattr(raw_stream, "close", None)
                     if callable(close):
                         close()
                 if final is None:
-                    raise ProviderStreamError(
-                        "OpenAI Responses 原始流缺少 response.completed，网关协议不完整"
+                    # 网关没发 response.completed：不丢已收到的内容，用累积结果兜底。
+                    recovered = [
+                        completed_items[i] for i in sorted(completed_items)
+                    ]
+                    if not recovered and not streamed_text_parts:
+                        raise ProviderStreamError(
+                            "OpenAI Responses 原始流既无 response.completed，"
+                            "也未收到任何可用内容，网关协议不完整"
+                        )
+                    final = _SynthesizedResponse(
+                        items=recovered,
+                        usage=getattr(last_response, "usage", None),
+                        model=getattr(last_response, "model", None),
                     )
             else:
                 with self._client.responses.stream(**params) as stream:
@@ -240,8 +280,11 @@ class OpenAIAdapter:
         except RuntimeError as exc:
             # SDK 状态机异常通常来自代理的事件顺序不兼容；不能返回空的正常响应，
             # 否则 Orchestrator 会误判为任务完成并停止继续处理。
+            # 凡是「首个事件不是 response.created」都走原始流兼容解析 —— 网关漏掉
+            # response.created 时，后面挂的事件名可能是 codex.* 也可能是标准事件
+            # （response.output_text.delta 等），根因相同，不该区别对待。
             message = str(exc)
-            if "Expected to have received `response.created` before `codex." in message:
+            if not _use_raw_stream and _MISSING_CREATED_MARKER in message:
                 return self.create_message(
                     messages=messages,
                     tools=tools,
@@ -254,7 +297,7 @@ class OpenAIAdapter:
                     reasoning_effort_override=reasoning_effort_override,
                     _use_raw_stream=True,
                 )
-            if "Expected to have received" in message or "rate_limit" in message.lower():
+            if _MISSING_CREATED_MARKER in message or "rate_limit" in message.lower():
                 raise ProviderStreamError(
                     f"OpenAI Responses 流式协议异常: {message}"
                 ) from exc
@@ -486,6 +529,22 @@ def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
                           if k not in ('parsed_arguments', 'status', 'namespace',
                                       'internal_chat_message_metadata_passthrough',
                                       'metadata', 'id', 'summary', 'encrypted_content')}
+
+                # 规范化 content: Responses API 要求 content 必须是数组
+                if "content" in cleaned:
+                    content = cleaned["content"]
+                    if isinstance(content, str):
+                        # 字符串转数组（根据 role 决定 input_text 或 output_text）
+                        msg_role = cleaned.get("role", "user")
+                        text_type = "output_text" if msg_role == "assistant" else "input_text"
+                        cleaned["content"] = [{"type": text_type, "text": content}]
+                    elif isinstance(content, list):
+                        # 已经是数组，保留
+                        pass
+                    else:
+                        # 其他类型（如None），转空数组
+                        cleaned["content"] = []
+
                 result.append(cleaned)
                 continue
 

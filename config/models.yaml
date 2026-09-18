@@ -24,6 +24,10 @@ models:
     capabilities: [chat, tools, vision]
     params:
       temperature: 0.2
+      # 单轮输出上限。Claude 的扩展思考内容与正文共用这份预算，4096 会在
+      # 推理未结束时被截断（stop_reason=max_tokens），正文/工具调用都拿不到。
+      # 可用 LLM_MAX_TOKENS 临时覆盖。
+      max_tokens: 32768
 
   # ── 硅基流动 SiliconFlow（OpenAI 兼容）────────────────────────────────────────
   # 协议同 OpenAI Chat Completions，走 openai_compatible adapter，无需改代码。

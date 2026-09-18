@@ -170,7 +170,7 @@ class OpenAICompatibleAdapter:
         tools: Optional[list[dict]] = None,
         system: Optional[str] = None,
         temperature: Optional[float] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
@@ -183,7 +183,7 @@ class OpenAICompatibleAdapter:
             all_messages = [{"role": "system", "content": system}] + all_messages
 
         params = self._base_params(all_messages, temperature)
-        params["max_tokens"] = max_tokens
+        params["max_tokens"] = max_tokens or self._cfg.max_tokens
         params["stream"] = True
         params["stream_options"] = {"include_usage": True}
         if tools:
