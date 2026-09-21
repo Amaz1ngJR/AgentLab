@@ -83,7 +83,9 @@ def test_interactive_header_includes_tool_context():
     assert any("write_file" in line for line in captured["header_lines"])
     assert any("/tmp/x.txt" in line for line in captured["header_lines"])
     # 四个选项,值分别是 yes / always / modify / no
-    assert [c[1] for c in captured["choices"]] == ["yes", "always", "modify", "no"]
+    assert [c[1] for c in captured["choices"]] == [
+        "yes", "enable_auto_execute", "always", "modify", "no",
+    ]
 
 
 def test_terminal_send_approval_shows_complete_input_without_truncation():
@@ -132,7 +134,9 @@ def test_outside_workspace_approval_cannot_be_remembered():
             {"path": "/outside/file"},
         )
 
-    assert [c[1] for c in captured["choices"]] == ["yes", "modify", "no"]
+    assert [c[1] for c in captured["choices"]] == [
+        "yes", "enable_auto_execute", "modify", "no",
+    ]
 
 
 def test_clear_session_images_approval_cannot_be_remembered():
@@ -146,7 +150,9 @@ def test_clear_session_images_approval_cannot_be_remembered():
         assert InteractivePolicy().request(
             "clear_session_images", {"session_id": "s1"},
         )
-    assert [choice[1] for choice in captured["choices"]] == ["yes", "modify", "no"]
+    assert [choice[1] for choice in captured["choices"]] == [
+        "yes", "enable_auto_execute", "modify", "no",
+    ]
 
 
     # legacy request() 没有 ToolDescriptor 和动态 workspace action，不能获得
@@ -161,7 +167,9 @@ def test_clear_session_images_approval_cannot_be_remembered():
         with patch("app.util.menu.select_menu", side_effect=fake_menu):
             assert InteractivePolicy().request(action, {"command": "pwd"})
 
-        assert [c[1] for c in captured["choices"]] == ["yes", "modify", "no"]
+        assert [c[1] for c in captured["choices"]] == [
+        "yes", "enable_auto_execute", "modify", "no",
+    ]
 
 
 def _shell_descriptor():
@@ -193,10 +201,10 @@ def test_workspace_shell_can_remember_safe_command_prefixes(monkeypatch, tmp_pat
         )
     assert first.approved is True
     assert [choice[1] for choice in captured["choices"]] == [
-        "yes", "auto_approve", "modify", "no",
+        "yes", "enable_auto_execute", "auto_approve", "modify", "no",
     ]
-    assert "nl -ba" in captured["choices"][1][0]
-    assert "sed -n" in captured["choices"][1][0]
+    assert "nl -ba" in captured["choices"][2][0]
+    assert "sed -n" in captured["choices"][2][0]
 
     with patch("app.util.menu.select_menu") as second_menu:
         second = policy.request_tool(
@@ -268,7 +276,9 @@ def test_complex_and_outside_shell_cannot_remember_approval(monkeypatch, tmp_pat
                 _shell_descriptor(), action, {"command": command, "cwd": "."},
             )
         assert result.approved is True
-        assert [choice[1] for choice in captured["choices"]] == ["yes", "modify", "no"]
+        assert [choice[1] for choice in captured["choices"]] == [
+        "yes", "enable_auto_execute", "modify", "no",
+    ]
 
 
 def test_structured_approval_shows_risk_and_target():
@@ -298,7 +308,9 @@ def test_structured_approval_shows_risk_and_target():
             {"ref": "x"},
         )
 
-    assert [c[1] for c in captured["choices"]] == ["yes", "modify", "no"]
+    assert [c[1] for c in captured["choices"]] == [
+        "yes", "enable_auto_execute", "modify", "no",
+    ]
     assert "风险: browser_control" in captured["header_lines"]
     assert "目标: browser / mcp_server:playwright / playwright" in captured["header_lines"]
     assert "来源: mcp" in captured["header_lines"]

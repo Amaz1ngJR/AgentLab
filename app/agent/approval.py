@@ -123,15 +123,19 @@ class InteractivePolicy:
         参数: {"path": "/tmp/x.txt", ...}
 
         是否允许执行?
-        ❯ 1. 允许这次
-          2. 本会话总是允许 write_file
-          3. 拒绝
+        ❯ 1. 接受
+          2. 自动执行（本轮起）
+          3. 本会话总是允许 write_file
+          4. 修改建议
+          5. 拒绝
 
         ↑↓ 移动 · Enter 确认 · 1-9 快捷键 · Esc 取消
 
-    三个选项:
-      允许这次   - 允许这一次,下次同一工具还会再问
+    选项:
+      接受      - 允许这一次,下次同一工具还会再问
+      自动执行   - 从本轮起进入全自动模式,后续工具调用不再询问
       总是允许   - 本会话内该工具名加入白名单,后续不再询问
+      修改建议   - 暂停当前 turn,回到输入框重新下达指令
       拒绝      - 模型会收到"用户拒绝"消息并自行决定下一步
 
     Ctrl-C / Esc 视为拒绝,安全退出。
@@ -255,6 +259,9 @@ class InteractivePolicy:
         """
         choices = [("接受", "yes")]
 
+        # "自动执行"固定放在第二位：用户要求每个审批对话框都能一眼看到这个入口。
+        choices.append(("自动执行（本轮起）", "enable_auto_execute"))
+
         # 高危操作：不能持久化，但保留"修改建议"
         is_shell_prefix = bool(
             tool and tool.name == "shell" and action == "shell"
@@ -370,6 +377,9 @@ class InteractivePolicy:
 
         if result == "yes":
             return ApprovalResult(approved=True)
+        if result == "enable_auto_execute":
+            # 用户选择"自动执行"：标记启用全自动模式，本次也放行
+            return ApprovalResult(approved=True, feedback="__enable_auto_execute__")
         if result == "always" and can_persist:
             self._always.add(tool_name)  # 加入白名单
             return ApprovalResult(approved=True)

@@ -72,15 +72,15 @@ def test_code_block_replaces_fence_with_bar_and_language_label():
     out = plain("```python\ndef f():\n    return 1\n```\n")
     assert "```" not in out
     assert "python" in out
-    assert "│ def f():" in out
+    assert "  def f():" in out
     # 缩进必须原样保留，pygments 的 stripall 会吃掉它
-    assert "│     return 1" in out
+    assert "      return 1" in out
 
 
 def test_code_block_without_language_has_no_label_line():
     out = plain("```\nplain text\n```\n")
-    assert "│ plain text" in out
-    assert out.splitlines()[0].strip() == "│ plain text"
+    assert "  plain text" in out
+    assert out.splitlines()[0].strip() == "plain text"
 
 
 def test_table_columns_align_on_wide_characters():
@@ -144,7 +144,7 @@ def test_streaming_flush_emits_trailing_line_without_newline():
 def test_streaming_flush_closes_unterminated_code_block():
     renderer = md.MarkdownRenderer(width_fn=lambda: 40)
     out = renderer.feed("```python\ndef f():\n") + renderer.flush()
-    assert "│ def f():" in strip_ansi(out)
+    assert "  def f():" in strip_ansi(out)
 
 
 # ── 降级 ─────────────────────────────────────────────────────────────────────
@@ -155,4 +155,4 @@ def test_color_disabled_passes_text_through_untouched():
 
 def test_unknown_language_falls_back_without_raising():
     out = plain("```notalanguage\nsome text\n```\n")
-    assert "│ some text" in out
+    assert "  some text" in out

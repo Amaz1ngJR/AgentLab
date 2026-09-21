@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
 from app.agent import events
-from app.agent.approval import ApprovalPolicy, AutoApprove, request_tool_approval
-from app.agent.cancel import CancelToken
+from app.agent.approval import ApprovalPolicy, ApprovalResult, AutoApprove, request_tool_approval
+from app.agent.cancel import CancelToken, Cancelled
 from app.agent.events import RunEvent
 from app.agent.mode_router import ExecutionMode, ModeRouter, SessionState
 from app.agent.tasks import TaskStore
@@ -190,6 +190,26 @@ class AgentSession:
         # 编排 run 的目标与结果状态,供 SessionRouter.persist_current 写 runs 审计
         self.last_goal: str = ""
         self.last_run_status: str = ""
+        # ── 全自动执行模式（免审批、直到任务完成）────────────────────────────
+        self._auto_execute_enabled: bool = False
+
+    def enable_auto_execute(self) -> None:
+        """打开全自动执行模式：所有工具调用免审批，直到任务完成。"""
+        self._auto_execute_enabled = True
+
+    def disable_auto_execute(self) -> None:
+        """关闭全自动执行模式，恢复正常审批流程。"""
+        self._auto_execute_enabled = False
+
+    def toggle_auto_execute(self) -> bool:
+        """切换全自动执行模式，返回切换后的状态。"""
+        self._auto_execute_enabled = not self._auto_execute_enabled
+        return self._auto_execute_enabled
+
+    @property
+    def auto_execute_enabled(self) -> bool:
+        """返回当前是否启用全自动执行模式。"""
+        return self._auto_execute_enabled
 
     def _prepare_skill_context(self, user_input: str) -> None:
         """每轮仅激活规则明确命中的 L1 正文；L0 目录由会话初始 prompt 持有。"""
@@ -396,7 +416,7 @@ class AgentSession:
             payload={"mode": mode.value},
         ))
         if mode is ExecutionMode.DIRECT:
-            return self._chat_legacy(user_input, images=images)
+            return self._chat_legacy(user_input, images=images, cancel=cancel)
         # AUTO 模式的 Task/Loop 仍使用现有 Orchestrator；Loop 的完整生命周期
         # 由 LoopCommandHandler 驱动，这里只负责普通目标的规划执行。
         return self._chat_orchestrated(
@@ -455,6 +475,7 @@ class AgentSession:
         user_input: str,
         *,
         images: list[ImageAttachment] | None = None,
+        cancel: Optional[CancelToken] = None,
     ) -> str:
         self.messages.append({
             "role": "user",
@@ -481,6 +502,13 @@ class AgentSession:
             has_tool_call = False
             corrected_no_tool = False
             for step_index in range(self.max_steps):
+                # 安全检查点：模型往返之间是干净的稳定点，此时 tool_use/tool_result
+                # 都已配对闭合，中断不会在历史里留下悬空调用。
+                if cancel is not None and cancel.cancelled:
+                    self._emit_turn_event(TurnEvent(
+                        kind="text", text="已中断。",
+                    ))
+                    return "已中断。"
                 text_streamed = False
                 streamed_parts: list[str] = []
                 with self._progress("thinking") as handle:
@@ -608,17 +636,41 @@ class AgentSession:
                         ))
 
                         tool = self.tools.get(call.name)
+
+                        # 安全检查点：工具执行前检查取消。全自动模式下没有审批弹窗
+                        # 吸收 Esc，这里必须显式检查，否则一串工具调用中途按 Esc 停不下来。
+                        # _flush_legacy 会给本轮所有未执行的工具补合成结果，不留悬空 tool_use。
+                        if cancel is not None and cancel.cancelled:
+                            _flush_legacy()
+                            self._emit_turn_event(TurnEvent(
+                                kind="text", text="已中断。",
+                            ))
+                            return "已中断。"
+
                         approval_action = (
                             tool.approval_action(call.arguments) if tool else None
                         )
                         approval_result = None
                         if approval_action and tool is not None:
-                            approval_result = request_tool_approval(
-                                self.approval,
-                                tool,
-                                approval_action,
-                                call.arguments,
-                            )
+                            # 全自动执行模式：跳过审批直接放行
+                            if self._auto_execute_enabled:
+                                approval_result = ApprovalResult(approved=True)
+                            else:
+                                approval_result = request_tool_approval(
+                                    self.approval,
+                                    tool,
+                                    approval_action,
+                                    call.arguments,
+                                )
+                                
+                                # 检查用户是否在审批对话框选择了"自动执行"
+                                if approval_result and approval_result.feedback == "__enable_auto_execute__":
+                                    self.enable_auto_execute()
+                                    self._emit_turn_event(TurnEvent(
+                                        kind="text",
+                                        text="🚀 已启用全自动执行模式（按 Ctrl+A 关闭）",
+                                    ))
+                                    approval_result.feedback = None  # 清除内部信号
 
                         if approval_result and approval_result.cancelled:
                             # 修改建议/取消都立即终止当前 turn；补齐结果后回到主输入框。

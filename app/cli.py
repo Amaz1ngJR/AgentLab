@@ -2447,6 +2447,17 @@ def _repl(router: RuntimeService) -> int:
         lambda: router.current_id,
     )
 
+    # Ctrl+A: 切换全自动执行模式
+    @key_bindings.add("c-a")
+    def _toggle_auto_execute(event) -> None:
+        session = router.current
+        if session is None:
+            return
+        enabled = session.toggle_auto_execute()
+        status = "🚀 已启用" if enabled else "❌ 已关闭"
+        print(f"\n{status}全自动执行模式")
+        get_app().invalidate()
+
     # 添加 bracketed paste 处理
     @key_bindings.add(Keys.BracketedPaste)
     def _handle_bracketed_paste(event):
@@ -2486,13 +2497,18 @@ def _repl(router: RuntimeService) -> int:
         _print_input_separator()
         # 动态构建 prompt:通过 RuntimeService 获取当前 Thread 摘要。
         thread = router.current_thread_summary()
+        session = router.current
         if thread:
             sess_id = thread["thread_id"]
             title = thread.get("title") or "?"
             # 标题可能很长，截断到合理长度
             if len(title) > 30:
                 title = title[:27] + "..."
-            prompt_text = f"[{sess_id[:6]}·{title}] ▸ "
+            prompt_text = f"[{sess_id[:6]}·{title}]"
+            # 显示自动执行模式状态
+            if session and session.auto_execute_enabled:
+                prompt_text += " 🚀"
+            prompt_text += " ▸ "
         else:
             prompt_text = "▸ "
         prompt_fragments = FormattedText([("class:prompt", prompt_text)])

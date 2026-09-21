@@ -198,7 +198,9 @@ class MarkdownRenderer:
     feed()。收尾必须调 flush()，因为模型末尾常常不带换行。
     """
 
-    CODE_BAR = "│ "
+    # 代码块用纯缩进而不是竖线：竖线会被用户一起复制走，粘到 commit message
+    # 或别处就成了每行一个 "│ " 的垃圾前缀。
+    CODE_BAR = "  "
     QUOTE_BAR = "▌ "
 
     def __init__(self, *, color: bool = True, width_fn=None, base: str = WHITE):
@@ -327,7 +329,7 @@ class MarkdownRenderer:
             body = highlight(line, self._lexer, _formatter()).rstrip("\n") if line else ""
         except Exception:
             body = line
-        # 代码块左侧竖线使用正常颜色
+        # 代码块左侧只留缩进，不画竖线
         return f"{self._base}{self.CODE_BAR}{RESET}{body}"
 
     # ── 表格 ────────────────────────────────────────────────────────────────
