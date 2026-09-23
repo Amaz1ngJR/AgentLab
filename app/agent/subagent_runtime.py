@@ -36,10 +36,19 @@ class RestrictedToolRegistry(ToolRegistry):
     def schemas_for_task(self, task: str, *, mode: str = "task", **kwargs) -> list[dict[str, Any]]:
         return self.schemas()
 
-    def execute(self, name: str, args: dict[str, Any], *, approved_action: str | None = None):
+    def execute(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        approved_action: str | None = None,
+        cancel: CancelToken | None = None,
+    ):
         if name not in self._allowed:
             return f"tool not allowed for this subagent: {name}", True
-        return self._source.execute(name, args, approved_action=approved_action)
+        return self._source.execute(
+            name, args, approved_action=approved_action, cancel=cancel,
+        )
 
 
 class SubagentRuntimeFactory:
@@ -55,6 +64,7 @@ class SubagentRuntimeFactory:
         on_event: Callable[[RunEvent], None] | None = None,
         max_steps: int = 16,
         max_tool_calls: int = 60,
+        auto_execute: bool = False,
     ):
         self.llm = llm
         self.tools = tools
@@ -63,6 +73,7 @@ class SubagentRuntimeFactory:
         self.on_event = on_event
         self.max_steps = max_steps
         self.max_tool_calls = max_tool_calls
+        self.auto_execute = auto_execute
         self._active_lock = threading.Lock()
         self._active_tool_calls = 0
 
@@ -96,7 +107,11 @@ class SubagentRuntimeFactory:
         )
         with use_workspace_root(workspace):
             cancel.raise_if_cancelled()
-            output = child.run(spec.instruction, cancel=cancel)
+            output = child.run(
+                spec.instruction,
+                cancel=cancel,
+                auto_execute=self.auto_execute,
+            )
         status = "succeeded" if child.last_run_status == "completed" else "failed"
         return SubagentResult(
             subagent_id=spec.subagent_id,

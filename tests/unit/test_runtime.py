@@ -566,6 +566,8 @@ def test_auto_mode_uses_planner_for_multi_step_request():
     assert session.execution_mode.value == "task"
     assert len(router.calls) == 2
 
+
+def test_orchestrated_chat_copies_run_stats_to_session():
     """orchestrate=True 时,chat 委托 Orchestrator,并把 run 统计拷回 session。"""
     from app.agent.events import RUN_COMPLETED
     router = FakeRouter([
@@ -586,6 +588,70 @@ def test_auto_mode_uses_planner_for_multi_step_request():
     assert session.last_goal == "帮我做点事"
 
 
+def test_auto_execute_routes_single_step_action_to_task_mode():
+    """🚀 模式下单步修改也必须进入 Task，不能在 Direct 一次编辑后静默收口。"""
+    router = FakeRouter([
+        _plan_json({"id": "t1", "content": "修复代码并确认结果", "dependencies": []}),
+        _resp_text("修复完成"),
+    ])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+    )
+    session.enable_auto_execute()
+
+    assert session.chat("请修复代码") == "修复完成"
+    assert session.execution_mode.value == "task"
+    assert session.last_run_status == "completed"
+
+
+def test_auto_execute_finishes_all_tasks_beyond_normal_global_budget():
+    """自动执行按任务进展持续推进，不因普通 run 的全局轮次预算提前停下。"""
+    router = FakeRouter([
+        _plan_json(
+            {"id": "t1", "content": "完成第一步", "dependencies": []},
+            {"id": "t2", "content": "验证第二步", "dependencies": ["t1"]},
+        ),
+        _resp_text("第一步完成"),
+        _resp_text("验证完成"),
+    ])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_echo_tool()),
+        orchestrate=True,
+        mode="auto",
+        max_steps=1,
+        max_task_steps=1,
+    )
+    session.enable_auto_execute()
+
+    assert session.chat("请修复代码") == "验证完成"
+    assert session.last_run_status == "completed"
+    assert session.task_store.summary()["completed"] == 2
+
+
+def test_auto_execute_bypasses_task_mode_approval():
+    router = FakeRouter([
+        _plan_json({"id": "t1", "content": "执行必要操作", "dependencies": []}),
+        _resp_tool("c1", "danger", {}),
+        _resp_text("操作完成"),
+    ])
+    session = AgentSession(
+        llm=router,
+        tools=_registry_with(_danger_tool()),
+        approval=DenyAll(),
+        orchestrate=True,
+        mode="auto",
+        max_task_steps=2,
+    )
+    session.enable_auto_execute()
+
+    assert session.chat("请修改代码") == "操作完成"
+    assert session.last_run_status == "completed"
+
+
 def test_orchestrated_chat_cancel_stops_run():
     """传入已取消的 CancelToken,编排路径在规划前就干净退出。"""
     from app.agent.cancel import CancelToken
@@ -599,9 +665,37 @@ def test_orchestrated_chat_cancel_stops_run():
 
 
 def test_legacy_chat_unaffected_by_orchestrate_flag_default():
-    """默认 orchestrate=False:仍走单轮循环,行为与历史一致。"""
+    """默认 orchestrate=False:仍走单轮循环,行为与历史一致。
+
+    注意 run 状态：Direct 路径现在也参与统一状态模型（原先只有编排路径写
+    last_run_status，Direct 恒为 ""）。自动模式的续跑判定依赖这个状态区分
+    "正常收口" / "预算耗尽" / "被取消"，留空会被当成未知而停下。
+    """
     router = FakeRouter([_resp_text("hi")])
     session = AgentSession(llm=router, tools=_registry_with(_echo_tool()))
     assert session.chat("hello") == "hi"
-    # legacy 路径不写 run 状态
-    assert session.last_run_status == ""
+    # 模型主动收口（无工具调用、有正文）→ completed
+    assert session.last_run_status == "completed"
+
+
+def test_legacy_direct_budget_exhausted_status():
+    """Direct 路径步数耗尽时状态是 budget_exhausted，不是 completed/空。"""
+    router = FakeRouter([_resp_tool(f"call_{i}", "echo", {"msg": str(i)}) for i in range(8)])
+    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()))
+    session.max_steps = 2
+    answer = session.chat("一直调用工具")
+    assert "最大步数" in answer
+    assert session.last_run_status == "budget_exhausted"
+
+
+def test_legacy_direct_cancel_records_cancelled_status():
+    """Direct 路径被取消时状态是 cancelled。"""
+    from app.agent.cancel import CancelToken
+
+    router = FakeRouter([_resp_text("hi")])
+    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()))
+    token = CancelToken()
+    token.cancel()
+    answer = session.chat("hello", cancel=token)
+    assert answer == "已中断。"
+    assert session.last_run_status == "cancelled"

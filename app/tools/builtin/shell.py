@@ -23,7 +23,9 @@
 """
 from __future__ import annotations
 
+import os
 import platform
+import signal
 import subprocess
 
 from app.tools.builtin.files import (
@@ -31,7 +33,7 @@ from app.tools.builtin.files import (
     _outside_workspace_approval,
     _resolve_within_workspace,
 )
-from app.tools.registry import Tool
+from app.tools.registry import Tool, current_cancel_token
 from app.tools.rtk_builtin import BuiltinRTK
 
 # 单次输出上限:8KB。超出截断并附说明,避免让模型上下文吞下兆级 log。
@@ -80,18 +82,55 @@ def _run_shell(args: dict) -> str:
         return f"not a working directory: {cwd}"
     argv = _build_argv(command)
 
+    cancel = current_cancel_token()
+    proc = None
+
+    def _stop_process() -> None:
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if platform.system() == "Windows":
+                proc.kill()
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+
     try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(cwd),
-            # errors="replace" 处理非 UTF-8 输出(比如某些命令输出 GBK)
-            errors="replace",
-        )
+        if cancel is None:
+            # 非 Agent 调用（测试/直接复用）保持简单的 subprocess.run 语义。
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(cwd),
+                errors="replace",
+            )
+            stdout, stderr = completed.stdout, completed.stderr
+            returncode = completed.returncode
+        else:
+            popen_kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "cwd": str(cwd),
+                "errors": "replace",
+            }
+            if platform.system() == "Windows":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen(argv, **popen_kwargs)
+            with cancel.callback(_stop_process):
+                stdout, stderr = proc.communicate(timeout=timeout)
+            cancel.raise_if_cancelled()
+            returncode = proc.returncode
     except subprocess.TimeoutExpired:
-        # 超时不抛异常,作为错误字符串返回给模型,让它自己决定是否调高 timeout
+        _stop_process()
+        if proc is not None:
+            proc.kill()
+            proc.communicate()
         return f"timeout: command exceeded {timeout}s and was killed"
     except FileNotFoundError as exc:
         # 没装 bash / powershell 时
@@ -102,9 +141,9 @@ def _run_shell(args: dict) -> str:
     # 执行完成后处理输出；过滤失败或收益不足时会返回原始 stdout/stderr。
     compression = BuiltinRTK().compress(
         command,
-        proc.stdout or "",
-        proc.stderr or "",
-        proc.returncode,
+        stdout or "",
+        stderr or "",
+        returncode,
     )
     body = compression.output
 
@@ -117,7 +156,7 @@ def _run_shell(args: dict) -> str:
             f"{compression.original_bytes}->{compression.output_bytes} bytes, "
             f"-{compression.savings_percent:.0f}%]"
         )
-    parts.append(f"[exit code: {proc.returncode}]")
+    parts.append(f"[exit code: {returncode}]")
 
     output = "\n".join(parts)
 

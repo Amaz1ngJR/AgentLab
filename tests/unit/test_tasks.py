@@ -63,6 +63,23 @@ def test_task_store_reset_failed_none():
     assert store.reset_failed() == 0
 
 
+def test_task_store_reset_for_resume_includes_interrupted_task():
+    store = TaskStore()
+    store.replace_all([
+        Task("1", "failed", FAILED),
+        Task("2", "interrupted", IN_PROGRESS),
+        Task("3", "done", COMPLETED),
+    ])
+
+    assert store.reset_for_resume() == 2
+    by_id = {task.id: task for task in store.all()}
+    assert by_id["1"].status == PENDING
+    assert by_id["2"].status == PENDING
+    assert by_id["3"].status == COMPLETED
+    assert by_id["1"].history[-1] == "-> pending (resume from failed)"
+    assert by_id["2"].history[-1] == "-> pending (resume from in_progress)"
+
+
 def test_task_store_all_returns_copy():
     """all() 返回副本,外部修改不应影响内部状态。"""
     store = TaskStore()

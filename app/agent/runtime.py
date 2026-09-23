@@ -15,7 +15,7 @@ from app.agent.mode_router import ExecutionMode, ModeRouter, SessionState
 from app.agent.tasks import TaskStore
 from app.attachments import ImageAttachment, build_user_content
 from app.models.protocol import ToolResult
-from app.models.router import ModelRouter
+from app.models.router import ModelRouter, call_create_message
 from app.tools.registry import ToolRegistry
 
 DEFAULT_SYSTEM_PROMPT = """你是 AgentLab,一个本地编码助手。
@@ -92,11 +92,16 @@ def _requires_tool_execution(user_input: str) -> bool:
     chinese_actions = (
         "帮我修复", "请修复", "直接修复", "修复代码",
         "帮我修改", "请修改", "直接修改", "修改代码",
+        "帮我完善", "请完善", "直接完善", "更新代码", "重构代码", "优化代码",
         "编辑文件", "运行测试", "执行命令", "创建文件", "删除文件", "实现功能",
+        "添加功能", "增加功能", "开发功能",
     )
     if any(marker in text for marker in chinese_actions):
         return True
-    return bool(re.search(r"\b(fix|edit|modify|implement|execute)\b", text))
+    return bool(re.search(
+        r"\b(fix|edit|modify|implement|execute|update|refactor|optimize|add|build)\b",
+        text,
+    ))
 
 
 def _looks_like_pseudo_tool_call(text: str, *, action_request: bool) -> bool:
@@ -269,6 +274,23 @@ class AgentSession:
         for callback in list(self._run_subscribers):
             callback(event)
 
+    def _emit_provider_retry(
+        self, attempt: int, delay: float, exc: BaseException,
+    ) -> None:
+        """发布当前模型调用的重试事件，不向共享 Router 注册全局监听。"""
+        self._emit_run_event(RunEvent(
+            kind=events.PROVIDER_RETRY,
+            text=(
+                f"模型服务暂时不可用（{type(exc).__name__}），"
+                f"{delay:.1f}s 后重试（第 {attempt} 次）"
+            ),
+            payload={
+                "attempt": attempt,
+                "delay": delay,
+                "error": type(exc).__name__,
+            },
+        ))
+
     def ensure_orchestrator(self):
         """返回当前编排器，供 Runtime/Loop 适配器使用。"""
         return self._ensure_orchestrator()
@@ -361,6 +383,7 @@ class AgentSession:
                 progress=self._progress,
                 messages=self.messages,
                 context_manager=self.context_manager,
+                on_auto_execute=self.enable_auto_execute,
             )
         # 每次都重新指向当前 messages:switch/reset 可能换过引用
         self._orch.messages = self.messages
@@ -377,7 +400,7 @@ class AgentSession:
             return self._configured_mode
         if self._configured_mode is None:
             return ExecutionMode.TASK if self._orchestrate else ExecutionMode.DIRECT
-        return ModeRouter.select(
+        selected = ModeRouter.select(
             user_input,
             images,
             SessionState(
@@ -386,6 +409,9 @@ class AgentSession:
                 orchestrate_enabled=True,
             ),
         )
+        if self._auto_execute_enabled and _requires_tool_execution(user_input):
+            return ExecutionMode.TASK
+        return selected
 
     @property
     def execution_mode(self) -> ExecutionMode | None:
@@ -455,9 +481,15 @@ class AgentSession:
                     cancel=cancel,
                     resume=resume,
                     append_goal_message=False,
+                    auto_execute=self._auto_execute_enabled,
                 )
             else:
-                answer = orch.run(user_input, cancel=cancel, resume=resume)
+                answer = orch.run(
+                    user_input,
+                    cancel=cancel,
+                    resume=resume,
+                    auto_execute=self._auto_execute_enabled,
+                )
             # 把 run 级统计拷回 session,供 CLI 展示 / 持久化
             self.last_turn_usage = dict(orch.last_run_usage)
             for k in ("input_tokens", "output_tokens"):
@@ -488,6 +520,7 @@ class AgentSession:
                 self.messages,
                 system=self.system_prompt,
                 tools=tools,
+                cancel=cancel,
             )
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
@@ -501,20 +534,38 @@ class AgentSession:
             )
             has_tool_call = False
             corrected_no_tool = False
-            for step_index in range(self.max_steps):
+            max_steps = self.max_steps
+            for step_index in range(max_steps):
                 # 安全检查点：模型往返之间是干净的稳定点，此时 tool_use/tool_result
                 # 都已配对闭合，中断不会在历史里留下悬空调用。
                 if cancel is not None and cancel.cancelled:
+                    self.last_run_status = "cancelled"
                     self._emit_turn_event(TurnEvent(
                         kind="text", text="已中断。",
                     ))
                     return "已中断。"
                 text_streamed = False
                 streamed_parts: list[str] = []
+
+                def _discard_partial(_exc: BaseException) -> None:
+                    """重试前作废本次尝试已流出的半截文本。
+
+                    重试时 adapter 会从头再流一遍，不清空的话 spinner 会把同一段
+                    内容推第二遍（屏幕重复），而 ``streamed_parts`` 里的残文还可能被
+                    当成最终答案返回（见下面 ``resp.text or "".join(...)`` 的兜底）。
+                    已经写进终端的内容无法回滚，只能提示用户"这段输出作废、正在重来"。
+                    """
+                    if not streamed_parts:
+                        return
+                    streamed_parts.clear()
+                    if on_discard is not None:
+                        on_discard()
+
                 with self._progress("thinking") as handle:
                     on_progress = getattr(handle, "update", None)
                     raw_on_text = getattr(handle, "on_text", None)
                     raw_on_thinking = getattr(handle, "on_thinking", None)
+                    on_discard = getattr(handle, "discard_text", None)
 
                     def on_text_delta(delta: str) -> None:
                         nonlocal text_streamed
@@ -523,8 +574,9 @@ class AgentSession:
                         if raw_on_text is not None:
                             raw_on_text(delta)
 
-                    resp = self.llm.create_message(
-                        messages=self.messages,
+                    resp = call_create_message(
+                        self.llm,
+                        self.messages,
                         tools=tools or None,
                         system=self.system_prompt,
                         on_progress=on_progress,
@@ -535,6 +587,10 @@ class AgentSession:
                             else None
                         ),
                         on_thinking_delta=raw_on_thinking,
+                        cancel=cancel,
+                        discard_partial=_discard_partial,
+                        on_retry=self._emit_provider_retry,
+                        retry_until_cancelled=self._auto_execute_enabled,
                     )
 
                 for k in ("input_tokens", "output_tokens"):
@@ -557,7 +613,7 @@ class AgentSession:
                 if not resp.tool_calls:
                     if not response_text.strip():
                         empty_rounds += 1
-                        if empty_rounds == 1 and step_index + 1 < self.max_steps:
+                        if empty_rounds == 1 and step_index + 1 < max_steps:
                             self.messages.append({
                                 "role": "user",
                                 "content": (
@@ -571,13 +627,21 @@ class AgentSession:
                             for item in (resp.provider_payload or [])
                             if isinstance(item, dict)
                         ]
+                        if (resp.finish_reason or "") in {
+                            "max_tokens", "length", "MAX_TOKENS",
+                        }:
+                            raise RuntimeError(
+                                "模型输出被 max_tokens 截断，正文/工具调用尚未开始写入"
+                                f" (output_types={output_types})。"
+                                "可调大 config 中的 max_tokens 后 /resume 继续。"
+                            )
                         raise RuntimeError(
                             "模型未返回正文或工具调用，任务未完成"
                             f" (status={resp.finish_reason or 'unknown'}, "
                             f"output_types={output_types})"
                         )
                     if action_request and not has_tool_call:
-                        if not corrected_no_tool and step_index + 1 < self.max_steps:
+                        if not corrected_no_tool and step_index + 1 < max_steps:
                             corrected_no_tool = True
                             self.messages.append({
                                 "role": "user",
@@ -590,7 +654,7 @@ class AgentSession:
                             continue
                         raise RuntimeError("模型只输出了文字，未进行结构化工具调用；请求未执行")
                     if _looks_like_pseudo_tool_call(response_text, action_request=action_request):
-                        if not corrected_no_tool and step_index + 1 < self.max_steps:
+                        if not corrected_no_tool and step_index + 1 < max_steps:
                             corrected_no_tool = True
                             self.messages.append({
                                 "role": "user",
@@ -604,6 +668,8 @@ class AgentSession:
                         raise RuntimeError("模型只在正文中模拟工具调用；本轮未执行任何操作")
                     if not text_streamed:
                         self._emit_turn_event(TurnEvent(kind="text", text=response_text))
+                    # 模型主动收口（无工具调用、有正文）= 本轮正常完成。
+                    self.last_run_status = "completed"
                     return response_text
 
                 if response_text and not text_streamed:
@@ -711,6 +777,7 @@ class AgentSession:
                                 call.name,
                                 call.arguments,
                                 approved_action=approval_action,
+                                cancel=cancel,
                             )
                             # 进入历史前截断超大输出(与编排路径一致,见 executor)。
                             from app.agent.executor import _truncate_tool_output
@@ -740,7 +807,14 @@ class AgentSession:
                 # OpenAI Responses 三家不一样),Runtime 不关心
                 self.messages.extend(self.llm.format_tool_results(tool_results))
 
-            return "(达到最大步数仍未给出最终答案)"
+            self.last_run_status = "budget_exhausted"
+            return (
+                f"(达到最大步数 {max_steps} 仍未给出最终答案；"
+                "请调整任务或使用 /resume 继续)"
+            )
+        except Cancelled:
+            self.last_run_status = "cancelled"
+            return "已中断。"
         finally:
             self.last_turn_seconds = time.monotonic() - turn_start
             self.cumulative_seconds += self.last_turn_seconds

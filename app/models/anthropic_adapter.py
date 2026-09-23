@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from app.agent.cancel import CancelToken, close_on_cancel
 from app.config.schemas import LLMConfig
 from app.attachments import materialize_image_block
 from app.models.token_progress import StreamingTokenProgress
@@ -110,6 +111,7 @@ class AnthropicAdapter:
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
+        cancel: Optional[CancelToken] = None,
     ) -> ModelResponse:
         system_from_msgs, converted = self._split_system(messages)
         converted = _materialize_anthropic_messages(converted)
@@ -135,37 +137,42 @@ class AnthropicAdapter:
         progress.emit(force=True)
 
         with self._client.messages.stream(**params) as stream:
-            for event in stream:
-                etype = getattr(event, "type", None)
-                if etype == "message_start":
-                    usage = getattr(event.message, "usage", None)
-                    if usage:
-                        in_tokens = getattr(usage, "input_tokens", 0) or 0
-                        out_tokens = getattr(usage, "output_tokens", 0) or 0
-                    progress.set_usage(
-                        input_tokens=in_tokens,
-                        output_tokens=out_tokens,
-                        force=True,
-                    )
-                elif etype == "content_block_delta":
-                    delta = getattr(event, "delta", None)
-                    if delta is not None and getattr(delta, "type", None) == "text_delta":
-                        text_chunk = normalizer.normalize(
-                            "content", getattr(delta, "text", "") or ""
+            with close_on_cancel(cancel, stream):
+                for event in stream:
+                    if cancel is not None:
+                        cancel.raise_if_cancelled()
+                    etype = getattr(event, "type", None)
+                    if etype == "message_start":
+                        usage = getattr(event.message, "usage", None)
+                        if usage:
+                            in_tokens = getattr(usage, "input_tokens", 0) or 0
+                            out_tokens = getattr(usage, "output_tokens", 0) or 0
+                        progress.set_usage(
+                            input_tokens=in_tokens,
+                            output_tokens=out_tokens,
+                            force=True,
                         )
-                        if text_chunk:
-                            if on_text_delta:
-                                on_text_delta(text_chunk)
-                            progress.add_text(text_chunk)
-                elif etype == "message_delta":
-                    usage = getattr(event, "usage", None)
-                    if usage:
-                        v = getattr(usage, "output_tokens", None)
-                        if v is not None:
-                            out_tokens = v
-                            progress.set_usage(output_tokens=v)
+                    elif etype == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta is not None and getattr(delta, "type", None) == "text_delta":
+                            text_chunk = normalizer.normalize(
+                                "content", getattr(delta, "text", "") or ""
+                            )
+                            if text_chunk:
+                                if on_text_delta:
+                                    on_text_delta(text_chunk)
+                                progress.add_text(text_chunk)
+                    elif etype == "message_delta":
+                        usage = getattr(event, "usage", None)
+                        if usage:
+                            v = getattr(usage, "output_tokens", None)
+                            if v is not None:
+                                out_tokens = v
+                                progress.set_usage(output_tokens=v)
 
-            message = stream.get_final_message()
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                message = stream.get_final_message()
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []

@@ -16,6 +16,7 @@
   tool_completed     工具执行完成(tool_name / tool_output / tool_error / elapsed)
   tool_denied        审批被拒(tool_name)
   task_updated       任务状态变化(task_id / task_status / 携带 snapshot)
+  provider_retry     provider 网络抖动，正在自动重试(text = 提示)
   run_completed      run 正常结束(text = 最终答复,payload.tasks = 最终 snapshot)
   run_failed         run 异常/卡死/取消结束(text = 原因)
 
@@ -47,6 +48,8 @@ TOOL_DENIED = "tool_denied"
 TASK_UPDATED = "task_updated"
 RUN_COMPLETED = "run_completed"
 RUN_FAILED = "run_failed"
+# Provider 网络抖动触发自动重试（text = 人类可读的提示）
+PROVIDER_RETRY = "provider_retry"
 
 # 上下文预算与压缩(§7.3)
 CONTEXT_BUDGET_WARNING = "context_budget_warning"

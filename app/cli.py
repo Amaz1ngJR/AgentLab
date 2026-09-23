@@ -24,6 +24,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Optional
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app
@@ -131,6 +132,42 @@ _ANSI_BOLD = "\033[1m"           # 加粗 (汇总行)
 _ANSI_YELLOW = "\033[33m"        # 黄色 (blocked)
 _ANSI_RED = "\033[31m"           # 红色 (failed)
 _ANSI_YELLOW_BOLD = "\033[1;33m" # 黄色加粗 (执行审批)
+
+# 当前存活的 spinner。spinner 直接往 stdout 写、靠相对上移擦 footer（见 _Spinner
+# 文档），外部"随手 print"会插进 footer 中间：提示和 footer 粘在同一行，spinner
+# 退出重画正文时还会把同一段文本再打一遍。所以 spinner 存活期间的事件提示统一交给
+# 它协调（见 _emit_progress_notice）。只登记 _Spinner：_PlainProgress 没有 footer，
+# 直接打印不会打架。
+_ACTIVE_SPINNER_LOCK = threading.Lock()
+_ACTIVE_SPINNER: Optional["_Spinner"] = None
+
+
+def _get_active_spinner() -> Optional["_Spinner"]:
+    with _ACTIVE_SPINNER_LOCK:
+        return _ACTIVE_SPINNER
+
+
+def _set_active_spinner(spinner: Optional["_Spinner"]) -> None:
+    global _ACTIVE_SPINNER
+    with _ACTIVE_SPINNER_LOCK:
+        _ACTIVE_SPINNER = spinner
+
+
+def _emit_progress_notice(text: str, marker: str = "⟳") -> None:
+    """在 spinner 存活期间安全地插一行提示，否则直接打印。
+
+    很多 RunEvent（provider 重试、上下文压缩）恰好发生在 spinner 内部 —— 它们由
+    "正在调用模型"的代码路径发出。直接 print 会和 footer 粘行并触发正文重画，所以
+    这里优先交给 spinner 的 notice() 走同一条渲染通道。
+    """
+    spinner = _get_active_spinner()
+    if spinner is not None:
+        spinner.notice(text, marker=marker)
+        return
+    print(
+        _colorize(f"\n  {marker} {text}\n", _ANSI_YELLOW, stream=sys.stdout),
+        flush=True,
+    )
 
 
 def _supports_color(stream=None) -> bool:
@@ -370,6 +407,7 @@ class _Spinner:
 
     def __enter__(self) -> "_Spinner":
         self._t0 = time.monotonic()
+        _set_active_spinner(self)
         self._thread.start()
         return self
 
@@ -377,6 +415,7 @@ class _Spinner:
         self._stop.set()
         self._thread.join(timeout=1.0)
         with self._lock:
+            _set_active_spinner(None)
             self._erase_footer()
             # 模型末尾常常不带换行，按行缓冲的最后一行要在这里补出来。
             trailing = self.flush_pending()
@@ -446,6 +485,45 @@ class _Spinner:
     def _process_streaming_highlight(self, delta: str) -> str:
         """把流式增量交给共享的 markdown 渲染器。"""
         return self._md.feed(delta)
+
+    def notice(self, text: str, *, marker: str = "⟳") -> None:
+        """在 footer 上方插一行提示（spinner 存活期间的安全打印通道）。
+
+        外部直接 print 会插进 footer 中间：提示与 footer 粘在同一行，spinner 下一帧
+        擦除 footer 时又按 ``_line_buf`` 复原正文，把同一段文本再打一遍（实测正文在
+        屏幕上出现两次）。这里走和流式文本完全相同的通道 —— 先擦 footer、收掉未换行
+        的正文尾行、打提示、再在新位置重画 footer。
+
+        收尾行必须清空 ``_line_buf``：残留的尾行会在下次擦除时被重新打出来。
+        """
+        with self._lock:
+            self._erase_footer()
+            self._commit_tasks()
+            self._close_partial_line()
+            sys.stdout.write(
+                _colorize(f"  {marker} {text}", _ANSI_YELLOW, stream=sys.stdout) + "\n"
+            )
+            self._draw_footer()
+            sys.stdout.flush()
+
+    def discard_text(self) -> None:
+        """作废当前这条未换行的流式尾行（重试前调用）。
+
+        重试会从头再流一遍：``_line_buf`` 若还留着残文，footer 擦除/重画时会把残文和
+        新内容拼在同一行重复输出。已经写进终端的字符无法回滚，只能换行收尾，让重试
+        内容从新一行开始（同时由 notice() 告知用户这段输出已作废）。
+        """
+        with self._lock:
+            self._erase_footer()
+            self._close_partial_line()
+            self._draw_footer()
+            sys.stdout.flush()
+
+    def _close_partial_line(self) -> None:
+        """把未换行的正文尾行收掉并清空缓冲。调用方必须已持有 ``self._lock``。"""
+        if self._line_buf:
+            sys.stdout.write("\n")
+            self._line_buf = ""
 
     def flush_pending(self) -> str:
         """吐出渲染器里缓冲的残留（未闭合的表格/代码块、最后一行）。"""
@@ -596,11 +674,29 @@ class _PlainProgress:
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self._text_started = False
         self._thinking_started = False
+        self._partial_line = False  # 是否有未换行的流式输出
 
     def __enter__(self) -> "_PlainProgress":
         self._t0 = time.monotonic()
         print(f"  ✻ {self.label}…", flush=True)
         return self
+
+    def notice(self, text: str, *, marker: str = "⟳") -> None:
+        """非 TTY 下的提示：没有 footer 要协调，收掉半行后直接打印即可。"""
+        if self._partial_line:
+            sys.stdout.write("\n")
+            self._partial_line = False
+        print(
+            _colorize(f"  {marker} {text}", _ANSI_YELLOW, stream=sys.stdout),
+            flush=True,
+        )
+
+    def discard_text(self) -> None:
+        """作废未换行的半截输出（重试会重流一遍，接着打会粘成一行）。"""
+        if self._partial_line:
+            sys.stdout.write("\n")
+            self._partial_line = False
+            sys.stdout.flush()
 
     def __exit__(self, *_) -> None:
         elapsed = time.monotonic() - self._t0
@@ -634,6 +730,7 @@ class _PlainProgress:
             # 思考流后接正文:先空一行把灰字推开
             sys.stdout.write("\n\n" if self._thinking_started else "\n")
         sys.stdout.write(_model_text(delta))
+        self._partial_line = not delta.endswith("\n")
         sys.stdout.flush()
 
 
@@ -985,6 +1082,10 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
             for line in task_lines:
                 print(line, flush=True)
             print(flush=True)
+    elif kind == run_events.PROVIDER_RETRY:
+        # 重试提示恰好发生在 spinner 内部（模型调用还没返回），不能直接 print：
+        # 会和 footer 粘在同一行，并让 spinner 把同一段正文重画一遍。
+        _emit_progress_notice(ev.text)
     elif kind == run_events.RUN_FAILED:
         print(f"\n  ⚠ {ev.text}", flush=True)
         tasks = ev.payload.get("tasks", [])
@@ -1002,15 +1103,19 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
     elif kind == run_events.CONTEXT_BUDGET_WARNING:
         rep = ev.payload or {}
         pct = int(rep.get("usage_ratio", 0) * 100)
-        print(f"  ⓘ 上下文已用 ~{pct}%(下个稳定点将压缩旧历史)", flush=True)
+        _emit_progress_notice(
+            f"上下文已用 ~{pct}%(下个稳定点将压缩旧历史)", marker="ⓘ",
+        )
     elif kind == run_events.CONTEXT_COMPACTION_STARTED:
-        print("  ✻ 压缩上下文 …", flush=True)
+        _emit_progress_notice("压缩上下文 …", marker="✻")
     elif kind == run_events.CONTEXT_COMPACTION_COMPLETED:
         p = ev.payload or {}
         before, after = p.get("token_before", 0), p.get("token_after", 0)
-        print(f"  ✓ 已压缩旧历史(~{before} → ~{after} tokens)", flush=True)
+        _emit_progress_notice(
+            f"已压缩旧历史(~{before} → ~{after} tokens)", marker="✓",
+        )
     elif kind == run_events.CONTEXT_COMPACTION_FAILED:
-        print(f"  ⚠ 上下文压缩跳过:{ev.text}", flush=True)
+        _emit_progress_notice(f"上下文压缩跳过:{ev.text}", marker="⚠")
     # ── Loop Engineering 事件 ──
     elif kind == run_events.LOOP_STARTED:
         p = ev.payload or {}
@@ -1798,7 +1903,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     from app.agent.loop_commands import LoopCommandHandler
 
     def _run_loop_with_cancel(loop) -> str:
-        """执行 loop.run(),带 Ctrl-C 协作式取消(复用 _chat_with_cancel 的模式)。"""
+        """执行 loop.run()，并把 Esc/Ctrl-C 接到同一个取消令牌。"""
         from app.agent.cancel import CancelToken
         import signal
         import threading
@@ -1807,13 +1912,16 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         can_trap = threading.current_thread() is threading.main_thread()
         prev_handler = None
 
-        def _on_sigint(signum, frame):
+        def _request_cancel(via: str) -> None:
             if not token.cancelled:
                 token.cancel()
-                print(f"\n  ⏹ 已请求中断;将在当前步骤后停止。", flush=True)
-            else:
+                _emit_progress_notice(f"已收到 {via}，正在停止当前 Loop", marker="⏹")
+
+        def _on_sigint(signum, frame):
+            if token.cancelled:
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
                 raise KeyboardInterrupt
+            _request_cancel("Ctrl-C")
 
         if can_trap:
             try:
@@ -1822,7 +1930,8 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
                 can_trap = False
 
         try:
-            return loop.run(cancel=token)
+            with _EscWatcher(on_esc=lambda: _request_cancel("Esc")):
+                return loop.run(cancel=token)
         finally:
             if can_trap and prev_handler is not None:
                 signal.signal(signal.SIGINT, prev_handler)
@@ -2155,8 +2264,6 @@ class _EscWatcher:
 
     @staticmethod
     def _can_enable() -> bool:
-        if platform.system() == "Windows":
-            return False
         try:
             return sys.stdin.isatty()
         except (ValueError, AttributeError):
@@ -2164,6 +2271,12 @@ class _EscWatcher:
 
     def __enter__(self) -> "_EscWatcher":
         if not self._enabled:
+            return self
+        if platform.system() == "Windows":
+            from app.util.input_arbiter import set_background_reader
+            set_background_reader(self)
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
             return self
         import termios
         import tty
@@ -2196,6 +2309,9 @@ class _EscWatcher:
                 pass
 
     def _run(self) -> None:
+        if platform.system() == "Windows":
+            self._run_windows()
+            return
         import select
         last_esc_time = 0.0
         debounce_seconds = 0.5  # 防抖窗口:同一次按键产生的多个事件只触发一次
@@ -2224,6 +2340,25 @@ class _EscWatcher:
                         self._on_esc()
                     except Exception:
                         pass
+
+    def _run_windows(self) -> None:
+        """Windows 控制台没有 termios/select，使用 msvcrt 非阻塞读取按键。"""
+        import msvcrt
+
+        while not self._stop.is_set():
+            if self._paused.is_set() or not msvcrt.kbhit():
+                time.sleep(0.02)
+                continue
+            key = msvcrt.getwch()
+            if key in ("\x00", "\xe0"):
+                if msvcrt.kbhit():
+                    msvcrt.getwch()  # 消费方向键/功能键的第二个字符
+                continue
+            if key == "\x1b":
+                try:
+                    self._on_esc()
+                except Exception:
+                    pass
 
 
 def _chat_with_cancel(
@@ -2260,8 +2395,10 @@ def _chat_with_cancel(
     def _request_cancel(via: str) -> None:
         if not token.cancelled:
             token.cancel()
-            print(f"\n  ⏹ 已请求中断({via});将在当前步骤后停止。"
-                  f"停下后可直接输入新指令调整方向,或 /resume 继续。", flush=True)
+            _emit_progress_notice(
+                f"已收到 {via}，正在立即停止；之后可输入新指令或 /resume 继续",
+                marker="⏹",
+            )
 
     if can_trap:
         def _on_sigint(signum, frame):
@@ -2455,7 +2592,8 @@ def _repl(router: RuntimeService) -> int:
             return
         enabled = session.toggle_auto_execute()
         status = "🚀 已启用" if enabled else "❌ 已关闭"
-        print(f"\n{status}全自动执行模式")
+        detail = "（动作任务免审批并持续执行，Esc/Ctrl+C 停止）" if enabled else ""
+        print(f"\n{status}全自动执行模式{detail}")
         get_app().invalidate()
 
     # 添加 bracketed paste 处理

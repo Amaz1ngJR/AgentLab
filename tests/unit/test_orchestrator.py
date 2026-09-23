@@ -562,6 +562,7 @@ def test_orchestrator_modify_request_stops_run_without_replanning():
     assert len(router.calls) == 2  # 一次 planning + 一次 executor，之后立即停止
 
 
+def test_orchestrator_stops_at_max_steps():
     """全局步数预算耗尽时,run 以"达到最大步数"收尾。"""
     # 单任务,但模型一直请求工具,永不收口
     responses = [_plan_json({"id": "t1", "content": "loop", "dependencies": []})]

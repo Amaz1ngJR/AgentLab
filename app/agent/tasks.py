@@ -85,12 +85,26 @@ class TaskStore:
         self._tasks = []
 
     def reset_failed(self) -> int:
-        """把所有 failed 任务重置为 pending,返回重置数量。供 /resume 用。"""
+        """把 failed 任务重置为 pending，保留原有 API 语义。"""
         count = 0
         for t in self._tasks:
             if t.status == FAILED:
+                previous = t.status
                 t.status = PENDING
+                t.history.append(f"-> pending (reset from {previous})")
                 count += 1
+        return count
+
+    def reset_for_resume(self) -> int:
+        """恢复可重试任务；中断时遗留的 in_progress 也重新排队。"""
+        count = 0
+        for task in self._tasks:
+            if task.status not in (FAILED, IN_PROGRESS):
+                continue
+            previous = task.status
+            task.status = PENDING
+            task.history.append(f"-> pending (resume from {previous})")
+            count += 1
         return count
 
     def is_empty(self) -> bool:

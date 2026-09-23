@@ -16,8 +16,10 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from app.agent.cancel import Cancelled, CancelToken
 from app.agent.tasks import PENDING, Task
 from app.agent.execution_plan import ExecutionPlan, PlannedTask, parse_execution_plan, validate_execution_plan
+from app.models.router import call_create_message
 
 PLANNER_SYSTEM = """你是任务规划器。把用户目标拆成可执行的子任务清单。
 
@@ -44,6 +46,7 @@ PLANNER_SYSTEM = """你是任务规划器。把用户目标拆成可执行的子
 - 不要把普通任务全部拆成子 Agent；简单目标只给一个 main_agent 任务。
 - 简单目标(一步能完成)就只给一个任务。
 - 不要拆得过细,通常 2-5 个任务即可。
+- 修改、修复或实现类目标必须包含验证任务（相关测试、构建或可观察结果）；验证通过前不能把计划视为完成。
 - 避免"确认"、"检查上下文"、"分析"等空泛任务，直接写具体操作。
 
 复杂任务示例:
@@ -118,7 +121,15 @@ class Planner:
         self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self.last_actual_model: str | None = None
 
-    def create_plan(self, goal: str, context: str = "", *, on_progress=None) -> TaskPlan:
+    def create_plan(
+        self,
+        goal: str,
+        context: str = "",
+        *,
+        on_progress=None,
+        cancel: CancelToken | None = None,
+        retry_until_cancelled: bool = False,
+    ) -> TaskPlan:
         """生成初始计划。context 可放 workspace、已知约束等补充信息。
 
         on_progress 是可选的 token 进度回调。Planner 使用自己精简的
@@ -128,11 +139,14 @@ class Planner:
         self.last_usage = {"input_tokens": 0, "output_tokens": 0}
         prompt = goal if not context else f"{context}\n\n目标:{goal}"
         try:
-            resp = self._llm.create_message(
-                messages=[{"role": "user", "content": prompt}],
+            resp = call_create_message(
+                self._llm,
+                [{"role": "user", "content": prompt}],
                 tools=None,
                 system=self._system,
                 on_progress=on_progress,
+                cancel=cancel,
+                retry_until_cancelled=retry_until_cancelled,
             )
             for k in ("input_tokens", "output_tokens"):
                 self.last_usage[k] = resp.usage.get(k, 0) if getattr(resp, "usage", None) else 0
@@ -146,6 +160,8 @@ class Planner:
             else:
                 errors = []
                 tasks = []
+        except Cancelled:
+            raise
         except Exception:
             execution_plan = None
             errors = []

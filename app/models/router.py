@@ -1,8 +1,10 @@
 """模型路由器 —— 根据配置选择 provider adapter，对外暴露统一接口。"""
 from __future__ import annotations
 
-from typing import Any, Optional
+import time
+from typing import Any, Callable, Optional
 
+from app.agent.cancel import CancelToken
 from app.config.schemas import LLMConfig
 from app.models.provider_retry import ProviderCircuitBreaker, call_with_retry
 from app.models.protocol import (
@@ -21,9 +23,15 @@ class ModelRouter:
     传给 AgentSession 使用。
     """
 
-    def __init__(self, adapter: Any):
+    def __init__(
+        self,
+        adapter: Any,
+        *,
+        retry_sleep: Callable[[float], None] = time.sleep,
+    ):
         self._adapter = adapter
         self._breaker = ProviderCircuitBreaker()
+        self._retry_sleep = retry_sleep
 
     @property
     def model(self) -> str:
@@ -74,19 +82,33 @@ class ModelRouter:
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
+        cancel: Optional[CancelToken] = None,
+        discard_partial: Optional[Callable[[BaseException], None]] = None,
+        on_retry: Optional[Callable[[int, float, BaseException], None]] = None,
+        retry_until_cancelled: bool = False,
     ) -> ModelResponse:
+        adapter_kwargs: dict[str, Any] = {
+            "tools": tools,
+            "system": system,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "on_progress": on_progress,
+            "on_text_delta": on_text_delta,
+            "on_thinking_delta": on_thinking_delta,
+        }
+        if cancel is not None and _accepts_keyword(self._adapter.create_message, "cancel"):
+            adapter_kwargs["cancel"] = cancel
         return call_with_retry(
             lambda: self._adapter.create_message(
                 messages,
-                tools=tools,
-                system=system,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                on_progress=on_progress,
-                on_text_delta=on_text_delta,
-                on_thinking_delta=on_thinking_delta,
+                **adapter_kwargs,
             ),
+            on_retry=on_retry,
+            cancel=cancel,
             breaker=self._breaker,
+            discard_partial=discard_partial,
+            sleep=self._retry_sleep,
+            max_retries=None if retry_until_cancelled else 2,
         )
 
     def format_tool_results(self, results: list[ToolResult]) -> list[dict]:
@@ -110,6 +132,67 @@ _PROVIDERS = {
     "vllm":                     "openai_compatible",
     "remote_openai_compatible": "openai_compatible",
 }
+
+
+def call_create_message(
+    target: Any,
+    messages: list[dict],
+    *,
+    tools: Optional[list[dict]] = None,
+    system: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    on_progress: Optional[ProgressCallback] = None,
+    on_text_delta: Optional[TextDeltaCallback] = None,
+    on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
+    cancel: Optional[CancelToken] = None,
+    discard_partial: Optional[Callable[[BaseException], None]] = None,
+    on_retry: Optional[Callable[[int, float, BaseException], None]] = None,
+    retry_until_cancelled: bool = False,
+) -> ModelResponse:
+    """转发 create_message，只在目标接受时才传可选关键字参数。
+
+    重试相关参数只传给支持它们的 Router。测试替身和第三方实现可以继续使用旧签名。
+    """
+    kwargs: dict[str, Any] = {
+        "tools": tools,
+        "system": system,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "on_progress": on_progress,
+        "on_text_delta": on_text_delta,
+        "on_thinking_delta": on_thinking_delta,
+    }
+    method = getattr(target, "create_message")
+    optional = {
+        "cancel": cancel,
+        "discard_partial": discard_partial,
+        "on_retry": on_retry,
+        "retry_until_cancelled": retry_until_cancelled if retry_until_cancelled else None,
+    }
+    for name, value in optional.items():
+        if value is not None and _accepts_keyword(method, name):
+            kwargs[name] = value
+    return method(messages, **kwargs)
+
+
+def _accepts_keyword(func: Any, name: str) -> bool:
+    """判断可调用对象是否接受指定关键字参数（含 **kwargs）。"""
+    import inspect
+
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return True  # 内建/无法内省：按接受处理，让调用方自己报错更直观
+    for param in sig.parameters.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
 
 def build_model_router(cfg: Optional[LLMConfig] = None) -> ModelRouter:

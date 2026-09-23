@@ -23,7 +23,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from app.agent.cancel import Cancelled, CancelToken
 from app.agent.context_budget import estimate_messages_tokens, estimate_message_tokens
+from app.models.router import call_create_message
 from app.util.redact import redact
 
 # 给压缩模型的系统指令:只输出结构化 JSON 摘要,不调用工具、不写散文。
@@ -375,6 +377,7 @@ class ContextCompressor:
         recent_budget: Optional[int] = None,
         source_run_ids: Optional[list[str]] = None,
         on_progress=None,
+        cancel: CancelToken | None = None,
     ) -> CompactionResult:
         """就地压缩 messages 的可压缩前缀。成功时 messages 被原地改短。
 
@@ -398,17 +401,21 @@ class ContextCompressor:
         transcript = _bound_transcript(transcript)
         fallback_reason = ""
         try:
-            resp = self._llm.create_message(
-                messages=[{"role": "user", "content": transcript}],
+            resp = call_create_message(
+                self._llm,
+                [{"role": "user", "content": transcript}],
                 tools=None,
                 system=self._system,
                 max_tokens=1024,
                 on_progress=on_progress,
+                cancel=cancel,
             )
             if getattr(resp, "usage", None):
                 for k in ("input_tokens", "output_tokens"):
                     self.last_usage[k] = resp.usage.get(k, 0)
             obj = _extract_json(getattr(resp, "text", "") or "")
+        except Cancelled:
+            raise
         except Exception as exc:  # 模型异常:进入本地兜底,不让手动 compact 失效
             if not self._allow_local_fallback:
                 return CompactionResult(False, reason=f"压缩模型调用失败: {exc}")

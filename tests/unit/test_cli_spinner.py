@@ -299,6 +299,89 @@ def test_thinking_renderer_preserves_legitimate_repeated_lines(monkeypatch):
     assert plain.count("other") == 1
 
 
+# ── spinner 存活期间的提示：不能与 footer 粘行，也不能让正文重影 ────────────────
+
+def test_spinner_notice_does_not_collide_with_footer(monkeypatch):
+    import app.cli as cli
+
+    term = _FakeTerminal()
+    sink = io.StringIO()
+    orig = sink.write
+
+    def _write(s):
+        term.feed(s)
+        return orig(s)
+
+    sink.write = _write  # type: ignore[method-assign]
+    monkeypatch.setattr(cli.sys, "stdout", sink)
+
+    sp = _Spinner("thinking", task_store=None)
+    sp._t0 = 0.0
+    sp.on_text("这是模型正在输出的正文。")
+    sp.notice("网络中断（ReadTimeout），1.5s 后自动重试（第 1 次）")
+    sp.on_text("续写。")
+    sp._erase_footer()
+    screen = term.screen()
+
+    notice_lines = [l for l in screen.splitlines() if "⟳" in l]
+    assert len(notice_lines) == 1, f"提示应当只出现一次: {screen!r}"
+    assert "thinking" not in notice_lines[0], f"提示和 footer 粘行了: {notice_lines[0]!r}"
+    # 正文不能被重画成两遍
+    assert screen.count("这是模型正在输出的正文。") == 1, f"正文重影: {screen!r}"
+
+
+def test_spinner_discard_text_closes_partial_line(monkeypatch):
+    """discard_text 后重试内容必须另起一行，不能和作废的残文拼在一起。"""
+    import app.cli as cli
+
+    term = _FakeTerminal()
+    sink = io.StringIO()
+    orig = sink.write
+
+    def _write(s):
+        term.feed(s)
+        return orig(s)
+
+    sink.write = _write  # type: ignore[method-assign]
+    monkeypatch.setattr(cli.sys, "stdout", sink)
+
+    sp = _Spinner("thinking", task_store=None)
+    sp._t0 = 0.0
+    sp.on_text("作废的残文")
+    sp.discard_text()
+    sp.on_text("重试后的正文")
+    sp._erase_footer()
+    screen = term.screen()
+
+    assert sp._line_buf == "" or "重试" in sp._line_buf
+    # 残文与重试内容不得挤在同一行
+    joined = [l for l in screen.splitlines() if "作废的残文" in l]
+    assert joined and "重试后的正文" not in joined[0], f"残文与新内容粘连: {screen!r}"
+
+
+def test_emit_progress_notice_routes_to_active_spinner(monkeypatch):
+    """spinner 存活时提示走 spinner 通道；不在 spinner 里则直接打印。"""
+    import app.cli as cli
+
+    sink = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", sink)
+
+    cli._emit_progress_notice("没有 spinner 时的提示")
+    assert "没有 spinner 时的提示" in _strip_ansi(sink.getvalue())
+
+    sink.seek(0)
+    sink.truncate()
+    sp = _Spinner("thinking")
+    sp._t0 = 0.0
+    try:
+        cli._set_active_spinner(sp)
+        cli._emit_progress_notice("spinner 内的提示")
+    finally:
+        cli._set_active_spinner(None)
+    assert "spinner 内的提示" in _strip_ansi(sink.getvalue())
+    assert cli._get_active_spinner() is None
+
+
     """thinking footer 画出后,第一段文本到达时应擦掉它(写过清屏序列 \\033[J)。"""
     import app.cli as cli
 

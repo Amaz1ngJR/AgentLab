@@ -25,6 +25,9 @@ _RUN_KIND = {
     "tool_completed": ("tool.result", "completed"),
     "tool_denied": ("tool.result", "failed"),
     "task_updated": ("task.execution", "completed"),
+    # provider 网络抖动自动重试：映射成结构化 item，前端（Web/TUI）不必靠
+    # runtime.event 兜底才能拿到 attempt/delay/error。
+    "provider_retry": ("provider.retry", "waiting"),
     "run_completed": ("turn.result", "completed"),
     "run_failed": ("turn.result", "failed"),
     "context_budget_warning": ("context.budget", "waiting"),

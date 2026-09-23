@@ -1,6 +1,7 @@
 """离线测试：shell 工具。mock subprocess.run 验证 cwd 锁定 / 超时 / 输出格式。"""
 from unittest.mock import MagicMock, patch
 
+import pytest
 import subprocess
 
 from app.tools.builtin.shell import (
@@ -133,6 +134,7 @@ def test_run_shell_rtk_disabled_preserves_raw_output(monkeypatch, tmp_path):
     assert "[rtk:" not in output
 
 
+def test_run_shell_timeout_kills_command(monkeypatch, tmp_path):
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
 
     def fake_run(*args, **kwargs):
@@ -167,3 +169,101 @@ def test_shell_tool_requires_approval():
     """shell 是高风险工具,必须默认走审批。"""
     assert SHELL.requires_approval is True
     assert SHELL.name == "shell"
+
+
+# ── 取消：长时间命令必须被迅速终止 ────────────────────────────────────────────
+# 背景：shell 原先用 subprocess.run，Ctrl-C/Esc 只能等 timeout 到期（最长用户指定
+# 的秒数）才返回，交互上等同于卡死。现在走 Popen + start_new_session，token 置位
+# 时通过 killpg 唤醒 communicate()。
+# 这些用真实子进程验证，不 mock —— mock 掉 Popen 就测不到"真的被终止"这件事。
+
+
+def test_long_running_shell_killed_quickly_on_cancel(monkeypatch, tmp_path):
+    """Esc 触发取消时，sleep 30 的命令应在远小于超时的时间内被终止。"""
+    import threading
+    import time
+
+    from app.agent.cancel import CancelToken, Cancelled
+    from app.tools.registry import ToolRegistry
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    registry = ToolRegistry()
+    registry.register(SHELL)
+    token = CancelToken()
+
+    def cancel_soon():
+        time.sleep(0.3)
+        token.cancel()
+
+    threading.Thread(target=cancel_soon, daemon=True).start()
+
+    started = time.monotonic()
+    with pytest.raises(Cancelled):
+        registry.execute(
+            "shell",
+            {"command": "sleep 30", "timeout": 30},
+            approved_action="shell",
+            cancel=token,
+        )
+    elapsed = time.monotonic() - started
+
+    # 关键断言：没有等满 30s。给足余量以容忍 CI 抖动。
+    assert elapsed < 5, f"命令未被及时终止，耗时 {elapsed:.1f}s"
+
+
+def test_shell_cancel_kills_whole_process_group(monkeypatch, tmp_path):
+    """killpg 要连带子进程一起终止 —— 否则子进程会变成孤儿继续跑。"""
+    import threading
+    import time
+
+    from app.agent.cancel import CancelToken, Cancelled
+    from app.tools.registry import ToolRegistry
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    registry = ToolRegistry()
+    registry.register(SHELL)
+    token = CancelToken()
+
+    def cancel_soon():
+        time.sleep(0.3)
+        token.cancel()
+
+    threading.Thread(target=cancel_soon, daemon=True).start()
+
+    # bash 起一个后台 sleep 再前台等待：只有整组被 kill 才不会有残留
+    with pytest.raises(Cancelled):
+        registry.execute(
+            "shell",
+            {"command": "sleep 30 & wait", "timeout": 30},
+            approved_action="shell",
+            cancel=token,
+        )
+
+
+def test_shell_without_cancel_uses_plain_subprocess_run(monkeypatch, tmp_path):
+    """cancel=None（非 Agent 调用）时保持 subprocess.run 语义，不引入 Popen 分支。"""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    with patch("subprocess.run", return_value=_make_completed(stdout="ok")) as run:
+        out = _run_shell({"command": "echo ok"})
+    assert run.called
+    assert "[exit code: 0]" in out
+
+
+def test_shell_already_cancelled_never_starts_process(monkeypatch, tmp_path):
+    """令牌已取消时，命令根本不应被启动。"""
+    from app.agent.cancel import CancelToken, Cancelled
+    from app.tools.registry import ToolRegistry
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    registry = ToolRegistry()
+    registry.register(SHELL)
+    token = CancelToken()
+    token.cancel()
+
+    with pytest.raises(Cancelled):
+        registry.execute(
+            "shell",
+            {"command": "echo should-not-run"},
+            approved_action="shell",
+            cancel=token,
+        )

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+from app.agent.cancel import CancelToken, close_on_cancel
 from app.config.schemas import LLMConfig
 from app.attachments import image_block_to_data_url
 from app.models.token_progress import StreamingTokenProgress
@@ -168,6 +169,7 @@ class OpenAIAdapter:
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
+        cancel: Optional[CancelToken] = None,
         reasoning_effort_override: Optional[str] = None,
         _use_raw_stream: bool = False,
     ) -> ModelResponse:
@@ -243,15 +245,18 @@ class OpenAIAdapter:
                 last_response = None
                 raw_stream = self._client.responses.create(**params, stream=True)
                 try:
-                    for event in raw_stream:
-                        completed = consume_event(event)
-                        if completed is not None:
-                            final = completed
-                        # 有些网关只在增量事件上带 response 外壳，没有 completed。
-                        # 记下最后见到的一个，供兜底取 usage / model。
-                        candidate = getattr(event, "response", None)
-                        if candidate is not None:
-                            last_response = candidate
+                    with close_on_cancel(cancel, raw_stream):
+                        for event in raw_stream:
+                            if cancel is not None:
+                                cancel.raise_if_cancelled()
+                            completed = consume_event(event)
+                            if completed is not None:
+                                final = completed
+                            # 有些网关只在增量事件上带 response 外壳，没有 completed。
+                            # 记下最后见到的一个，供兜底取 usage / model。
+                            candidate = getattr(event, "response", None)
+                            if candidate is not None:
+                                last_response = candidate
                 finally:
                     close = getattr(raw_stream, "close", None)
                     if callable(close):
@@ -273,11 +278,18 @@ class OpenAIAdapter:
                     )
             else:
                 with self._client.responses.stream(**params) as stream:
-                    for event in stream:
-                        consume_event(event)
-                    # 仍在 with 内取最终响应：stream 关闭后 SDK 不保证还能取到。
-                    final = stream.get_final_response()
+                    with close_on_cancel(cancel, stream):
+                        for event in stream:
+                            if cancel is not None:
+                                cancel.raise_if_cancelled()
+                            consume_event(event)
+                        if cancel is not None:
+                            cancel.raise_if_cancelled()
+                        # 仍在 with 内取最终响应：stream 关闭后 SDK 不保证还能取到。
+                        final = stream.get_final_response()
         except RuntimeError as exc:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
             # SDK 状态机异常通常来自代理的事件顺序不兼容；不能返回空的正常响应，
             # 否则 Orchestrator 会误判为任务完成并停止继续处理。
             # 凡是「首个事件不是 response.created」都走原始流兼容解析 —— 网关漏掉
@@ -294,6 +306,7 @@ class OpenAIAdapter:
                     on_progress=on_progress,
                     on_text_delta=on_text_delta,
                     on_thinking_delta=on_thinking_delta,
+                    cancel=cancel,
                     reasoning_effort_override=reasoning_effort_override,
                     _use_raw_stream=True,
                 )
@@ -380,6 +393,7 @@ class OpenAIAdapter:
                     on_progress=on_progress,
                     on_text_delta=on_text_delta,
                     on_thinking_delta=on_thinking_delta,
+                    cancel=cancel,
                     reasoning_effort_override=fallback_effort,
                 )
                 if not retry.text.strip() and not retry.tool_calls:

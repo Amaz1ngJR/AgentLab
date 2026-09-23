@@ -4,8 +4,8 @@
   1. Planner.create_plan(goal) 产出初始任务,写入 TaskStore -> 发 plan_created。
   2. 循环:从 TaskStore claim 下一个可执行任务 -> Executor.run_task 执行 ->
      Replanner.apply 回写状态(必要时追加补救任务)-> 发 task_updated。
-  3. 直到:全部任务到终态(收工)、卡死(剩余任务依赖被 failed 卡住)、
-     取消、或全局步数预算耗尽。
+  3. 普通模式直到全部任务到终态、卡死、取消或全局预算耗尽；全自动模式只按
+     单任务无进展保护收敛，不因全局轮次预算提前停止。
   4. 发 run_completed(或 run_failed),返回最终答复文本。
 
 与 AgentSession 的分工:
@@ -93,6 +93,7 @@ class Orchestrator:
         progress: Optional[ProgressFn] = None,
         messages: Optional[list[dict[str, Any]]] = None,
         context_manager: Optional[Any] = None,
+        on_auto_execute: Optional[Callable[[], None]] = None,
     ):
         self._llm = llm
         self._tools = tools
@@ -123,6 +124,8 @@ class Orchestrator:
         # 上下文预算/压缩协调者(可选,§7.3)。None 时不做任何预算检查与压缩,
         # 行为与之前完全一致(既有测试不受影响)。
         self._ctx = context_manager
+        self._on_auto_execute = on_auto_execute
+        self._auto_execute_requested = False
         self._run_seq = 0  # run 计数,用于给任务 id 加 run 前缀,避免跨 run 撞 id
         # run 级统计:每次 run() 重置,供 AgentSession 拷回去展示
         self.last_run_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
@@ -168,7 +171,18 @@ class Orchestrator:
             text=note, payload={"tasks": self.store.snapshot()},
         ))
 
-    def _maybe_compact(self, tools: list[dict[str, Any]] | None = None) -> None:
+    def _enable_auto_execute(self) -> None:
+        """接收审批菜单中的“自动执行”，让当前 run 立即切换为持续模式。"""
+        self._auto_execute_requested = True
+        if self._on_auto_execute is not None:
+            self._on_auto_execute()
+
+    def _maybe_compact(
+        self,
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        cancel: CancelToken | None = None,
+    ) -> None:
         """在稳定点或模型调用前检查上下文预算并按需压缩。"""
         if self._ctx is None:
             return
@@ -180,7 +194,10 @@ class Orchestrator:
                     system=self._system,
                     tools=tools,
                     on_progress=getattr(handle, "update", None),
+                    cancel=cancel,
                 )
+        except Cancelled:
+            raise
         except Exception:
             pass
 
@@ -191,12 +208,14 @@ class Orchestrator:
         cancel: Optional[CancelToken] = None,
         resume: bool = False,
         append_goal_message: bool = True,
+        auto_execute: bool = False,
     ) -> str:
         """规划并执行一个目标,返回最终答复文本。
 
         cancel 用于协作式取消;不传则不可取消。
         resume=True 时不清空旧任务(继续上一轮未完成的任务,失败任务重置为 pending);
         resume=False(默认)时清空,确保任务面板只展示当前轮的计划。
+        auto_execute=True 时免审批、持续重试瞬时网络故障，并执行完全部计划任务。
         """
         cancel = cancel or CancelToken()
         self._run_seq += 1
@@ -207,16 +226,17 @@ class Orchestrator:
         self.subagent_results = {}
         self.subagent_merge_plan = []
         self._planned_subagents = {}
+        self._auto_execute_requested = auto_execute
         if not resume:
             # 非 resume 模式:清空旧任务,只展示本轮计划
             self.store.clear()
         else:
-            # resume 模式:保留已有任务,把 failed 重置为 pending,继续推进
-            reset_count = self.store.reset_failed()
+            # resume 模式:保留已有任务,把中断/失败的任务重置后继续推进
+            reset_count = self.store.reset_for_resume()
             if reset_count > 0:
                 self._emit(RunEvent(
                     kind=events.RUN_STARTED,
-                    text=f"继续上一轮任务(已重置 {reset_count} 个失败任务)",
+                    text=f"继续上一轮任务(已重置 {reset_count} 个未完成任务)",
                 ))
         if append_goal_message:
             self.messages.append({"role": "user", "content": goal})
@@ -230,7 +250,7 @@ class Orchestrator:
             cancel.raise_if_cancelled()
             # Planner 本身不接收工具，但压缩要按随后执行阶段的工具集算预算，
             # 否则规划后第一次执行调用就可能直接撞上窗口。
-            self._maybe_compact(self._tools_for_task(goal))
+            self._maybe_compact(self._tools_for_task(goal), cancel=cancel)
             with self._progress("planning") as handle:
                 on_progress = getattr(handle, "update", None)
                 # 提取 skill 相关内容传给 Planner，让它能按 skill 指示拆任务。
@@ -240,6 +260,8 @@ class Orchestrator:
                     goal,
                     context=skill_context,
                     on_progress=on_progress,
+                    cancel=cancel,
+                    retry_until_cancelled=auto_execute,
                 )
         except Cancelled:
             self.last_run_status = "cancelled"
@@ -260,13 +282,13 @@ class Orchestrator:
                             payload={"tasks": self.store.snapshot()}))
         # 规划后是第一个稳定点:此时只追加了 goal,通常还不到阈值,但若上一轮 run
         # 已让历史很长,这里先压一次,避免第一个任务就带着超长上下文起步。
-        self._maybe_compact()
+        self._maybe_compact(cancel=cancel)
 
         # ── 2. 执行 + 重规划循环 ──────────────────────────────────────────────
-        rounds_left = self._max_steps
+        rounds_left: int | None = None if auto_execute else self._max_steps
         last_text = ""
         try:
-            while rounds_left > 0:
+            while rounds_left is None or rounds_left > 0:
                 cancel.raise_if_cancelled()
                 task = self.store.claim_next()
                 if task is None:
@@ -277,17 +299,27 @@ class Orchestrator:
 
                 # 每个任务只获得独立的模型往返上限；全局预算由 rounds_left 控制。
                 # 不能把全部剩余额度一次性交给首个任务，否则多任务计划会饿死。
-                budget = max(1, min(rounds_left, self._max_task_steps))
+                budget = self._max_task_steps if rounds_left is None else max(
+                    1, min(rounds_left, self._max_task_steps),
+                )
                 spec = self._planned_subagents.get(task.id)
                 if spec is not None:
-                    outcome = self._run_subagent_task(spec, task, cancel)
+                    outcome = self._run_subagent_task(
+                        spec, task, cancel, auto_execute=auto_execute,
+                    )
                 else:
                     outcome = self._executor.run_task(
                         task, self.messages,
                         system=self._system, max_steps=budget, cancel=cancel,
                         usage_acc=self.last_run_usage, on_actual_model=_record_model,
+                        auto_execute=auto_execute,
+                        on_auto_execute=self._enable_auto_execute,
                     )
-                rounds_left -= max(1, outcome.model_rounds)
+                if self._auto_execute_requested and not auto_execute:
+                    auto_execute = True
+                    rounds_left = None
+                if rounds_left is not None:
+                    rounds_left -= max(1, outcome.model_rounds)
                 self.last_run_tool_calls += outcome.tool_calls_made
 
                 patch = self._replanner.apply(task, outcome)
@@ -297,7 +329,9 @@ class Orchestrator:
 
                 # 任务之间是干净的稳定点:此时 tool_use/tool_result 都已闭合,
                 # 安全压缩旧历史(若预算触发)。
-                self._maybe_compact(self._tools_for_task(task.content))
+                self._maybe_compact(
+                    self._tools_for_task(task.content), cancel=cancel,
+                )
 
         except Cancelled as exc:
             self.last_run_status = "cancelled"
@@ -316,7 +350,7 @@ class Orchestrator:
                                 payload={"tasks": snapshot}))
             return last_text or "部分任务未能完成(被阻塞或失败)。"
 
-        if rounds_left <= 0 and self.store.has_open():
+        if rounds_left is not None and rounds_left <= 0 and self.store.has_open():
             self.last_run_status = "failed"
             self.last_run_error = "达到最大模型往返次数仍未完成全部任务"
             self._emit(RunEvent(kind=events.RUN_FAILED,
@@ -324,14 +358,43 @@ class Orchestrator:
                                 payload={"tasks": snapshot}))
             return last_text or "达到最大模型往返次数,任务未全部完成。"
 
+        # failed 是终态，不会被 has_open()/is_stalled() 捕获，必须显式判定。
+        failed_count = self.store.summary().get("failed", 0)
+        if failed_count > 0:
+            self.last_run_status = "failed"
+            self.last_run_error = f"{failed_count} 个任务失败"
+            self._emit(RunEvent(
+                kind=events.RUN_FAILED,
+                text=f"{failed_count} 个任务失败，任务未全部完成",
+                payload={"tasks": snapshot},
+            ))
+            return last_text or "部分任务失败，未能全部完成。"
+
         self.last_run_status = "completed"
         self.last_run_error = ""
         self._emit(RunEvent(kind=events.RUN_COMPLETED, text=last_text,
                             payload={"tasks": snapshot}))
         return last_text or "已完成。"
 
-    def _run_subagent_task(self, spec: SubagentSpec, task, cancel: CancelToken) -> TaskOutcome:
+    def _run_subagent_task(
+        self,
+        spec: SubagentSpec,
+        task,
+        cancel: CancelToken,
+        *,
+        auto_execute: bool = False,
+    ) -> TaskOutcome:
         """执行一个已通过 Planner 校验的子 Agent 任务。"""
+        factory = SubagentRuntimeFactory(
+            llm=self._llm,
+            tools=self._tools,
+            approval=AutoApprove() if auto_execute else self._approval,
+            parent_system=self._system,
+            on_event=self._emit,
+            max_steps=self._max_task_steps,
+            auto_execute=auto_execute,
+        )
+
         def _delegate(spec: SubagentSpec, workspace, child_cancel):
             return factory.delegate(spec, workspace, child_cancel)
 

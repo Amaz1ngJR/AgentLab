@@ -93,8 +93,12 @@ class PtySession:
 
     # ── 读 / 写 ──────────────────────────────────────────────────────────────
 
-    def read_until_idle(self, idle: float = DEFAULT_IDLE,
-                        timeout: float = DEFAULT_SEND_TIMEOUT) -> str:
+    def read_until_idle(
+        self,
+        idle: float = DEFAULT_IDLE,
+        timeout: float = DEFAULT_SEND_TIMEOUT,
+        cancel=None,
+    ) -> str:
         """持续读输出,直到静默 `idle` 秒(程序在等输入)或到 `timeout` 硬超时。
 
         这是通用驱动的核心:不假设任何提示符,只靠"输出停了"来判断该把控制权
@@ -104,6 +108,8 @@ class PtySession:
         deadline = time.time() + timeout
         last_data = time.time()
         while time.time() < deadline:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
             r, _, _ = select.select([self._fd], [], [], 0.1)
             if self._fd in r:
                 try:
@@ -223,7 +229,7 @@ class PtySessionManager:
 
 def make_terminal_tools(manager: PtySessionManager) -> list:
     """返回绑定到指定 manager 的 terminal_open / send / close / list 四个工具。"""
-    from app.tools.registry import Tool
+    from app.tools.registry import Tool, current_cancel_token
 
     def _open(args: dict) -> str:
         if _IS_WINDOWS:
@@ -249,7 +255,9 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         except OSError as exc:
             return f"failed to start session: {exc}"
         # 读启动后的首屏输出(登录横幅、提示符、REPL 欢迎语等)
-        initial = session.read_until_idle(idle=idle, timeout=timeout)
+        initial = session.read_until_idle(
+            idle=idle, timeout=timeout, cancel=current_cancel_token(),
+        )
         status = "" if session.alive else "\n[session 已结束]"
         body = initial.strip() or "(无输出)"
         return f"[session {sid}]\n{_clip(body)}{status}"
@@ -279,7 +287,9 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             session.send(str(data), append_newline=append_nl)
         except OSError as exc:
             return f"failed to send: {exc}"
-        out = session.read_until_idle(idle=idle, timeout=timeout)
+        out = session.read_until_idle(
+            idle=idle, timeout=timeout, cancel=current_cancel_token(),
+        )
         status = "" if session.alive else f"\n[session {sid} 已结束]"
         body = out.strip() or "(无输出)"
         return f"{_clip(body)}{status}"

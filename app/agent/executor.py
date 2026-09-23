@@ -18,12 +18,17 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
 from app.agent import events
-from app.agent.approval import ApprovalPolicy, AutoApprove, request_tool_approval
+from app.agent.approval import (
+    ApprovalPolicy,
+    ApprovalResult,
+    AutoApprove,
+    request_tool_approval,
+)
 from app.agent.cancel import CancelToken, Cancelled
 from app.agent.events import RunEvent
 from app.agent.tasks import BLOCKED, COMPLETED, FAILED, Task
 from app.models.protocol import ToolResult
-from app.models.router import ModelRouter
+from app.models.router import ModelRouter, call_create_message
 from app.tools.registry import ToolRegistry
 
 DENIED_MESSAGE = (
@@ -165,6 +170,27 @@ class Executor:
             return selector(task, mode=mode)
         return self._tools.schemas()
 
+    def _emit_provider_retry(
+        self,
+        task_id: str,
+        attempt: int,
+        delay: float,
+        exc: BaseException,
+    ) -> None:
+        self._emit(RunEvent(
+            kind=events.PROVIDER_RETRY,
+            task_id=task_id,
+            text=(
+                f"模型服务暂时不可用（{type(exc).__name__}），"
+                f"{delay:.1f}s 后重试（第 {attempt} 次）"
+            ),
+            payload={
+                "attempt": attempt,
+                "delay": delay,
+                "error": type(exc).__name__,
+            },
+        ))
+
     def run_task(
         self,
         task: Task,
@@ -175,6 +201,8 @@ class Executor:
         cancel: Optional[CancelToken] = None,
         usage_acc: Optional[dict[str, int]] = None,
         on_actual_model: Optional[Callable[[str], None]] = None,
+        auto_execute: bool = False,
+        on_auto_execute: Optional[Callable[[], None]] = None,
     ) -> TaskOutcome:
         """执行一个任务。就地把对话追加进共享 messages,返回 TaskOutcome。
 
@@ -198,10 +226,26 @@ class Executor:
             tools = self._tools_for_task(task.content, mode="task") or None
             text_streamed = False
             streamed_parts: list[str] = []
+
+            def _discard_partial(_exc: BaseException) -> None:
+                """重试前作废本次尝试已流出的半截文本。
+
+                重试时 adapter 会从头再流一遍，不清空的话 spinner 会把同一段内容推
+                第二遍，而 ``streamed_parts`` 里的残文还可能被当成最终答复。
+                """
+                nonlocal text_streamed
+                if not streamed_parts:
+                    return
+                streamed_parts.clear()
+                text_streamed = False
+                if on_discard is not None:
+                    on_discard()
+
             with self._progress("thinking") as handle:
                 on_progress = getattr(handle, "update", None)
                 raw_on_text = getattr(handle, "on_text", None)
                 raw_on_thinking = getattr(handle, "on_thinking", None)
+                on_discard = getattr(handle, "discard_text", None)
 
                 if self._ctx is not None:
                     try:
@@ -210,7 +254,10 @@ class Executor:
                             system=system,
                             tools=tools,
                             on_progress=on_progress,
+                            cancel=cancel,
                         )
+                    except Cancelled:
+                        raise
                     except Exception:
                         pass
 
@@ -221,13 +268,20 @@ class Executor:
                     if raw_on_text is not None:
                         raw_on_text(delta)
 
-                resp = self._llm.create_message(
-                    messages=messages,
+                resp = call_create_message(
+                    self._llm,
+                    messages,
                     tools=tools,
                     system=system,
                     on_progress=on_progress,
                     on_text_delta=on_text_delta if raw_on_text else None,
                     on_thinking_delta=raw_on_thinking,
+                    cancel=cancel,
+                    discard_partial=_discard_partial,
+                    on_retry=lambda attempt, delay, exc: self._emit_provider_retry(
+                        task.id, attempt, delay, exc,
+                    ),
+                    retry_until_cancelled=auto_execute,
                 )
 
             if usage_acc is not None and getattr(resp, "usage", None):
@@ -264,9 +318,14 @@ class Executor:
                         for item in (resp.provider_payload or [])
                         if isinstance(item, dict)
                     ]
+                    truncated = (resp.finish_reason or "") in {
+                        "max_tokens", "length", "MAX_TOKENS",
+                    }
                     return TaskOutcome(
                         status=FAILED,
                         error=(
+                            "模型输出被 max_tokens 截断，正文/工具调用尚未开始写入"
+                            if truncated else
                             "模型未返回正文或工具调用，任务未完成"
                             f" (status={resp.finish_reason or 'unknown'}, "
                             f"output_types={output_types})"
@@ -354,12 +413,24 @@ class Executor:
 
                     approval_result = None
                     if needs_approval and tool is not None:
-                        approval_result = request_tool_approval(
-                            self._approval,
-                            tool,
-                            approval_action,
-                            call.arguments,
-                        )
+                        if auto_execute:
+                            approval_result = ApprovalResult(approved=True)
+                        else:
+                            approval_result = request_tool_approval(
+                                self._approval,
+                                tool,
+                                approval_action,
+                                call.arguments,
+                            )
+                            if (
+                                approval_result is not None
+                                and approval_result.approved
+                                and approval_result.feedback == "__enable_auto_execute__"
+                            ):
+                                auto_execute = True
+                                approval_result.feedback = None
+                                if on_auto_execute is not None:
+                                    on_auto_execute()
 
                     if approval_result and not approval_result.approved:
                         # 用户拒绝或按 ESC 取消
@@ -394,6 +465,7 @@ class Executor:
                             call.name,
                             call.arguments,
                             approved_action=approval_action,
+                            cancel=cancel,
                         )
                         # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
                         # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
@@ -443,7 +515,10 @@ class Executor:
                     self._ctx.compact_before_model_call(
                         messages, system=system, tools=tools,
                         on_progress=on_progress,
+                        cancel=cancel,
                     )
+                except Cancelled:
+                    raise
                 except Exception:
                     pass  # 压缩失败不能中断任务主路径
 

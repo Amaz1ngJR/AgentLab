@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 from app.agent import events
+from app.agent.cancel import CancelToken
 from app.agent.context_budget import ContextBudget, estimate_messages_tokens
 from app.agent.context_compaction import ContextCompressor, ContextSummary
 from app.agent.events import RunEvent
@@ -110,6 +111,7 @@ class ContextManager:
         system: str = "",
         tools: Optional[list[dict[str, Any]]] = None,
         on_progress=None,
+        cancel: CancelToken | None = None,
     ) -> bool:
         """在任何模型请求前压缩超限历史，返回是否发生压缩。"""
         estimate = self.estimate(messages, system=system, tools=tools)
@@ -120,6 +122,7 @@ class ContextManager:
             system=system,
             tools=tools,
             on_progress=on_progress,
+            cancel=cancel,
         )
 
     # ── 压缩 ──────────────────────────────────────────────────────────────────
@@ -133,6 +136,7 @@ class ContextManager:
         force: bool = False,
         tools: Optional[list[dict[str, Any]]] = None,
         on_progress=None,
+        cancel: CancelToken | None = None,
     ) -> bool:
         """在稳定点检查预算并按需压缩。返回是否发生了压缩。
 
@@ -167,7 +171,7 @@ class ContextManager:
         result = self._compressor.compact(
             messages, keep_recent=self.keep_recent,
             recent_budget=effective_recent_budget,
-            source_run_ids=source_run_ids, on_progress=on_progress,
+            source_run_ids=source_run_ids, on_progress=on_progress, cancel=cancel,
         )
         if not result.compacted or result.summary is None:
             self._emit(RunEvent(

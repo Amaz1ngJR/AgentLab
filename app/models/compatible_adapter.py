@@ -13,6 +13,7 @@ import json
 import re
 from typing import Any, Optional
 
+from app.agent.cancel import CancelToken, close_on_cancel
 from app.config.schemas import LLMConfig
 from app.attachments import image_block_to_data_url
 from app.models.token_progress import StreamingTokenProgress
@@ -174,6 +175,7 @@ class OpenAICompatibleAdapter:
         on_progress: Optional[ProgressCallback] = None,
         on_text_delta: Optional[TextDeltaCallback] = None,
         on_thinking_delta: Optional[ThinkingDeltaCallback] = None,
+        cancel: Optional[CancelToken] = None,
     ) -> ModelResponse:
         # OpenAI-compatible 接口把 system 放在 messages 里（role=system）
         # _base_params 会统一转换 Responses/Anthropic/Chat Completions 历史；这里
@@ -214,10 +216,28 @@ class OpenAICompatibleAdapter:
         actual_model: Optional[str] = None
 
         stream = self._client.chat.completions.create(**params)
-        for chunk in stream:
-            if actual_model is None and getattr(chunk, "model", None):
-                actual_model = chunk.model
-            if chunk.choices:
+        with close_on_cancel(cancel, stream):
+            for chunk in stream:
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                if actual_model is None and getattr(chunk, "model", None):
+                    actual_model = chunk.model
+                if not chunk.choices:
+                    usage = getattr(chunk, "usage", None)
+                    if usage:
+                        p = getattr(usage, "prompt_tokens", None)
+                        c = getattr(usage, "completion_tokens", None)
+                        if p is not None:
+                            in_tokens = p
+                        if c is not None:
+                            out_tokens = c
+                        progress.set_usage(
+                            input_tokens=in_tokens,
+                            output_tokens=out_tokens,
+                            force=True,
+                            final=True,
+                        )
+                    continue
                 choice = chunk.choices[0]
                 delta = choice.delta
                 if choice.finish_reason:
@@ -257,20 +277,20 @@ class OpenAICompatibleAdapter:
                                     )
                                     buf["args"] += args_delta
 
-            usage = getattr(chunk, "usage", None)
-            if usage:
-                p = getattr(usage, "prompt_tokens", None)
-                c = getattr(usage, "completion_tokens", None)
-                if p is not None:
-                    in_tokens = p
-                if c is not None:
-                    out_tokens = c
-                progress.set_usage(
-                    input_tokens=in_tokens,
-                    output_tokens=out_tokens,
-                    force=True,
-                    final=True,
-                )
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    p = getattr(usage, "prompt_tokens", None)
+                    c = getattr(usage, "completion_tokens", None)
+                    if p is not None:
+                        in_tokens = p
+                    if c is not None:
+                        out_tokens = c
+                    progress.set_usage(
+                        input_tokens=in_tokens,
+                        output_tokens=out_tokens,
+                        force=True,
+                        final=True,
+                    )
 
         text = "".join(text_parts)
 

@@ -16,6 +16,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
+from app.agent.cancel import Cancelled, CancelToken
 from app.util.redact import redact
 
 
@@ -92,11 +93,20 @@ _approved_action: ContextVar[Optional[str]] = ContextVar(
     "approved_tool_action",
     default=None,
 )
+_cancel_token: ContextVar[Optional[CancelToken]] = ContextVar(
+    "tool_cancel_token",
+    default=None,
+)
 
 
 def is_approval_granted(action: str) -> bool:
     """当前工具执行上下文是否获得了指定审批动作。"""
     return _approved_action.get() == action
+
+
+def current_cancel_token() -> Optional[CancelToken]:
+    """返回当前工具调用的取消令牌，供阻塞型内置工具协作式停止。"""
+    return _cancel_token.get()
 
 
 @dataclass
@@ -400,6 +410,7 @@ class ToolRegistry:
         args: dict[str, Any],
         *,
         approved_action: Optional[str] = None,
+        cancel: Optional[CancelToken] = None,
     ) -> tuple[str, bool]:
         """执行指定工具,返回 (结果文本, 是否出错)。
 
@@ -429,10 +440,17 @@ class ToolRegistry:
             )
             return result, True
 
-        token = _approved_action.set(approved_action)
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        approval_token = _approved_action.set(approved_action)
+        cancel_context = _cancel_token.set(cancel)
         try:
             result = tool.executor(args or {})
+            if cancel is not None:
+                cancel.raise_if_cancelled()
             is_error = False
+        except Cancelled:
+            raise
         except ToolExecutionError as exc:
             result = str(exc)
             is_error = True
@@ -440,7 +458,8 @@ class ToolRegistry:
             result = f"{type(exc).__name__}: {exc}"
             is_error = True
         finally:
-            _approved_action.reset(token)
+            _cancel_token.reset(cancel_context)
+            _approved_action.reset(approval_token)
         self._emit_audit(
             tool,
             args or {},
