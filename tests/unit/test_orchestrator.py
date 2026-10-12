@@ -416,10 +416,11 @@ def test_orchestrator_replans_after_tool_failure():
     router = FakeRouter([
         _plan_json({"id": "t1", "content": "跑工具", "dependencies": []}),
         _resp_tool("c1", "explode", {}),  # t1 执行:工具炸了 -> failed
-        _resp_text("补救完成"),            # 补救任务执行:直接给文本 -> completed
+        _resp_tool("c2", "echo", {"msg": "recovered"}),
+        _resp_text("补救完成"),
     ])
     log: list[RunEvent] = []
-    orch = Orchestrator(router, _registry(_explode_tool()), on_event=_collect(log))
+    orch = Orchestrator(router, _registry(_explode_tool(), _echo_tool()), on_event=_collect(log))
     orch.run("跑个会失败的工具")
     snap = orch.store.snapshot()
     statuses = {t["id"]: t["status"] for t in snap}

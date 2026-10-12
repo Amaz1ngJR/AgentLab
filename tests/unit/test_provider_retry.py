@@ -508,3 +508,31 @@ def test_interruptible_sleep_without_cancel_does_not_slice():
     slept = []
     _interruptible_sleep(2.5, cancel=None, sleep=slept.append)
     assert slept == [2.5]
+
+
+def test_provider_stream_error_retryable_flag_is_honored():
+    """adapter 解析网关流式失败后给出的可重试标记优先于文本猜测。
+
+    参数/协议类失败（annotations 非法）是确定性的：重试只会重复同一个失败；
+    服务端瞬时故障才该退避重试。adapter 比 retry 层更清楚病因，所以它标了
+    就必须听它的 —— 尤其是标 False 时不能因为消息里碰巧含 "timeout" 之类
+    字眼就被误判成可重试。
+    """
+    class StreamError(RuntimeError):
+        def __init__(self, message, *, retryable):
+            super().__init__(message)
+            self.retryable = retryable
+
+    decision = classify_provider_error(StreamError("boom", retryable=True))
+    assert decision.retryable is True
+    assert decision.reason == "provider_stream_retryable"
+
+    decision = classify_provider_error(StreamError("boom", retryable=False))
+    assert decision.retryable is False
+    assert decision.reason == "provider_stream_terminal"
+
+    # 标 False 时，即便消息里带可重试关键字也不能翻案。
+    decision = classify_provider_error(
+        StreamError("request timed out", retryable=False)
+    )
+    assert decision.retryable is False

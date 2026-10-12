@@ -615,6 +615,7 @@ def test_auto_execute_finishes_all_tasks_beyond_normal_global_budget():
             {"id": "t2", "content": "验证第二步", "dependencies": ["t1"]},
         ),
         _resp_text("第一步完成"),
+        _resp_tool("verify", "echo", {"msg": "verified"}),
         _resp_text("验证完成"),
     ])
     session = AgentSession(
@@ -623,7 +624,7 @@ def test_auto_execute_finishes_all_tasks_beyond_normal_global_budget():
         orchestrate=True,
         mode="auto",
         max_steps=1,
-        max_task_steps=1,
+        max_task_steps=2,
     )
     session.enable_auto_execute()
 
@@ -679,13 +680,17 @@ def test_legacy_chat_unaffected_by_orchestrate_flag_default():
 
 
 def test_legacy_direct_budget_exhausted_status():
-    """Direct 路径步数耗尽时状态是 budget_exhausted，不是 completed/空。"""
+    """Direct 预算耗尽必须发出可见提示，且不把最后的工具结果当成完成。"""
     router = FakeRouter([_resp_tool(f"call_{i}", "echo", {"msg": str(i)}) for i in range(8)])
-    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()))
+    seen = []
+    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()), on_event=seen.append)
     session.max_steps = 2
     answer = session.chat("一直调用工具")
     assert "最大步数" in answer
     assert session.last_run_status == "budget_exhausted"
+    assert [event.text for event in seen if event.kind == "text"] == [answer]
+    assert len(router.calls) == 2
+    assert session.messages[-1]["content"][0]["type"] == "tool_result"
 
 
 def test_legacy_direct_cancel_records_cancelled_status():

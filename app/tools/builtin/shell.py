@@ -33,7 +33,7 @@ from app.tools.builtin.files import (
     _outside_workspace_approval,
     _resolve_within_workspace,
 )
-from app.tools.registry import Tool, current_cancel_token
+from app.tools.registry import Tool, ToolExecutionError, current_cancel_token
 from app.tools.rtk_builtin import BuiltinRTK
 
 # 单次输出上限:8KB。超出截断并附说明,避免让模型上下文吞下兆级 log。
@@ -61,7 +61,7 @@ def _run_shell(args: dict) -> str:
     """执行命令，并使用 AgentLab 内置 RTK 风格过滤器压缩输出。"""
     command = args.get("command", "")
     if not command:
-        return "refused: empty command"
+        raise ToolExecutionError("refused: empty command")
 
     # timeout 字段允许 int 或 str(模型有时给字符串)
     try:
@@ -75,11 +75,11 @@ def _run_shell(args: dict) -> str:
             "shell_outside_workspace",
         )
     except WorkspacePathError as exc:
-        return f"refused: {exc}"
+        raise ToolExecutionError(f"refused: {exc}")
     if not cwd.exists():
-        return f"working directory not found: {cwd}"
+        raise ToolExecutionError(f"working directory not found: {cwd}")
     if not cwd.is_dir():
-        return f"not a working directory: {cwd}"
+        raise ToolExecutionError(f"not a working directory: {cwd}")
     argv = _build_argv(command)
 
     cancel = current_cancel_token()
@@ -131,10 +131,10 @@ def _run_shell(args: dict) -> str:
         if proc is not None:
             proc.kill()
             proc.communicate()
-        return f"timeout: command exceeded {timeout}s and was killed"
+        raise ToolExecutionError(f"timeout: command exceeded {timeout}s and was killed")
     except FileNotFoundError as exc:
         # 没装 bash / powershell 时
-        return f"shell not found: {exc}"
+        raise ToolExecutionError(f"shell not found: {exc}")
 
     # ── 内置 RTK 输出过滤 ────────────────────────────────────────────────────
     # 命令仍由 AgentLab 原样执行：审批、cwd、timeout 与退出码完全不变。RTK 仅在
@@ -164,7 +164,9 @@ def _run_shell(args: dict) -> str:
     # 改命令(比如加 head / tail)
     if len(output) > MAX_OUTPUT_BYTES:
         truncated = output[:MAX_OUTPUT_BYTES]
-        output = f"{truncated}\n\n[...truncated, total {len(output)} bytes]"
+        output = f"{truncated}\n\n[...truncated, total {len(output)} bytes]\n[exit code: {returncode}]"
+    if returncode != 0:
+        raise ToolExecutionError(output)
     return output
 
 
@@ -183,10 +185,12 @@ SHELL = Tool(
         "properties": {
             "command": {
                 "type": "string",
+                "minLength": 1,
                 "description": "要执行的命令字符串,例如 'git status' 或 'pytest tests/'",
             },
             "timeout": {
                 "type": "integer",
+                "minimum": 1,
                 "description": f"超时秒数,默认 {DEFAULT_TIMEOUT}",
                 "default": DEFAULT_TIMEOUT,
             },

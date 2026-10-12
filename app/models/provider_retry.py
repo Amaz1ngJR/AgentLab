@@ -195,6 +195,17 @@ def classify_provider_error(exc: BaseException) -> RetryDecision:
         return RetryDecision(False, retry_after_seconds=exc.retry_after,
                              reason="provider_circuit_open")
 
+    # 异常自带的可重试标记优先。adapter 在解析网关流式失败（response.failed）时
+    # 比这里更清楚病因：参数/协议类失败是确定性的，重试只会重复；只有服务端
+    # 瞬时故障才该退避重试。按类名 import 会形成 adapter→retry 的循环依赖，
+    # 因此用鸭子类型读这个属性。
+    explicit = getattr(exc, "retryable", None)
+    if explicit is True:
+        return RetryDecision(True, retry_after_seconds=_retry_after(exc),
+                             reason="provider_stream_retryable")
+    if explicit is False:
+        return RetryDecision(False, reason="provider_stream_terminal")
+
     # 状态码优先：拿到 int 状态码说明服务端已经明确回应，按状态码分类比顺着异常链
     # 或消息文本猜类型更可信（也避免 `status in {...}` 因 status 是容器而抛 TypeError）。
     status = _status_code(exc)

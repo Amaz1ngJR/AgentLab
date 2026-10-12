@@ -533,6 +533,8 @@ class AgentSession:
                 "[pasted text" in user_input.lower() or "历史工具调用" in user_input
             )
             has_tool_call = False
+            successful_tool_calls = 0
+            denied_tools: set[str] = set()
             corrected_no_tool = False
             max_steps = self.max_steps
             for step_index in range(max_steps):
@@ -640,7 +642,7 @@ class AgentSession:
                             f" (status={resp.finish_reason or 'unknown'}, "
                             f"output_types={output_types})"
                         )
-                    if action_request and not has_tool_call:
+                    if action_request and not successful_tool_calls and not denied_tools:
                         if not corrected_no_tool and step_index + 1 < max_steps:
                             corrected_no_tool = True
                             self.messages.append({
@@ -669,7 +671,7 @@ class AgentSession:
                     if not text_streamed:
                         self._emit_turn_event(TurnEvent(kind="text", text=response_text))
                     # 模型主动收口（无工具调用、有正文）= 本轮正常完成。
-                    self.last_run_status = "completed"
+                    self.last_run_status = "blocked" if denied_tools else "completed"
                     return response_text
 
                 if response_text and not text_streamed:
@@ -713,6 +715,25 @@ class AgentSession:
                             ))
                             return "已中断。"
 
+                        validation_error = tool.validate_arguments(call.arguments) if tool else None
+                        if validation_error:
+                            output, _ = self.tools.execute(call.name, call.arguments, cancel=cancel)
+                            tool_results.append(ToolResult(
+                                tool_call_id=call.id, output=output, is_error=True,
+                            ))
+                            resulted_ids.add(call.id)
+                            self._emit_turn_event(TurnEvent(
+                                kind="tool_result", tool_name=call.name,
+                                tool_input=call.arguments, tool_output=output, tool_error=True,
+                            ))
+                            continue
+                        if call.name in denied_tools:
+                            tool_results.append(ToolResult(
+                                tool_call_id=call.id, output=DENIED_MESSAGE, is_error=False,
+                            ))
+                            resulted_ids.add(call.id)
+                            self._emit_turn_event(TurnEvent(kind="tool_denied", tool_name=call.name))
+                            continue
                         approval_action = (
                             tool.approval_action(call.arguments) if tool else None
                         )
@@ -759,6 +780,7 @@ class AgentSession:
                             raise KeyboardInterrupt("用户取消操作")
 
                         if approval_result and not approval_result.approved:
+                            denied_tools.add(call.name)
                             # 用户拒绝或提供了修改建议
                             if approval_result.feedback:
                                 output = f"[denied] 用户拒绝并提供了修改建议:\n\n{approval_result.feedback}"
@@ -782,6 +804,8 @@ class AgentSession:
                             # 进入历史前截断超大输出(与编排路径一致,见 executor)。
                             from app.agent.executor import _truncate_tool_output
                             output = _truncate_tool_output(output)
+                            if not is_error and call.name not in {"todo_write", "load_skill"}:
+                                successful_tool_calls += 1
                             self._emit_turn_event(TurnEvent(
                                 kind="tool_result",
                                 tool_name=call.name,
@@ -808,13 +832,19 @@ class AgentSession:
                 self.messages.extend(self.llm.format_tool_results(tool_results))
 
             self.last_run_status = "budget_exhausted"
-            return (
+            answer = (
                 f"(达到最大步数 {max_steps} 仍未给出最终答案；"
                 "请调整任务或使用 /resume 继续)"
             )
+            # CLI 通过事件显示正文，不消费 chat 的返回值；收尾提示也必须发事件。
+            self._emit_turn_event(TurnEvent(kind="text", text=answer))
+            return answer
         except Cancelled:
             self.last_run_status = "cancelled"
             return "已中断。"
+        except Exception:
+            self.last_run_status = "failed"
+            raise
         finally:
             self.last_turn_seconds = time.monotonic() - turn_start
             self.cumulative_seconds += self.last_turn_seconds

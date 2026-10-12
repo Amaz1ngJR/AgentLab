@@ -6,6 +6,7 @@ pyyaml>=6.0
 # Keep this exact so a normal requirements upgrade repairs older/broken installs.
 prompt-toolkit==3.0.52
 pathspec>=0.12
+jsonschema>=4.18.0
 # 1.27.2 includes Windows executable resolution and process-tree cleanup.
 mcp>=1.27.2
 

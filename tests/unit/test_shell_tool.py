@@ -11,7 +11,7 @@ from app.tools.builtin.shell import (
     _build_argv,
     _run_shell,
 )
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolExecutionError, ToolRegistry
 
 
 def _make_completed(stdout: str = "", stderr: str = "", returncode: int = 0):
@@ -63,7 +63,9 @@ def test_run_shell_includes_stderr_on_failure(monkeypatch, tmp_path):
         return _make_completed(stdout="", stderr="bash: nope: command not found", returncode=127)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    out = _run_shell({"command": "nope"})
+    with pytest.raises(ToolExecutionError) as exc:
+        _run_shell({"command": "nope"})
+    out = str(exc.value)
 
     assert "[stderr]" in out
     assert "command not found" in out
@@ -141,7 +143,9 @@ def test_run_shell_timeout_kills_command(monkeypatch, tmp_path):
         raise subprocess.TimeoutExpired(cmd="bash", timeout=30)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    out = _run_shell({"command": "sleep 999"})
+    with pytest.raises(ToolExecutionError) as exc:
+        _run_shell({"command": "sleep 999"})
+    out = str(exc.value)
     assert out.startswith("timeout:")
     assert "30s" in out
 
@@ -161,8 +165,8 @@ def test_run_shell_truncates_long_output(monkeypatch, tmp_path):
 
 
 def test_run_shell_empty_command_refused():
-    out = _run_shell({"command": ""})
-    assert out.startswith("refused:")
+    with pytest.raises(ToolExecutionError, match="refused:"):
+        _run_shell({"command": ""})
 
 
 def test_shell_tool_requires_approval():

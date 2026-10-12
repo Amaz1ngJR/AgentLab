@@ -16,6 +16,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
+from jsonschema import validators
+
 from app.agent.cancel import Cancelled, CancelToken
 from app.util.redact import redact
 
@@ -186,6 +188,22 @@ class ToolDescriptor:
                 f"expected one of: {allowed}"
             )
         self.capabilities = frozenset(capabilities)
+
+    def validate_arguments(self, args: Any) -> str | None:
+        """执行前校验模型参数；不做类型强转，也不补可能改变写入语义的缺省值。"""
+        if not isinstance(args, dict):
+            return "invalid arguments: expected an object"
+        try:
+            validator_cls = validators.validator_for(self.input_schema)
+            validator_cls.check_schema(self.input_schema)
+            error = next(validator_cls(self.input_schema).iter_errors(args), None)
+        except Exception:
+            return "invalid tool schema: execution refused"
+        if error is None:
+            return None
+        path = ".".join(str(part) for part in error.absolute_path) or "$"
+        # 不回显 instance/message，避免将密码或大段文件正文带入错误事件。
+        return f"invalid arguments at {path}: violates {error.validator}"
 
     def approval_action(self, args: dict[str, Any]) -> Optional[str]:
         """返回本次调用需要批准的动作名,无需审批则返回 None。"""
@@ -426,7 +444,15 @@ class ToolRegistry:
             return f"unknown tool: {name}", True
         # 记在审批之前:即使这次被拦下,历史里也已经有了对应的 tool_use。
         self._used_tools.add(tool.name)
-        required_action = tool.approval_action(args or {})
+        validation_error = tool.validate_arguments(args)
+        if validation_error is not None:
+            self._emit_audit(
+                tool, args if isinstance(args, dict) else {}, validation_error,
+                approval_action=None, outcome="invalid_arguments", is_error=True,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            return validation_error, True
+        required_action = tool.approval_action(args)
         if required_action is not None and approved_action != required_action:
             result = f"approval required: {required_action}"
             self._emit_audit(

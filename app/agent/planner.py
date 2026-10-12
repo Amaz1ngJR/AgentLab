@@ -167,9 +167,8 @@ class Planner:
             errors = []
             tasks = []
         if not tasks:
-            # 兜底:单任务计划。用简短标题而非整段 goal(避免面板被长问题刷屏)
-            summary = goal.strip()[:50].rstrip() + ("…" if len(goal.strip()) > 50 else "")
-            tasks = [Task(id="t1", content=summary or "完成用户请求", status=PENDING)]
+            # 兜底只改变计划粒度，不能截断用户目标中的约束。
+            tasks = [Task(id="t1", content=goal.strip() or "完成用户请求", status=PENDING)]
             execution_plan = ExecutionPlan(
                 version=0,
                 goal=goal,

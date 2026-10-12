@@ -19,6 +19,8 @@ from app.models.openai_adapter import (
     _MISSING_TOOL_OUTPUT,
     _convert_messages_to_responses_format,
     _repair_responses_tool_pairs,
+    _sanitize_content_parts,
+    _stream_failure,
 )
 from app.models.protocol import ToolResult
 
@@ -783,3 +785,286 @@ def test_convert_messages_normalizes_string_content_to_array():
     assert isinstance(converted[2]["content"], list)
     assert converted[2]["content"][0]["type"] == "input_text"
     assert converted[2]["content"][0]["text"] == "继续"
+
+
+# ── 网关以 response.failed 收尾 + 流式残留字段回灌 ──────────────────────
+
+
+def test_convert_messages_strips_null_content_part_fields():
+    """回归：网关流式返回的 assistant message 带 annotations/logprobs/parsed=null。
+
+    这些字段回灌进下一轮请求时会被 CRS 网关判为非法输入并被拒
+    ("Invalid type for 'input[1].content[0].annotations': expected an array
+    of objects, but got null instead")，且错误以 response.failed 形式返回，
+    让用户看到毫不相关的 "Didn't receive a response.completed event"。
+    """
+    messages = [
+        {"role": "user", "content": "继续"},
+        {
+            "type": "message",
+            "role": "assistant",
+            "id": "item_abc",
+            "status": "completed",
+            "phase": None,
+            "content": [{
+                "type": "output_text",
+                "text": " ",
+                "annotations": None,
+                "logprobs": None,
+                "parsed": None,
+            }],
+        },
+    ]
+    converted = _convert_messages_to_responses_format(messages)
+    part = converted[1]["content"][0]
+    assert part == {"type": "output_text", "text": " "}
+    assert "phase" not in converted[1]
+    assert "id" not in converted[1]
+    assert "status" not in converted[1]
+
+
+def test_convert_messages_keeps_non_null_annotations():
+    """有真实注释时不能一刀切删掉整个字段，只该剔除 None。"""
+    message = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": "见引用",
+            "annotations": [{"type": "url_citation", "url": "https://example.com"}],
+            "logprobs": None,
+        }],
+    }
+    converted = _convert_messages_to_responses_format([message])
+    part = converted[0]["content"][0]
+    assert part["annotations"] == [{"type": "url_citation", "url": "https://example.com"}]
+    assert "logprobs" not in part
+
+
+def test_sanitize_content_parts_passes_through_non_list():
+    """非列表输入原样返回，交给调用方既有逻辑处理。"""
+    assert _sanitize_content_parts("plain string") == "plain string"
+    assert _sanitize_content_parts(None) is None
+
+
+def test_stream_failure_parses_response_failed_event():
+    """response.failed 事件解析出真实病因，且不是瞬时故障。"""
+    err = MagicMock()
+    err.code = "invalid_type"
+    err.message = "Invalid type for 'input[1].content[0].annotations': expected an array of objects, but got null instead."
+    resp = MagicMock()
+    resp.error = err
+    event = MagicMock()
+    event.type = "response.failed"
+    event.response = resp
+    event.error = None
+
+    detail, retryable = _stream_failure(event)
+    assert "annotations" in detail
+    assert "invalid_type" in detail
+    assert retryable is False
+
+
+def test_stream_failure_treats_server_error_as_retryable():
+    """服务端瞬时故障码应当可重试。"""
+    err = MagicMock()
+    err.code = "server_error"
+    err.message = "upstream model error"
+    resp = MagicMock()
+    resp.error = err
+    event = MagicMock()
+    event.type = "response.failed"
+    event.response = resp
+    event.error = None
+
+    detail, retryable = _stream_failure(event)
+    assert "upstream model error" in detail
+    assert retryable is True
+
+
+def test_stream_failure_ignores_non_terminal_events():
+    event = MagicMock()
+    event.type = "response.output_text.delta"
+    assert _stream_failure(event) is None
+
+
+def test_response_failed_surfaces_real_gateway_error():
+    """回归：typed 流吞掉 response.failed，必须重跑原始流并透出真实原因。
+
+    修复前会抛出 SDK 那句泛化的 "Didn't receive a response.completed event"，
+    用户看不到 annotations 非法这个真实病因。
+    """
+    def _fake_raw_stream():
+        err = MagicMock()
+        err.code = "invalid_type"
+        err.message = "Invalid type for 'input[1].content[0].annotations'"
+        resp = MagicMock()
+        resp.error = err
+        resp.usage = None
+        resp.model = "gpt-5"
+        created = MagicMock()
+        created.type = "response.created"
+        created.response = resp
+        created.delta = ""
+        failed = MagicMock()
+        failed.type = "response.failed"
+        failed.response = resp
+        failed.error = None
+        failed.delta = ""
+        return iter([created, failed])
+
+    class TypedStreamBroken:
+        """typed 流：消费到 response.failed 时 SDK 抛泛化 RuntimeError。"""
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def __iter__(self):
+            raise RuntimeError("Didn't receive a `response.completed` event.")
+            yield  # pragma: no cover
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MagicMock()
+        MockOpenAI.return_value = client
+        client.responses.stream.return_value = TypedStreamBroken()
+        client.responses.create.return_value = _fake_raw_stream()
+
+        with pytest.raises(ProviderStreamError) as caught:
+            OpenAIAdapter(_cfg()).create_message(
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+    # 透出的是网关真实原因，不是 SDK 的泛化文案。
+    assert "annotations" in str(caught.value)
+    assert "response.completed" not in str(caught.value)
+    # 参数非法是确定性失败，不该重试。
+    assert caught.value.retryable is False
+
+
+def test_response_failed_raw_stream_is_retryable_for_server_error():
+    """原始流里的服务端瞬时故障要标成可重试。"""
+    def _fake_raw_stream():
+        err = MagicMock()
+        err.code = "server_error"
+        err.message = "upstream model error"
+        resp = MagicMock()
+        resp.error = err
+        resp.usage = None
+        resp.model = "gpt-5"
+        created = MagicMock()
+        created.type = "response.created"
+        created.response = resp
+        created.delta = ""
+        failed = MagicMock()
+        failed.type = "response.failed"
+        failed.response = resp
+        failed.error = None
+        failed.delta = ""
+        return iter([created, failed])
+
+    class TypedStreamBroken:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def __iter__(self):
+            raise RuntimeError("Didn't receive a `response.completed` event.")
+            yield  # pragma: no cover
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MagicMock()
+        MockOpenAI.return_value = client
+        client.responses.stream.return_value = TypedStreamBroken()
+        client.responses.create.return_value = _fake_raw_stream()
+
+        with pytest.raises(ProviderStreamError) as caught:
+            OpenAIAdapter(_cfg()).create_message(
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+    assert "upstream model error" in str(caught.value)
+    assert caught.value.retryable is True
+
+
+@pytest.mark.parametrize("missing_part", ["output_item", "content_part", "function_call"])
+def test_sdk_stream_index_error_falls_back_to_raw_stream(missing_part):
+    """用真实 SDK 状态机复现缺前置事件，而非手工抛同名异常。"""
+    from openai import omit
+    from openai.lib.streaming.responses._responses import ResponseStreamState
+    from openai.types.responses import (
+        Response, ResponseCreatedEvent, ResponseFunctionCallArgumentsDeltaEvent,
+        ResponseOutputMessage, ResponseTextDeltaEvent,
+    )
+
+    output = []
+    if missing_part == "content_part":
+        output = [ResponseOutputMessage.model_construct(
+            id="msg-1", type="message", role="assistant", content=[],
+        )]
+    created = ResponseCreatedEvent.model_construct(
+        type="response.created", sequence_number=0,
+        response=Response.model_construct(id="resp-1", output=output),
+    )
+    if missing_part == "function_call":
+        delta = ResponseFunctionCallArgumentsDeltaEvent.model_construct(
+            type="response.function_call_arguments.delta", output_index=0,
+            item_id="fc-1", delta="{}", sequence_number=1,
+        )
+    else:
+        delta = ResponseTextDeltaEvent.model_construct(
+            type="response.output_text.delta", output_index=0, content_index=0,
+            item_id="msg-1", delta="OK", sequence_number=1, logprobs=[],
+        )
+
+    class BrokenSDKStream(_FakeStream):
+        def __iter__(self):
+            state = ResponseStreamState(input_tools=omit, text_format=omit)
+            yield from state.handle_event(created)
+            yield from state.handle_event(delta)
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.return_value = BrokenSDKStream([], None)
+        raw = MagicMock()
+        raw.__iter__.return_value = iter([
+            _delta_event("OK"),
+            _completed_event(_build_final([_message_item("OK")])),
+        ])
+        client.responses.create.return_value = raw
+        response = OpenAIAdapter(_cfg()).create_message(messages=[])
+
+    assert response.text == "OK"
+    assert client.responses.stream.call_count == 1
+    assert client.responses.create.call_count == 1
+    assert client.responses.create.call_args.kwargs["stream"] is True
+    raw.close.assert_called_once()
+
+
+def test_callback_index_error_is_not_treated_as_sdk_protocol_error():
+    def broken_callback(text):
+        return [][0]
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.stream.return_value = _FakeStream(
+            [_delta_event("OK")], _build_final([_message_item("OK")]),
+        )
+        with pytest.raises(IndexError):
+            OpenAIAdapter(_cfg()).create_message(
+                messages=[], on_text_delta=broken_callback,
+            )
+    client.responses.create.assert_not_called()
+
+
+def test_raw_stream_index_error_does_not_repeat_fallback():
+    def broken_raw_stream():
+        yield _delta_event("partial")
+        raise IndexError("list index out of range")
+
+    with patch("openai.OpenAI") as MockOpenAI:
+        client = MockOpenAI.return_value
+        client.responses.create.return_value = broken_raw_stream()
+        with pytest.raises(IndexError):
+            OpenAIAdapter(_cfg()).create_message(messages=[], _use_raw_stream=True)
+    assert client.responses.create.call_count == 1
+    client.responses.stream.assert_not_called()

@@ -38,13 +38,43 @@ from app.models.protocol import (
 
 
 class ProviderStreamError(RuntimeError):
-    """Provider 流式协议异常，不能伪装成正常模型响应。"""
+    """Provider 流式协议异常，不能伪装成正常模型响应。
+
+    ``retryable`` 明确告诉重试层这个失败是不是瞬时故障。协议/参数类失败
+    （例如网关拒绝非法输入）是确定性的，重试只会重复同一个失败；中途断流
+    这类失败才值得退避重试。默认 False：宁可不重试，也不要让确定的错误
+    反复打满重试预算。
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 # SDK 状态机要求首个事件必须是 response.created，否则抛这个前缀的 RuntimeError。
 # 部分网关（Codex 风格代理、自建转发）会跳过它直接推标准增量事件，事件名各不相同，
 # 因此只匹配前缀、不绑定 before 后面挂的是哪一个。
 _MISSING_CREATED_MARKER = "Expected to have received `response.created` before"
+
+# SDK 在流里没看到 response.completed 时抛这个。网关改用 response.failed 收尾时，
+# typed 流不会把失败事件转发给消费者，只剩这句泛化文案 —— 真实原因必须重跑原始流
+# 才能拿到，否则用户只会看到 "gateway 没发完成事件" 这种指不到病根的报错。
+_MISSING_COMPLETED_MARKER = "Didn't receive a `response.completed` event"
+
+
+def _is_sdk_stream_index_error(exc: BaseException) -> bool:
+    """只识别 SDK 流式状态机自身的越界，不掩盖应用或回调的编程错误。"""
+    if not isinstance(exc, IndexError):
+        return False
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    return (
+        tb.tb_frame.f_globals.get("__name__") == "openai.lib.streaming.responses._responses"
+        and tb.tb_frame.f_code.co_name in {"accumulate_event", "handle_event"}
+    )
 
 
 class _SynthesizedResponse:
@@ -64,6 +94,90 @@ class _SynthesizedResponse:
 
 
 _MISSING_TOOL_OUTPUT = "[历史中的工具结果缺失，状态未知，请勿假设工具已执行]"
+
+
+# 网关用这些事件替代 response.completed 来报告失败。SDK 的 typed 流不把它们
+# 转发给消费者，只有原始流能看到。
+_STREAM_FAILURE_EVENT_TYPES = frozenset({
+    "response.failed", "response.error", "error",
+})
+
+# 明确表示 "服务端瞬时故障" 的失败码。命中即退避重试；未知或参数校验类失败码
+# 按确定性错误处理（重试只会重复同一个失败，白等一个退避周期）。
+_RETRYABLE_STREAM_FAILURE_CODES = frozenset({
+    "server_error", "internal_error", "overloaded", "overloaded_error",
+    "rate_limit_exceeded", "rate_limit", "timeout", "unavailable",
+    "service_unavailable",
+})
+
+# 失败消息里出现这些字眼同样按瞬时故障处理。
+_RETRYABLE_STREAM_FAILURE_MARKERS = (
+    "overload", "rate limit", "timed out", "timeout",
+    "temporarily unavailable", "server error", "try again",
+)
+
+
+def _stream_failure(event: Any) -> tuple[str, bool] | None:
+    """把流式失败事件解析成 ``(原因文本, 是否可按瞬时故障重试)``。
+
+    非失败事件返回 None。原因文本优先取网关给的 ``error.code`` /
+    ``error.message``，这样上层看到的是 "annotations 非法" 这类真实病因，
+    而不是 SDK 那句泛化的 "Didn't receive a response.completed event"。
+    """
+    if getattr(event, "type", None) not in _STREAM_FAILURE_EVENT_TYPES:
+        return None
+    response = getattr(event, "response", None)
+    error = getattr(response, "error", None) if response is not None else None
+    if error is None:
+        error = getattr(event, "error", None)
+    code = getattr(error, "code", None) if error is not None else None
+    if code is None:
+        code = getattr(event, "code", None)
+    message = getattr(error, "message", None) if error is not None else None
+    if message is None:
+        message = getattr(event, "message", None)
+    detail = " | ".join(str(part) for part in (code, message) if part) or "网关未提供失败详情"
+    retryable = (
+        str(code).lower() in _RETRYABLE_STREAM_FAILURE_CODES
+        if code is not None else False
+    ) or any(
+        marker in str(message).lower() for marker in _RETRYABLE_STREAM_FAILURE_MARKERS
+    )
+    return detail, retryable
+
+
+# Responses API 输入接受这几个 content part 字段。annotations / logprobs 是
+# 网关在输出里附带的：给数组（含空数组）没问题，但给 null 会被直接拒绝
+# ("Invalid type for 'input[N].content[0].annotations': expected an array of
+# objects, but got null instead")，且错误以 response.failed 形式返回。因此这里
+# 不是一刀切删掉这两个字段，而是保留非 null 值、只剔除 null；parsed / phase
+# 等纯输出字段则整体丢弃（输入不接受，且没有回放价值）。
+_CONTENT_PART_ALLOWED_KEYS = frozenset({
+    "type", "text", "image_url", "detail", "refusal", "file_id", "file_data",
+    "filename", "annotations", "logprobs",
+})
+
+
+def _sanitize_content_parts(parts: Any) -> Any:
+    """清理 message item 的 content 数组：只保留输入接受的字段。
+
+    网关流式返回的 assistant message 带 annotations=null / logprobs=null /
+    parsed=null 这类残留字段。它们既不是输入必需的，也没有回放价值，却会在
+    下一轮请求里被网关判为非法输入。这里统一剥离；值为 None 的字段一并去掉。
+    非列表项原样返回，交给调用方的既有逻辑处理。
+    """
+    if not isinstance(parts, list):
+        return parts
+    cleaned: list[Any] = []
+    for part in parts:
+        if isinstance(part, dict):
+            cleaned.append({
+                key: value for key, value in part.items()
+                if key in _CONTENT_PART_ALLOWED_KEYS and value is not None
+            })
+        else:
+            cleaned.append(part)
+    return cleaned
 
 
 def _repair_responses_tool_pairs(items: list[dict]) -> list[dict]:
@@ -243,12 +357,15 @@ class OpenAIAdapter:
             if _use_raw_stream:
                 final = None
                 last_response = None
+                failure: tuple[str, bool] | None = None
                 raw_stream = self._client.responses.create(**params, stream=True)
                 try:
                     with close_on_cancel(cancel, raw_stream):
                         for event in raw_stream:
                             if cancel is not None:
                                 cancel.raise_if_cancelled()
+                            if failure is None:
+                                failure = _stream_failure(event)
                             completed = consume_event(event)
                             if completed is not None:
                                 final = completed
@@ -261,6 +378,15 @@ class OpenAIAdapter:
                     close = getattr(raw_stream, "close", None)
                     if callable(close):
                         close()
+                if failure is not None:
+                    # 网关用 response.failed 收尾：这是真失败，不能拿累积的半截
+                    # 内容伪装成完成。把网关给的原因透出去，并按失败码决定是否
+                    # 值得退避重试。
+                    detail, retryable = failure
+                    raise ProviderStreamError(
+                        f"OpenAI Responses 流以失败终止: {detail}",
+                        retryable=retryable,
+                    )
                 if final is None:
                     # 网关没发 response.completed：不丢已收到的内容，用累积结果兜底。
                     recovered = [
@@ -269,7 +395,8 @@ class OpenAIAdapter:
                     if not recovered and not streamed_text_parts:
                         raise ProviderStreamError(
                             "OpenAI Responses 原始流既无 response.completed，"
-                            "也未收到任何可用内容，网关协议不完整"
+                            "也未收到任何可用内容，网关协议不完整",
+                            retryable=True,
                         )
                     final = _SynthesizedResponse(
                         items=recovered,
@@ -287,16 +414,28 @@ class OpenAIAdapter:
                             cancel.raise_if_cancelled()
                         # 仍在 with 内取最终响应：stream 关闭后 SDK 不保证还能取到。
                         final = stream.get_final_response()
-        except RuntimeError as exc:
+        except (RuntimeError, IndexError) as exc:
             if cancel is not None:
                 cancel.raise_if_cancelled()
+            sdk_index_error = _is_sdk_stream_index_error(exc)
+            if isinstance(exc, IndexError) and not sdk_index_error:
+                raise
             # SDK 状态机异常通常来自代理的事件顺序不兼容；不能返回空的正常响应，
             # 否则 Orchestrator 会误判为任务完成并停止继续处理。
             # 凡是「首个事件不是 response.created」都走原始流兼容解析 —— 网关漏掉
             # response.created 时，后面挂的事件名可能是 codex.* 也可能是标准事件
             # （response.output_text.delta 等），根因相同，不该区别对待。
             message = str(exc)
-            if not _use_raw_stream and _MISSING_CREATED_MARKER in message:
+            # 漏 response.created（SDK 状态机直接报错）和漏 response.completed
+            # （SDK 吞掉 response.failed 后只剩泛化文案）根因相同：typed 流看不全
+            # 网关事件。都改走原始流重跑，既能拿到真实失败原因，也能兜住内容。
+            # 漏 output_item.added / content_part.added 时，SDK 会按尚不存在的
+            # 下标取 output/content；仅 SDK 状态机自身的越界也走这一次回退。
+            if not _use_raw_stream and (
+                sdk_index_error
+                or _MISSING_CREATED_MARKER in message
+                or _MISSING_COMPLETED_MARKER in message
+            ):
                 return self.create_message(
                     messages=messages,
                     tools=tools,
@@ -542,7 +681,8 @@ def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
                 cleaned = {k: v for k, v in msg.items()
                           if k not in ('parsed_arguments', 'status', 'namespace',
                                       'internal_chat_message_metadata_passthrough',
-                                      'metadata', 'id', 'summary', 'encrypted_content')}
+                                      'metadata', 'id', 'summary', 'encrypted_content',
+                                      'phase')}
 
                 # 规范化 content: Responses API 要求 content 必须是数组
                 if "content" in cleaned:
@@ -553,8 +693,9 @@ def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
                         text_type = "output_text" if msg_role == "assistant" else "input_text"
                         cleaned["content"] = [{"type": text_type, "text": content}]
                     elif isinstance(content, list):
-                        # 已经是数组，保留
-                        pass
+                        # 已经是数组：清掉网关流式残留的 annotations / logprobs /
+                        # parsed / phase 等回灌会被拒的字段（含值为 None 的）。
+                        cleaned["content"] = _sanitize_content_parts(content)
                     else:
                         # 其他类型（如None），转空数组
                         cleaned["content"] = []

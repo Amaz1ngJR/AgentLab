@@ -17,7 +17,7 @@ models:
   # 直连官方时设置 ANTHROPIC_API_KEY。
   cloud_claude_opus:
     provider: anthropic
-    model: ${ANTHROPIC_MODEL:-claude-fable-5}
+    model: ${ANTHROPIC_MODEL:-claude-fable-5.1}
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     api_key_env: ANTHROPIC_API_KEY
     base_url_env: ANTHROPIC_BASE_URL
@@ -54,16 +54,22 @@ models:
     params:
       temperature: 0.2
 
-  # ── CRS 网关 GPT 模型（gpt-5.6-sol）──────────────────────────────────────────
-  # 使用内部 CRS 网关访问 GPT-5.6-sol/claude-fable-5 模型，采用 OpenAI Responses API 格式
+  # ── CRS 网关 GPT 模型（gpt-6.1-sol）──────────────────────────────────────────
+  # 使用内部 CRS 网关访问 GPT-6.1-sol/claude-fable-5 模型，采用 OpenAI Responses API 格式
   crs_gpt:
     provider: openai
-    model: gpt-6-astra
+    model: gpt-6.1-sol
     base_url_env: CRS_OAI_URL
     api_key_env: CRS_OAI_KEY
     capabilities: [chat, tools, vision]
     params:
       temperature: 0.2
+      # 上下文窗口。必须显式声明：窗口解析按模型名前缀查表（context_budget.py），
+      # 表里只有 gpt-5，gpt-6.1-sol 匹配不到会掉进 DEFAULT_CONTEXT_LIMIT=8192，
+      # 压缩阈值随之降到 7536 token，导致每次模型调用前都重复压缩旧历史。
+      # 2026-10-12 实测：向网关发 ~74.5k token 输入正常返回，远超 8192，与
+      # gpt-5.6-sol 同族按 256k 记。可用 LLM_CONTEXT_SIZE 临时覆盖。
+      context_size: 256000
       # 已于 2026-08-17 使用当前 CRS 网关 + gpt-5.6-sol 实测：
       # none、minimal、low、medium、high、xhigh、max 均请求成功。
       # 中文可理解为：无、最小、低、中、高、极高、最高。

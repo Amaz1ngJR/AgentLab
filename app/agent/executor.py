@@ -12,6 +12,7 @@ Replanner 根据这里返回的 TaskOutcome 决定,Executor 自己不写 TaskSto
 """
 from __future__ import annotations
 
+import json
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -94,22 +95,6 @@ def _looks_like_action_task(task_content: str) -> bool:
                     any(kw in content_lower for kw in thinking_keywords)
     return has_action and not only_thinking
 
-
-def _looks_like_completion_message(text: str) -> bool:
-    """判断模型输出是否像"任务已完成/无需操作"的消息。
-
-    用于空转检测的例外：有些任务检查后发现不需要操作，模型直接说明即可。
-    """
-    if not text:
-        return False
-    text_lower = text.lower()
-    completion_patterns = [
-        "已完成", "完成", "done", "finished", "completed",
-        "无需", "不需要", "no need", "not needed", "unnecessary",
-        "已经", "already",
-        "成功", "successfully", "success",
-    ]
-    return any(pattern in text_lower for pattern in completion_patterns)
 
 # progress 工厂签名:接收 label,返回一个上下文管理器(可带 .update / .on_text)
 ProgressFn = Callable[[str], ContextManager[Any]]
@@ -214,6 +199,8 @@ class Executor:
 
         last_text = ""
         tool_calls_made = 0
+        successful_tool_calls = 0
+        corrected_no_tool = False
         model_rounds = 0
         no_progress_rounds = 0
         seen_tool_signatures: set[tuple[str, str]] = set()
@@ -335,26 +322,26 @@ class Executor:
                     )
                 # 模型输出新的完成文本，说明本轮有进展；只有首次空转才给一次纠正机会。
                 no_progress_rounds = 0
-                # 空转检测：第一轮就没调用工具，且任务描述明显需要工具操作时，给予提示
-                # 但如果模型给出的文本说明了不需要操作（如"已完成"、"无需修改"等），则接受
-                if tool_calls_made == 0 and _looks_like_action_task(task.content) and \
-                   not _looks_like_completion_message(last_text):
-                    # 这是第一轮，任务看起来需要工具操作，模型只输出了文字且不像完成消息
-                    # 给模型一次纠正机会，明确提示必须调用工具
+                # 完成措辞不是执行证据；元工具(todo/skill)也不能证明操作已完成。
+                if successful_tool_calls == 0 and _looks_like_action_task(task.content):
+                    if corrected_no_tool or model_rounds >= max_steps:
+                        return TaskOutcome(
+                            status=FAILED,
+                            error="任务需要实际操作，但没有成功的工具执行证据",
+                            text=last_text.strip(),
+                            tool_calls_made=tool_calls_made,
+                            model_rounds=model_rounds,
+                        )
+                    corrected_no_tool = True
                     messages.append({
                         "role": "user",
                         "content": (
-                            "注意：你只输出了文字说明，但没有调用任何工具。\n"
-                            "请立即调用相关工具完成任务，而不是只描述要做什么。\n"
-                            "例如：\n"
-                            "- 需要读文件 → 调用 read_file\n"
-                            "- 需要写文件 → 调用 write_file 或 edit_file\n"
-                            "- 需要执行命令 → 调用 shell\n"
-                            "- 需要搜索代码 → 调用 code_search\n\n"
-                            "现在请立即调用工具完成任务。"
-                        )
+                            "你尚未成功执行任何相关工具，不能仅凭完成措辞标记任务完成。"
+                            "请通过结构化工具接口核实或执行当前任务；"
+                            "todo_write/load_skill 不算实际操作证据。"
+                        ),
                     })
-                    continue  # 给模型一次重新响应的机会
+                    continue
                 # 否则认为任务确实完成了
                 return TaskOutcome(
                     status=COMPLETED,
@@ -387,8 +374,9 @@ class Executor:
                     if cancel is not None:
                         cancel.raise_if_cancelled()
                     tool_calls_made += 1
-                    signature = (call.name, repr(sorted(call.arguments.items())))
+                    signature = (call.name, json.dumps(call.arguments, sort_keys=True, default=repr))
                     if signature in seen_tool_signatures:
+                        _flush_pending_tool_results()
                         return TaskOutcome(
                             status=FAILED,
                             error=f"模型重复请求工具 {call.name}，任务无进展",
@@ -402,6 +390,20 @@ class Executor:
                                         tool_name=call.name, tool_input=call.arguments))
 
                     tool = self._tools.get(call.name)
+                    validation_error = tool.validate_arguments(call.arguments) if tool else None
+                    if validation_error:
+                        output, _ = self._tools.execute(call.name, call.arguments, cancel=cancel)
+                        tool_results.append(ToolResult(
+                            tool_call_id=call.id, output=output, is_error=True,
+                        ))
+                        resulted_ids.add(call.id)
+                        self._emit(RunEvent(
+                            kind=events.TOOL_COMPLETED, task_id=task.id,
+                            tool_name=call.name, tool_input=call.arguments,
+                            tool_output=output, tool_error=True,
+                        ))
+                        # 参数错误允许模型在剩余预算内纠正，但不审批、不执行。
+                        continue
                     approval_action = (
                         tool.approval_action(call.arguments) if tool else None
                     )
@@ -470,6 +472,8 @@ class Executor:
                         # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
                         # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
                         output = _truncate_tool_output(output)
+                        if not is_error and call.name not in {"todo_write", "load_skill"}:
+                            successful_tool_calls += 1
                         self._emit(RunEvent(
                             kind=events.TOOL_COMPLETED, task_id=task.id,
                             tool_name=call.name, tool_input=call.arguments,

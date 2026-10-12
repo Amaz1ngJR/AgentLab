@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 
 from app.config.loader import workspace_root
-from app.tools.registry import Tool, is_approval_granted
+from app.tools.registry import Tool, ToolExecutionError, is_approval_granted
 
 # 单次读取上限:200KB。超出部分截断并附提示,避免撑爆模型上下文窗口。
 MAX_READ_BYTES = 200_000
@@ -94,9 +94,9 @@ def _read_file(args: dict) -> str:
     except WorkspacePathError as exc:
         return f"refused: {exc}"
     if not path.exists():
-        return f"file not found: {path}"
+        raise ToolExecutionError(f"file not found: {path}")
     if not path.is_file():
-        return f"not a file: {path}"
+        raise ToolExecutionError(f"not a file: {path}")
     data = path.read_bytes()
     truncated = len(data) > MAX_READ_BYTES
     # errors="replace" 遇到非 UTF-8 字节时用 ? 替代,不报错
@@ -144,12 +144,12 @@ def _edit_file(args: dict) -> str:
     except WorkspacePathError as exc:
         return f"refused: {exc}"
     if not path.exists():
-        return f"file not found: {path}(新建文件请用 write_file)"
+        raise ToolExecutionError(f"file not found: {path}(新建文件请用 write_file)")
     if not path.is_file():
-        return f"not a file: {path}"
+        raise ToolExecutionError(f"not a file: {path}")
 
-    old_str = args.get("old_str", "")
-    new_str = args.get("new_str", "")
+    old_str = args["old_str"]
+    new_str = args["new_str"]
     text = path.read_text(encoding="utf-8", errors="replace")
 
     if old_str == "":
@@ -158,11 +158,13 @@ def _edit_file(args: dict) -> str:
     else:
         count = text.count(old_str)
         if count == 0:
-            return ("old_str 未在文件中找到。请先 read_file 确认原文(注意空格/缩进/"
-                    "换行完全一致),再重试。")
+            raise ToolExecutionError(
+                "old_str 未在文件中找到。请先 read_file 确认原文(注意空格/缩进/"
+                "换行完全一致),再重试。")
         if count > 1:
-            return (f"old_str 在文件中出现 {count} 次,不唯一。请在 old_str 里带上更多"
-                    f"上下文(前后多几行)使其唯一,再重试。")
+            raise ToolExecutionError(
+                f"old_str 在文件中出现 {count} 次,不唯一。请在 old_str 里带上更多"
+                "上下文(前后多几行)使其唯一,再重试。")
         updated = text.replace(old_str, new_str, 1)
 
     if updated == text:
@@ -183,9 +185,9 @@ def _list_dir(args: dict) -> str:
     except WorkspacePathError as exc:
         return f"refused: {exc}"
     if not path.exists():
-        return f"directory not found: {path}"
+        raise ToolExecutionError(f"directory not found: {path}")
     if not path.is_dir():
-        return f"not a directory: {path}"
+        raise ToolExecutionError(f"not a directory: {path}")
     entries = []
     for child in sorted(path.iterdir()):
         marker = "/" if child.is_dir() else ""

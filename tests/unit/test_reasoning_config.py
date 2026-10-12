@@ -37,3 +37,32 @@ def test_invalid_reasoning_effort_is_rejected(monkeypatch):
     monkeypatch.setenv("LLM_REASONING_EFFORT", "maximum")
     with pytest.raises(ValueError, match="reasoning_effort"):
         load_config("crs_gpt")
+
+
+def test_crs_profile_declares_context_window(monkeypatch):
+    """回归：crs_gpt 必须显式声明 context_size，否则窗口解析掉进 8192 兜底。
+
+    窗口按模型名前缀查表（context_budget._MODEL_CONTEXT_LIMITS），表里只有
+    gpt-5，gpt-6.1-sol 匹配不到会退回 DEFAULT_CONTEXT_LIMIT=8192。这会把压缩
+    阈值压到 7536 token —— 小于 system prompt + 工具 schema + 任意一次工具结果，
+    于是每次模型调用前都重复压缩旧历史。这里锁定声明值，防止模型名再变动时
+    静默回退。
+    """
+    monkeypatch.setenv("CRS_OAI_KEY", "test-key")
+    monkeypatch.setenv("CRS_OAI_URL", "https://example.com/openai")
+    monkeypatch.delenv("LLM_CONTEXT_SIZE", raising=False)
+    cfg = load_config("crs_gpt")
+    assert cfg.context_size is not None and cfg.context_size > 8192
+
+    from app.agent.context_budget import ContextBudget, resolve_context_limit
+    # 声明值优先于按名查表：即使模型名匹配不到任何前缀，也用 profile 的窗口。
+    assert resolve_context_limit(cfg.model, cfg.context_size) == cfg.context_size
+    assert ContextBudget.from_model(cfg.model, cfg.context_size).model_context_limit > 8192
+
+
+def test_context_size_env_overrides_profile(monkeypatch):
+    """LLM_CONTEXT_SIZE 仍可临时覆盖 profile 声明的窗口。"""
+    monkeypatch.setenv("CRS_OAI_KEY", "test-key")
+    monkeypatch.setenv("CRS_OAI_URL", "https://example.com/openai")
+    monkeypatch.setenv("LLM_CONTEXT_SIZE", "12000")
+    assert load_config("crs_gpt").context_size == 12000

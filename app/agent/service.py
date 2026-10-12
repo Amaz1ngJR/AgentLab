@@ -49,6 +49,7 @@ _LEGACY_EVENT_KIND = {
     "turn_event": "turn.legacy_event",
     "agent_run_event": "turn.agent_event",
     "run_completed": "turn.completed",
+    "run_suspended": "turn.suspended",
     "run_failed": "turn.failed",
     "run_cancel_requested": "turn.cancel_requested",
 }
@@ -710,10 +711,13 @@ class RuntimeService:
             result = session.chat(message, **chat_kwargs)
             self.router.persist(target_id)
             usage = getattr(session, "last_turn_usage", {}) or {}
+            # 正常返回不代表目标完成：Direct 耗尽预算时可恢复，但不是成功。
+            run_status = getattr(session, "last_run_status", "")
+            suspended = run_status == "budget_exhausted"
             completed_turn = TurnRecord(
                 turn_id=actual_run_id,
                 thread_id=target_id,
-                status="completed",
+                status="suspended" if suspended else "completed",
                 input_text=message,
                 started_at=turn.started_at,
                 finished_at=utc_now(),
@@ -723,10 +727,13 @@ class RuntimeService:
             if storage is not None:
                 storage.save_runtime_turn(completed_turn)
             self.publish(
-                "run_completed",
+                "run_suspended" if suspended else "run_completed",
                 session_id=target_id,
                 run_id=actual_run_id,
-                payload={"result": result},
+                payload=(
+                    {"result": result, "reason": run_status, "resumable": True}
+                    if suspended else {"result": result}
+                ),
             )
             return result
         except BaseException as exc:

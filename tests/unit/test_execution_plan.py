@@ -127,7 +127,12 @@ def test_restricted_registry_cannot_execute_unlisted_tool():
 
 
 def test_runtime_factory_uses_independent_child_runtime(tmp_path: Path):
-    router = FakeRouter([response("child completed")])
+    router = FakeRouter([
+        response(json.dumps({"tasks": [{"id": "t1", "content": "读取文件"}]})),
+        ModelResponse("", [ToolCall("c1", "read_file", {})],
+                      {"input_tokens": 1, "output_tokens": 1}, []),
+        response("child completed"),
+    ])
     factory = SubagentRuntimeFactory(
         llm=router,
         tools=registry(),
@@ -137,7 +142,7 @@ def test_runtime_factory_uses_independent_child_runtime(tmp_path: Path):
     )
     result = factory.delegate(
         SubagentSpec("child-1", "执行只读任务", role="research", read_only=True,
-                     tools=("read_file",), max_steps=1),
+                     tools=("read_file",), max_steps=2),
         tmp_path,
         CancelToken(),
     )
