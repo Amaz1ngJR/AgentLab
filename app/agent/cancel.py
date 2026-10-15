@@ -1,22 +1,21 @@
-"""CancelToken —— 协作式取消信号。
+"""Per-run cancellation and steering mailbox.
 
-Runtime 是同步单线程循环,无法被强行打断;取消采用"协作式":调用方(CLI 的
-Ctrl-C 处理、Web 的 Stop 按钮)调用 token.cancel(),编排循环在每个安全检查点
-(claim 下一个任务前、调用模型前、执行工具前)调用 token.raise_if_cancelled(),
-抛出 Cancelled 让循环干净退出。
-
-令牌同时支持取消回调。模型流、子进程等阻塞资源可以注册 close/terminate，Esc
-置位时主动唤醒阻塞调用，而不是只能等到下一个检查点。
+Execution owns conversation mutations. Input can request cancellation or queue
+steering from another thread; messages are consumed only at tool-safe boundaries.
+Blocking reads can be isolated, but writes must implement cooperative cancellation.
 """
 from __future__ import annotations
 
 import threading
+import contextvars
 from contextlib import contextmanager
-from typing import Callable, Iterator
+from typing import Callable, Iterator, TypeVar
+
+T = TypeVar("T")
 
 
 class Cancelled(Exception):
-    """协作式取消被触发时抛出。编排循环捕获它并以 run_failed(已取消) 收尾。"""
+    """协作式取消被触发时抛出，由执行循环和 Service 以 cancelled 收尾。"""
 
 
 class CancelToken:
@@ -24,9 +23,12 @@ class CancelToken:
 
     def __init__(self) -> None:
         self._cancelled = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._callbacks: dict[int, Callable[[], None]] = {}
         self._next_callback_id = 0
+        self._event = threading.Event()
+        self._steering: list[str] = []
+        self._accepting_steering = True
 
     @property
     def cancelled(self) -> bool:
@@ -38,6 +40,7 @@ class CancelToken:
             if self._cancelled:
                 return
             self._cancelled = True
+            self._event.set()
             callbacks = list(self._callbacks.values())
             self._callbacks.clear()
         for callback in callbacks:
@@ -50,6 +53,37 @@ class CancelToken:
     def raise_if_cancelled(self) -> None:
         if self.cancelled:
             raise Cancelled()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._event.wait(timeout)
+
+    def steer(self, text: str) -> bool:
+        """Queue user input; only the execution thread may mutate conversation history."""
+        if not text.strip():
+            raise ValueError("steer input must not be empty")
+        with self._lock:
+            if self._cancelled or not self._accepting_steering:
+                return False
+            self._steering.append(text)
+            return True
+
+    @property
+    def has_steering(self) -> bool:
+        with self._lock:
+            return bool(self._steering)
+
+    def drain_steering(self) -> list[str]:
+        with self._lock:
+            pending, self._steering = self._steering, []
+            return pending
+
+    def finish_or_drain_steering(self) -> list[str]:
+        """Atomically finish an idle mailbox or return input racing with completion."""
+        with self._lock:
+            pending, self._steering = self._steering, []
+            if not pending or self._cancelled:
+                self._accepting_steering = False
+            return pending
 
     def add_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
         """注册即时取消回调，返回幂等的退订函数。
@@ -95,5 +129,51 @@ def close_on_cancel(cancel: CancelToken | None, resource: object) -> Iterator[No
     if cancel is None or not callable(close):
         yield
         return
-    with cancel.callback(close):
+    def request_close() -> None:
+        # SDK close may wait on a blocked socket. Never run it on the input thread.
+        def cleanup() -> None:
+            try:
+                close()
+            except Exception:
+                pass
+        threading.Thread(target=cleanup, name="agentlab-stream-close", daemon=True).start()
+
+    with cancel.callback(request_close):
         yield
+
+
+def apply_steering(cancel: CancelToken | None, messages: list[dict]) -> list[str]:
+    """Call only when all outstanding tool calls have matching results."""
+    if cancel is None:
+        return []
+    pending = cancel.drain_steering()
+    for text in pending:
+        messages.append({"role": "user", "content": text})
+    return pending
+
+
+def run_read_only_cancellable(work: Callable[[], T], cancel: CancelToken) -> T:
+    """Detach a blocked read only; callers must not pass writes or session mutations."""
+    cancel.raise_if_cancelled()
+    done = threading.Event()
+    outcome: list = []
+
+    def invoke() -> None:
+        try:
+            outcome.append((work(), None))
+        except BaseException as exc:
+            outcome.append((None, exc))
+        finally:
+            done.set()
+
+    context = contextvars.copy_context()
+    threading.Thread(
+        target=lambda: context.run(invoke), name="agentlab-read-request", daemon=True,
+    ).start()
+    while not done.wait(0.02):
+        cancel.raise_if_cancelled()
+    cancel.raise_if_cancelled()
+    value, error = outcome[0]
+    if error is not None:
+        raise error
+    return value

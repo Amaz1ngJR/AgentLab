@@ -48,6 +48,15 @@ def clear_background_reader(obj: _PausableReader) -> None:
             _reader = None
 
 
+def cancel_background_run() -> None:
+    """Esc in a foreground approval must also stop the owning live turn."""
+    with _lock:
+        reader = _reader
+    cancel = getattr(reader, "cancel", None)
+    if callable(cancel):
+        cancel()
+
+
 @contextmanager
 def foreground_stdin():
     """可重入地独占 stdin；最外层进入/退出时才 pause/resume 后台 reader。"""

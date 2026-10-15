@@ -25,7 +25,7 @@ from app.agent.approval import (
     AutoApprove,
     request_tool_approval,
 )
-from app.agent.cancel import CancelToken, Cancelled
+from app.agent.cancel import CancelToken, Cancelled, apply_steering
 from app.agent.events import RunEvent
 from app.agent.tasks import BLOCKED, COMPLETED, FAILED, Task
 from app.models.protocol import ToolResult
@@ -104,6 +104,7 @@ ProgressFn = Callable[[str], ContextManager[Any]]
 _TASK_DIRECTIVE = (
     "【当前子任务】{content}\n\n"
     "执行要求:\n"
+    "- 用户执行中补充的约束和方向优先于原有计划；不要继续执行已被用户否定的动作。\n"
     "- 先判断任务是否确实需要读取文件、修改代码、执行命令或联网查询。\n"
     "- 需要外部操作时，立即调用最相关的工具，不要只描述计划。\n"
     "- 介绍项目、文件或代码时，先读取相关资料，再基于实际内容回答。\n"
@@ -204,13 +205,18 @@ class Executor:
         model_rounds = 0
         no_progress_rounds = 0
         seen_tool_signatures: set[tuple[str, str]] = set()
+        task_context = task.content
 
         for _ in range(max(1, max_steps)):
             model_rounds += 1
             if cancel is not None:
                 cancel.raise_if_cancelled()
+            steering = apply_steering(cancel, messages)
+            if steering:
+                seen_tool_signatures.clear()
+                task_context += "\n" + "\n".join(steering)
 
-            tools = self._tools_for_task(task.content, mode="task") or None
+            tools = self._tools_for_task(task_context, mode="task") or None
             text_streamed = False
             streamed_parts: list[str] = []
 
@@ -289,6 +295,11 @@ class Executor:
 
             # 没有工具调用 = 模型认为这个子任务已经做完
             if not resp.tool_calls:
+                steering = apply_steering(cancel, messages)
+                if steering:
+                    seen_tool_signatures.clear()
+                    task_context += "\n" + "\n".join(steering)
+                    continue
                 if not response_text.strip():
                     no_progress_rounds += 1
                     if no_progress_rounds == 1 and model_rounds < max_steps:
@@ -373,6 +384,9 @@ class Executor:
                 for call in resp.tool_calls:
                     if cancel is not None:
                         cancel.raise_if_cancelled()
+                        if cancel.has_steering:
+                            _flush_pending_tool_results()
+                            break
                     tool_calls_made += 1
                     signature = (call.name, json.dumps(call.arguments, sort_keys=True, default=repr))
                     if signature in seen_tool_signatures:
@@ -511,7 +525,8 @@ class Executor:
                 _flush_pending_tool_results()
                 raise
 
-            messages.extend(self._llm.format_tool_results(tool_results))
+            if tool_results:
+                messages.extend(self._llm.format_tool_results(tool_results))
 
             # tool_result 刚入历史后再次预检，尽早压缩下一轮要发送的上下文。
             if self._ctx is not None:

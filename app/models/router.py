@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import time
+import copy
+import contextvars
+import queue
+import threading
 from typing import Any, Callable, Optional
 
 from app.agent.cancel import CancelToken
@@ -173,7 +177,53 @@ def call_create_message(
     for name, value in optional.items():
         if value is not None and _accepts_keyword(method, name):
             kwargs[name] = value
-    return method(messages, **kwargs)
+    if cancel is None:
+        return method(messages, **kwargs)
+    cancel.raise_if_cancelled()
+    # Isolate a slow SDK call from session state. A cancelled request may finish
+    # later, but its response and callbacks must never enter the next turn.
+    snapshot = copy.deepcopy(messages)
+    kwargs["tools"] = copy.deepcopy(tools)
+    mailbox: queue.Queue = queue.Queue()
+    callbacks = {}
+    for name in ("on_progress", "on_text_delta", "on_thinking_delta", "on_retry", "discard_partial"):
+        callback = kwargs.get(name)
+        if callback is not None:
+            callbacks[name] = callback
+
+            def enqueue(*args, _name=name):
+                if not cancel.cancelled:
+                    mailbox.put(("callback", (_name, args)))
+            kwargs[name] = enqueue
+
+    def invoke() -> None:
+        try:
+            mailbox.put(("result", method(snapshot, **kwargs)))
+        except BaseException as exc:
+            mailbox.put(("error", exc))
+
+    context = contextvars.copy_context()
+    threading.Thread(
+        target=lambda: context.run(invoke), name="agentlab-model-request", daemon=True,
+    ).start()
+    while True:
+        cancel.raise_if_cancelled()
+        try:
+            kind, value = mailbox.get(timeout=0.02)
+        except queue.Empty:
+            continue
+        cancel.raise_if_cancelled()
+        if kind == "callback":
+            name, args = value
+            try:
+                callbacks[name](*args)
+            except BaseException:
+                cancel.cancel()
+                raise
+        elif kind == "error":
+            raise value
+        else:
+            return value
 
 
 def _accepts_keyword(func: Any, name: str) -> bool:

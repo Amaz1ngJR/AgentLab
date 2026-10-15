@@ -43,7 +43,8 @@ from app.attachments import (
     capture_system_clipboard,
 )
 from app.agent.approval_broker import ApprovalBroker, BrokerApprovalPolicy
-from app.agent.cancel import CancelToken
+from app.agent.cancel import CancelToken, Cancelled
+from app.util.live_turn import LiveTurnInput
 from app.agent.context import ContextManager
 from app.agent.context_budget import ContextBudget
 from app.agent.context_compaction import ContextCompressor
@@ -138,8 +139,9 @@ _ANSI_YELLOW_BOLD = "\033[1;33m" # 黄色加粗 (执行审批)
 # 退出重画正文时还会把同一段文本再打一遍。所以 spinner 存活期间的事件提示统一交给
 # 它协调（见 _emit_progress_notice）。只登记 _Spinner：_PlainProgress 没有 footer，
 # 直接打印不会打架。
-_ACTIVE_SPINNER_LOCK = threading.Lock()
+_ACTIVE_SPINNER_LOCK = threading.RLock()
 _ACTIVE_SPINNER: Optional["_Spinner"] = None
+_LIVE_INPUT: LiveTurnInput | None = None
 
 
 def _get_active_spinner() -> Optional["_Spinner"]:
@@ -392,7 +394,7 @@ class _Spinner:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._t0 = 0.0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self._any_text = False         # 整个 turn 是否出现过正文(决定退出收尾)
         self._any_thinking = False     # 是否出现过思考流(用于在思考→正文/摘要间分隔)
@@ -622,6 +624,10 @@ class _Spinner:
         footer 跟正文挤在同一行;否则光标已在行首,直接画。这个 \\n 只是 _line_buf
         与 footer 之间的边界,不额外占一整屏行 —— 擦除时不计入上移行数。
         """
+        if _LIVE_INPUT is not None:
+            _LIVE_INPUT.status = f"{self.label} ({self._fmt_status()})"
+            _LIVE_INPUT.invalidate()
+            return
         term_width = _term_width()
         if self._line_buf:
             sys.stdout.write("\n")
@@ -1701,7 +1707,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         "审批     : 支持单次允许、工作区工具授权和 Session 命令前缀授权"
     )
     _print_init("输入 /version 查看版本; /rtk 查看内置输出压缩; /image 或 Ctrl+V 附加图片; /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
-    _print_init("执行中按 Esc 或 Ctrl-C 可中断,停下后直接输入新指令即可调整方向。\n")
+    _print_init("执行中可直接输入补充方向；Esc 或 Ctrl-C 停止当前任务。\n")
 
     # ── MCP server 接入 ───────────────────────────────────────────────────────
     # 读 config/mcp_servers.yaml 中 enabled 的 server,启动 manager(供所有 session 共用)。
@@ -1909,6 +1915,8 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         import threading
 
         token = CancelToken()
+        if _LIVE_INPUT is not None:
+            return _LIVE_INPUT.run(lambda: loop.run(cancel=token), token)
         can_trap = threading.current_thread() is threading.main_thread()
         prev_handler = None
 
@@ -2368,6 +2376,7 @@ def _chat_with_cancel(
     resume: bool = False,
     service: RuntimeService | None = None,
     images: list[ImageAttachment] | None = None,
+    live_input: LiveTurnInput | None = None,
 ) -> str:
     """跑一轮 chat,并把 Ctrl-C 接到协作式取消(对应 PRD 紧急停止)。
 
@@ -2389,6 +2398,26 @@ def _chat_with_cancel(
     import signal
 
     token = CancelToken()
+    if live_input is not None:
+        global _LIVE_INPUT
+        _LIVE_INPUT = live_input
+        import uuid
+        run_id = f"run-{uuid.uuid4().hex}"
+        if service is not None:
+            live_input.on_steer = lambda text: service.steer_turn(run_id, text)
+        try:
+            def execute():
+                if service is not None:
+                    return service.send_message(
+                        line, images=images, cancel=token, resume=resume, run_id=run_id,
+                    )
+                return session.chat(line, images=images, cancel=token, resume=resume)
+            return live_input.run(execute, token)
+        except (KeyboardInterrupt, Cancelled):
+            session.last_run_status = "cancelled"
+            return "已中断。"
+        finally:
+            _LIVE_INPUT = None
     can_trap = threading.current_thread() is threading.main_thread()
     prev_handler = None
 
@@ -2628,8 +2657,30 @@ def _repl(router: RuntimeService) -> int:
         key_bindings=key_bindings,
     )
 
-    # 粘贴计数器，用于显示 [Pasted text #N +X lines]
-    paste_counter = 0
+    queued_input = None
+    input_draft = ""
+
+    def prepare_steering(text: str) -> str:
+        # Image placeholders remain queued for the next turn; steering is text-only.
+        return _IMAGE_PLACEHOLDER_RE.sub("", _extract_pasted_text(text, pending_clipboard)).strip()
+
+    def run_chat(session, text, *, resume=False, images=None):
+        nonlocal queued_input, input_draft
+        live = None
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            live = LiveTurnInput(
+                pt_session, message=prompt_fragments, style=_PROMPT_STYLE,
+                prepare_input=prepare_steering,
+            )
+        try:
+            return _chat_with_cancel(
+                session, text, resume=resume, service=router, images=images,
+                live_input=live,
+            )
+        finally:
+            if live is not None:
+                queued_input = live.next_input
+                input_draft = live.draft
 
     while True:
         _print_input_separator()
@@ -2652,7 +2703,13 @@ def _repl(router: RuntimeService) -> int:
         prompt_fragments = FormattedText([("class:prompt", prompt_text)])
 
         try:
-            line = pt_session.prompt(prompt_fragments, style=_PROMPT_STYLE).strip()
+            if queued_input is not None:
+                line, queued_input = queued_input.strip(), None
+            else:
+                line = pt_session.prompt(
+                    prompt_fragments, style=_PROMPT_STYLE, default=input_draft,
+                ).strip()
+            input_draft = ""
 
             # 检测粘贴的多行文本并显示提示
             # 注意：prompt_toolkit 默认将多行粘贴转换为单行（用空格替换换行符）
@@ -2820,11 +2877,28 @@ def _repl(router: RuntimeService) -> int:
 
         # /goal 和 /loop 命令通过 RuntimeService 显式入口处理。
         if line.startswith("/goal") or line.startswith("/loop"):
-            out = (
-                router.handle_goal_command(line)
-                if line.startswith("/goal")
-                else router.handle_loop_command(line)
-            )
+            live = None
+            if line.startswith(("/loop start", "/loop resume")) and sys.stdin.isatty() and sys.stdout.isatty():
+                live = LiveTurnInput(
+                    pt_session, message=prompt_fragments, style=_PROMPT_STYLE,
+                    prepare_input=prepare_steering,
+                )
+            global _LIVE_INPUT
+            _LIVE_INPUT = live
+            try:
+                out = (
+                    router.handle_goal_command(line)
+                    if line.startswith("/goal")
+                    else router.handle_loop_command(line)
+                )
+            except (Cancelled, KeyboardInterrupt):
+                out = "已中断。"
+            except Exception as exc:
+                out = format_exception(exc)
+            finally:
+                _LIVE_INPUT = None
+                if live is not None:
+                    queued_input, input_draft = live.next_input, live.draft
             if out:
                 print(out)
             continue
@@ -2852,11 +2926,10 @@ def _repl(router: RuntimeService) -> int:
             extra = line[len("/resume"):].strip()
             goal = extra or "继续完成上一轮未完成的任务。"
             try:
-                _chat_with_cancel(
+                run_chat(
                     session,
                     goal,
                     resume=True,
-                    service=router,
                     images=images,
                 )
             except Exception as exc:
@@ -2870,7 +2943,7 @@ def _repl(router: RuntimeService) -> int:
             if repaired:
                 print(f"  ⚠ 检测到 {repaired} 个悬空 tool_use，已自动修复（历史损坏可能由上次中断引起）。",
                       file=sys.stderr)
-            _chat_with_cancel(session, line, service=router, images=images)
+            run_chat(session, line, images=images)
         except Exception as exc:
             # 脱敏后输出,避免 Authorization / API key 等凭据泄漏到终端
             print(f"  !! {format_exception(exc)}\n", file=sys.stderr)

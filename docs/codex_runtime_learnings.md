@@ -415,7 +415,25 @@ Learner --> Skills : 生成待审阅 Skill 草稿
 @enduml
 ```
 
-## 9. 明确不做的事
+## 9. 常驻输入和取消的源码参考
+
+Codex 的 [ChatComposer](https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/chat_composer.rs)
+独立维护输入草稿、历史和底部状态；
+[ChatWidget](https://github.com/openai/codex/blob/main/codex-rs/tui/src/chatwidget.rs)
+区分当前 Agent turn 和其他忙碌状态，消费事件更新界面。
+这支持 AgentLab 将输入与执行分开，而不必先开发完整全屏 TUI。
+
+[SessionTask 的取消处理](https://github.com/openai/codex/blob/main/codex-rs/core/src/tasks/mod.rs)
+先取消 token，有限等待任务退出，再 abort 任务并完成取消生命周期。
+Python 同步线程无法直接照搬 Tokio abort：AgentLab 应隔离模型请求的快照和迟到
+回调，让执行线程可以停止等待；本地进程与 MCP 调用则显式注册取消适配。
+不能放弃仍在写文件或改会话的执行线程后立即启动同一 session 的新任务。
+
+个人 Agent 的落地重点是：执行中可随时输入、在安全点接收 steering、Esc/Ctrl+C
+不等待网络超时、保留草稿、审批结束后恢复输入、取消不冒充成功。实现与回归进展
+统一记录在 `process.md` 的 3.18 节，产品约束见 PRD 11.1.1。
+
+## 10. 明确不做的事
 
 - 不为了“像 Codex”而改写为 Rust；
 - 不要求所有模型支持 OpenAI 专属字段；

@@ -123,7 +123,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.7 测试
 
-- **724 个 unit tests**（全离线），覆盖：runtime（含动态审批、编排委托 + 取消）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、ToolDescriptor/九级风险/结构化审批/Session 命令前缀/统一审计/旧数据库迁移、MCP（config/adapter/manager，含 Windows `npx.cmd`、最小运行环境和 cwd）、CLI 全局入口与 workspace 参数、code_search（含外部目录审批）、web_search、web_fetch（公网地址校验、DNS/重定向 SSRF、正文抽取、截断、脱敏）、shell（含复合命令与外部 cwd 审批）、交互式终端会话、workspace path、存储、记忆、session_router、Skill loader/catalog、Loop Engineering（真实多轮编排、Verifier 审批、worktree 相对路径/未跟踪文件/审批提交与合并边界、执行异常终止）。
+- **925 个测试**（离线全量回归），覆盖：runtime（含动态审批、编排委托、取消与 steering）、Orchestrator/Planner/Executor/Replanner 编排路径、TaskStore（依赖/claim/状态回写/snapshot/restore）、上下文预算与压缩（token 估算/预算阈值/安全选段/摘要校验脱敏/ContextManager/storage）、三种 adapter、ToolDescriptor/九级风险/结构化审批/Session 命令前缀/统一审计/旧数据库迁移、MCP（config/adapter/manager，含 Windows `npx.cmd`、最小运行环境和 cwd）、CLI 全局入口与 workspace 参数、常驻输入与真实按键、code_search（含外部目录审批）、web_search、web_fetch（公网地址校验、DNS/重定向 SSRF、正文抽取、截断、脱敏）、shell（含复合命令与外部 cwd 审批）、交互式终端会话、workspace path、存储、记忆、session_router、Skill loader/catalog、Loop Engineering（真实多轮编排、Verifier 审批、worktree 相对路径/未跟踪文件/审批提交与合并边界、执行异常终止）。
 - `.github/workflows/mcp-cross-platform.yml` 在 Windows、Linux、macOS
   runner 安装 Node.js 后真实验证 `npx` 解析，并运行 MCP 专项测试。
 
@@ -214,9 +214,35 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - 新增 `test_loop_evidence.py` 并扩展 Verifier 测试，覆盖成功证据、任务快照、预算、脱敏/限长制品、diff 查询、恢复状态、API 审批和 Human 决策。
 
 
+### 3.18 执行期间常驻输入与及时取消
+
+- `app/util/live_turn.py` 使用 prompt_toolkit 异步输入和独立执行线程，在普通聊天、
+  `/resume`、`/loop start/resume` 执行期间保留输入框；状态与 token 显示放入输入区域的
+  toolbar，输出通过 StdoutProxy 渲染，避免旧 spinner 移动光标破坏输入。
+- StdoutProxy 前增加完整行缓冲，频繁 flush 不会暴露半行文字；结束时补齐最后
+  一行的换行，防止输入框重绘吞字或与正文粘连。新增分段中文/ANSI 测试，并用
+  pyte 模拟 32/60/100 列终端检查实际屏幕内容；pyte 未安装时仅跳过屏幕模拟测试。
+- Enter 提交文字作为 steering；取消收尾期间输入的新消息排入下一轮，未发送草稿
+  保留。管理命令需先停止，图片保留在附件队列供下一轮发送。
+- `CancelToken` 增加按 run 隔离的 FIFO steering mailbox；RuntimeService 不再从 UI
+  线程直接改写 messages，也不会因 steering 切换其他 session。Direct/Executor 在
+  工具结果完整配对后应用新方向，跳过批次中已过时但尚未执行的动作。
+- 模型请求使用独立输入快照和回调队列；取消后执行线程立即结束等待，迟到响应和
+  文本不再进入历史或终端。网络流 close 在后台清理，已知内置只读工具的等待也可取消。
+- MCP future 接入取消；Shell 与 Loop command Verifier 共用 `run_process`，Unix
+  终止进程组，Windows 使用 taskkill 的进程树终止并保留 fallback；清理不阻塞输入线程。
+- 审批通过 stdin arbiter 暂停并恢复输入框；审批中的 Esc/Ctrl+C 取消当前 run。
+  RuntimeService 发布 `turn.steered / turn.cancelled`，取消不再误记为 completed；
+  收口时尚未被处理的消息继续执行，避免结束竞态丢失输入。
+- 回归测试覆盖实际 prompt_toolkit 按键、Esc/Ctrl+C、草稿、审批输入独占与恢复、
+  模型回调隔离、工具配对、只读取消、MCP coroutine 取消和会话隔离。平台相关行为
+  使用可移植实现与 mock；真实 Windows/Linux 终端仍需对应设备 smoke test。
+- 边界：Python 不能安全强杀任意第三方同步写工具。此类工具必须实现取消适配；
+  收尾期间仍保留输入，但同一 session 不会并发执行下一轮写操作。
+
 | 模块 | 当前进展 | 关键文件 |
 |---|---|---|
-| CLI | 交互 REPL、`-p`、`--profile`、`-y`、`/reset`、`/session` 命令族 + 斜杠补全；spinner、任务面板、统计 | `app/cli.py` |
+| CLI | 交互 REPL、执行期间常驻输入、文字 steering、`-p`、`--profile`、`-y`、斜杠命令补全；状态、任务面板、统计 | `app/cli.py`, `app/util/live_turn.py` |
 | 配置 | `.env` + `config/models.yaml`（模型）+ `config/agents.yaml`（Agent）+ `config/mcp_servers.yaml`（MCP） | `app/config/`, `app/agent/profiles.py`, `app/mcp/config.py` |
 | 模型层 | Anthropic / OpenAI Responses / OpenAI-compatible；统一内部协议；JSON tool call fallback | `app/models/` |
 | Runtime | CLI 主路径已切到编排:`AgentSession(orchestrate=True)` 委托 Orchestrator;`orchestrate=False` 仍保留 legacy 单轮循环 | `app/agent/runtime.py`, `app/agent/orchestrator.py` |
@@ -233,7 +259,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 浏览器控制 | Playwright MCP：打开/snapshot/点击/输入；named profile；数据边界提示 | `config/mcp_servers.example.yaml`, `app/cli.py` |
 | 存储 | SQLite：sessions/messages/memories/tool_executions/runs/tasks/context_summaries + Loop 表；工具审计含风险/目标/来源/审批/结果；settings 表待做 | `app/storage/` |
 | 安全基础 | workspace 默认信任边界、越界强审批、审批上下文防模型伪造、脱敏、MCP env allowlist、敏感目录不入库 | `app/tools/registry.py`, `app/util/redact.py`, `.gitignore` |
-| 取消 | Ctrl-C 协作式取消(CancelToken):首次置位、当前步骤后停止,连按强制中断 | `app/agent/cancel.py`, `app/cli.py` |
+| 取消 | Esc/Ctrl+C 取消模型/MCP/只读请求/命令等待；保留草稿与输入；迟到输出隔离、取消状态持久化 | `app/agent/cancel.py`, `app/util/live_turn.py`, `app/util/process.py` |
 | 上下文压缩 | ContextBudget + ContextCompressor + 结构化摘要;编排稳定点超 85% 自动压缩、可审计;`/context` 命令族 | `app/agent/context.py`, `context_budget.py`, `context_compaction.py` |
 | 测试 | 完整离线 unit tests 通过（数量见 3.7）；三平台 MCP 专项 CI 已配置 | `tests/unit/`, `.github/workflows/mcp-cross-platform.yml` |
 

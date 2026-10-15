@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from app.agent.approval import ApprovalPolicy
-from app.agent.cancel import CancelToken
+from app.agent.cancel import CancelToken, Cancelled
 from app.agent.events import (
     GOAL_DEFINED,
     LOOP_BLOCKED,
@@ -314,7 +314,7 @@ class LoopRunner:
 
                 # 验证
                 self.status = "verifying"
-                verification = self._verify()
+                verification = self._verify(cancel=cancel)
                 self.verification_results.append(verification)
                 self._persist_verification(verification)
 
@@ -334,6 +334,8 @@ class LoopRunner:
             # 循环被取消
             return self._finish_cancelled()
 
+        except Cancelled:
+            return self._finish_cancelled()
         except Exception as exc:
             return self._finish_failed(f"{type(exc).__name__}: {exc}")
 
@@ -444,7 +446,7 @@ class LoopRunner:
         # completed 进入验证:验证才是 Loop 是否达成目标的唯一裁判。
         return "ok"
 
-    def _verify(self) -> VerificationResult:
+    def _verify(self, cancel: CancelToken | None = None) -> VerificationResult:
         """运行验证计划。"""
         self.on_event(RunEvent(
             kind=VERIFICATION_STARTED,
@@ -460,7 +462,13 @@ class LoopRunner:
         ]
 
         # 运行验证
-        result = self.verifier.verify(checks)
+        from app.models.router import _accepts_keyword
+        if cancel is not None and _accepts_keyword(self.verifier.verify, "cancel"):
+            result = self.verifier.verify(checks, cancel=cancel)
+        else:
+            result = self.verifier.verify(checks)
+        if cancel is not None:
+            cancel.raise_if_cancelled()
 
         self.on_event(RunEvent(
             kind=VERIFICATION_COMPLETED,

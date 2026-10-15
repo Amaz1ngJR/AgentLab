@@ -221,17 +221,19 @@ def test_call_create_message_skips_unsupported_optional_kwargs():
             return "ok"
 
     dest = OldAdapter()
+    from app.agent.cancel import CancelToken
+    token = CancelToken()
     assert call_create_message(
-        dest, [], cancel="token", discard_partial=lambda _e: None,
+        dest, [], cancel=token, discard_partial=lambda _e: None,
         on_retry=lambda *_: None,
     ) == "ok"
-    assert dest.got["cancel"] == "token"
+    assert dest.got["cancel"] is token
     assert callable(dest.got["discard_partial"])
     assert callable(dest.got["on_retry"])
 
     # 旧签名替身不该因为多传 cancel/discard_partial 而 TypeError
     assert call_create_message(
-        StrictOldAdapter(), [], cancel="token", discard_partial=lambda _e: None,
+        StrictOldAdapter(), [], cancel=token, discard_partial=lambda _e: None,
         on_retry=lambda *_: None,
     ) == "ok"
 

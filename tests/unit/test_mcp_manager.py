@@ -187,6 +187,49 @@ def test_call_tool_timeout(running_manager):
     assert "timeout" in text
 
 
+def test_cancel_stops_waiting_for_mcp_and_cancels_its_coroutine(running_manager):
+    import threading
+    from app.agent.cancel import CancelToken, Cancelled
+    from app.tools.registry import Tool, ToolRegistry
+
+    started, cleaned, stopped = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockingSession:
+        async def call_tool(self, name, arguments):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            finally:
+                cleaned.set()
+
+    mgr = running_manager
+    mgr._sessions["slow"] = BlockingSession()
+    token = CancelToken()
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="mcp_wait", description="wait", input_schema={"type": "object"},
+        executor=lambda args: mgr.call_tool("slow", "wait", args)[0],
+        requires_approval=False,
+    ))
+
+    def execute():
+        try:
+            registry.execute("mcp_wait", {}, cancel=token)
+        except Cancelled:
+            stopped.set()
+
+    worker = threading.Thread(target=execute)
+    worker.start()
+    try:
+        assert started.wait(1)
+        token.cancel()
+        assert stopped.wait(0.3)
+        assert cleaned.wait(1)
+    finally:
+        token.cancel()
+        worker.join(1)
+
+
 def test_start_noop_without_servers():
     """没有配置 server 时 start() 不应起 loop。"""
     mgr = MCPManager(servers=[])

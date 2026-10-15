@@ -23,9 +23,7 @@
 """
 from __future__ import annotations
 
-import os
 import platform
-import signal
 import subprocess
 
 from app.tools.builtin.files import (
@@ -35,6 +33,7 @@ from app.tools.builtin.files import (
 )
 from app.tools.registry import Tool, ToolExecutionError, current_cancel_token
 from app.tools.rtk_builtin import BuiltinRTK
+from app.util.process import run_process
 
 # 单次输出上限:8KB。超出截断并附说明,避免让模型上下文吞下兆级 log。
 MAX_OUTPUT_BYTES = 8_000
@@ -83,54 +82,10 @@ def _run_shell(args: dict) -> str:
     argv = _build_argv(command)
 
     cancel = current_cancel_token()
-    proc = None
-
-    def _stop_process() -> None:
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            if platform.system() == "Windows":
-                proc.kill()
-            else:
-                os.killpg(proc.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            pass
-
     try:
-        if cancel is None:
-            # 非 Agent 调用（测试/直接复用）保持简单的 subprocess.run 语义。
-            completed = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(cwd),
-                errors="replace",
-            )
-            stdout, stderr = completed.stdout, completed.stderr
-            returncode = completed.returncode
-        else:
-            popen_kwargs = {
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.PIPE,
-                "text": True,
-                "cwd": str(cwd),
-                "errors": "replace",
-            }
-            if platform.system() == "Windows":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                popen_kwargs["start_new_session"] = True
-            proc = subprocess.Popen(argv, **popen_kwargs)
-            with cancel.callback(_stop_process):
-                stdout, stderr = proc.communicate(timeout=timeout)
-            cancel.raise_if_cancelled()
-            returncode = proc.returncode
+        completed = run_process(argv, cwd=str(cwd), timeout=timeout, cancel=cancel)
+        stdout, stderr, returncode = completed.stdout, completed.stderr, completed.returncode
     except subprocess.TimeoutExpired:
-        _stop_process()
-        if proc is not None:
-            proc.kill()
-            proc.communicate()
         raise ToolExecutionError(f"timeout: command exceeded {timeout}s and was killed")
     except FileNotFoundError as exc:
         # 没装 bash / powershell 时

@@ -2885,6 +2885,54 @@ CLI、终端 TUI 和 Web UI 都消费 Runtime 产生的事件：
 | `run_completed` | 最终回答及使用统计 |
 | `run_failed` | 可理解的错误与重试入口 |
 
+#### 11.1.1 常驻输入、实时引导与停止
+
+CLI、TUI 和 Web 的输入区域必须在 Direct、Task、Loop 执行期间持续可用。输入与
+执行使用独立调度路径；模型流、工具输出和状态更新不能直接控制输入区域的光标。
+
+- 执行期间按 Enter 提交文字作为当前 run 的补充方向，不启动同一 session 的并发 run。
+- 补充消息按 FIFO 入队，由执行线程在稳定点写入上下文。已有工具调用与结果必须
+  先配对；批次中尚未执行的旧动作应补充“未执行”结果，再由模型按最新约束决策。
+- 用户的新约束优先于旧计划。引导不会撤销已经完成的文件修改、浏览器提交或远程动作；
+  如需回滚，应成为后续明确任务。验收标准、权限与预算仍通过对应管理入口调整。
+- Esc、Ctrl+C、Web Stop 共用当前 run 的取消令牌：立即停止启动后续模型请求和工具，
+  唤醒模型等待、重试等待、MCP 调用及命令进程；不得等待正常网络或命令超时才响应。
+- 输入区域在取消收尾期间仍可编辑；未发送草稿必须保留，已提交的新指令在当前 run
+  释放执行槽位后发送。禁止在旧执行线程仍可能修改会话或文件时启动同 session 的新 run。
+- 慢网络请求的关闭和进程清理不能阻塞输入线程。取消后的迟到响应、正文和进度必须
+  丢弃；只读请求可以与会话隔离后停止等待，写操作必须保留明确的协作取消和清理边界。
+- 审批弹窗独占输入并临时暂停主输入区域，关闭后恢复原草稿；弹窗中的 Esc/Ctrl+C
+  同样停止所属 run，不能被解释为继续自动执行。
+- 补充指令与取消应发布可持久化事件，取消状态不得计为成功。任务完成瞬间收到的
+  输入应成为后续执行或待发送消息，不得确认收到后丢失。
+
+```plantuml
+@startuml
+title 执行中的输入与控制
+skinparam shadowing false
+skinparam linetype ortho
+participant "常驻输入区域" as Input
+queue "Run 输入队列" as Queue
+participant "Runtime 执行线程" as Runtime
+participant "模型 / 工具" as Worker
+
+Runtime -> Worker : 执行当前调用
+Input -> Queue : Enter：补充方向
+Worker --> Runtime : 当前结果
+Runtime -> Runtime : 闭合工具调用 / 结果配对
+Runtime -> Queue : 获取补充方向
+Queue --> Runtime : 最新用户约束
+Runtime -> Worker : 调整后继续执行
+Input -> Runtime : Esc / Ctrl+C：取消令牌
+Runtime -> Worker : 取消等待 / 停止进程 / 清理资源
+Runtime --> Input : 已停止，保留输入草稿
+@enduml
+```
+
+验收要求：使用阻塞 fake provider 和慢 MCP server，验证按键后立即更新停止状态，
+模型等待与本地命令的取消不依赖正常超时；覆盖草稿保留、审批恢复、迟到输出丢弃、
+批量工具配对、连续补充消息、结束竞态，以及 Windows/Linux/macOS 的键盘输入。
+
 ### 11.2 终端 TUI
 
 终端 TUI 是介于行式 CLI 和浏览器 Web UI 之间的全屏终端界面，目标是在不离开终端、不启动浏览器的前提下提供分区布局和更强的可视化。建议使用 Textual / Rich 实现，复用同一 Runtime 与事件协议，不实现任何 Agent 决策逻辑。

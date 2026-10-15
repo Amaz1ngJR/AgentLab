@@ -9,7 +9,7 @@ from typing import Any, Callable, ContextManager, Optional
 
 from app.agent import events
 from app.agent.approval import ApprovalPolicy, ApprovalResult, AutoApprove, request_tool_approval
-from app.agent.cancel import CancelToken, Cancelled
+from app.agent.cancel import CancelToken, Cancelled, apply_steering
 from app.agent.events import RunEvent
 from app.agent.mode_router import ExecutionMode, ModeRouter, SessionState
 from app.agent.tasks import TaskStore
@@ -429,7 +429,7 @@ class AgentSession:
         """处理一轮用户输入。
 
         orchestrate=True 时委托给 Orchestrator(规划→执行→重规划,产出 RunEvent);
-        否则走 legacy 单轮循环。cancel 仅编排路径生效(legacy 路径忽略)。
+        否则走 Direct 多轮工具循环。两条路径均支持取消与稳定点 steering。
         resume=True 时继续上一轮未完成的任务(失败任务重置为 pending),仅编排路径生效。
         """
         self._prepare_skill_context(user_input)
@@ -537,6 +537,7 @@ class AgentSession:
             denied_tools: set[str] = set()
             corrected_no_tool = False
             max_steps = self.max_steps
+            tool_context = user_input
             for step_index in range(max_steps):
                 # 安全检查点：模型往返之间是干净的稳定点，此时 tool_use/tool_result
                 # 都已配对闭合，中断不会在历史里留下悬空调用。
@@ -546,6 +547,10 @@ class AgentSession:
                         kind="text", text="已中断。",
                     ))
                     return "已中断。"
+                steering = apply_steering(cancel, self.messages)
+                if steering:
+                    tool_context += "\n" + "\n".join(steering)
+                    tools = self._tools_for_task(tool_context, mode="direct")
                 text_streamed = False
                 streamed_parts: list[str] = []
 
@@ -613,6 +618,11 @@ class AgentSession:
                 response_text = resp.text or "".join(streamed_parts)
 
                 if not resp.tool_calls:
+                    steering = apply_steering(cancel, self.messages)
+                    if steering:
+                        tool_context += "\n" + "\n".join(steering)
+                        tools = self._tools_for_task(tool_context, mode="direct")
+                        continue
                     if not response_text.strip():
                         empty_rounds += 1
                         if empty_rounds == 1 and step_index + 1 < max_steps:
@@ -697,6 +707,9 @@ class AgentSession:
 
                 try:
                     for call in resp.tool_calls:
+                        if cancel is not None and cancel.has_steering:
+                            _flush_legacy()
+                            break
                         self._emit_turn_event(TurnEvent(
                             kind="tool_call",
                             tool_name=call.name,
@@ -829,7 +842,8 @@ class AgentSession:
 
                 # 工具结果的回传格式由 adapter 决定(Anthropic / OpenAI Chat /
                 # OpenAI Responses 三家不一样),Runtime 不关心
-                self.messages.extend(self.llm.format_tool_results(tool_results))
+                if tool_results:
+                    self.messages.extend(self.llm.format_tool_results(tool_results))
 
             self.last_run_status = "budget_exhausted"
             answer = (

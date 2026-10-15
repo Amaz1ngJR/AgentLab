@@ -331,6 +331,8 @@ def call_with_retry(
             continue
         try:
             result = call()
+            if cancel is not None:
+                cancel.raise_if_cancelled()
             breaker.record_success()
             return result
         except Cancelled:

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app.agent.approval_broker import ApprovalBroker
-from app.agent.cancel import CancelToken
+from app.agent.cancel import CancelToken, Cancelled
 from app.agent.session_router import SessionRouter
 from app.agent.submission import SubmissionQueue, SubmissionQueueOverloaded, TurnSubmission
 from app.protocol.envelopes import EventEnvelope, utc_now
@@ -52,6 +52,8 @@ _LEGACY_EVENT_KIND = {
     "run_suspended": "turn.suspended",
     "run_failed": "turn.failed",
     "run_cancel_requested": "turn.cancel_requested",
+    "run_cancelled": "turn.cancelled",
+    "turn_steered": "turn.steered",
 }
 
 
@@ -577,7 +579,7 @@ class RuntimeService:
         )
 
     def steer_turn(self, turn_id: str, input_text: str) -> bool:
-        """把用户 steering 注入当前历史，供当前 Turn 的下一次模型请求读取。"""
+        """排队用户 steering，由执行线程在工具结果完整配对后读取。"""
         if not input_text.strip():
             raise ValueError("steer input must not be empty")
         with self._lock:
@@ -585,10 +587,8 @@ class RuntimeService:
             active = self._runs.get(turn_id)
             if active is None:
                 return False
-            session = self.router.switch(active.session_id) and self.router.current
-            if session is None:
+            if not active.cancel.steer(input_text):
                 return False
-            session.messages.append({"role": "user", "content": input_text})
         self.publish(
             "turn_steered",
             session_id=active.session_id,
@@ -709,15 +709,33 @@ class RuntimeService:
             if images:
                 chat_kwargs["images"] = images
             result = session.chat(message, **chat_kwargs)
+            # Do not acknowledge input and then lose it at the last model boundary.
+            # A late steering message becomes a follow-up inside this same run.
+            accumulated_usage = dict(getattr(session, "last_turn_usage", {}) or {})
+            accumulated_seconds = getattr(session, "last_turn_seconds", 0.0)
+            while True:
+                pending = token.finish_or_drain_steering()
+                if not pending:
+                    break
+                if token.cancelled:
+                    session.messages.extend({"role": "user", "content": text} for text in pending)
+                    break
+                result = session.chat("\n\n".join(pending), cancel=token)
+                for key, value in (getattr(session, "last_turn_usage", {}) or {}).items():
+                    accumulated_usage[key] = accumulated_usage.get(key, 0) + value
+                accumulated_seconds += getattr(session, "last_turn_seconds", 0.0)
+            session.last_turn_usage = accumulated_usage
+            session.last_turn_seconds = accumulated_seconds
             self.router.persist(target_id)
             usage = getattr(session, "last_turn_usage", {}) or {}
             # 正常返回不代表目标完成：Direct 耗尽预算时可恢复，但不是成功。
             run_status = getattr(session, "last_run_status", "")
             suspended = run_status == "budget_exhausted"
+            cancelled = token.cancelled or run_status == "cancelled"
             completed_turn = TurnRecord(
                 turn_id=actual_run_id,
                 thread_id=target_id,
-                status="suspended" if suspended else "completed",
+                status="cancelled" if cancelled else "suspended" if suspended else "completed",
                 input_text=message,
                 started_at=turn.started_at,
                 finished_at=utc_now(),
@@ -727,7 +745,7 @@ class RuntimeService:
             if storage is not None:
                 storage.save_runtime_turn(completed_turn)
             self.publish(
-                "run_suspended" if suspended else "run_completed",
+                "run_cancelled" if cancelled else "run_suspended" if suspended else "run_completed",
                 session_id=target_id,
                 run_id=actual_run_id,
                 payload=(
@@ -738,11 +756,12 @@ class RuntimeService:
             return result
         except BaseException as exc:
             failure = RuntimeFailure.from_exception(exc)
+            was_cancelled = token.cancelled or isinstance(exc, (Cancelled, KeyboardInterrupt))
             if storage is not None:
                 storage.save_runtime_turn(TurnRecord(
                     turn_id=actual_run_id,
                     thread_id=target_id,
-                    status="cancelled" if isinstance(exc, KeyboardInterrupt) else "failed",
+                    status="cancelled" if was_cancelled else "failed",
                     input_text=message,
                     started_at=turn.started_at,
                     finished_at=utc_now(),
@@ -750,7 +769,7 @@ class RuntimeService:
                 ))
             # BaseException 保证 KeyboardInterrupt 时也能发出收尾事件并释放 run 槽位。
             self.publish(
-                "run_failed",
+                "run_cancelled" if was_cancelled else "run_failed",
                 session_id=target_id,
                 run_id=actual_run_id,
                 payload={"error": exc},
@@ -768,12 +787,12 @@ class RuntimeService:
             return list(self._runs)
 
     def cancel_run(self, run_id: str) -> bool:
-        """请求协作式取消；真正停止发生在 Orchestrator 的下一个安全检查点。"""
+        """取消当前 run，主动唤醒模型/MCP/命令等待，并阻止后续动作。"""
         with self._lock:
             active = self._runs.get(run_id)
             if active is None:
                 return False
-            active.cancel.cancel()
+        active.cancel.cancel()
         self.publish("run_cancel_requested", session_id=active.session_id, run_id=run_id)
         return True
 

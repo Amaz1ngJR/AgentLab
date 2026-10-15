@@ -264,6 +264,8 @@ def select_menu(
     @kb.add("escape", eager=True)
     @kb.add("c-c")
     def _cancel(event):
+        from app.util.input_arbiter import cancel_background_run
+        cancel_background_run()
         state["cancelled"] = True
         event.app.exit()
 
@@ -361,6 +363,8 @@ def prompt_text(message: str) -> Optional[str]:
     @kb.add("escape")
     @kb.add("c-c")
     def _cancel(event):
+        from app.util.input_arbiter import cancel_background_run
+        cancel_background_run()
         event.app.exit(exception=KeyboardInterrupt())
 
     try:

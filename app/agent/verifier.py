@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from app.agent.approval import ApprovalPolicy
+from app.agent.cancel import CancelToken, Cancelled
 from app.agent.goals import VerificationCheck
 from app.tools.builtin.shell import _build_argv
 
@@ -71,7 +72,7 @@ class Verifier:
         self.approval = approval
         self.human_confirm = human_confirm
 
-    def verify(self, checks: list[VerificationCheck]) -> VerificationResult:
+    def verify(self, checks: list[VerificationCheck], *, cancel: CancelToken | None = None) -> VerificationResult:
         """执行验证计划，返回统一结果。
 
         规则（PRD §7.6.5）：
@@ -93,7 +94,11 @@ class Verifier:
         has_uncertain = False
 
         for check in checks:
-            result = self._run_check(check)
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            result = self._run_check(check, cancel=cancel)
+            if cancel is not None:
+                cancel.raise_if_cancelled()
             results.append(result)
 
             if result.status == "blocked":
@@ -132,10 +137,10 @@ class Verifier:
             next_hint=hint,
         )
 
-    def _run_check(self, check: VerificationCheck) -> CheckResult:
+    def _run_check(self, check: VerificationCheck, *, cancel: CancelToken | None = None) -> CheckResult:
         """执行单个检查项。"""
         if check.type == "command":
-            return self._check_command(check)
+            return self._check_command(check, cancel=cancel)
         elif check.type == "file_assertion":
             return self._check_file_assertion(check)
         elif check.type == "api":
@@ -150,7 +155,7 @@ class Verifier:
                 summary=f"验证器类型 '{check.type}' 尚未实现",
             )
 
-    def _check_command(self, check: VerificationCheck) -> CheckResult:
+    def _check_command(self, check: VerificationCheck, *, cancel: CancelToken | None = None) -> CheckResult:
         """command 验证器：运行命令，检查 exit code。
 
         用途：单元测试、lint、typecheck、构建命令
@@ -200,14 +205,15 @@ class Verifier:
         # 与内置 shell 工具复用相同的跨平台解释器选择：macOS/Linux 用 bash，
         # Windows 用 PowerShell；使用 argv 执行，避免 subprocess shell=True。
         try:
-            result = subprocess.run(
+            from app.util.process import run_process
+            result = run_process(
                 _build_argv(check.command),
                 cwd=str(self.workspace_root),
-                capture_output=True,
-                text=True,
-                errors="replace",
                 timeout=timeout,
+                cancel=cancel,
             )
+        except Cancelled:
+            raise
         except subprocess.TimeoutExpired:
             return CheckResult(
                 name=name,

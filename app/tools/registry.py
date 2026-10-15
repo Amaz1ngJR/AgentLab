@@ -471,11 +471,28 @@ class ToolRegistry:
         approval_token = _approved_action.set(approved_action)
         cancel_context = _cancel_token.set(cancel)
         try:
-            result = tool.executor(args or {})
+            # These builtins only read external data. A blocked DNS/HTTP request
+            # must not hold up turn cancellation; writes still finish cooperatively.
+            if (
+                cancel is not None and tool.origin == "builtin"
+                and tool.risk in {"read", "observe", "network"}
+                and name in {"web_search", "web_fetch", "code_search", "read_file", "list_dir"}
+            ):
+                import copy
+                from app.agent.cancel import run_read_only_cancellable
+                snapshot = copy.deepcopy(args or {})
+                result = run_read_only_cancellable(lambda: tool.executor(snapshot), cancel)
+            else:
+                result = tool.executor(args or {})
             if cancel is not None:
                 cancel.raise_if_cancelled()
             is_error = False
         except Cancelled:
+            self._emit_audit(
+                tool, args or {}, "Execution interrupted",
+                approval_action=required_action, outcome="cancelled", is_error=False,
+                elapsed_seconds=time.monotonic() - started,
+            )
             raise
         except ToolExecutionError as exc:
             result = str(exc)

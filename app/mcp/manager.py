@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from app.mcp.config import MCPServerConfig, PROJECT_ROOT
+from app.agent.cancel import Cancelled
 from app.util.redact import format_exception, redact
 
 
@@ -280,13 +281,24 @@ class MCPManager:
             return (f"MCP server '{server_name}' not connected", True)
         coro = session.call_tool(tool_name, arguments or {})
         fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        from app.tools.registry import current_cancel_token
+        cancel = current_cancel_token()
+        unsubscribe = cancel.add_callback(fut.cancel) if cancel is not None else lambda: None
         try:
             result = fut.result(timeout=timeout)
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+        except Cancelled:
+            raise
         except FuturesTimeout:
             fut.cancel()
             return (f"timeout: MCP tool '{tool_name}' exceeded {timeout}s", True)
         except Exception as exc:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
             return (format_exception(exc), True)
+        finally:
+            unsubscribe()
         return _content_to_text(result)
 
     # ── 关闭 ─────────────────────────────────────────────────────────────────

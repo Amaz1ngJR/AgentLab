@@ -169,6 +169,7 @@ def test_callbacks_run_before_cancel_returns():
 
 def test_close_on_cancel_closes_resource():
     token = CancelToken()
+    closed = threading.Event()
 
     class Stream:
         def __init__(self):
@@ -176,10 +177,12 @@ def test_close_on_cancel_closes_resource():
 
         def close(self):
             self.closed += 1
+            closed.set()
 
     stream = Stream()
     with close_on_cancel(token, stream):
         token.cancel()
+    assert closed.wait(1)
     assert stream.closed == 1
 
 
@@ -239,3 +242,35 @@ def test_concurrent_cancel_fires_callback_exactly_once():
 
     assert fired == [1]
     assert token.cancelled is True
+
+
+def test_cancel_does_not_wait_for_blocking_stream_close():
+    import time
+
+    token = CancelToken()
+    started = threading.Event()
+    release = threading.Event()
+
+    class Stream:
+        def close(self):
+            started.set()
+            release.wait(2)
+
+    try:
+        with close_on_cancel(token, Stream()):
+            start = time.monotonic()
+            token.cancel()
+            assert time.monotonic() - start < 0.2
+            assert started.wait(1)
+    finally:
+        release.set()
+
+
+def test_steering_is_fifo_and_cancelled_token_rejects_new_input():
+    token = CancelToken()
+    assert token.steer("first")
+    assert token.steer("second")
+    assert token.drain_steering() == ["first", "second"]
+    assert not token.has_steering
+    token.cancel()
+    assert not token.steer("late")

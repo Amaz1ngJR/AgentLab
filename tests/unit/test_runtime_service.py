@@ -154,6 +154,45 @@ def test_cancel_run_reaches_session_token():
     worker.join(1)
     assert result == ["cancelled"]
     assert session.cancel_seen
+
+
+def test_steer_queues_without_switching_session_or_mutating_active_history():
+    gate = threading.Event()
+    session = _Session(gate)
+    router = _Router({"s1": session, "s2": _Session()})
+    service = RuntimeService(router)
+    started = threading.Event()
+    service.subscribe(lambda event: started.set() if event.kind == "run_started" else None)
+    worker = threading.Thread(target=lambda: service.send_message("original", run_id="r1"))
+    worker.start()
+    try:
+        assert started.wait(1)
+        router.switch("s2")
+        assert service.steer_turn("r1", "new direction")
+        assert router.current_id == "s2"
+        assert {"role": "user", "content": "new direction"} not in session.messages
+        gate.set()
+        worker.join(1)
+        assert not worker.is_alive()
+        assert session.messages[-1] == {"role": "user", "content": "new direction"}
+        assert not service.steer_turn("r1", "too late")
+    finally:
+        gate.set()
+        worker.join(1)
+        service.close()
+
+
+def test_cancelled_turn_emits_cancelled_instead_of_completed():
+    token = CancelToken()
+    token.cancel()
+    service = RuntimeService(_Router({"s1": _Session()}))
+    events = []
+    service.subscribe(events.append)
+    try:
+        service.send_message("hello", cancel=token)
+        assert events[-1].kind == "run_cancelled"
+    finally:
+        service.close()
     assert service.active_runs() == []
 
 
