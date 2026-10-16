@@ -1,6 +1,7 @@
 """Agent Runtime —— 驱动"模型 → 工具 → 模型"的多轮对话循环。"""
 from __future__ import annotations
 
+import math
 import re
 import time
 from contextlib import nullcontext
@@ -149,8 +150,25 @@ class AgentSession:
         on_run_event: Optional[Callable[[RunEvent], None]] = None,
         context_manager: Optional[Any] = None,
         mode: ExecutionMode | str | None = None,
+        delegation_policy: str = "explicit",
+        max_parallel_agents: int = 2,
+        max_tool_calls: int = 120,
+        timeout_seconds: float = 300,
     ):
         self.llm = llm
+        from app.agent.delegation_policy import POLICIES
+        if delegation_policy not in POLICIES or not 1 <= max_parallel_agents <= 4:
+            raise ValueError("invalid delegation policy or concurrency limit")
+        self.delegation_policy = delegation_policy
+        self.max_parallel_agents = max_parallel_agents
+        if max_tool_calls <= 0 or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("invalid shared tool/time budget")
+        self.max_tool_calls = max_tool_calls
+        self.timeout_seconds = timeout_seconds
+        self.child_records: list[dict] = []
+        self._retiring_managers: list = []
+        self.child_checkpoint = lambda records: None
+        self._delegation_allowed = False
         self.tools = tools
         self.approval: ApprovalPolicy = approval or AutoApprove()
         self.system_prompt = system_prompt
@@ -221,6 +239,7 @@ class AgentSession:
         catalog = getattr(self, "skill_catalog", None)
         profile_skills = getattr(self, "profile_skills", None)
         base_prompt = getattr(self, "base_system_prompt", self.system_prompt)
+        self._delegation_workflow = ""
         if catalog is None:
             return
         activated = catalog.match(user_input, profile_skills)
@@ -228,6 +247,7 @@ class AgentSession:
             skill for skill in (catalog.load_skill(s.skill_id) for s in activated) if skill
         ]
         workflow = catalog.build_skill_context(loaded)
+        self._delegation_workflow = "\n".join(skill.workflow for skill in loaded)
         skill_index = catalog.build_skill_index(profile_skills)
         catalog.record_disclosure(
             catalog.index(profile_skills), loaded, len(skill_index), len(workflow),
@@ -301,6 +321,9 @@ class AgentSession:
 
     def close(self) -> None:
         """释放会话持有的外部资源(MCP server 进程等)。重复调用安全。"""
+        for manager in self._retiring_managers:
+            manager.cancel_all()
+            manager.pump()
         for c in self._closeables:
             stop = getattr(c, "stop", None) or getattr(c, "close", None)
             if stop is not None:
@@ -387,6 +410,9 @@ class AgentSession:
             )
         # 每次都重新指向当前 messages:switch/reset 可能换过引用
         self._orch.messages = self.messages
+        self._orch._tools = self.tools
+        self._orch._executor._tools = self.tools
+        self._orch._allow_subagents = self._delegation_allowed
         return self._orch
 
     def _select_mode(
@@ -441,14 +467,86 @@ class AgentSession:
             text=f"执行模式: {mode.value}",
             payload={"mode": mode.value},
         ))
-        if mode is ExecutionMode.DIRECT:
-            return self._chat_legacy(user_input, images=images, cancel=cancel)
-        # AUTO 模式的 Task/Loop 仍使用现有 Orchestrator；Loop 的完整生命周期
-        # 由 LoopCommandHandler 驱动，这里只负责普通目标的规划执行。
-        return self._chat_orchestrated(
-            user_input, images=images, cancel=cancel,
-            resume=resume,
+        from app.agent.agent_manager import AgentManager, DelegationRegistry
+        from app.agent.delegation_policy import delegation_allowed
+        from app.config.loader import workspace_root
+        cancel = cancel or CancelToken()
+        retiring = []
+        for previous in self._retiring_managers:
+            before = dict(previous.usage)
+            previous.pump()
+            for key, value in previous.usage.items():
+                self.cumulative_usage[key] += value - before.get(key, 0)
+            if any(not child.done.is_set() for child in previous.children.values()):
+                retiring.append(previous)
+        self._retiring_managers = retiring
+        if any(not child.spec.read_only and not child.done.is_set()
+               for previous in retiring for child in previous.children.values()):
+            self.last_run_status = "blocked"
+            self.last_run_error = "上轮写入子任务仍在停止中；保留作用域锁，不能开始新写入运行。"
+            return self.last_run_error
+        latest_records = []
+        if self.child_records:
+            latest_run = max(self.child_records, key=lambda record: (
+                record.get("parent_started_at", record.get("started_at", 0)),
+                record.get("started_at", 0),
+            )).get("parent_run_id")
+            latest_records = [record for record in self.child_records if record.get("parent_run_id") == latest_run]
+        resume_workflow = ""
+        if resume and latest_records and latest_records[-1].get("delegation_allowed"):
+            # Resume continues an already authorized run, not a fresh implicit delegation.
+            # delegation_allowed still gives off and a new user veto precedence.
+            resume_workflow = "使用子 agent 继续已授权任务"
+        self._delegation_allowed = delegation_allowed(
+            self.delegation_policy, user_input,
+            workflow=getattr(self, "_delegation_workflow", "") + resume_workflow,
         )
+        source = self.tools
+
+        def checkpoint(records):
+            merged = {record["child_run_id"]: record for record in self.child_records}
+            merged.update({record["child_run_id"]: record for record in records})
+            self.child_records = list(merged.values())
+            self.child_checkpoint(records)
+
+        manager = AgentManager(
+            llm=self.llm, tools=source, approval=self.approval, workspace=workspace_root(),
+            cancel=cancel, allowed=self._delegation_allowed, system=self.system_prompt,
+            context=user_input, max_parallel=self.max_parallel_agents,
+            model_rounds=self.max_steps, task_rounds=self.max_task_steps,
+            tool_calls=self.max_tool_calls, timeout=self.timeout_seconds,
+            on_event=self._emit_run_event, checkpoint=checkpoint,
+            history=self.messages,
+        )
+        if resume and self._delegation_allowed:
+            manager.restore_results(latest_records, messages=self.messages)
+        self.tools = DelegationRegistry(source, manager)
+        try:
+            if mode is ExecutionMode.DIRECT:
+                answer = self._chat_legacy(user_input, images=images, cancel=cancel)
+            else:
+                answer = self._chat_orchestrated(user_input, images=images, cancel=cancel, resume=resume)
+            manager.pump()
+            unresolved = manager.unresolved()
+            if unresolved and self.last_run_status == "completed":
+                self.last_run_status = "blocked"
+                answer += "\n\n委派尚未交付：" + "; ".join(unresolved)
+                self._emit_run_event(RunEvent(kind=events.RUN_FAILED, text=answer,
+                                             payload={"children": manager.records()}))
+            return answer
+        finally:
+            try:
+                manager.finish()
+                if any(not child.done.is_set() for child in manager.children.values()):
+                    self._retiring_managers.append(manager)
+                for key, value in manager.usage.items():
+                    self.last_turn_usage[key] += value
+                    self.cumulative_usage[key] += value
+            finally:
+                self.tools = source
+                if self._orch is not None:
+                    self._orch._tools = source
+                    self._orch._executor._tools = source
 
     def _chat_orchestrated(
         self,
@@ -548,6 +646,10 @@ class AgentSession:
                     ))
                     return "已中断。"
                 steering = apply_steering(cancel, self.messages)
+                manager = getattr(self.tools, "manager", None)
+                if manager is not None:
+                    manager.deliver(self.messages)
+                    manager.charge_parent_round()
                 if steering:
                     tool_context += "\n" + "\n".join(steering)
                     tools = self._tools_for_task(tool_context, mode="direct")
@@ -618,6 +720,9 @@ class AgentSession:
                 response_text = resp.text or "".join(streamed_parts)
 
                 if not resp.tool_calls:
+                    manager = getattr(self.tools, "manager", None)
+                    if manager is not None and manager.settle_before_final(self.messages):
+                        continue
                     steering = apply_steering(cancel, self.messages)
                     if steering:
                         tool_context += "\n" + "\n".join(steering)
@@ -703,6 +808,9 @@ class AgentSession:
                         self.messages.extend(
                             self.llm.format_tool_results(tool_results + pending)
                         )
+                        manager = getattr(self.tools, "manager", None)
+                        if manager is not None:
+                            manager.acknowledge_tool_results(tool_results + pending)
                         tool_results.clear()
 
                 try:
@@ -817,6 +925,11 @@ class AgentSession:
                             # 进入历史前截断超大输出(与编排路径一致,见 executor)。
                             from app.agent.executor import _truncate_tool_output
                             output = _truncate_tool_output(output)
+                            # Only bind result envelopes actually retained in history.
+                            if call.name == "wait_agent":
+                                binder = getattr(self.tools, "manager", None)
+                                if binder is not None:
+                                    binder.bind_wait_tool_result(call.id, output, is_error)
                             if not is_error and call.name not in {"todo_write", "load_skill"}:
                                 successful_tool_calls += 1
                             self._emit_turn_event(TurnEvent(
@@ -844,6 +957,9 @@ class AgentSession:
                 # OpenAI Responses 三家不一样),Runtime 不关心
                 if tool_results:
                     self.messages.extend(self.llm.format_tool_results(tool_results))
+                    manager = getattr(self.tools, "manager", None)
+                    if manager is not None:
+                        manager.acknowledge_tool_results(tool_results)
 
             self.last_run_status = "budget_exhausted"
             answer = (

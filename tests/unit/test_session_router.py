@@ -5,7 +5,7 @@ from app.agent.session_router import SessionRouter
 from app.agent.approval import AutoApprove
 from app.storage import Storage
 from app.tools.registry import ToolRegistry
-from app.models.protocol import ModelResponse
+from app.models.protocol import ModelResponse, ToolResult
 
 
 class _FakeRouter:
@@ -295,3 +295,183 @@ def test_non_session_command_returns_none(tmp_path):
     r = _make_router(Storage(tmp_path / "db"), _profiles())
     assert r.handle_command("/reset") is None
     assert r.handle_command("hello world") is None
+
+
+def test_checkpoint_before_child_start_restores_dag_history_and_association(tmp_path, monkeypatch):
+    import json
+    from app.agent.subagent_runtime import SubagentRuntimeFactory
+    from tests.unit.test_execution_plan import FakeRouter, registry, response
+    from app.config.loader import use_workspace_root
+    db_path = tmp_path / "crash.db"
+    db = Storage(db_path)
+    observed = []
+    class Parent(FakeRouter):
+        def fork(self):
+            return FakeRouter([response("child finding")])
+    plan = {"version": 1, "tasks": [
+        {"id": "prepare", "content": "prepare"},
+        {"id": "research", "content": "research", "dependencies": ["prepare"],
+         "executor": "subagent", "subagent": {"id": "researcher", "instruction": "总结已给材料",
+         "role": "research", "read_only": True, "max_steps": 2, "max_tool_calls": 2}},
+    ]}
+    def factory(profile, session_id):
+        prepared = response("PREPARED_CONTEXT")
+        prepared.provider_payload = [{"role": "assistant", "content": "PREPARED_CONTEXT"}]
+        return AgentSession(Parent([response(json.dumps(plan)), prepared,
+                                    response("parent synthesis")]), registry(), orchestrate=True, max_steps=16)
+    router = SessionRouter(storage=db, session_factory=factory, profiles=_profiles(), default_profile_id="default")
+    sid = router.new("default")
+    original_delegate = SubagentRuntimeFactory.delegate
+    def probe(self, spec, workspace, cancel):
+        # Independent connection before any child model or tool runs; no persist_current().
+        disk = Storage(db_path)
+        tasks = {task["id"]: task for task in disk.load_tasks(sid)}
+        records = disk.load_child_runs(sid)
+        history = disk.load_messages(sid)
+        assert len(records) == 1
+        assert tasks["research"]["execution"]["child_run_id"] == spec.subagent_id
+        assert tasks["research"]["status"] == "in_progress"
+        assert tasks["research"]["dependencies"] == ["prepare"]
+        assert tasks["prepare"]["status"] == "completed"
+        assert "PREPARED_CONTEXT" in json.dumps(history)
+        restored = SessionRouter(storage=disk, session_factory=factory, profiles=_profiles(), default_profile_id="default")
+        assert restored.switch(sid)
+        assert restored.current.child_records[0]["execution_status"] == "interrupted"
+        assert restored.current.task_store.get("research").execution["child_run_id"] == spec.subagent_id
+        assert restored.current.messages
+        observed.append(True)
+        disk.close()
+        return original_delegate(self, spec, workspace, cancel)
+    monkeypatch.setattr(SubagentRuntimeFactory, "delegate", probe)
+    with use_workspace_root(tmp_path):
+        answer = router.current.chat("多个 agent 调查")
+        assert answer == "parent synthesis", str([(r["status"], r["error"]) for r in router.current.child_records])
+    assert observed == [True]
+    db.close()
+
+
+def test_delegation_checkpoint_rolls_back_all_parts_on_failure(tmp_path, monkeypatch):
+    import pytest
+    db_path = tmp_path / "atomic.db"
+    db = Storage(db_path)
+    db.create_session("s", "default", "fake")
+    db.save_messages("s", [{"role": "user", "content": "previous"}])
+    def fail(*args):
+        raise RuntimeError("disk failure")
+    monkeypatch.setattr(db, "save_child_runs", fail)
+    with pytest.raises(RuntimeError, match="disk failure"):
+        db.save_delegation_checkpoint("s", messages=[{"role": "user", "content": "new"}],
+                                      tasks=[{"id": "task"}], records=[])
+    disk = Storage(db_path)
+    assert disk.load_messages("s") == [{"role": "user", "content": "previous"}]
+    assert disk.load_tasks("s") == []
+    disk.close()
+    db.close()
+
+
+def test_portable_checkpoint_receipt_survives_merged_user_messages(tmp_path):
+    import json
+    from tests.unit.test_agent_manager import manager
+    db_path = tmp_path / "receipt.db"
+    db = Storage(db_path)
+    router = _make_router(db, _profiles())
+    session_id = router.new("default")
+    session = router.current
+    session.messages.append({"role": "user", "content": "original goal"})
+    m = manager(tmp_path, checkpoint=session.child_checkpoint)
+    sid = m.spawn("调查")["child_run_id"]
+    m.wait([sid], 2, consume=False)
+    assert m.deliver(session.messages)
+    records = db.load_child_runs(session_id)
+    assert records[0]["delivery_receipt"] == {
+        "parent_run_id": m.run_id, "result_id": sid, "revision": 1,
+    }
+    history = db.load_messages(session_id)
+    assert len(history) == 1 and history[0]["content"].startswith("original goal")
+    assert json.dumps(history).count("CHILD_FINDING") == 1
+    m.finish()
+    db.close()
+
+    # Only checkpoint writes above; no end-of-turn persist_current().
+    for _ in range(2):
+        db = Storage(db_path)
+        router = _make_router(db, _profiles())
+        assert router.switch(session_id)
+        restored = manager(tmp_path, checkpoint=router.current.child_checkpoint)
+        restored.restore_results(router.current.child_records, messages=router.current.messages)
+        assert restored.result_delivered(sid)
+        assert not restored.deliver(router.current.messages)
+        assert json.dumps(router.current.messages).count("CHILD_FINDING") == 1
+        restored.finish()
+        db.close()
+
+
+def test_wait_receipt_is_committed_only_after_result_enters_history(tmp_path):
+    import json
+    from tests.unit.test_agent_manager import manager
+    db = Storage(tmp_path / "wait.db")
+    router = _make_router(db, _profiles())
+    session_id = router.new("default")
+    session = router.current
+    session.messages.append({"role": "user", "content": "original goal"})
+    m = manager(tmp_path, checkpoint=session.child_checkpoint)
+    sid = m.spawn("调查")["child_run_id"]
+    result = m.wait([sid], 2)
+    records = db.load_child_runs(session_id)
+    assert records[0]["delivered_revision"] is None
+    assert records[0]["delivery_receipt"] is None
+    recovered = manager(tmp_path)
+    history = db.load_messages(session_id)
+    recovered.restore_results(records, messages=history)
+    assert recovered.deliver(history)  # Crash before tool result append must not lose it.
+    recovered.finish()
+
+    # 仿真父进程路径:先绑定(tool 执行完、截断后),再入历史,最后才确认。
+    output = json.dumps(result)
+    m.bind_wait_tool_result("call-wait", output, False)
+    session.messages.append({"role": "user", "content": output})
+    m.acknowledge_tool_results([
+        ToolResult(tool_call_id="call-wait", output=output, is_error=False),
+    ])
+    records = db.load_child_runs(session_id)
+    assert records[0]["delivery_receipt"]["revision"] == 1
+    history = db.load_messages(session_id)
+    assert len(history) == 1  # portable history merged goal and tool output
+    recovered = manager(tmp_path)
+    recovered.restore_results(records, messages=history)
+    assert not recovered.deliver(history)
+    assert json.dumps(history).count("CHILD_FINDING") == 1
+    recovered.finish()
+    m.finish()
+    db.close()
+
+
+def test_delivery_receipt_and_history_rollback_together(tmp_path, monkeypatch):
+    import pytest
+    from tests.unit.test_agent_manager import manager
+    db = Storage(tmp_path / "rollback.db")
+    router = _make_router(db, _profiles())
+    session_id = router.new("default")
+    session = router.current
+    session.messages.append({"role": "user", "content": "original goal"})
+    m = manager(tmp_path, checkpoint=session.child_checkpoint)
+    sid = m.spawn("调查")["child_run_id"]
+    m.wait([sid], 2, consume=False)
+    save = db.save_child_runs
+    def fail_after_write(*args):
+        save(*args)
+        raise RuntimeError("checkpoint failure after receipt write")
+    with monkeypatch.context() as patch:
+        patch.setattr(db, "save_child_runs", fail_after_write)
+        with pytest.raises(RuntimeError, match="checkpoint failure"):
+            m.deliver(session.messages)
+    history = db.load_messages(session_id)
+    records = db.load_child_runs(session_id)
+    assert history == [{"role": "user", "content": "original goal"}]
+    assert records[0]["delivery_receipt"] is None
+    restored = manager(tmp_path)
+    restored.restore_results(records, messages=history)
+    assert restored.deliver(history)
+    restored.finish()
+    m.finish()
+    db.close()

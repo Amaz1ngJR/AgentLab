@@ -212,6 +212,10 @@ class Executor:
             if cancel is not None:
                 cancel.raise_if_cancelled()
             steering = apply_steering(cancel, messages)
+            manager = getattr(self._tools, "manager", None)
+            if manager is not None:
+                manager.deliver(messages)
+                manager.charge_parent_round()
             if steering:
                 seen_tool_signatures.clear()
                 task_context += "\n" + "\n".join(steering)
@@ -295,6 +299,9 @@ class Executor:
 
             # 没有工具调用 = 模型认为这个子任务已经做完
             if not resp.tool_calls:
+                manager = getattr(self._tools, "manager", None)
+                if manager is not None and manager.settle_before_final(messages):
+                    continue
                 steering = apply_steering(cancel, messages)
                 if steering:
                     seen_tool_signatures.clear()
@@ -377,7 +384,12 @@ class Executor:
                     for c in resp.tool_calls if c.id not in resulted_ids
                 ]
                 if pending:
-                    messages.extend(self._llm.format_tool_results(tool_results + pending))
+                    combined = tool_results + pending
+                    messages.extend(self._llm.format_tool_results(combined))
+                    manager = getattr(self._tools, "manager", None)
+                    if manager is not None:
+                        # 合成占位结果与已绑定输出不相等,不会被误确认。
+                        manager.acknowledge_tool_results(combined)
                     tool_results.clear()  # 已随 pending 一起入历史,避免下方重复 extend
 
             try:
@@ -486,6 +498,11 @@ class Executor:
                         # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
                         # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
                         output = _truncate_tool_output(output)
+                        # wait batches are bounded per result before serialization.
+                        if call.name == "wait_agent":
+                            binder = getattr(self._tools, "manager", None)
+                            if binder is not None:
+                                binder.bind_wait_tool_result(call.id, output, is_error)
                         if not is_error and call.name not in {"todo_write", "load_skill"}:
                             successful_tool_calls += 1
                         self._emit(RunEvent(
@@ -527,6 +544,9 @@ class Executor:
 
             if tool_results:
                 messages.extend(self._llm.format_tool_results(tool_results))
+                manager = getattr(self._tools, "manager", None)
+                if manager is not None:
+                    manager.acknowledge_tool_results(tool_results)
 
             # tool_result 刚入历史后再次预检，尽早压缩下一轮要发送的上下文。
             if self._ctx is not None:

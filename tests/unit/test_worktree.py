@@ -199,3 +199,27 @@ def test_worktree_merge_suggestion_rejects_dirty_worktree(git_repo):
 
     assert "不能直接合并" in suggestion
     assert "git merge worktree/" not in suggestion
+
+
+def test_changed_files_handles_unicode_spaces_rename_delete_and_untracked(git_repo):
+    manager = WorktreeManager(git_repo)
+    worktree = manager.create("paths")
+    renamed = "中文 空格\t文件.txt"
+    subprocess.run(["git", "mv", "README.md", renamed], cwd=worktree.path, check=True)
+    (worktree.path / "未跟踪 文件.txt").write_text("a\r\nb\r\n")
+    changed = manager.changed_files(worktree)
+    assert changed == sorted(["README.md", renamed, "未跟踪 文件.txt"])
+
+
+def test_state_fingerprint_detects_untracked_content_changes(git_repo):
+    manager = WorktreeManager(git_repo)
+    (git_repo / "new.txt").write_text("first")
+    first = manager.state_fingerprint()
+    (git_repo / "new.txt").write_text("second")
+    assert manager.state_fingerprint() != first
+
+
+@pytest.mark.parametrize("worktree_id", ["../escape", "/absolute", "a/b", "a\\b", "..", ""])
+def test_worktree_rejects_escaping_id(git_repo, worktree_id):
+    with pytest.raises(ValueError, match="worktree_id"):
+        WorktreeManager(git_repo).create(worktree_id)

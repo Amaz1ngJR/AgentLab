@@ -90,7 +90,17 @@ class SessionRouter:
             workspace=str(workspace_root()),
         )
         self.current_id = session_id
+        self._bind_checkpoint(session, session_id)
         return session_id
+
+    def _bind_checkpoint(self, session, session_id: str) -> None:
+        from app.models.history import make_history_portable
+        # delivery_receipt lives in structured child records, not in display text:
+        # portable history may merge messages. Commit both in the same transaction.
+        session.child_checkpoint = lambda records: self._storage.save_delegation_checkpoint(
+            session_id, messages=make_history_portable(session.messages),
+            tasks=session.task_store.snapshot(), records=records,
+        )
 
     def switch(self, session_id: str) -> bool:
         """切换到已有 session（内存或 SQLite 恢复），返回是否成功。"""
@@ -116,6 +126,8 @@ class SessionRouter:
                 )
             session = self._factory(profile, session_id)
             session.messages = self._storage.load_messages(session_id)
+            session.child_records = self._storage.load_child_runs(session_id)
+            self._bind_checkpoint(session, session_id)
             # 恢复任务快照(若有):让 /session switch 后任务面板与编排状态接上
             tasks_snapshot = self._storage.load_tasks(session_id)
             if tasks_snapshot and getattr(session, "task_store", None) is not None:

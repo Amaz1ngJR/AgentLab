@@ -3,6 +3,7 @@
 # 每个 profile 定义一个 Agent 实例的静态配置。
 # 启动后用 /session new <agent_id> 创建该 Agent 的会话。
 # 文件不存在时程序照常启动（使用默认 Agent）。
+# 本文件仅是示例；实际读取 config/agents.yaml。修改实际配置后重启并新建会话。
 #
 # 配置说明：
 #
@@ -24,9 +25,26 @@
 #   task   - 所有请求都使用任务编排
 #   legacy - 沿用旧式 orchestrate 开关（true 强制编排，false 直接执行）
 #
+# delegation_policy（与 mode、自动审批独立）：
+#   "off"    - 禁止启动子 Agent；请保留引号，避免 YAML 将 off 解析成布尔值
+#   explicit - 仅用户或适用 Skill 明确要求委派时允许（默认）
+#   auto     - 允许模型根据独立任务的收益决定是否委派，不保证一定启动子 Agent
+#   explicit 示例：请用多个 agent 并行检查运行时和存储，最后汇总结论。
+#
+# max_parallel_agents:
+#   同一父请求内同时运行的子 Agent 上限，范围 1..4，默认 2。
+#   不是 /session 会话数量；计划自身的并发数、预算和权限也会限制实际并发。
+#   子 Agent 不再嵌套创建子 Agent，父级负责汇总；写入产物需验证、审批和集成。
+#
 # max_steps / max_task_steps:
-#   max_steps      - 一次用户请求的模型往返总预算
-#   max_task_steps - 单个子任务的模型往返上限（仅编排模式有效）
+#   max_steps      - 一次用户请求的模型往返预算；启用委派时父子共享并预留预算
+#   max_task_steps - 主计划任务与子 Agent 共用的单任务轮次上限，省略则继承 max_steps
+#   子 Agent 不再默认限制为 8 轮或最多 32 轮；实际分配还受剩余总预算和并发数限制。
+#
+# max_tool_calls / timeout_seconds:
+#   启用委派时父子共用的总工具次数（默认 120）和请求时间预算（默认 300 秒）。
+#   子 Agent 默认继承同一配置，并发时分配剩余额度，给父级汇总和验证留出余量。
+#   模型可请求更小的任务预算，但不能扩大总预算；取消、只读和审批约束保持不变。
 #
 # skills:
 #   显式启用的 Skill 列表（对应 skills/ 目录下的 skill）
@@ -38,14 +56,19 @@
 
 agents:
 
-  # 默认通用助手（不写 agents.yaml 时的默认行为）
+  # 默认通用助手：显式要求时才委派
   default:
     name: 默认助手
     model_profile: cloud_claude_opus
     memory_policy: none
     orchestrate: true
+    mode: auto
+    delegation_policy: explicit
+    max_parallel_agents: 2
     max_steps: 16
     max_task_steps: 8
+    max_tool_calls: 120
+    timeout_seconds: 300
     skills: []
 
   # 代码助手——专注于代码审查、重构和测试
@@ -58,11 +81,18 @@ agents:
       2. 改动最小化，不做无关重构
       3. 修改后立即运行测试验证
       4. 代码风格与项目现有代码保持一致
+      5. 仅将独立且有收益的工作委派给子 Agent；简单任务自行完成，避免重复调查
+      6. 委派后由你汇总证据、检查冲突并验证结果；未集成的修改不能宣称已交付
     skills: [code-review, git-commit]
     memory_policy: read_write
     orchestrate: true
-    max_steps: 100
-    max_task_steps: 50
+    mode: auto
+    delegation_policy: auto
+    max_parallel_agents: 4
+    max_steps: 10000
+    max_task_steps: 500
+    max_tool_calls: 120
+    timeout_seconds: 600
 
   # 本地助手——使用本地模型，数据不出本机
   local:
@@ -70,8 +100,13 @@ agents:
     model_profile: local_qwen3_14b
     memory_policy: none
     orchestrate: true
+    mode: auto
+    delegation_policy: explicit
+    max_parallel_agents: 2
     max_steps: 16
     max_task_steps: 8
+    max_tool_calls: 120
+    timeout_seconds: 300
     skills: []
 
   # 研究助手——擅长信息检索和分析
@@ -87,8 +122,13 @@ agents:
     skills: []
     memory_policy: read_write
     orchestrate: true
+    mode: auto
+    delegation_policy: explicit
+    max_parallel_agents: 2
     max_steps: 32
     max_task_steps: 16
+    max_tool_calls: 120
+    timeout_seconds: 300
 
   # 快速助手——简单任务，快速响应
   quick:
@@ -96,5 +136,8 @@ agents:
     model_profile: siliconflow
     memory_policy: none
     orchestrate: false  # 不拆分任务，直接执行
+    mode: direct
+    delegation_policy: "off"
+    max_parallel_agents: 1
     max_steps: 8
     skills: []

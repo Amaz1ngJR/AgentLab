@@ -37,6 +37,13 @@ class ModelRouter:
         self._breaker = ProviderCircuitBreaker()
         self._retry_sleep = retry_sleep
 
+    def fork(self) -> "ModelRouter":
+        """Independent SDK client and retry breaker for concurrent child runs."""
+        cfg = getattr(self._adapter, "_cfg", None)
+        if cfg is None:
+            raise ValueError("provider does not support isolated child clients")
+        return build_model_router(copy.deepcopy(cfg))
+
     @property
     def model(self) -> str:
         return self._adapter.model

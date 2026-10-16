@@ -164,11 +164,12 @@ def test_claim_next_respects_dependencies():
     assert second.id == "t2"
 
 
-def test_claim_next_missing_dependency_treated_satisfied():
-    """依赖一个不存在的 id 不应永久卡死(容忍模型写错依赖)。"""
+def test_claim_next_missing_dependency_is_blocked():
+    """未知依赖不可作为成功证据。"""
     store = TaskStore()
     store.add(Task("t1", "x", dependencies=["nope"]))
-    assert store.claim_next().id == "t1"
+    assert store.claim_next() is None
+    assert store.is_stalled()
 
 
 def test_update_status_records_evidence_error_history():

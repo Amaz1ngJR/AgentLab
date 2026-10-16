@@ -144,7 +144,7 @@ class InteractivePolicy:
     # workspace 越界和交互终端执行必须逐次确认，不能被会话白名单吞掉。
     # workspace 内 shell 可在用户明确选择后按受限命令前缀记住到当前 session。
     _NON_PERSISTENT_ACTIONS = {
-        "shell", "bash", "terminal_open", "terminal_send", "clear_session_images",
+        "shell", "bash", "terminal_open", "terminal_send", "clear_session_images", "integrate_agent",
     }
     _NON_PERSISTENT_RISKS = {
         "browser_control",
@@ -231,6 +231,15 @@ class InteractivePolicy:
             if other_params:
                 lines.append(f"  ({', '.join(other_params)})")
             return lines
+
+        # Integration approval must expose the exact artifact, not a 100-character
+        # generic preview. JSON escaping keeps terminal control characters inert.
+        if tool_name == "integrate_agent":
+            return ["● integrate_agent", *[
+                "  " + line for line in json.dumps(
+                    tool_input, ensure_ascii=False, indent=2, default=repr,
+                ).splitlines()
+            ]]
 
         # 默认：简洁显示工具名 + 参数摘要
         try:

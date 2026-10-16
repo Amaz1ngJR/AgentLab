@@ -139,3 +139,140 @@ def test_invalid_dependency_is_rejected_before_worktree_creation(git_repo):
         coordinator.run([SubagentSpec("a", "work", dependencies=("missing",))])
 
     assert not (git_repo / "data" / "worktrees").exists()
+
+
+def test_real_result_collects_changes_and_emits_only_final_conflicts(git_repo):
+    from app.agent.subagents import SubagentResult
+    events = []
+
+    def delegate(spec, workspace, cancel):
+        (workspace / "README.md").write_text(spec.subagent_id)
+        return SubagentResult(spec.subagent_id, spec.role, "succeeded", output="edited")
+
+    results = SubagentCoordinator(WorktreeManager(git_repo), delegate, on_event=events.append).run([
+        SubagentSpec("a", "edit"), SubagentSpec("b", "edit"),
+    ])
+    assert all(r.changed_files == ["README.md"] for r in results.values())
+    completed = [e for e in events if e.kind == "subagent_completed"]
+    assert len(completed) == 2
+    assert all(e.payload["status"] == "conflict" for e in completed)
+
+
+def test_merge_plan_rejects_committed_but_still_dirty_worktree(git_repo):
+    def delegate(spec, workspace, cancel):
+        (workspace / "child.txt").write_text("committed")
+        _commit(workspace, "child")
+        (workspace / "child.txt").write_text("not committed")
+        return "done"
+
+    coordinator = SubagentCoordinator(WorktreeManager(git_repo), delegate)
+    results = coordinator.run([SubagentSpec("a", "edit")])
+    plan = coordinator.merge_plan(results)
+    assert not plan[0]["mergeable"]
+    assert "未提交" in plan[0]["reason"]
+
+
+def test_merge_plan_rejects_uncommitted_parent_drift(git_repo):
+    def delegate(spec, workspace, cancel):
+        (workspace / "child.txt").write_text("committed")
+        _commit(workspace, "child")
+        return "done"
+
+    coordinator = SubagentCoordinator(WorktreeManager(git_repo), delegate)
+    results = coordinator.run([SubagentSpec("a", "edit")])
+    (git_repo / "README.md").write_text("parent drift without commit")
+    assert not coordinator.merge_plan(results)[0]["mergeable"]
+
+
+def test_coordinator_uses_separate_child_mailboxes(git_repo):
+    from app.agent.cancel import CancelToken
+    parent = CancelToken()
+    parent.steer("parent only")
+    tokens = []
+
+    def delegate(spec, workspace, cancel):
+        tokens.append(cancel)
+        assert not cancel.has_steering
+        return "done"
+
+    SubagentCoordinator(WorktreeManager(git_repo), delegate).run([
+        SubagentSpec("a", "read", read_only=True), SubagentSpec("b", "read", read_only=True),
+    ], cancel=parent)
+    assert tokens[0] is not tokens[1] and parent not in tokens
+    assert parent.drain_steering() == ["parent only"]
+
+
+def test_mergeable_snapshot_is_refreshed_after_workspace_changes(git_repo):
+    def delegate(spec, workspace, cancel):
+        (workspace / "child.txt").write_text("ready")
+        _commit(workspace, "child")
+        return "done"
+
+    coordinator = SubagentCoordinator(WorktreeManager(git_repo), delegate)
+    results = coordinator.run([SubagentSpec("a", "edit")])
+    assert not results["a"].mergeable  # 尚未校验
+    assert coordinator.merge_plan(results)[0]["mergeable"]
+    assert results["a"].mergeable
+    (results["a"].workspace / "child.txt").write_text("dirty again")
+    assert not coordinator.merge_plan(results)[0]["mergeable"]
+    assert not results["a"].mergeable
+
+
+def test_parent_task_dependency_allows_real_writer_but_not_delivery(git_repo):
+    import json
+    from app.agent.approval import AutoApprove
+    from app.agent.orchestrator import Orchestrator
+    from app.config.loader import use_workspace_root
+    from app.models.protocol import ModelResponse, ToolCall
+    from app.tools.builtin.files import default_tools
+    from app.tools.registry import ToolRegistry
+    from tests.unit.test_multiagent_handoff import SnapshotRouter
+    from tests.unit.test_execution_plan import response
+
+    tools = ToolRegistry()
+    for tool in default_tools():
+        tools.register(tool)
+    plan = {"version": 1, "tasks": [
+        {"id": "before", "content": "准备"},
+        {"id": "write", "content": "创建文件", "dependencies": ["before"], "executor": "subagent",
+         "subagent": {"id": "writer", "instruction": "创建文件", "role": "executor",
+                      "read_only": False, "tools": ["write_file"]}},
+    ]}
+    router = SnapshotRouter([
+        response(json.dumps(plan)), response("准备完成"),
+        response(json.dumps({"tasks": [{"id": "c", "content": "创建文件"}]})),
+        ModelResponse("", [ToolCall("w", "write_file", {"path": "child.txt", "content": "new"})],
+                      {"input_tokens": 1, "output_tokens": 1}, []), response("已创建文件"),
+    ])
+    events = []
+    with use_workspace_root(git_repo):
+        orch = Orchestrator(router, tools, AutoApprove(), on_event=events.append)
+        orch.run("准备后创建文件")
+    result = orch.subagent_results["writer"]
+    assert result.status == "succeeded"
+    assert result.changed_files == ["child.txt"]
+    assert not (git_repo / "child.txt").exists()
+    assert orch.last_run_status == "blocked"
+    saved = orch.store.get("write").execution["result"]
+    assert saved["delivery_status"] == "pending_review"
+    assert saved["worktree"]["base_commit"] == result.worktree.base_commit
+    assert [event.kind for event in events].count("subagent_completed") == 1
+
+
+def test_cancel_preserves_writer_artifact_and_terminal_event(git_repo):
+    from app.agent.cancel import CancelToken
+    token = CancelToken()
+    events = []
+
+    def delegate(spec, workspace, cancel):
+        (workspace / "partial.txt").write_text("partial")
+        token.cancel()
+        cancel.raise_if_cancelled()
+
+    results = SubagentCoordinator(WorktreeManager(git_repo), delegate, on_event=events.append).run([
+        SubagentSpec("a", "write"), SubagentSpec("b", "wait", dependencies=("a",)),
+    ], cancel=token)
+    assert results["a"].status == results["b"].status == "cancelled"
+    assert results["a"].changed_files == ["partial.txt"]
+    assert results["a"].worktree.path.exists()
+    assert len([e for e in events if e.kind == "subagent_completed"]) == 2

@@ -336,3 +336,22 @@ def test_request_tool_approval_keeps_legacy_policy_compatible():
 
     assert request_tool_approval(policy, tool, "write_file", {"path": "x"})
     assert policy.calls == [("write_file", {"path": "x"})]
+
+
+def test_integration_approval_displays_complete_patch_and_cannot_be_remembered():
+    captured = {}
+    diff = "+first\n" + "+change\n" * 5000 + "+LAST_REVIEWED_LINE\n"
+    def menu(choices, header_lines, **_):
+        captured.update(choices=choices, header=header_lines)
+        return "yes"
+    tool = ToolDescriptor("integrate_agent", "integrate", {}, lambda _: "", risk="write")
+    with patch("app.util.menu.select_menu", side_effect=menu):
+        result = InteractivePolicy().request_tool(tool, "integrate_agent", {
+            "patch_sha256": "artifact-hash", "diff": diff,
+            "verification": [{"command": "pytest", "output": "passed"}],
+        })
+    assert result.approved
+    preview = "\n".join(captured["header"])
+    assert "LAST_REVIEWED_LINE" in preview and "artifact-hash" in preview
+    assert "passed" in preview
+    assert "always" not in [value for _, value in captured["choices"]]

@@ -17,6 +17,7 @@ Loop 模式的代码修改默认在隔离 worktree 内完成，验证通过后�
 """
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,7 +80,7 @@ class WorktreeManager:
 
     def _is_dirty(self) -> bool:
         """检查工作区是否有未提交改动。"""
-        result = self._run_git("status", "--porcelain")
+        result = self._run_git("status", "--porcelain", "--", ".", ":(exclude)data/worktrees")
         return bool(result.stdout.strip())
 
     def create(self, worktree_id: str, require_clean_base: bool = False) -> WorktreeInfo:
@@ -96,11 +97,15 @@ class WorktreeManager:
             ValueError: 原工作区有未提交改动且 require_clean_base=True
             RuntimeError: git worktree 创建失败
         """
+        # worktree_id 来自计划，不能用 ../ 或绝对路径逃离管理目录。
+        if (not worktree_id or worktree_id in {".", ".."}
+                or any(char in worktree_id for char in "/\\\0\r\n")):
+            raise ValueError("非法 worktree_id")
         # 检查原工作区状态
         if require_clean_base and self._is_dirty():
             raise ValueError(
                 "原工作区有未提交改动，不能创建 worktree。"
-                "请先提交或暂存改动，或设置 require_clean_base=False。"
+                "请先自行保存并提交改动，或设置 require_clean_base=False（不保证包含未提交改动）。"
             )
 
         base_branch = self._get_current_branch()
@@ -138,26 +143,43 @@ class WorktreeManager:
         if not worktree.path.exists():
             return []
         changed: set[str] = set()
-        committed = self._run_git(
-            "-C", str(worktree.path), "diff", "--name-only", worktree.base_commit,
-            check=False,
+        # --no-renames 包含新旧路径，便于保守判定 rename 与 delete 冲突。
+        diff = subprocess.run(
+            ["git", "-C", str(worktree.path), "diff", "--name-only", "--no-renames", "-z",
+             worktree.base_commit], capture_output=True, check=True,
         )
-        if committed.returncode == 0:
-            changed.update(line.strip() for line in committed.stdout.splitlines() if line.strip())
-        status = self._run_git(
-            "-C", str(worktree.path), "status", "--porcelain", "--untracked-files=all",
-            check=False,
+        changed.update(path.decode("utf-8", errors="surrogateescape")
+                       for path in diff.stdout.split(b"\0") if path)
+        untracked = subprocess.run(
+            ["git", "-C", str(worktree.path), "ls-files", "--others", "--exclude-standard", "-z"],
+            capture_output=True, check=True,
         )
-        if status.returncode == 0:
-            for line in status.stdout.splitlines():
-                if len(line) < 4:
-                    continue
-                # porcelain v1 的前两列是状态；rename 行后半段是新路径。
-                path = line[3:]
-                if " -> " in path:
-                    path = path.rsplit(" -> ", 1)[1]
-                changed.add(path.strip().strip('"'))
+        changed.update(path.decode("utf-8", errors="surrogateescape")
+                       for path in untracked.stdout.split(b"\0") if path)
         return sorted(changed)
+
+    def state_fingerprint(self) -> str:
+        """HEAD、索引、工作文件和未跟踪内容指纹（不读取 worktree 管理目录）。"""
+        digest = hashlib.sha256()
+        excluded = ("--", ".", ":(exclude)data/worktrees")
+        for args in [("rev-parse", "HEAD"), ("diff", "--binary", "HEAD", *excluded),
+                     ("diff", "--cached", "--binary", *excluded),
+                     ("status", "--porcelain", "-z", "--untracked-files=all", *excluded)]:
+            output = subprocess.run(["git", *args], cwd=self.repo_root,
+                                    capture_output=True, check=True).stdout
+            digest.update(output)
+        files = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z", *excluded],
+            cwd=self.repo_root, capture_output=True, check=True,
+        ).stdout
+        for name in sorted(path for path in files.split(b"\0") if path):
+            path = self.repo_root / name.decode("utf-8", errors="surrogateescape")
+            digest.update(name)
+            if path.is_symlink():
+                digest.update(str(path.readlink()).encode("utf-8", errors="surrogateescape"))
+            elif path.is_file():
+                digest.update(path.read_bytes())
+        return digest.hexdigest()
 
     def get_diff_summary(self, worktree: WorktreeInfo) -> str:
         """生成 worktree 的 diff 摘要（统计 + 文件列表）。"""

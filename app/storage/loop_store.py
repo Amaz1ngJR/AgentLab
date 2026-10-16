@@ -395,7 +395,7 @@ def finish_subagent_run(
     finished_at: str | None = None,
 ) -> None:
     """更新子 Agent 完成状态；状态值由调度器限制。"""
-    if status not in {"succeeded", "failed", "blocked", "cancelled", "conflict"}:
+    if status not in {"succeeded", "failed", "blocked", "cancelled", "conflict", "timed_out", "budget_exhausted"}:
         raise ValueError(f"非法子 Agent 状态: {status}")
     conn.execute("""
         UPDATE subagent_runs

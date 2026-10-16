@@ -240,6 +240,51 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 - 边界：Python 不能安全强杀任意第三方同步写工具。此类工具必须实现取消适配；
   收尾期间仍保留输入，但同一 session 不会并发执行下一轮写操作。
 
+### 3.18 统一运行时委派与写入交付（t.md M01–M12）
+
+父子共用配置回归：`test_shared_agent_config.py` 覆盖 Direct/Task、显式/省略单任务额度、长任务和非法配置；全量 `pytest -q` 为 **1060 passed**，`git diff --check` 通过。
+
+- **父子共用配置**：AgentProfile 的 `max_steps` / `max_task_steps` 同时用于父级和子级任务；省略单任务额度时继承总轮次，CLI 委派不再固定默认 8 轮或最多 32 轮。新增共用 `max_tool_calls`（默认 120）和 `timeout_seconds`（默认 300 秒），经 CLI 传入运行时；子运行按剩余总预算和空闲并发槽分配额度，保留父级收尾空间。Planner 与 spawn 两条路径均覆盖超过 32 轮、超过 30 次工具调用及继承更长 deadline 的确定性回归。共用配置不放宽子角色、路径、审批和取消限制。示例 coder 使用 600 秒；实际配置文件未自动修改。
+
+- **入口与策略（M01/M02）**：Direct/Task 共用 run 范围的 `AgentManager` 和临时工具目录，提供 spawn/wait/send_input/close 及 `integrate_agent`。AUTO 识别明确委派请求；`off/explicit/auto` 与执行模式和审批独立。适用、已加载的本地 Skill 可表达 explicit 委派要求，用户否决和 off 优先。恢复沿用原 run 的明确授权，off 仍拒绝启动与恢复。
+- **计划与并发（M03/M10）**：Task DAG 是唯一依赖源，task ID 与 child ID 分离；只派发依赖满足的独立子任务，`max_parallel` 受父上限约束，容量满返回 busy，不回退同步旧入口。父 Agent 可继续独立任务，fail_fast 取消活动兄弟，block_dependents 保留无关任务结果。execution mode、failure policy 和并发配置随任务落盘。
+- **上下文与结果（M04/M05）**：有限委派走轻量 Executor，不额外规划；交接目标、约束和依赖证据均作为低信任普通消息。可显式请求有界、脱敏、移除私有推理及图片载荷的文本历史快照，默认不复制。结果包含父子标识、目标、角色、状态、文件、验证、用量、模型和时间；超长摘要保留首尾。全子任务计划增加父级综合答复任务。完成通知按 result_id/revision 去重；恢复同时核对父历史，防止通知记录先落盘造成结果丢失。
+- **预算和权限（M07/M11）**：父子共享模型轮次、工具次数及 wall-clock deadline，派发原子预留、结束按实际消耗结算，恢复继承剩余额度。只读角色只开放明确只读工具；写角色要求不重叠相对 file_scope，禁用任意 shell，路径解析拒绝越界和 Git 元数据。父级临时 always/shell-prefix 授权不向子级传播，子模型不能调用管理工具。只读失败可按 retry_limit 在同一逻辑任务内有限重试；保留工具、作用域和累计消耗，零次重试不得自动补救。中断写任务不自动重跑。
+- **生命周期与恢复（M08/M09/M12）**：每子运行使用独立模型客户端、token 和 steering 邮箱，父取消向下传播。查询/重复关闭/重复集成不重复计费。子审批由父线程串行服务，按子工作区解释相对路径，显示 child/workspace，deadline 包括审批等待。CLI/Protocol 区分父子事件及计划降级原因。SQLite 自动迁移任务执行规格并保存子运行、结果和预算；重启将活动记录标为 interrupted，不恢复 Future。
+- **写入交付（M06）**：拒绝脏父基线并提示自行保存，不自动 stash/提交用户改动。worktree 保留 base commit、实际 changed_files 和补丁；Git NUL/字节路径解析覆盖中文、空格、重命名、删除和未跟踪文件。父级先执行明确验证命令，再审批具体 diff/hash，重验父状态及子产物后一次性应用，不提交或推送。拒绝、验证失败、取消、漂移或未集成均保留产物并阻止整体成功。受控的非重叠集成可推进兄弟基线，外部漂移仍拒绝。未停止的写线程保持 cancelling，session 保留作用域锁并阻止下一轮写运行。
+
+**验证证据**：`test_agent_manager.py`、`test_agent_delivery.py`、`test_multiagent_handoff.py` 及扩展 execution_plan/subagents/tasks/orchestrator/worktree/storage 测试，覆盖真实 AgentSession/FakeRouter 消费链、并发屏障、父并行工作、失败/取消、预算、审批隔离、SQLite 重启与真实 Git 写入验证集成。最新全量验证：`python -m pytest tests -q` **1052 passed in 80.38s**；`git diff --check` 通过。早期阶段一的 963 passed 不是本轮结果。补丁审批展示完整 diff/hash/验证证据，不再走通用 100 字符预览；验证与最终审批共用父级剩余 deadline，超时不得应用补丁。两个不重叠写任务还覆盖了首个集成后关闭并重新打开 SQLite、恢复第二个产物继续集成的链路。
+
+#### 3.18.1 验收映射
+
+**批量结果截断更正**：1049 项测试仍未覆盖整批 JSON 被头尾截断时中间结果完全消失的问题。现将 wait 输出在序列化前按子结果分配预算，按 JSON 编码后字符数约束整体大小，每条保留 parent/result/child ID、revision、执行/交付状态、首尾摘要及可读取 `result_ref`。引用通过同一 `wait_agent` 的 `output_offset/output_limit` 分页读取保留的输出，重启后仍可用；超长页因转义再缩小时保持连续 offset，不跳过内容。回执只从实际入历史的合法 JSON 条目绑定，不再读取 raw_output；wait 返回也不提前设置 delivered，非法或被裁掉的结果保持可补投。Direct/Task 三长结果链路回归验证所有摘要/ID/引用进入历史、同事务回执、SQLite 重启去重及逐页还原；另覆盖八条结果、重复 ID、JSON 转义膨胀、非法截断输出不确认。针对性 111 passed，全量 1052 passed in 80.38s，`git diff --check` 通过。本轮现场根目录 t.md 不存在，未改动现有暂存区。
+
+**取消边界回执更正**：1040 项测试未覆盖 wait 返回后、实际结果入历史前取消产生占位结果的边界。回执现在绑定 wait 的调用 ID、结果标识/修订及实际写入历史的输出，只确认对应的非错误结果；中断占位结果不能确认，未交付结果仍可补投。Direct/Task 均在截断后、事件回调前绑定，解析使用原始 JSON，确认比较实际入历史的有界输出，避免长结果截断导致绑定失效。新增回归在 wait 返回和输出绑定后分别触发 CancelToken（ESC 使用的取消机制），两条真实父执行路径都重新打开 SQLite，核对历史只有占位结果、回执为空、恢复后结论仅补投一次；另覆盖不同调用 ID、同批成功/错误/占位结果隔离及超长输出。针对性 108 passed；全量 1049 passed in 73.82s。未验证原生终端键盘输入链路，本轮验收针对执行层取消边界。
+
+**检查点结果幂等补充更正**：1031 项测试仍漏掉 portable history 合并相邻 user 消息后的结果去重。现在 child record 独立保存 `delivery_receipt={parent_run_id,result_id,revision}`，随父历史、DAG、子记录在同一检查点事务提交；恢复新记录不再解析展示文本。仅没有回执字段的旧记录保留历史解析兼容路径，无法证明交付时保守补投。`wait_agent` 返回时不生成回执，Direct/Task 在工具结果实际加入历史后才确认，避免中途崩溃漏投；修订号变化或 run/result 不匹配的回执不能抑制新结果。新增回归覆盖目标与结果合并后连续两次 SQLite 重启、wait 返回前后边界、Direct/Task 实际确认路径、历史和回执整组回滚、旧格式兼容及 run/result/revision 隔离。本轮全量 1040 passed，`git diff --check` 通过。
+
+**复核更正**：此前 1023 项测试未覆盖运行中崩溃的完整父子检查点、完成边界的已接受引导，以及主任务后接子任务的最终汇总，不能据此宣称 M04/M11/M12 已完全闭环。本轮补上：
+
+- 派发前先写任务与 child_run_id 的关联，再在同一 SQLite 事务保存 DAG、预算/子运行和必要父历史；检查点失败则回滚整组数据且不启动 worker。运行中历史转成无悬空工具配对的文本快照，正常结束仍保存原始历史。独立数据库连接在 child delegate 执行前重建 SessionRouter，核对依赖、已完成准备任务、上下文、关联及 interrupted 状态；并注入写库失败验证整组回滚。另在独立进程的真实 writer 首次模型请求中调用 `os._exit(0)`，不经过 finally 或整轮保存，父测试重新打开 SQLite 核对完整 DAG、关联、父上下文及 interrupted 写产物记录。
+- 轻量子运行原子关闭或取出完成边界的 steering，取出的消息在同一上下文、模型/工具计数器、worktree 和 deadline 内继续执行；预算不足明确 budget_exhausted 并保留未执行指令，异常委派若遗留已接受消息不得发布成功。读任务和实际写入/审批/集成均有确定性竞态回归。
+- 根据子任务是否存在下游父任务消费者决定汇总，不再只检查“全部为子任务”。单个子任务、准备任务后接子任务及恢复计划都可补齐父级综合答复；已有依赖消费者不重复追加。混合链路回归核对父模型实际收到唯一子结论，并返回父级综合文本。
+
+| 需求 | 本地验收证据 | 结果 |
+|---|---|---|
+| M01 显式路由、M02 Direct/Task 四工具及策略 | mode_router；test_agent_manager 的 policy、direct_and_task、off_rejects、steering、interrupt、close、matching_skill | 通过本地回归 |
+| M03 计划真并行、M10 DAG 与父级同时工作 | parallel_nonblocking、planner_children_run_parallel、planned_parent_continues、fail_fast、child_failure_blocks_only、task_dependencies_do_not_become_child_ids | 通过本地回归 |
+| M04 结果真实进入父模型与幂等 | real_parent_child_handoff、all_child_plan_gets_a_real_parent_synthesis、restored_result_delivery_is_idempotent_across_sqlite_restart | 通过本地回归 |
+| M05 轻量子运行、上下文隔离与显式快照 | runtime_factory_uses_independent_child_runtime、dependency_data_is_not_promoted_to_child_system、explicit_history_fork | 通过本地回归 |
+| M06 真实写入、基线、验证、审批、集成 | test_agent_delivery 全部；test_subagents 的 merge_plan / mergeable；test_worktree 的路径收集与指纹 | 通过本地 Git 回归；原生 Windows 未验 |
+| M07 权限与共享预算 | read_only_child_cannot_run_shell、tool_budget_and_scope、task_parent_rounds_share_child_budget、auto_execute_does_not_remove_child_total_budget、integration_deadline | 通过本地回归 |
+| M08 生命周期、M09 父子邮箱 | cli_and_protocol_distinguish_child_lifecycle、child_does_not_drain_parent_steering、steering_is_targeted、cancel_preserves_writer_artifact | 通过本地回归 |
+| M11 SQLite 规格、重启和有限重试 | storage_roundtrip、recovery_does_not_reset_aggregate_budget、planned_readonly_retry、task_resume_saved_writer、interrupted_recovery | 通过本地回归 |
+| M12 并发审批、独立客户端、停止线程 | child_approvals_are_serialized、child_deadline、finish_does_not_claim_noncooperative_worker_stopped、unstopped_writer_blocks_next_session_turn | 通过 fake/真实文件工具回归；真实 provider 压测未验 |
+
+以上为代码与确定性回归验收，不代表真实模型必然选择委派；§8.3 的触发率、端到端收益和账单指标尚未采样。测试失败项：本轮全量为 0；外部未验证项不能计作通过。
+
+**运行边界**：worktree 不是 OS 沙箱；验证 shell 仍须按现有策略审批。Python 无法强杀任意第三方同步写工具，活动线程不得被标为已停止。已经发给 provider、但取消前未返回 usage 的账单无法从本地准确重建。旧快照若从未保存委派规格，不能猜测恢复。Windows 原生终端/Git 行为与真实 provider 并发、费用和触发率需要对应设备/凭据 smoke test，本地 fake/mock 回归不冒充这些外部验收。
+
 | 模块 | 当前进展 | 关键文件 |
 |---|---|---|
 | CLI | 交互 REPL、执行期间常驻输入、文字 steering、`-p`、`--profile`、`-y`、斜杠命令补全；状态、任务面板、统计 | `app/cli.py`, `app/util/live_turn.py` |
@@ -247,7 +292,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 | 模型层 | Anthropic / OpenAI Responses / OpenAI-compatible；统一内部协议；JSON tool call fallback | `app/models/` |
 | Runtime | CLI 主路径已切到编排:`AgentSession(orchestrate=True)` 委托 Orchestrator;`orchestrate=False` 仍保留 legacy 单轮循环 | `app/agent/runtime.py`, `app/agent/orchestrator.py` |
 | Protocol v1 | Thread/Turn/Item/EventEnvelope/RuntimeFailure、JSON Schema/JSONL、握手能力协商、有界订阅队列、游标重放；常用 Runtime 事件已映射 TurnItem | `app/protocol/`, `app/agent/service.py`, `app/storage/` |
-| Loop Engineering | GoalSpec → Orchestrator → Verifier → 诊断修复 → worktree 审批提交；run/iteration/verification/worktree/repair/diff/commit/预算/终止原因完整持久化；支持 `/loop evidence/diff/resume`；Learner、Project Knowledge、子 Agent 待做（见 6.14） | `app/agent/goals.py`, `verifier.py`, `loop_runner.py`, `loop_commands.py`, `app/workspace/worktree.py`, `app/storage/loop_store.py` |
+| Loop Engineering | GoalSpec → Orchestrator → Verifier → 诊断修复 → worktree 审批提交；run/iteration/verification/worktree/repair/diff/commit/预算/终止原因完整持久化；支持 `/loop evidence/diff/resume`；Learner、Project Knowledge 待做，子运行时与交付见 3.18（Loop 目标级编排见 6.14） | `app/agent/goals.py`, `verifier.py`, `loop_runner.py`, `loop_commands.py`, `app/workspace/worktree.py`, `app/storage/loop_store.py` |
 | 多 Agent / Session | AgentProfile + SessionRouter + `/session` 命令族；SQLite 持久化、恢复、隔离（含任务快照恢复） | `app/agent/profiles.py`, `app/agent/session_router.py`, `app/storage/` |
 | 长期记忆 | none/read/read_write 三策略 + 注入；LIKE 检索（未做向量） | `app/memory/` |
 | Skill | Loader + Catalog：扫 `skills/*/SKILL.md`、按 AgentProfile 注入工作流；只影响上下文不授权 | `app/skills/`, `skills/` |
@@ -565,7 +610,7 @@ PRD 模式分层（§7.6.1）：Prompt 模式（单轮）→ Task 模式（Plann
 - **CLI 命令补全**：`/goal edit/verify` 与 `/loop evidence/diff/learn/clean`，修改成功标准和清理 dirty worktree 必须审批。
 - `app/agent/learner.py`：仅在稳定点（成功/阻塞/预算耗尽/停止）生成 `memory_candidate / skill_update_proposal / project_knowledge_update / anti_pattern` 候选，不自动落库；密钥/cookie/私钥/验证码不写记忆。
 - `app/workspace/knowledge.py`：Project Knowledge 索引（README/AGENTS/CLAUDE/SKILL/测试命令/历史 loop 经验），每条标来源；与实际代码冲突时以代码和验证结果为准。
-- `app/agent/subagents.py`：子 Agent 协作（Executor/Verifier/Reviewer/Research），独立 session + TaskStore snapshot + 临时授权；不能降低 GoalSpec 或扩权；输出回父 LoopRunner 统一审计；验证 Agent 不复用执行 Agent 私有推理上下文。
+- `app/agent/subagents.py`：子 Agent 协作（Executor/Verifier/Reviewer/Research），独立 messages / TaskStore / 取消邮箱；不是自动注册的完整 `/session`。Task 由父 Orchestrator 接收结果，Loop 由父 LoopRunner 调度；子级不继承父级临时工具授权。统一运行时与交付验收见 3.18。
 - 定时/后台 Loop（`app/workspace/scheduler.py`）：手动 `/loop` / 本地 cron / GitHub Actions 三类入口；后台 loop 默认禁用、只跑预配置 GoalSpec、高风险动作转人工审批。优先级最低，可放最后。
 
 安全要求（PRD §12）：Loop 默认要求至少一个非 `llm_judge` verifier；默认 `git_worktree`；默认禁用后台自动运行 / 自动 push / 发布 / 部署；模型提出降低 success_criteria 必须审批。

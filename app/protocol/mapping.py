@@ -46,6 +46,7 @@ _RUN_KIND = {
     "loop_blocked": ("loop.lifecycle", "waiting"),
     "loop_budget_exhausted": ("loop.lifecycle", "failed"),
     "worktree_prepared": ("workspace", "completed"),
+    "plan_fallback": ("plan", "failed"),
     "subagent_started": ("subagent", "started"),
     "subagent_completed": ("subagent", "completed"),
 }
@@ -64,6 +65,8 @@ def runtime_event_to_item(
         return None
     item_kind, status = mapping
     payload = _event_payload(event)
+    if getattr(event, "payload", {}).get("child_event") and kind in {"run_completed", "run_failed"}:
+        item_kind = "subagent.result"
     return TurnItem.create(
         item_id=f"item-{uuid.uuid4().hex}",
         thread_id=thread_id,

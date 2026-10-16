@@ -57,6 +57,10 @@ class Task:
     evidence: str = ""
     error: str = ""
     history: list[str] = field(default_factory=list)
+    # 可恢复执行规格；空字典兼容旧任务，未知执行器不得回落到主 Agent。
+    execution: dict = field(default_factory=dict)
+    retry_of: str | None = None
+    recovered_by: str | None = None
 
 
 class TaskStore:
@@ -101,6 +105,19 @@ class TaskStore:
         for task in self._tasks:
             if task.status not in (FAILED, IN_PROGRESS):
                 continue
+            if task.recovered_by:
+                continue
+            if task.execution.get("executor") == "subagent":
+                spec = task.execution.get("subagent") or {}
+                if not isinstance(spec, dict) or spec.get("read_only") is not True:
+                    task.status = BLOCKED
+                    task.history.append("interrupted write: inspect worktree before replanning")
+                    continue
+                if task.execution.get("retries", 0) >= spec.get("retry_limit", 0):
+                    task.status = BLOCKED
+                    task.error = "retry_limit exhausted; explicit new task required"
+                    continue
+                task.execution["retries"] = task.execution.get("retries", 0) + 1
             previous = task.status
             task.status = PENDING
             task.history.append(f"-> pending (resume from {previous})")
@@ -179,14 +196,14 @@ class TaskStore:
         task.history.append(note or f"-> {status}")
         return task
 
-    def claim_next(self) -> Task | None:
+    def claim_next(self, *, exclude_executors: frozenset[str] = frozenset()) -> Task | None:
         """取下一个可执行任务:pending 且依赖全部 completed。
 
         把它置为 in_progress 后返回(返回内部引用)。没有可执行任务时返回 None
         —— 可能是全部做完,也可能是剩下的都被未满足的依赖卡住(见 is_blocked)。
         """
         for t in self._tasks:
-            if t.status != PENDING:
+            if t.status != PENDING or t.execution.get("executor") in exclude_executors:
                 continue
             if self._deps_satisfied(t):
                 t.status = IN_PROGRESS
@@ -197,8 +214,8 @@ class TaskStore:
     def _deps_satisfied(self, task: Task) -> bool:
         for dep_id in task.dependencies:
             dep = self.get(dep_id)
-            # 依赖不存在视为已满足(容忍模型写错依赖,不至于永久卡死)
-            if dep is not None and dep.status != COMPLETED:
+            # 未知依赖不能被当作已完成。
+            if dep is None or dep.status != COMPLETED:
                 return False
         return True
 
@@ -231,6 +248,9 @@ class TaskStore:
                 "evidence": t.evidence,
                 "error": t.error,
                 "history": list(t.history),
+                **({"execution": copy.deepcopy(t.execution)} if t.execution else {}),
+                **({"retry_of": t.retry_of} if t.retry_of else {}),
+                **({"recovered_by": t.recovered_by} if t.recovered_by else {}),
             }
             for t in self._tasks
         ]
@@ -261,5 +281,8 @@ class TaskStore:
                 evidence=str(item.get("evidence") or ""),
                 error=str(item.get("error") or ""),
                 history=hist,
+                execution=copy.deepcopy(item.get("execution")) if isinstance(item.get("execution"), dict) else {},
+                retry_of=item.get("retry_of"),
+                recovered_by=item.get("recovered_by"),
             ))
         self._tasks = tasks

@@ -41,8 +41,12 @@ PLANNER_SYSTEM = """你是任务规划器。把用户目标拆成可执行的子
 - executor 可选 main_agent 或 subagent；省略时使用 main_agent。
 - 只有确实适合隔离执行的复杂任务才使用 subagent，并同时填写 subagent 对象。
 - subagent 对象格式为 {"id":"sa1","role":"research|reviewer|verifier|executor","instruction":"...","read_only":true,"tools":["read_file"]}。
-- research/reviewer/verifier 必须只读；写入任务只能 role=executor，系统会在独立 worktree 中执行。
-- 子 Agent 不得请求 delegate_subagent、spawn_subagent、merge_worktree 或 force_push。
+- research/reviewer/verifier 必须只读，只允许 read_file/list_dir/code_search；写入任务只能 role=executor，系统会在独立 worktree 中执行。
+- 依赖只声明在任务 dependencies 中，不要在 subagent 中重复声明另一套依赖。
+- 写子任务必须填写互不重叠的相对 file_scope，只通过受限文件工具修改；验证与集成由父级审批执行。
+- 显式委派时按独立任务划分；没有独立任务或预算不足则保留主任务，并向用户说明原因。
+- 复杂计划请显式填写 max_steps/max_tool_calls，子任务预算总和必须给父级汇总和验证预留余量。
+- 子 Agent 不得请求 spawn_agent、wait_agent、send_input、close_agent、integrate_agent 或其他委派、合并、推送能力。
 - 不要把普通任务全部拆成子 Agent；简单目标只给一个 main_agent 任务。
 - 简单目标(一步能完成)就只给一个任务。
 - 不要拆得过细,通常 2-5 个任务即可。
@@ -119,7 +123,10 @@ class Planner:
         self._system = system
         # 最近一次规划的 token 用量,供 Orchestrator 汇总进 run 统计
         self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+        self.last_diagnostics: list[str] = []
         self.last_actual_model: str | None = None
+        self.budget_defaults: dict = {}
+        self.max_child_steps = 32
 
     def create_plan(
         self,
@@ -137,6 +144,8 @@ class Planner:
         （Skills/MCP/记忆会重复并显著增加 planning 输入 token）。
         """
         self.last_usage = {"input_tokens": 0, "output_tokens": 0}
+        self.last_diagnostics = []
+        self.last_actual_model = None
         prompt = goal if not context else f"{context}\n\n目标:{goal}"
         try:
             resp = call_create_message(
@@ -153,16 +162,19 @@ class Planner:
             if getattr(resp, "actual_model", None):
                 self.last_actual_model = resp.actual_model
             obj = _extract_json(getattr(resp, "text", "") or "")
-            execution_plan = parse_execution_plan(obj, goal) if obj else None
+            execution_plan = parse_execution_plan(obj, goal, budget_defaults=self.budget_defaults) if obj else None
             if execution_plan is not None:
-                errors = validate_execution_plan(execution_plan)
+                errors = validate_execution_plan(execution_plan, max_steps=self.max_child_steps)
+                self.last_diagnostics = list(errors)
                 tasks = [item.task for item in execution_plan.tasks] if not errors else []
             else:
+                self.last_diagnostics = ["Planner 未返回有效 JSON 计划，已退化为主 Agent 单任务"]
                 errors = []
                 tasks = []
         except Cancelled:
             raise
-        except Exception:
+        except Exception as exc:
+            self.last_diagnostics = [f"规划失败，已退化为单任务: {type(exc).__name__}: {exc}"]
             execution_plan = None
             errors = []
             tasks = []

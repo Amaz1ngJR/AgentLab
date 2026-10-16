@@ -1022,7 +1022,21 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
     避免 RUN_COMPLETED/RUN_FAILED 又重复打印面板。
     """
     kind = ev.kind
-    if kind == run_events.MESSAGE_DELTA:
+    if ev.payload.get("child_event") and kind in {
+        run_events.RUN_STARTED, run_events.RUN_COMPLETED, run_events.RUN_FAILED,
+        run_events.PLAN_CREATED, run_events.TASK_UPDATED,
+    }:
+        return  # 子 run 不渲染为父任务完成面板。
+    if kind == run_events.SUBAGENT_STARTED:
+        p = ev.payload
+        print(f"  ↳ 子 Agent {p.get('subagent_id')} [{p.get('role')}] 开始", flush=True)
+    elif kind == run_events.SUBAGENT_COMPLETED:
+        p = ev.payload
+        print(f"  ↳ 子 Agent {p.get('subagent_id')}: {p.get('execution_status', p.get('status'))}"
+              f" · 交付: {p.get('delivery_status', 'none')}", flush=True)
+    elif kind == run_events.PLAN_FALLBACK:
+        print(f"  ⚠ 规划降级: {ev.text}", flush=True)
+    elif kind == run_events.MESSAGE_DELTA:
         if ev.text:
             print(f"\n{_model_text(ev.text)}\n", flush=True)
     elif kind == run_events.TOOL_REQUESTED:
@@ -1863,6 +1877,10 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             system_prompt=sys_prompt,
             max_steps=agent_profile.max_steps,
             max_task_steps=agent_profile.max_task_steps,
+            delegation_policy=agent_profile.delegation_policy,
+            max_parallel_agents=agent_profile.max_parallel_agents,
+            max_tool_calls=agent_profile.max_tool_calls,
+            timeout_seconds=agent_profile.timeout_seconds,
             # auto 可逐轮选择 Direct；两种路径使用不同事件，不会重复渲染。
             on_event=_print_event,
             progress=progress_fn,

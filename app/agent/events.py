@@ -70,6 +70,7 @@ LOOP_FAILED = "loop_failed"
 LOOP_BLOCKED = "loop_blocked"
 LOOP_BUDGET_EXHAUSTED = "loop_budget_exhausted"
 WORKTREE_PREPARED = "worktree_prepared"
+PLAN_FALLBACK = "plan_fallback"
 SUBAGENT_STARTED = "subagent_started"
 SUBAGENT_COMPLETED = "subagent_completed"
 

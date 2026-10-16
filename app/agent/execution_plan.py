@@ -1,7 +1,7 @@
 """Planner 生成的声明式执行计划及其安全校验。"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from app.agent.subagents import SubagentSpec
@@ -11,11 +11,14 @@ ROLES = frozenset({"research", "reviewer", "verifier", "executor"})
 EXECUTORS = frozenset({"main_agent", "subagent"})
 READ_ONLY_TOOLS = frozenset({"read_file", "list_dir", "code_search"})
 WRITE_TOOLS = frozenset({"write_file", "edit_file"})
-FORBIDDEN_SUBAGENT_TOOLS = frozenset({"delegate_subagent", "spawn_subagent", "merge_worktree", "force_push"})
+FORBIDDEN_SUBAGENT_TOOLS = frozenset({
+    "delegate_subagent", "spawn_subagent", "spawn_agent", "wait_agent", "close_agent",
+    "send_input", "integrate_agent", "merge_worktree", "force_push",
+})
 ROLE_TOOLS = {
     "research": READ_ONLY_TOOLS,
-    "reviewer": READ_ONLY_TOOLS | {"shell"},
-    "verifier": READ_ONLY_TOOLS | {"shell"},
+    "reviewer": READ_ONLY_TOOLS,
+    "verifier": READ_ONLY_TOOLS,
     "executor": READ_ONLY_TOOLS | WRITE_TOOLS | {"shell"},
 }
 
@@ -59,14 +62,15 @@ def _int(value: Any, default: int) -> int:
         return default
 
 
-def _parse_spec(item: dict[str, Any], task_id: str) -> SubagentSpec | None:
+def _parse_spec(item: dict[str, Any], task_id: str, defaults: dict[str, Any]) -> SubagentSpec | None:
     raw = item.get("subagent")
     if not isinstance(raw, dict):
         return None
     role = _as_str(raw.get("role")) or "executor"
     sid = _as_str(raw.get("id")) or f"subagent-{task_id}"
     instruction = _as_str(raw.get("instruction")) or _as_str(item.get("content"))
-    deps = raw.get("dependencies", item.get("dependencies", []))
+    # Planner 只使用 task DAG；不能把 task_id 隐式变成 child ID。
+    deps = raw.get("dependencies", [])
     dependencies = tuple(str(dep).strip() for dep in deps if str(dep).strip()) if isinstance(deps, list) else ()
     tools = raw.get("tools", [])
     requested_tools = tuple(str(tool).strip() for tool in tools if str(tool).strip()) if isinstance(tools, list) else ()
@@ -78,16 +82,17 @@ def _parse_spec(item: dict[str, Any], task_id: str) -> SubagentSpec | None:
         read_only=bool(raw.get("read_only", role != "executor")),
         worktree_id=_as_str(raw.get("worktree_id")) or None,
         tools=requested_tools,
-        max_steps=max(1, _int(raw.get("max_steps"), 8)),
-        max_tool_calls=max(1, _int(raw.get("max_tool_calls"), 30)),
-        timeout_seconds=max(1, _int(raw.get("timeout_seconds"), 300)),
+        max_steps=max(1, _int(raw.get("max_steps"), defaults.get("max_steps", 8))),
+        max_tool_calls=max(1, _int(raw.get("max_tool_calls"), defaults.get("max_tool_calls", 30))),
+        timeout_seconds=max(1, _int(raw.get("timeout_seconds"), defaults.get("timeout_seconds", 300))),
         file_scope=tuple(str(path).strip() for path in (raw.get("file_scope") or []) if str(path).strip()),
         retry_limit=max(0, _int(raw.get("retry_limit"), 0)),
         output_limit=max(1, _int(raw.get("output_limit"), 20_000)),
     )
 
 
-def parse_execution_plan(obj: dict[str, Any], goal: str) -> ExecutionPlan:
+def parse_execution_plan(obj: dict[str, Any], goal: str, *,
+                         budget_defaults: dict[str, Any] | None = None) -> ExecutionPlan:
     """解析新协议；旧版只含 tasks 时返回全 main_agent 计划。"""
     if not isinstance(obj, dict):
         raise ValueError("执行计划必须是 JSON 对象")
@@ -119,7 +124,10 @@ def parse_execution_plan(obj: dict[str, Any], goal: str) -> ExecutionPlan:
         deps = [str(dep).strip() for dep in deps_raw if str(dep).strip()] if isinstance(deps_raw, list) else []
         task = Task(id=task_id, content=content, status=PENDING, dependencies=deps)
         executor = _as_str(raw.get("executor")) or "main_agent"
-        spec = _parse_spec(raw, task_id) if executor == "subagent" else None
+        spec = _parse_spec(raw, task_id, budget_defaults or {}) if executor == "subagent" else None
+        task.execution = {"executor": executor}
+        if spec is not None:
+            task.execution["subagent"] = asdict(spec)
         planned.append(PlannedTask(task=task, executor=executor, subagent=spec))
     return ExecutionPlan(version=version, goal=goal, policy=policy, tasks=planned)
 
@@ -141,16 +149,24 @@ def validate_execution_plan(
         errors.append(f"并发数超过上限: {plan.policy.max_parallel} > {max_parallel}")
     if plan.policy.merge_policy != "manual":
         errors.append("merge_policy 必须为 manual")
+    if plan.policy.failure_policy not in {"block_dependents", "fail_fast"}:
+        errors.append("failure_policy 必须为 block_dependents/fail_fast")
+    if plan.policy.allow_nested_subagents:
+        errors.append("不支持嵌套子 Agent")
     ids = {item.task.id for item in plan.tasks}
     subagent_ids: set[str] = set()
     subagents = 0
     for item in plan.tasks:
         if item.executor not in EXECUTORS:
             errors.append(f"任务 {item.task.id} executor 非法: {item.executor}")
+        if plan.policy.mode == "subagents" and item.executor != "subagent":
+            errors.append("subagents 模式的执行任务必须使用 subagent；混合调度请用 hybrid")
         if any(dep not in ids for dep in item.task.dependencies):
             errors.append(f"任务 {item.task.id} 存在不存在的依赖")
         if item.executor != "subagent":
             continue
+        if plan.policy.mode == "single_agent":
+            errors.append("single_agent 模式不能声明子 Agent")
         subagents += 1
         spec = item.subagent
         if spec is None:
@@ -159,6 +175,8 @@ def validate_execution_plan(
         if spec.subagent_id in subagent_ids:
             errors.append(f"重复的 subagent_id: {spec.subagent_id}")
         subagent_ids.add(spec.subagent_id)
+        if spec.dependencies:
+            errors.append(f"子 Agent 依赖请声明在任务 dependencies 中: {spec.subagent_id}")
         if spec.role not in ROLES:
             errors.append(f"子 Agent {spec.subagent_id} role 非法: {spec.role}")
         if not spec.instruction:
@@ -169,11 +187,17 @@ def validate_execution_plan(
         if requested & FORBIDDEN_SUBAGENT_TOOLS:
             errors.append(f"子 Agent 请求了禁止工具: {spec.subagent_id}")
         role_allowed = ROLE_TOOLS.get(spec.role, frozenset())
-        if requested - role_allowed:
+        if requested - role_allowed or (spec.read_only and requested - READ_ONLY_TOOLS):
             errors.append(f"子 Agent 工具超出角色权限: {spec.subagent_id}")
         if allowed_tools is not None and requested - allowed_tools:
             errors.append(f"子 Agent 工具不在父级允许集合: {spec.subagent_id}")
-        if spec.max_steps > max_steps:
+        if not isinstance(spec.read_only, bool):
+            errors.append(f"read_only 必须为布尔值: {spec.subagent_id}")
+        for name in ("max_steps", "max_tool_calls", "timeout_seconds", "output_limit"):
+            value = getattr(spec, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                errors.append(f"子 Agent 预算必须为正数: {spec.subagent_id}.{name}")
+        if isinstance(spec.max_steps, (int, float)) and spec.max_steps > max_steps:
             errors.append(f"子 Agent 步数超过上限: {spec.subagent_id}")
         if not spec.read_only and not spec.worktree_id and plan.policy.mode == "single_agent":
             errors.append(f"写入子 Agent 不能运行在 single_agent 模式: {spec.subagent_id}")

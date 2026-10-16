@@ -25,7 +25,10 @@ from app.config.loader import use_workspace_root
 from app.workspace.worktree import WorktreeInfo, WorktreeManager
 
 
-SUBAGENT_STATUSES = frozenset({"pending", "running", "succeeded", "failed", "blocked", "cancelled", "conflict"})
+SUBAGENT_STATUSES = frozenset({
+    "pending", "running", "succeeded", "failed", "blocked", "cancelled", "conflict",
+    "timed_out", "budget_exhausted",
+})
 
 
 @dataclass(frozen=True)
@@ -62,12 +65,21 @@ class SubagentResult:
     conflict_files: list[str] = field(default_factory=list)
     started_at: str | None = None
     finished_at: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+    tool_calls: int = 0
+    model_rounds: int = 0
+    elapsed_seconds: float = 0.0
+    actual_model: str | None = None
+    delivery_status: str = "none"
+    base_state_fingerprint: str | None = None
+    merge_ready: bool = False
 
     @property
     def mergeable(self) -> bool:
-        """当前结果是否满足生成合并建议的条件。"""
+        """最近一次 merge_plan 校验快照；真正集成前仍须重新校验。"""
         return (
-            self.status == "succeeded"
+            self.merge_ready
+            and self.status == "succeeded"
             and not self.conflict_files
             and self.worktree is not None
             and bool(self.worktree and self.worktree.base_commit)
@@ -119,7 +131,10 @@ class SubagentCoordinator:
 
         with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="subagent") as pool:
             while pending or running:
-                cancel.raise_if_cancelled()
+                if cancel.cancelled:
+                    for subagent_id in pending:
+                        results[subagent_id] = self._cancelled_result(by_id[subagent_id])
+                    pending.clear()
                 self._block_failed_dependencies(pending, by_id, results)
                 pending.difference_update(results)
 
@@ -130,6 +145,7 @@ class SubagentCoordinator:
                     if not self._dependencies_succeeded(spec, results):
                         continue
                     result = self._start_result(spec)
+                    result.base_state_fingerprint = self.worktree_manager.state_fingerprint()
                     if spec.read_only:
                         workspace = self.worktree_manager.repo_root
                         result.workspace = workspace
@@ -157,7 +173,7 @@ class SubagentCoordinator:
                     pending.clear()
                     break
 
-                done, _ = wait(tuple(running), return_when=FIRST_COMPLETED)
+                done, _ = wait(tuple(running), timeout=0.05, return_when=FIRST_COMPLETED)
                 for future in done:
                     spec = running.pop(future)
                     try:
@@ -167,10 +183,11 @@ class SubagentCoordinator:
                     except Exception as exc:  # 子 Agent 故障不能吞掉其他任务结果
                         result = self._failed_result(spec, f"{type(exc).__name__}: {exc}")
                     results[spec.subagent_id] = result
-                    self._record_finished(result)
-                    self._emit_completed(result)
 
         self._apply_conflicts(results)
+        for result in results.values():
+            self._record_finished(result)
+            self._emit_completed(result)
         return {subagent_id: results[subagent_id] for subagent_id in sorted(results)}
 
     def merge_plan(self, results: dict[str, SubagentResult]) -> list[dict[str, Any]]:
@@ -183,6 +200,7 @@ class SubagentCoordinator:
         current_commit = self.worktree_manager.current_commit()
         for subagent_id in sorted(results):
             result = results[subagent_id]
+            result.merge_ready = False
             item: dict[str, Any] = {
                 "subagent_id": subagent_id,
                 "status": result.status,
@@ -198,10 +216,17 @@ class SubagentCoordinator:
                 item["reason"] = "多个子 Agent 修改了相同文件"
             elif current_commit != result.worktree.base_commit:
                 item["reason"] = "主分支在子 Agent 派发后发生变化，需要重新验证"
+            elif result.base_state_fingerprint and (
+                self.worktree_manager.state_fingerprint() != result.base_state_fingerprint
+            ):
+                item["reason"] = "主工作区内容在派发后发生变化，需要重新验证"
+            elif self.worktree_manager.check_dirty(result.worktree):
+                item["reason"] = "worktree 仍有未提交改动，不能直接合并"
             elif not self.worktree_manager.has_commits(result.worktree):
                 item["reason"] = "worktree 没有已提交改动，不能生成 merge 命令"
             else:
                 item["mergeable"] = True
+                result.merge_ready = True
                 item["branch"] = f"worktree/{result.worktree.worktree_id}"
                 item["suggestion"] = self.worktree_manager.merge_suggestion(result.worktree)
             plan.append(item)
@@ -255,10 +280,11 @@ class SubagentCoordinator:
         result: SubagentResult,
         cancel: CancelToken,
     ) -> SubagentResult:
+        child_cancel = CancelToken()
         try:
-            cancel.raise_if_cancelled()
-            with use_workspace_root(workspace):
-                delegated = self.delegate(spec, workspace, cancel)
+            with cancel.callback(child_cancel.cancel), use_workspace_root(workspace):
+                child_cancel.raise_if_cancelled()
+                delegated = self.delegate(spec, workspace, child_cancel)
             if isinstance(delegated, SubagentResult):
                 delegated.subagent_id = spec.subagent_id
                 delegated.role = spec.role
@@ -268,17 +294,21 @@ class SubagentCoordinator:
                 delegated.finished_at = datetime.utcnow().isoformat()
                 if delegated.status == "pending":
                     delegated.status = "succeeded"
-                return delegated
-            result.output = "" if delegated is None else str(delegated)
-            result.status = "succeeded"
+                delegated.base_state_fingerprint = result.base_state_fingerprint
+                result = delegated
+            else:
+                result.output = "" if delegated is None else str(delegated)
+                result.status = "succeeded"
         except Cancelled:
-            raise
+            result.status = "cancelled"
+            result.error = "子运行已取消"
         except Exception as exc:
             result.status = "failed"
             result.error = f"{type(exc).__name__}: {exc}"
         result.finished_at = datetime.utcnow().isoformat()
         if result.worktree is not None:
             result.changed_files = self.worktree_manager.changed_files(result.worktree)
+            result.delivery_status = "pending_review"
         return result
 
     def _apply_conflicts(self, results: dict[str, SubagentResult]) -> None:
@@ -297,7 +327,7 @@ class SubagentCoordinator:
                 if path not in result.conflict_files:
                     result.conflict_files.append(path)
                 result.error = f"与子 Agent {', '.join(x for x in subagent_ids if x != subagent_id)} 修改相同文件"
-                self._emit_completed(result)
+                result.delivery_status = "conflict"
 
     def _worktree_id(self, spec: SubagentSpec) -> str:
         return f"subagent-{spec.subagent_id}-{uuid.uuid4().hex[:8]}"
@@ -340,6 +370,10 @@ class SubagentCoordinator:
                 "subagent_id": result.subagent_id,
                 "role": result.role,
                 "status": result.status,
+                "execution_status": result.status,
+                "delivery_status": result.delivery_status,
+                "usage": result.usage,
+                "tool_calls": result.tool_calls,
                 "changed_files": list(result.changed_files),
                 "conflict_files": list(result.conflict_files),
                 "error": result.error,

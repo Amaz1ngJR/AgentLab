@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -29,7 +30,7 @@ class AgentProfile:
                       仅影响上下文，不授予工具权限（见 app/skills）
     memory_policy   - 记忆策略：none/read/read_write（默认 none）
     max_steps       - 一次 run 的模型往返总上限（兼容旧配置名，默认 8）
-    max_task_steps  - 单个子任务的模型往返上限（默认 min(8, max_steps)）
+    max_task_steps  - 主任务和子 Agent 共用的单任务轮次上限（默认 max_steps）
     orchestrate     - 是否启用编排能力（False 强制 Direct，默认 True）
     mode            - auto/direct/task/legacy；配置未设置时按 orchestrate 选择
     """
@@ -45,14 +46,25 @@ class AgentProfile:
     max_task_steps: int | None = None
     orchestrate: bool = True
     mode: str = "legacy"
+    delegation_policy: str = "explicit"
+    max_parallel_agents: int = 2
+    max_tool_calls: int = 120
+    timeout_seconds: float = 300
 
     def __post_init__(self) -> None:
+        from app.agent.delegation_policy import POLICIES
+        if self.delegation_policy not in POLICIES:
+            raise ValueError("delegation_policy 必须是 off/explicit/auto")
+        if not 1 <= self.max_parallel_agents <= 4:
+            raise ValueError("max_parallel_agents 必须在 1..4")
         if self.mode not in {"legacy", "auto", "direct", "task"}:
             raise ValueError(f"mode 必须是 legacy/auto/direct/task，当前值: {self.mode!r}")
         if self.mode == "auto" and not self.orchestrate:
             raise ValueError("mode=auto 需要 orchestrate=True")
         if self.max_steps <= 0:
             raise ValueError("AgentProfile.max_steps 必须 > 0")
+        if self.max_tool_calls <= 0 or not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("max_tool_calls 和 timeout_seconds 必须为正数")
         if self.max_task_steps is not None and self.max_task_steps <= 0:
             raise ValueError("AgentProfile.max_task_steps 必须 > 0")
 
@@ -84,6 +96,10 @@ def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
                 int(body["max_task_steps"])
                 if body.get("max_task_steps") is not None else None
             ),
+            delegation_policy=body.get("delegation_policy", "explicit"),
+            max_parallel_agents=int(body.get("max_parallel_agents", 2)),
+            max_tool_calls=int(body.get("max_tool_calls", 120)),
+            timeout_seconds=float(body.get("timeout_seconds", 300)),
             orchestrate=orchestrate,
             mode=_parse_mode(body.get("mode"), orchestrate=orchestrate),
         )

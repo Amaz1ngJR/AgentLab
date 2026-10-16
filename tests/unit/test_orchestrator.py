@@ -424,7 +424,10 @@ def test_orchestrator_replans_after_tool_failure():
     orch.run("跑个会失败的工具")
     snap = orch.store.snapshot()
     statuses = {t["id"]: t["status"] for t in snap}
-    assert statuses["t1"] == FAILED
+    assert statuses["t1"] == COMPLETED
+    assert orch.store.get("t1").recovered_by
+    # 原失败记录保留在 history，逻辑任务按补救结果恢复。
+    assert any("failed" in note for note in orch.store.get("t1").history)
     # 追加了一个补救任务且已完成
     retry = [t for t in snap if t["id"].startswith("t1-retry")]
     assert retry and retry[0]["status"] == COMPLETED

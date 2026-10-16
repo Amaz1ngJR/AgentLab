@@ -231,9 +231,18 @@ class Storage:
         self._con = sqlite3.connect(str(self._path), check_same_thread=False)
         self._con.row_factory = sqlite3.Row
         self._runtime_lock = threading.RLock()
+        self._tx_depth = 0
         self._con.executescript(_SCHEMA)
         self._migrate_tool_executions()
         self._migrate_sessions_workspace()
+        columns = {row["name"] for row in self._con.execute("PRAGMA table_info(tasks)")}
+        if "execution_metadata" not in columns:
+            self._con.execute("ALTER TABLE tasks ADD COLUMN execution_metadata TEXT NOT NULL DEFAULT '{}'")
+        self._con.execute("""CREATE TABLE IF NOT EXISTS child_runs (
+            session_id TEXT NOT NULL, child_run_id TEXT NOT NULL, record TEXT NOT NULL,
+            PRIMARY KEY(session_id, child_run_id),
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )""")
         self._con.commit()
         # Loop Engineering 相关表(goal_specs/loop_runs/loop_iterations/
         # verification_results/worktrees/subagent_runs)。与上面的核心表共用同一连接,
@@ -273,12 +282,19 @@ class Storage:
 
     @contextmanager
     def _tx(self):
-        try:
-            yield self._con
-            self._con.commit()
-        except Exception:
-            self._con.rollback()
-            raise
+        with self._runtime_lock:
+            outermost = self._tx_depth == 0
+            self._tx_depth += 1
+            try:
+                yield self._con
+                if outermost:
+                    self._con.commit()
+            except BaseException:
+                if outermost:
+                    self._con.rollback()
+                raise
+            finally:
+                self._tx_depth -= 1
 
     # ── sessions ─────────────────────────────────────────────────────────────
 
@@ -602,15 +618,17 @@ class Storage:
                 con.execute(
                     """INSERT INTO tasks
                        (session_id,task_id,content,status,dependencies,
-                        evidence,error,history,position,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        evidence,error,history,position,updated_at,execution_metadata)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (session_id, str(t.get("id", "")), str(t.get("content", "")),
                      str(t.get("status", "pending")),
                      json.dumps(t.get("dependencies", []), ensure_ascii=False),
                      redact(str(t.get("evidence", ""))),
                      redact(str(t.get("error", ""))),
                      json.dumps(t.get("history", []), ensure_ascii=False),
-                     pos, now),
+                     pos, now, json.dumps(redact_value({
+                         key: t[key] for key in ("execution", "retry_of", "recovered_by") if key in t
+                     }), ensure_ascii=False)),
                 )
 
     def load_tasks(self, session_id: str) -> list[dict]:
@@ -628,12 +646,46 @@ class Storage:
                 hist = json.loads(r["history"])
             except (json.JSONDecodeError, TypeError):
                 hist = []
+            try:
+                metadata = json.loads(r["execution_metadata"])
+                metadata = {key: metadata[key] for key in ("execution", "retry_of", "recovered_by") if key in metadata}
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
             out.append({
+                **metadata,
                 "id": r["task_id"], "content": r["content"], "status": r["status"],
                 "dependencies": deps, "evidence": r["evidence"],
                 "error": r["error"], "history": hist,
             })
         return out
+
+    def save_delegation_checkpoint(self, session_id: str, *, messages: list[dict],
+                                   tasks: list[dict], records: list[dict]) -> None:
+        """Commit parent evidence, DAG/child associations and reservations together."""
+        with self._tx():
+            self.save_messages(session_id, messages)
+            self.save_tasks(session_id, tasks)
+            self.save_child_runs(session_id, records)
+
+    def save_child_runs(self, session_id: str, records: list[dict]) -> None:
+        with self._runtime_lock, self._tx() as con:
+            for record in records:
+                con.execute("INSERT OR REPLACE INTO child_runs VALUES (?,?,?)", (
+                    session_id, record["child_run_id"],
+                    json.dumps(redact_value(record), ensure_ascii=False),
+                ))
+
+    def load_child_runs(self, session_id: str) -> list[dict]:
+        with self._runtime_lock:
+            records = [json.loads(row[0]) for row in self._con.execute(
+                "SELECT record FROM child_runs WHERE session_id=?", (session_id,),
+            )]
+        for record in records:
+            if record["status"] in {"running", "cancelling", "queued", "waiting_approval"}:
+                record["status"] = "interrupted"
+                record["execution_status"] = "interrupted"
+                record["error"] = "process restarted; explicit recovery required"
+        return records
 
     # ── runs(每次编排 run 的目标 / 状态 / token 审计)───────────────────────────
 

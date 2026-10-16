@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import json
 from pathlib import Path
 
 from app.agent.approval import AutoApprove
@@ -138,11 +137,11 @@ def test_runtime_factory_uses_independent_child_runtime(tmp_path: Path):
         tools=registry(),
         approval=AutoApprove(),
         parent_system="parent system",
-        max_steps=2,
+        max_steps=3,
     )
     result = factory.delegate(
         SubagentSpec("child-1", "执行只读任务", role="research", read_only=True,
-                     tools=("read_file",), max_steps=2),
+                     tools=("read_file",), max_steps=3),
         tmp_path,
         CancelToken(),
     )
@@ -162,7 +161,7 @@ def test_factory_propagates_child_failure():
         SubagentSpec("child-fail", "执行任务", role="executor", tools=("read_file",), max_steps=1),
         Path("."), CancelToken(),
     )
-    assert result.status == "failed"
+    assert result.status == "budget_exhausted"
     assert result.error
 
 
