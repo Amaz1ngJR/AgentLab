@@ -1,4 +1,4 @@
-"""WorktreeManager 单元测试。"""
+"""WorktreeManager 与真实 Git 仓库的离线集成测试。"""
 import subprocess
 import tempfile
 from pathlib import Path

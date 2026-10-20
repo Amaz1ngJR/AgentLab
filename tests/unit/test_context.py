@@ -2,7 +2,8 @@
 
 覆盖:token 估算、窗口解析、ContextBudget 阈值、安全选段(不切 tool 对)、
 ContextCompressor 摘要解析/校验/脱敏、ContextManager.maybe_compact 触发与不触发、
-storage round-trip、Orchestrator 在超阈值时压缩。全程 FakeRouter,无网络。
+Orchestrator 在超阈值时压缩。全程 FakeRouter,无网络。
+SQLite round-trip 另见 tests/integration/test_context_storage.py。
 """
 from __future__ import annotations
 
@@ -32,7 +33,6 @@ from app.agent.events import RunEvent
 from app.agent.orchestrator import Orchestrator
 from app.agent.planner import Planner
 from app.models.protocol import ModelResponse, ToolCall, ToolResult
-from app.storage import Storage
 from app.tools.registry import Tool, ToolRegistry
 
 
@@ -82,19 +82,7 @@ def _resp_tool(tool_id, name, args):
                                             "name": name, "input": args}])
 
 
-_VALID_SUMMARY = {
-    "user_goal": "重构登录模块",
-    "active_constraints": ["不要改数据库 schema"],
-    "decisions": ["用 JWT 而非 session"],
-    "current_state": "已读完 auth.py",
-    "open_tasks": ["补单元测试"],
-    "tool_evidence": [{"source": "read_file", "finding": "auth.py 有硬编码密钥"}],
-    "files_and_artifacts": ["app/auth.py"],
-    "failed_attempts": [],
-    "approvals_and_risks": [],
-    "memory_candidates": [],
-    "handoff_note": "继续补测试并移除硬编码密钥",
-}
+from tests.support.context import _VALID_SUMMARY, _long_messages
 
 
 def _summary_resp():
@@ -279,11 +267,6 @@ def test_extract_json_returns_none_for_invalid():
 # ── ContextCompressor ─────────────────────────────────────────────────────────
 
 
-def _long_messages(n=12):
-    return [{"role": "user" if i % 2 == 0 else "assistant",
-             "content": f"消息 {i} " + "内容" * 20} for i in range(n)]
-
-
 def test_compressor_compacts_and_returns_summary():
     llm = FakeRouter([_summary_resp()])
     comp = ContextCompressor(llm, model_profile="cloud_claude")
@@ -462,42 +445,6 @@ def test_manager_report_shape():
 
 
 # ── storage round-trip ────────────────────────────────────────────────────────
-
-
-def test_storage_context_summary_round_trip(tmp_path):
-    s = Storage(tmp_path / "t.db")
-    s.create_session("sid", "default", "cloud_claude")
-    rec = ContextSummary(summary=_VALID_SUMMARY, source_message_range=(0, 8),
-                         source_run_ids=["r1"], token_count_before=500,
-                         token_count_after=80, compression_model_profile="p").to_record()
-    s.save_context_summary("sid", rec)
-    rows = s.list_context_summaries("sid")
-    assert len(rows) == 1
-    assert rows[0]["range_start"] == 0 and rows[0]["range_end"] == 8
-    assert rows[0]["token_before"] == 500
-    latest = s.latest_context_summary("sid")
-    assert latest is not None
-    assert json.loads(latest["summary_json"])["user_goal"] == "重构登录模块"
-
-
-def test_storage_context_summary_redacted(tmp_path):
-    s = Storage(tmp_path / "t.db")
-    s.create_session("sid", "default", "cloud_claude")
-    leaky = dict(_VALID_SUMMARY)
-    leaky["current_state"] = "sk-ant-api03-LEAKLEAKLEAKLEAK"
-    rec = ContextSummary(summary=leaky, source_message_range=(0, 4)).to_record()
-    s.save_context_summary("sid", rec)
-    latest = s.latest_context_summary("sid")
-    assert "LEAKLEAKLEAKLEAK" not in latest["summary_json"]
-
-
-def test_storage_delete_session_clears_summaries(tmp_path):
-    s = Storage(tmp_path / "t.db")
-    s.create_session("sid", "default", "cloud_claude")
-    s.save_context_summary("sid", ContextSummary(
-        summary=_VALID_SUMMARY, source_message_range=(0, 4)).to_record())
-    s.delete_session("sid")
-    assert s.list_context_summaries("sid") == []
 
 
 # ── Orchestrator 集成:超阈值时在稳定点压缩 ──────────────────────────────────────

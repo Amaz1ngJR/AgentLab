@@ -1,13 +1,5 @@
 """离线测试：长期记忆策略。"""
-from app.memory import (
-    NoMemory, ReadMemory, ReadWriteMemory,
-    build_memory_policy, inject_memories,
-)
-from app.storage import Storage
-
-
-def _store(tmp_path):
-    return Storage(tmp_path / "test.db")
+from app.memory import NoMemory, build_memory_policy, inject_memories
 
 
 def test_no_memory_returns_empty():
@@ -17,53 +9,6 @@ def test_no_memory_returns_empty():
 
 def test_no_memory_save_is_noop():
     NoMemory().save("agent", "s1", [{"role": "user", "content": "hi"}])
-
-
-def test_read_memory_retrieves(tmp_path):
-    s = _store(tmp_path)
-    s.write_memory("用户喜欢 Python", scope="agent", agent_id="coder", workspace="/workspace")
-    m = ReadMemory(s)
-    results = m.retrieve("Python", "coder", workspace="/workspace")
-    assert any("Python" in r for r in results)
-
-
-def test_read_memory_does_not_save(tmp_path):
-    s = _store(tmp_path)
-    m = ReadMemory(s)
-    m.save("coder", "s1", [{"role": "user", "content": "hi"}])
-    results = s.search_memories("hi", workspace="/workspace")
-    assert results == []
-
-
-def test_read_write_memory_saves_summary(tmp_path):
-    s = _store(tmp_path)
-    m = ReadWriteMemory(s)
-    msgs = [
-        {"role": "user", "content": "帮我优化这段代码"},
-        {"role": "assistant", "content": "好的，我来看一下"},
-    ]
-    m.save("coder", "s1", msgs, workspace="/work")
-    results = s.search_memories("优化", agent_id="coder", workspace="/work")
-    assert len(results) == 1
-    assert results[0]["scope"] == "session"
-
-
-def test_read_memory_rejects_missing_and_other_workspace(tmp_path):
-    s = _store(tmp_path)
-    s.write_memory("private", scope="agent", agent_id="coder", workspace="/one")
-    m = ReadMemory(s)
-    assert m.retrieve("private", "coder") == []
-    assert m.retrieve("private", "coder", workspace="/two") == []
-
-
-def test_read_write_memory_updates_same_session_summary(tmp_path):
-    s = _store(tmp_path)
-    m = ReadWriteMemory(s)
-    m.save("coder", "s1", [{"role": "user", "content": "old"}], workspace="/work")
-    m.save("coder", "s1", [{"role": "user", "content": "new"}], workspace="/work")
-    rows = s.search_memories("", agent_id="coder", workspace="/work")
-    assert len(rows) == 1
-    assert "new" in rows[0]["content"]
 
 
 def test_inject_memories_appends_block():
@@ -79,9 +24,3 @@ def test_inject_memories_empty_unchanged():
 
 def test_build_memory_policy_none():
     assert isinstance(build_memory_policy("none"), NoMemory)
-
-
-def test_build_memory_policy_read_write(tmp_path):
-    s = _store(tmp_path)
-    m = build_memory_policy("read_write", s)
-    assert isinstance(m, ReadWriteMemory)

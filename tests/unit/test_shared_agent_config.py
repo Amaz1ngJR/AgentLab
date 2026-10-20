@@ -6,7 +6,7 @@ from app.agent.profiles import load_agent_profiles
 from app.agent.runtime import AgentSession
 from app.config.loader import use_workspace_root
 from app.models.protocol import ModelResponse, ToolCall
-from tests.unit.test_execution_plan import FakeRouter, registry, response
+from tests.support.delegation import FakeRouter, registry, response
 
 
 @pytest.mark.parametrize("orchestrate", [False, True])

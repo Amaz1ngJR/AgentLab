@@ -23,6 +23,7 @@ class CancelToken:
 
     def __init__(self) -> None:
         self._cancelled = False
+        self._reason: str | None = None
         self._lock = threading.RLock()
         self._callbacks: dict[int, Callable[[], None]] = {}
         self._next_callback_id = 0
@@ -35,11 +36,17 @@ class CancelToken:
         with self._lock:
             return self._cancelled
 
-    def cancel(self) -> None:
+    @property
+    def reason(self) -> str | None:
+        with self._lock:
+            return self._reason
+
+    def cancel(self, reason: str = "unspecified") -> None:
         with self._lock:
             if self._cancelled:
                 return
             self._cancelled = True
+            self._reason = reason
             self._event.set()
             callbacks = list(self._callbacks.values())
             self._callbacks.clear()

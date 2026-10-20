@@ -2,7 +2,7 @@
 from app.agent.context import ContextManager
 from app.agent.context_compaction import ContextCompressor
 from app.agent.context_budget import ContextBudget
-from tests.unit.test_context import _long_messages
+from tests.support.context import _long_messages
 
 
 class TimeoutLLM:

@@ -731,7 +731,7 @@ class RuntimeService:
             # 正常返回不代表目标完成：Direct 耗尽预算时可恢复，但不是成功。
             run_status = getattr(session, "last_run_status", "")
             suspended = run_status == "budget_exhausted"
-            cancelled = token.cancelled or run_status == "cancelled"
+            cancelled = not suspended and (token.cancelled or run_status == "cancelled")
             completed_turn = TurnRecord(
                 turn_id=actual_run_id,
                 thread_id=target_id,
@@ -744,14 +744,16 @@ class RuntimeService:
             )
             if storage is not None:
                 storage.save_runtime_turn(completed_turn)
+            payload = {"result": result}
+            if suspended:
+                payload.update(reason=run_status, resumable=True)
+            elif cancelled:
+                payload["reason"] = token.reason or "unspecified"
             self.publish(
                 "run_cancelled" if cancelled else "run_suspended" if suspended else "run_completed",
                 session_id=target_id,
                 run_id=actual_run_id,
-                payload=(
-                    {"result": result, "reason": run_status, "resumable": True}
-                    if suspended else {"result": result}
-                ),
+                payload=payload,
             )
             return result
         except BaseException as exc:
@@ -768,11 +770,16 @@ class RuntimeService:
                     failure_code=failure.code,
                 ))
             # BaseException 保证 KeyboardInterrupt 时也能发出收尾事件并释放 run 槽位。
+            payload = {"error": exc}
+            if was_cancelled:
+                payload["reason"] = token.reason or (
+                    "keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "unspecified"
+                )
             self.publish(
                 "run_cancelled" if was_cancelled else "run_failed",
                 session_id=target_id,
                 run_id=actual_run_id,
-                payload={"error": exc},
+                payload=payload,
             )
             raise
         finally:
@@ -792,7 +799,7 @@ class RuntimeService:
             active = self._runs.get(run_id)
             if active is None:
                 return False
-        active.cancel.cancel()
+        active.cancel.cancel("api_cancel")
         self.publish("run_cancel_requested", session_id=active.session_id, run_id=run_id)
         return True
 
@@ -817,7 +824,7 @@ class RuntimeService:
         for subscription in subscriptions:
             subscription.close()
         for active in active_runs:
-            active.cancel.cancel()
+            active.cancel.cancel("service_shutdown")
         self._submissions.close()
         self.approval_broker.close()
         self.router.close_all()

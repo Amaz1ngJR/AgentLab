@@ -574,7 +574,10 @@ AgentLab/
 │   ├── codex_runtime_learnings.md     # Codex Runtime 借鉴与 AgentLab 演进路线
 │   ├── local_model_guide.md           # 本地模型落地指南
 │   └── process.md                     # 开发进度与下一步计划
-├── tests/unit/             # 离线单元测试
+├── tests/                  # 离线测试（分层与运行方式见 tests/README.md）
+│   ├── unit/               # 单模块规则与组件契约
+│   ├── integration/        # 跨组件、SQLite 与真实 Git 工作流
+│   └── support/            # 共享测试数据与模型替身
 ├── pyproject.toml          # Python 打包配置和 agentlab 全局命令
 └── .env.example
 ```
@@ -584,7 +587,9 @@ AgentLab/
 ```bash
 conda activate agentlab
 pip install -e .
-python -m pytest tests/unit/ -v
+python -m pytest tests/ -q              # 完整离线回归
+python -m pytest tests/unit/ -q         # 单元 / 组件测试
+python -m pytest tests/integration/ -q  # 集成测试（需要 Git）
 ```
 
 进度与路线见 [`docs/process.md`](docs/process.md)；总体设计方案见 [`docs/technical_architecture.md`](docs/technical_architecture.md)；Codex Runtime 的架构借鉴与 AgentLab 演进建议见 [`docs/codex_runtime_learnings.md`](docs/codex_runtime_learnings.md)。

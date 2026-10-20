@@ -56,6 +56,7 @@ class AgentManager:
         self.history = history if history is not None else []
         self.max_parallel, self.max_agents = min(max_parallel, 4), min(max_agents, 8)
         self.rounds_left, self.tools_left = model_rounds, tool_calls
+        self.model_limit = model_rounds
         self.task_rounds = min(task_rounds or model_rounds, model_rounds)
         self.tool_limit, self.timeout = tool_calls, timeout
         self.deadline = time.monotonic() + timeout
@@ -77,6 +78,42 @@ class AgentManager:
         self._unsubscribe = cancel.add_callback(self.cancel_all)
         self.usage = {"input_tokens": 0, "output_tokens": 0}
         self.tool_calls = 0
+        self.long_run = False
+        self.auto_execute_active = False
+        self.budget_error: str | None = None
+        self._deadline_timer: threading.Timer | None = None
+
+    def enable_long_run(self, rounds: int, tools: int, timeout: float) -> None:
+        """Expand limits, not remaining consumption; keep the original start time."""
+        with self._lock:
+            if self._closed:
+                return
+            self.rounds_left += max(0, rounds - self.model_limit)
+            self.tools_left += max(0, tools - self.tool_limit)
+            self.model_limit = max(self.model_limit, rounds)
+            self.tool_limit = max(self.tool_limit, tools)
+            self.task_rounds = self.model_limit
+            self.timeout = max(self.timeout, timeout)
+            self.deadline = max(self.deadline, time.monotonic() + max(
+                0, self.timeout - (time.time() - self.started)))
+            self.long_run = True
+            self.auto_execute_active = True
+            self._schedule_deadline()
+
+    def _schedule_deadline(self):
+        if self._deadline_timer is not None:
+            self._deadline_timer.cancel()
+        self._deadline_timer = threading.Timer(max(0, self.deadline - time.monotonic()),
+            lambda: self._expire_budget("budget_exhausted: 自动运行达到时间上限；未完成任务已保留，请检查预算后继续或重新规划"))
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
+
+    def _expire_budget(self, reason: str):
+        with self._lock:
+            if self._closed or self.cancel.cancelled:
+                return
+            self.budget_error = reason
+        self.cancel.cancel("budget_exhausted")
 
     def result_delivered(self, sid: str) -> bool:
         return sid in self._delivered
@@ -189,7 +226,7 @@ class AgentManager:
                                              child_run_id=sid, waiting=child.waiting_approval),
                 parent_system=self.system,
                 parent_context=redact_value(self.context[:5000] + "\n" + context[:10000] + "\n" + history_context),
-                child_token=child.token, lightweight=True,
+                child_token=child.token, lightweight=True, retry_until_cancelled=self.long_run,
                 max_steps=max_steps, max_tool_calls=max_tool_calls,
                 on_event=self._events.put,
             )
@@ -256,8 +293,19 @@ class AgentManager:
             self.run_id = records[0].get("parent_run_id", self.run_id)
             self.started = records[0].get("parent_started_at", records[0].get("started_at", self.started))
             budget = records[-1].get("budget", {})
-            self.rounds_left = min(self.rounds_left, budget.get("model_rounds_left", self.rounds_left))
-            self.tools_left = min(self.tools_left, budget.get("tool_calls_left", self.tools_left))
+            if "model_limit" in budget:
+                self.model_limit = min(self.model_limit, budget["model_limit"])
+                self.rounds_left = max(0, self.model_limit - (
+                    budget["model_limit"] - budget["model_rounds_left"]))
+            else:
+                self.rounds_left = min(self.rounds_left, budget.get("model_rounds_left", self.rounds_left))
+            if "tool_limit" in budget:
+                self.tool_limit = min(self.tool_limit, budget["tool_limit"])
+                self.tools_left = max(0, self.tool_limit - (
+                    budget["tool_limit"] - budget["tool_calls_left"]))
+            else:
+                self.tools_left = min(self.tools_left, budget.get("tool_calls_left", self.tools_left))
+            self.timeout = min(self.timeout, budget.get("timeout_seconds", self.timeout))
             seconds = budget.get("seconds_left", max(0, self.deadline - time.monotonic()))
             if "deadline_at" in budget:
                 seconds = min(seconds, max(0, budget["deadline_at"] - time.time()))
@@ -313,19 +361,32 @@ class AgentManager:
             self._consumed.add(sid)  # Old usage is already settled in the old run.
         self._save()
 
+    def _wait_for_reservations(self, counter: str):
+        while (self.long_run and getattr(self, counter) <= 0
+               and any(not child.done.is_set() for child in self.children.values())):
+            self.cancel.raise_if_cancelled()
+            self.pump()
+            self.cancel.wait(0.02)
+        if self.long_run:
+            self.pump()  # A worker may finish during the last wait; settle before charging.
+
     def charge_parent_round(self):
-        if not self.allowed:
+        if not self.allowed and not self.long_run:
             return
         self.pump()
+        self._wait_for_reservations("rounds_left")
         if time.monotonic() >= self.deadline or self.rounds_left <= 0:
+            self._expire_budget("budget_exhausted: parent/child aggregate model budget")
             raise Cancelled("budget_exhausted: parent/child aggregate model budget")
         self.rounds_left -= 1
         self._save()
 
     def charge_parent_tool(self):
-        if not self.allowed:
+        if not self.allowed and not self.long_run:
             return
+        self._wait_for_reservations("tools_left")
         if time.monotonic() >= self.deadline or self.tools_left <= 0:
+            self._expire_budget("budget_exhausted: parent/child aggregate tool budget")
             raise Cancelled("budget_exhausted: parent/child aggregate tool budget")
         self.tools_left -= 1
         self._save()
@@ -526,6 +587,8 @@ class AgentManager:
             "delivered_revision": child.revision if sid in self._delivered else None,
             "delivery_receipt": (dict(self._delivery_receipts[sid]) if sid in self._delivery_receipts else None),
             "budget": {"model_rounds_left": self.rounds_left, "tool_calls_left": self.tools_left,
+                       "model_limit": self.model_limit, "tool_limit": self.tool_limit,
+                       "timeout_seconds": self.timeout,
                        "seconds_left": max(0, self.deadline - time.monotonic()),
                        "deadline_at": time.time() + self.deadline - time.monotonic()},
             "spec": asdict(child.spec), "started_at": child.started,
@@ -643,6 +706,8 @@ class AgentManager:
 
     def finish(self):
         self._closed = True
+        if self._deadline_timer is not None:
+            self._deadline_timer.cancel()
         self.cancel_all()
         deadline = time.monotonic() + 0.25
         for child in self.children.values():

@@ -50,6 +50,9 @@ class AgentProfile:
     max_parallel_agents: int = 2
     max_tool_calls: int = 120
     timeout_seconds: float = 300
+    auto_max_steps: int = 10_000
+    auto_max_tool_calls: int = 10_000
+    auto_timeout_seconds: float = 14_400
 
     def __post_init__(self) -> None:
         from app.agent.delegation_policy import POLICIES
@@ -65,6 +68,9 @@ class AgentProfile:
             raise ValueError("AgentProfile.max_steps 必须 > 0")
         if self.max_tool_calls <= 0 or not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("max_tool_calls 和 timeout_seconds 必须为正数")
+        if (self.auto_max_steps <= 0 or self.auto_max_tool_calls <= 0
+                or not math.isfinite(self.auto_timeout_seconds) or self.auto_timeout_seconds <= 0):
+            raise ValueError("auto 执行预算必须为正数")
         if self.max_task_steps is not None and self.max_task_steps <= 0:
             raise ValueError("AgentProfile.max_task_steps 必须 > 0")
 
@@ -100,6 +106,9 @@ def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
             max_parallel_agents=int(body.get("max_parallel_agents", 2)),
             max_tool_calls=int(body.get("max_tool_calls", 120)),
             timeout_seconds=float(body.get("timeout_seconds", 300)),
+            auto_max_steps=int(body.get("auto_max_steps", 10_000)),
+            auto_max_tool_calls=int(body.get("auto_max_tool_calls", 10_000)),
+            auto_timeout_seconds=float(body.get("auto_timeout_seconds", 14_400)),
             orchestrate=orchestrate,
             mode=_parse_mode(body.get("mode"), orchestrate=orchestrate),
         )

@@ -64,6 +64,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.1 P0 核心 CLI Agent
 
+- 自动运行停止诊断：取消令牌保留首次取消来源，`turn.cancelled` 事件记录 Esc、Ctrl+C/SIGINT、EOF、API 取消等原因，CLI 在实时输入框退出后显示停止说明；单条 shell 超时仅回传工具错误，不取消整个任务，保留有界的部分输出并提示先检查已发生的改动，避免盲目重试。非交互子进程使用空 stdin，与实时输入框隔离；交互命令使用 terminal 工具。已覆盖 Direct/Task 同批次超时后继续、真实子进程超时、父取消令牌不受影响及输入取消来源的回归测试。历史会话 `31316530` 的本轮记录为 cancelled，而非正常完成；旧事件未记录取消来源，不能仅凭 180 秒超时断定根因。
 - CLI REPL：交互模式、单次 `-p/--prompt`、`--profile`、`-y` 自动审批；prompt_toolkit 输入框、spinner 进度（`✻ thinking… (3.2s · ↓ 42 tokens)`）、token/耗时统计。
 - 模型层：Anthropic Messages、OpenAI Responses、OpenAI-compatible 三种 adapter；内部协议统一 `ModelResponse / ToolCall / ToolResult`；OpenAI-compatible 具备 JSON tool call fallback；实际模型 ID 规范化 + 代理静默映射提示。
 - Runtime：同步多轮"模型 → 工具 → 模型"循环；工具审批、工具错误回灌、流式文本回调；`max_steps` 作为 run 级模型往返总预算，`max_task_steps` 限制单个子任务，二者共同防止空转与单任务独占。
@@ -241,6 +242,10 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
   收尾期间仍保留输入，但同一 session 不会并发执行下一轮写操作。
 
 ### 3.18 统一运行时委派与写入交付（t.md M01–M12）
+
+- **显式自动执行长运行**：Profile 新增父子共用的 `auto_max_steps` / `auto_max_tool_calls` / `auto_timeout_seconds`，默认 10000 轮、10000 次工具、4 小时；不再受普通单任务步数及 5 分钟运行窗口截断。Direct/Task 和执行中启用自动模式均接通；不会重置已消耗计数。工具错误反馈模型纠正，持续错误或无变化重复调用停止；临时网络故障可取消退避。Direct 每轮、长运行子级独立上下文均接入现有压缩机制。硬 deadline 主动取消等待中的模型，预算耗尽通过 Service 记录为 suspended，区别于 ESC/Ctrl+C；子预算预留期间父级等待真实结算。关闭自动模式恢复审批。示例配置和 CLI 启用提示已同步。真实 provider 数小时运行、费用和原生 Windows 输入仍需设备验证。
+
+长运行验证：`test_long_auto_execution.py` 的 24 个用例覆盖短配置下持续工作、父子预算、执行中切换、网络重试标志、等待请求的主动超时与人工取消、错误纠正/无进展保护、压缩轮次计费和预算恢复；全量 **1084 passed**，`git diff --check` 通过。没有进行真实 provider 数小时耐久测试。
 
 父子共用配置回归：`test_shared_agent_config.py` 覆盖 Direct/Task、显式/省略单任务额度、长任务和非法配置；全量 `pytest -q` 为 **1060 passed**，`git diff --check` 通过。
 

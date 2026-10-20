@@ -12,6 +12,7 @@ Replanner 根据这里返回的 TaskOutcome 决定,Executor 自己不写 TaskSto
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from contextlib import nullcontext
@@ -205,9 +206,15 @@ class Executor:
         model_rounds = 0
         no_progress_rounds = 0
         seen_tool_signatures: set[tuple[str, str]] = set()
+        repeated_requests = 0
+        error_rounds = 0
+        last_outputs: dict[tuple[str, str], bytes] = {}
         task_context = task.content
+        manager = getattr(self._tools, "manager", None)
 
-        for _ in range(max(1, max_steps)):
+        while auto_execute or (manager is not None and manager.long_run) or model_rounds < max(1, max_steps):
+            if manager is not None and manager.long_run:
+                auto_execute = manager.auto_execute_active
             model_rounds += 1
             if cancel is not None:
                 cancel.raise_if_cancelled()
@@ -218,6 +225,9 @@ class Executor:
                 manager.charge_parent_round()
             if steering:
                 seen_tool_signatures.clear()
+                repeated_requests = 0
+                error_rounds = 0
+                last_outputs.clear()
                 task_context += "\n" + "\n".join(steering)
 
             tools = self._tools_for_task(task_context, mode="task") or None
@@ -309,7 +319,7 @@ class Executor:
                     continue
                 if not response_text.strip():
                     no_progress_rounds += 1
-                    if no_progress_rounds == 1 and model_rounds < max_steps:
+                    if no_progress_rounds == 1 and (auto_execute or model_rounds < max_steps):
                         messages.append({
                             "role": "user",
                             "content": (
@@ -383,7 +393,7 @@ class Executor:
                                is_error=False)
                     for c in resp.tool_calls if c.id not in resulted_ids
                 ]
-                if pending:
+                if pending or tool_results:
                     combined = tool_results + pending
                     messages.extend(self._llm.format_tool_results(combined))
                     manager = getattr(self._tools, "manager", None)
@@ -401,7 +411,7 @@ class Executor:
                             break
                     tool_calls_made += 1
                     signature = (call.name, json.dumps(call.arguments, sort_keys=True, default=repr))
-                    if signature in seen_tool_signatures:
+                    if signature in seen_tool_signatures and not auto_execute:
                         _flush_pending_tool_results()
                         return TaskOutcome(
                             status=FAILED,
@@ -441,6 +451,8 @@ class Executor:
 
                     approval_result = None
                     if needs_approval and tool is not None:
+                        if manager is not None and manager.long_run:
+                            auto_execute = manager.auto_execute_active
                         if auto_execute:
                             approval_result = ApprovalResult(approved=True)
                         else:
@@ -513,7 +525,7 @@ class Executor:
                         ))
                         # 工具执行出错 -> 任务失败。先补齐 tool_result 配对,再返回,
                         # 否则 assistant 的 tool_use 悬空,Replanner 重试时 provider 报错。
-                        if is_error:
+                        if is_error and not auto_execute:
                             tool_results.append(ToolResult(
                                 tool_call_id=call.id, output=output, is_error=is_error,
                             ))
@@ -527,6 +539,21 @@ class Executor:
                                 tool_calls_made=tool_calls_made,
                                 model_rounds=model_rounds,
                             )
+                        if auto_execute:
+                            digest = hashlib.sha256(output.encode("utf-8", errors="replace")).digest()
+                            unchanged = last_outputs.get(signature) == digest
+                            repeated_requests = repeated_requests + 1 if unchanged else 0
+                            if (not unchanged and not is_error and tool is not None
+                                    and (tool.risk == "write" or call.name in {"write_file", "edit_file"})):
+                                last_outputs.clear()
+                            last_outputs[signature] = digest
+                            if repeated_requests >= 3:
+                                tool_results.append(ToolResult(call.id, output, is_error))
+                                resulted_ids.add(call.id)
+                                _flush_pending_tool_results()
+                                return TaskOutcome(FAILED, error="重复工具调用且结果未变化，停止自动空转",
+                                                   text=last_text, model_rounds=model_rounds,
+                                                   tool_calls_made=tool_calls_made)
 
                     tool_results.append(ToolResult(
                         tool_call_id=call.id, output=output, is_error=is_error,
@@ -547,6 +574,11 @@ class Executor:
                 manager = getattr(self._tools, "manager", None)
                 if manager is not None:
                     manager.acknowledge_tool_results(tool_results)
+                error_rounds = error_rounds + 1 if all(r.is_error for r in tool_results) else 0
+                if auto_execute and error_rounds >= 3:
+                    return TaskOutcome(FAILED, error="连续三轮工具失败且无执行进展，停止自动重试",
+                                       text=last_text, model_rounds=model_rounds,
+                                       tool_calls_made=tool_calls_made)
 
             # tool_result 刚入历史后再次预检，尽早压缩下一轮要发送的上下文。
             if self._ctx is not None:

@@ -300,7 +300,7 @@ def test_non_session_command_returns_none(tmp_path):
 def test_checkpoint_before_child_start_restores_dag_history_and_association(tmp_path, monkeypatch):
     import json
     from app.agent.subagent_runtime import SubagentRuntimeFactory
-    from tests.unit.test_execution_plan import FakeRouter, registry, response
+    from tests.support.delegation import FakeRouter, registry, response
     from app.config.loader import use_workspace_root
     db_path = tmp_path / "crash.db"
     db = Storage(db_path)
@@ -371,7 +371,7 @@ def test_delegation_checkpoint_rolls_back_all_parts_on_failure(tmp_path, monkeyp
 
 def test_portable_checkpoint_receipt_survives_merged_user_messages(tmp_path):
     import json
-    from tests.unit.test_agent_manager import manager
+    from tests.support.delegation import manager
     db_path = tmp_path / "receipt.db"
     db = Storage(db_path)
     router = _make_router(db, _profiles())
@@ -408,7 +408,7 @@ def test_portable_checkpoint_receipt_survives_merged_user_messages(tmp_path):
 
 def test_wait_receipt_is_committed_only_after_result_enters_history(tmp_path):
     import json
-    from tests.unit.test_agent_manager import manager
+    from tests.support.delegation import manager
     db = Storage(tmp_path / "wait.db")
     router = _make_router(db, _profiles())
     session_id = router.new("default")
@@ -448,7 +448,7 @@ def test_wait_receipt_is_committed_only_after_result_enters_history(tmp_path):
 
 def test_delivery_receipt_and_history_rollback_together(tmp_path, monkeypatch):
     import pytest
-    from tests.unit.test_agent_manager import manager
+    from tests.support.delegation import manager
     db = Storage(tmp_path / "rollback.db")
     router = _make_router(db, _profiles())
     session_id = router.new("default")

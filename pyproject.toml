@@ -12,6 +12,13 @@ requires-python = ">=3.11"
 [project.scripts]
 agentlab = "app.cli:main"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: isolated behavior and component contract tests",
+    "integration: offline cross-component, SQLite, or real Git workflow tests",
+]
+
 [tool.setuptools.packages.find]
 include = ["app", "app.*"]
 

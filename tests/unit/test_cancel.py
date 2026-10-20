@@ -54,6 +54,17 @@ def test_cancel_is_idempotent_and_fires_callbacks_once():
     assert fired == [1]
 
 
+def test_cancellation_preserves_first_source_before_callbacks():
+    token = CancelToken()
+    seen = []
+    token.add_callback(lambda: seen.append(token.reason))
+    assert token.reason is None
+    token.cancel("keyboard_escape")
+    token.cancel("input_worker_error")
+    assert token.reason == "keyboard_escape"
+    assert seen == ["keyboard_escape"]
+
+
 def test_multiple_callbacks_all_fire():
     token = CancelToken()
     fired = []

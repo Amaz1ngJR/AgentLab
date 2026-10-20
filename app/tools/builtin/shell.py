@@ -85,8 +85,24 @@ def _run_shell(args: dict) -> str:
     try:
         completed = run_process(argv, cwd=str(cwd), timeout=timeout, cancel=cancel)
         stdout, stderr, returncode = completed.stdout, completed.stderr, completed.returncode
-    except subprocess.TimeoutExpired:
-        raise ToolExecutionError(f"timeout: command exceeded {timeout}s and was killed")
+    except subprocess.TimeoutExpired as exc:
+        details = []
+        for part in (exc.output, exc.stderr):
+            if isinstance(part, bytes):
+                part = part.decode("utf-8", errors="replace")
+            if part:
+                details.append(part.rstrip())
+        partial = "\n".join(details)
+        if len(partial) > MAX_OUTPUT_BYTES:
+            partial = "[...truncated partial output]\n" + partial[-MAX_OUTPUT_BYTES:]
+        message = (
+            f"timeout: command exceeded {timeout}s and was killed\n"
+            "Only this command timed out; inspect partial changes before retrying. "
+            "Use a longer timeout or terminal_open/terminal_send for long-running work."
+        )
+        if partial:
+            message += "\n[partial output]\n" + partial
+        raise ToolExecutionError(message) from exc
     except FileNotFoundError as exc:
         # 没装 bash / powershell 时
         raise ToolExecutionError(f"shell not found: {exc}")

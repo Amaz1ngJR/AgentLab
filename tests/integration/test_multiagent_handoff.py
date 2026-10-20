@@ -1,5 +1,4 @@
 """多 Agent P0：真实父子模型链路、恢复与权限的确定性回归。"""
-import copy
 import json
 import time
 from dataclasses import asdict
@@ -17,12 +16,7 @@ from app.agent.subagent_runtime import RestrictedToolRegistry, SubagentRuntimeFa
 from app.agent.subagents import SubagentSpec
 from app.agent.tasks import BLOCKED, COMPLETED, FAILED, IN_PROGRESS, Task, TaskStore
 from app.models.protocol import ModelResponse, ToolCall
-from tests.unit.test_execution_plan import FakeRouter, registry, response
-
-
-class SnapshotRouter(FakeRouter):
-    def create_message(self, messages, **kwargs):
-        return super().create_message(copy.deepcopy(messages), **kwargs)
+from tests.support.delegation import FakeRouter, SnapshotRouter, registry, response
 
 
 def child_task(read_only=True):

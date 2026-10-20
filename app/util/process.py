@@ -15,9 +15,11 @@ def run_process(argv: list[str], *, cwd: str, timeout: float, cancel: CancelToke
     if cancel is None:
         return subprocess.run(
             argv, cwd=cwd, timeout=timeout, capture_output=True, text=True, errors="replace",
+            stdin=subprocess.DEVNULL,
         )
     cancel.raise_if_cancelled()
-    options = dict(cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    options = dict(cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE, text=True, errors="replace")
     windows = platform.system() == "Windows"
     if windows:
         options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -65,6 +67,7 @@ def run_process(argv: list[str], *, cwd: str, timeout: float, cancel: CancelToke
             pass
 
     deadline = time.monotonic() + timeout
+    partial_stdout = partial_stderr = None
     try:
         with cancel.callback(stop):
             while True:
@@ -72,12 +75,15 @@ def run_process(argv: list[str], *, cwd: str, timeout: float, cancel: CancelToke
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     stop()
-                    raise subprocess.TimeoutExpired(argv, timeout)
+                    raise subprocess.TimeoutExpired(
+                        argv, timeout, output=partial_stdout, stderr=partial_stderr,
+                    )
                 try:
                     stdout, stderr = proc.communicate(timeout=min(0.05, remaining))
                     cancel.raise_if_cancelled()
                     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as exc:
+                    partial_stdout, partial_stderr = exc.output, exc.stderr
                     continue
     except BaseException:
         stop()

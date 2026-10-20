@@ -46,6 +46,14 @@
 #   子 Agent 默认继承同一配置，并发时分配剩余额度，给父级汇总和验证留出余量。
 #   模型可请求更小的任务预算，但不能扩大总预算；取消、只读和审批约束保持不变。
 #
+# 自动执行（Ctrl+A 或审批中选择自动执行；与 delegation_policy: auto 不同）：
+#   auto_max_steps        - 自动执行的父子共享总轮次，默认 10000
+#   auto_max_tool_calls   - 自动执行的父子共享总工具次数，默认 10000
+#   auto_timeout_seconds  - 自动执行的总时间上限，默认 14400 秒（4 小时）
+#   自动模式不因普通 max_steps/max_task_steps 耗尽而退出；完成、取消、阻塞、
+#   连续无进展或达到以上硬上限时才收尾。网络瞬时故障退避重试，取消仍立即传递。
+#   预算控制的是最长允许执行量，不强制任务运行这么久；普通模式配置保持有效。
+#
 # skills:
 #   显式启用的 Skill 列表（对应 skills/ 目录下的 skill）
 #   例如：[code-review, git-commit]
@@ -93,6 +101,9 @@ agents:
     max_task_steps: 500
     max_tool_calls: 120
     timeout_seconds: 600
+    auto_max_steps: 10000
+    auto_max_tool_calls: 10000
+    auto_timeout_seconds: 14400
 
   # 本地助手——使用本地模型，数据不出本机
   local:

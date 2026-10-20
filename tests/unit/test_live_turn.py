@@ -56,6 +56,7 @@ def test_live_prompt_stops_blocked_model_and_preserves_draft(key):
             assert live.run(work, token) == "stopped"
             assert time.monotonic() - start < 0.8
             assert live.draft == "unfinished draft"
+            assert token.reason == ("keyboard_escape" if key == "\x1b" else "keyboard_interrupt")
         finally:
             release.set()
             typer.join(1)
@@ -87,6 +88,53 @@ def test_enter_steers_running_turn_without_cancelling():
         assert live.run(work, token) == ["focus on tests"]
         typer.join(1)
         assert not token.cancelled
+
+
+def test_input_eof_is_recorded_separately_from_escape():
+    started = threading.Event()
+    with create_pipe_input() as pipe:
+        prompt = PromptSession(input=pipe, output=DummyOutput())
+        live = LiveTurnInput(prompt, message="> ", style=Style([]), prepare_input=lambda s: s)
+        token = CancelToken()
+
+        def work():
+            started.set()
+            assert token.wait(2)
+            return "stopped"
+
+        def close_input():
+            assert started.wait(1)
+            pipe.send_text("\x04")
+
+        typer = threading.Thread(target=close_input)
+        typer.start()
+        try:
+            assert live.run(work, token) == "stopped"
+            assert token.reason == "input_eof"
+            assert live.next_input == "exit"
+        finally:
+            typer.join(1)
+
+
+@pytest.mark.parametrize("reason,notice", [
+    ("keyboard_escape", "收到 Esc"),
+    ("keyboard_interrupt", "收到 Ctrl+C"),
+    ("input_eof", "EOF"),
+])
+def test_cli_displays_stop_reason_after_live_composer_exits(monkeypatch, reason, notice):
+    from types import SimpleNamespace
+    from app import cli
+
+    class StoppedInput:
+        def run(self, work, token):
+            token.cancel(reason)
+            return "stopped"
+
+    notices = []
+    monkeypatch.setattr(cli, "_emit_progress_notice", lambda text: notices.append(text))
+    assert cli._chat_with_cancel(SimpleNamespace(), "work", live_input=StoppedInput()) == "stopped"
+    assert notice in notices[0]
+    assert cli._LIVE_INPUT is None
 
 
 def test_approval_prompt_exclusively_reads_input_then_restores_composer():

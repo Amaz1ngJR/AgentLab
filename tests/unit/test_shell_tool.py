@@ -150,6 +150,21 @@ def test_run_shell_timeout_kills_command(monkeypatch, tmp_path):
     assert "30s" in out
 
 
+def test_timeout_keeps_bounded_partial_output(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("bash", 30, output=b"x" * 16000,
+                                        stderr=b"download interrupted")
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    with pytest.raises(ToolExecutionError) as exc:
+        _run_shell({"command": "download"})
+    assert "download interrupted" in str(exc.value)
+    assert "inspect partial changes" in str(exc.value)
+    assert len(str(exc.value)) < MAX_OUTPUT_BYTES + 500
+
+
 def test_run_shell_truncates_long_output(monkeypatch, tmp_path):
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
     huge = "a" * (MAX_OUTPUT_BYTES * 2)

@@ -154,6 +154,9 @@ class AgentSession:
         max_parallel_agents: int = 2,
         max_tool_calls: int = 120,
         timeout_seconds: float = 300,
+        auto_max_steps: int = 10_000,
+        auto_max_tool_calls: int = 10_000,
+        auto_timeout_seconds: float = 14_400,
     ):
         self.llm = llm
         from app.agent.delegation_policy import POLICIES
@@ -165,6 +168,12 @@ class AgentSession:
             raise ValueError("invalid shared tool/time budget")
         self.max_tool_calls = max_tool_calls
         self.timeout_seconds = timeout_seconds
+        if (auto_max_steps <= 0 or auto_max_tool_calls <= 0
+                or not math.isfinite(auto_timeout_seconds) or auto_timeout_seconds <= 0):
+            raise ValueError("invalid automatic execution budget")
+        self.auto_max_steps = auto_max_steps
+        self.auto_max_tool_calls = auto_max_tool_calls
+        self.auto_timeout_seconds = auto_timeout_seconds
         self.child_records: list[dict] = []
         self._retiring_managers: list = []
         self.child_checkpoint = lambda records: None
@@ -219,14 +228,30 @@ class AgentSession:
     def enable_auto_execute(self) -> None:
         """打开全自动执行模式：所有工具调用免审批，直到任务完成。"""
         self._auto_execute_enabled = True
+        manager = getattr(self.tools, "manager", None)
+        if manager is not None:
+            manager.enable_long_run(self.auto_max_steps, self.auto_max_tool_calls, self.auto_timeout_seconds)
+            if manager.allowed:
+                for tool in manager.tool_descriptors():
+                    self.tools.register(tool)
+            if self._orch is not None:
+                self._orch._auto_execute_requested = True
+                self._orch._max_steps = manager.model_limit
+                self._orch._max_task_steps = manager.task_rounds
 
     def disable_auto_execute(self) -> None:
         """关闭全自动执行模式，恢复正常审批流程。"""
         self._auto_execute_enabled = False
+        manager = getattr(self.tools, "manager", None)
+        if manager is not None:
+            manager.auto_execute_active = False
 
     def toggle_auto_execute(self) -> bool:
         """切换全自动执行模式，返回切换后的状态。"""
-        self._auto_execute_enabled = not self._auto_execute_enabled
+        if self._auto_execute_enabled:
+            self.disable_auto_execute()
+        else:
+            self.enable_auto_execute()
         return self._auto_execute_enabled
 
     @property
@@ -513,20 +538,31 @@ class AgentSession:
             llm=self.llm, tools=source, approval=self.approval, workspace=workspace_root(),
             cancel=cancel, allowed=self._delegation_allowed, system=self.system_prompt,
             context=user_input, max_parallel=self.max_parallel_agents,
-            model_rounds=self.max_steps, task_rounds=self.max_task_steps,
-            tool_calls=self.max_tool_calls, timeout=self.timeout_seconds,
+            model_rounds=self.auto_max_steps if self._auto_execute_enabled else self.max_steps,
+            task_rounds=None if self._auto_execute_enabled else self.max_task_steps,
+            tool_calls=self.auto_max_tool_calls if self._auto_execute_enabled else self.max_tool_calls,
+            timeout=self.auto_timeout_seconds if self._auto_execute_enabled else self.timeout_seconds,
             on_event=self._emit_run_event, checkpoint=checkpoint,
             history=self.messages,
         )
         if resume and self._delegation_allowed:
             manager.restore_results(latest_records, messages=self.messages)
+        if self._auto_execute_enabled:
+            manager.enable_long_run(self.auto_max_steps, self.auto_max_tool_calls, self.auto_timeout_seconds)
         self.tools = DelegationRegistry(source, manager)
+        def report_budget():
+            self.last_run_status = "budget_exhausted"
+            text = manager.budget_error or "budget_exhausted"
+            self._emit_run_event(RunEvent(kind=events.RUN_FAILED, text=text))
+            return text
         try:
             if mode is ExecutionMode.DIRECT:
                 answer = self._chat_legacy(user_input, images=images, cancel=cancel)
             else:
                 answer = self._chat_orchestrated(user_input, images=images, cancel=cancel, resume=resume)
             manager.pump()
+            if manager.budget_error:
+                return report_budget()
             unresolved = manager.unresolved()
             if unresolved and self.last_run_status == "completed":
                 self.last_run_status = "blocked"
@@ -534,6 +570,10 @@ class AgentSession:
                 self._emit_run_event(RunEvent(kind=events.RUN_FAILED, text=answer,
                                              payload={"children": manager.records()}))
             return answer
+        except Cancelled:
+            if manager.budget_error:
+                return report_budget()
+            raise
         finally:
             try:
                 manager.finish()
@@ -563,6 +603,10 @@ class AgentSession:
         turn_start = time.monotonic()
         try:
             orch = self._ensure_orchestrator()
+            manager = getattr(self.tools, "manager", None)
+            if manager is not None and manager.long_run:
+                orch._max_steps = manager.model_limit
+                orch._max_task_steps = manager.task_rounds
             if images:
                 # Planner 仍接收纯文本目标；图片消息先进入共享历史，Executor 随后
                 # 可在首个子任务中看到并分析这些图片。
@@ -613,13 +657,6 @@ class AgentSession:
         })
         # 在每次模型调用前检查，确保当前用户输入和 Responses 顶层 item 都计入预算。
         tools = self._tools_for_task(user_input, mode="direct")
-        if self.context_manager is not None:
-            self.context_manager.compact_before_model_call(
-                self.messages,
-                system=self.system_prompt,
-                tools=tools,
-                cancel=cancel,
-            )
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
         turn_start = time.monotonic()
@@ -636,7 +673,9 @@ class AgentSession:
             corrected_no_tool = False
             max_steps = self.max_steps
             tool_context = user_input
-            for step_index in range(max_steps):
+            step_index = -1
+            while self._auto_execute_enabled or step_index + 1 < max_steps:
+                step_index += 1
                 # 安全检查点：模型往返之间是干净的稳定点，此时 tool_use/tool_result
                 # 都已配对闭合，中断不会在历史里留下悬空调用。
                 if cancel is not None and cancel.cancelled:
@@ -652,7 +691,11 @@ class AgentSession:
                     manager.charge_parent_round()
                 if steering:
                     tool_context += "\n" + "\n".join(steering)
-                    tools = self._tools_for_task(tool_context, mode="direct")
+                tools = self._tools_for_task(tool_context, mode="direct")
+                if self.context_manager is not None:
+                    self.context_manager.compact_before_model_call(
+                        self.messages, system=self.system_prompt, tools=tools, cancel=cancel,
+                    )
                 text_streamed = False
                 streamed_parts: list[str] = []
 
@@ -730,7 +773,7 @@ class AgentSession:
                         continue
                     if not response_text.strip():
                         empty_rounds += 1
-                        if empty_rounds == 1 and step_index + 1 < max_steps:
+                        if empty_rounds == 1 and (self._auto_execute_enabled or step_index + 1 < max_steps):
                             self.messages.append({
                                 "role": "user",
                                 "content": (
@@ -758,7 +801,7 @@ class AgentSession:
                             f"output_types={output_types})"
                         )
                     if action_request and not successful_tool_calls and not denied_tools:
-                        if not corrected_no_tool and step_index + 1 < max_steps:
+                        if not corrected_no_tool and (self._auto_execute_enabled or step_index + 1 < max_steps):
                             corrected_no_tool = True
                             self.messages.append({
                                 "role": "user",
@@ -771,7 +814,7 @@ class AgentSession:
                             continue
                         raise RuntimeError("模型只输出了文字，未进行结构化工具调用；请求未执行")
                     if _looks_like_pseudo_tool_call(response_text, action_request=action_request):
-                        if not corrected_no_tool and step_index + 1 < max_steps:
+                        if not corrected_no_tool and (self._auto_execute_enabled or step_index + 1 < max_steps):
                             corrected_no_tool = True
                             self.messages.append({
                                 "role": "user",
@@ -804,7 +847,7 @@ class AgentSession:
                                    is_error=False)
                         for c in resp.tool_calls if c.id not in resulted_ids
                     ]
-                    if pending:
+                    if pending or tool_results:
                         self.messages.extend(
                             self.llm.format_tool_results(tool_results + pending)
                         )

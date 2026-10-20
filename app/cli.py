@@ -1881,6 +1881,9 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             max_parallel_agents=agent_profile.max_parallel_agents,
             max_tool_calls=agent_profile.max_tool_calls,
             timeout_seconds=agent_profile.timeout_seconds,
+            auto_max_steps=agent_profile.auto_max_steps,
+            auto_max_tool_calls=agent_profile.auto_max_tool_calls,
+            auto_timeout_seconds=agent_profile.auto_timeout_seconds,
             # auto 可逐轮选择 Direct；两种路径使用不同事件，不会重复渲染。
             on_event=_print_event,
             progress=progress_fn,
@@ -2431,17 +2434,29 @@ def _chat_with_cancel(
                     )
                 return session.chat(line, images=images, cancel=token, resume=resume)
             return live_input.run(execute, token)
-        except (KeyboardInterrupt, Cancelled):
+        except (KeyboardInterrupt, Cancelled) as exc:
+            token.cancel("keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "unspecified")
             session.last_run_status = "cancelled"
             return "已中断。"
         finally:
             _LIVE_INPUT = None
+            if token.cancelled and token.reason != "budget_exhausted":
+                reason = {
+                    "keyboard_escape": "收到 Esc",
+                    "keyboard_interrupt": "收到 Ctrl+C / SIGINT",
+                    "input_eof": "终端输入流已关闭（EOF）",
+                    "approval_cancelled": "审批被取消",
+                    "api_cancel": "收到 API 取消请求",
+                    "service_shutdown": "运行服务关闭",
+                    "input_worker_error": "执行或输入协程异常，详情见错误信息",
+                }.get(token.reason, "来源未标记，请检查运行事件")
+                _emit_progress_notice(f"本轮已停止：{reason}；任务未必完成，可继续输入指令")
     can_trap = threading.current_thread() is threading.main_thread()
     prev_handler = None
 
     def _request_cancel(via: str) -> None:
         if not token.cancelled:
-            token.cancel()
+            token.cancel("keyboard_escape" if via == "Esc" else "keyboard_interrupt")
             _emit_progress_notice(
                 f"已收到 {via}，正在立即停止；之后可输入新指令或 /resume 继续",
                 marker="⏹",
@@ -2639,7 +2654,9 @@ def _repl(router: RuntimeService) -> int:
             return
         enabled = session.toggle_auto_execute()
         status = "🚀 已启用" if enabled else "❌ 已关闭"
-        detail = "（动作任务免审批并持续执行，Esc/Ctrl+C 停止）" if enabled else ""
+        detail = (f"（持续执行，预算 {session.auto_max_steps} 轮 / "
+                  f"{session.auto_max_tool_calls} 次工具 / {session.auto_timeout_seconds / 3600:g} 小时，"
+                  "Esc/Ctrl+C 停止）") if enabled else ""
         print(f"\n{status}全自动执行模式{detail}")
         get_app().invalidate()
 

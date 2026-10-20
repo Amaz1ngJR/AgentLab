@@ -83,9 +83,9 @@ class LiveTurnInput:
     def invalidate(self) -> None:
         self.prompt.app.invalidate()
 
-    def cancel(self) -> None:
+    def cancel(self, reason: str = "approval_cancelled") -> None:
         if self._token is not None:
-            self._token.cancel()
+            self._token.cancel(reason)
             self.invalidate()
 
     def pause(self) -> None:
@@ -139,9 +139,12 @@ class LiveTurnInput:
         bindings = KeyBindings()
 
         @bindings.add("escape", eager=True)
+        def stop_escape(event):
+            self.cancel("keyboard_escape")
+
         @bindings.add("c-c", eager=True)
         def stop(event):
-            self.cancel()
+            self.cancel("keyboard_interrupt")
 
         def toolbar():
             if token.cancelled:
@@ -159,10 +162,10 @@ class LiveTurnInput:
                         refresh_interval=0.1,
                     )
                 except KeyboardInterrupt:
-                    self.cancel()
+                    self.cancel("keyboard_interrupt")
                     continue
                 except EOFError:
-                    self.cancel()
+                    self.cancel("input_eof")
                     self.next_input = "exit"
                     return
                 if not text.strip():
@@ -212,8 +215,8 @@ class LiveTurnInput:
                 if error is not None:
                     raise error
                 return result
-            except BaseException:
-                token.cancel()
+            except BaseException as exc:
+                token.cancel("keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "input_worker_error")
                 raise
             finally:
                 clear_background_reader(self)

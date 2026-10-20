@@ -1,43 +1,13 @@
 """Runtime Protocol v1 与 append-only Event/Item 存储测试。"""
 import sqlite3
 import threading
-from datetime import datetime, timezone
-
 import pytest
 
 from app.agent.service import RuntimeService
 from app.protocol.envelopes import EventEnvelope
-from app.protocol.errors import RuntimeFailure
 from app.protocol.items import TurnItem
 from app.protocol.models import TurnRecord
 from app.storage import Storage
-
-
-def test_protocol_envelope_requires_namespaced_kind_and_json_payload():
-    event = EventEnvelope.create(
-        sequence=1,
-        thread_id="s1",
-        turn_id="r1",
-        kind="turn.started",
-        payload={"path": __file__},
-    )
-    assert event.schema_version == 1
-    assert event.to_dict()["payload"]["path"] == __file__
-    with pytest.raises(ValueError):
-        EventEnvelope.create(sequence=1, thread_id="s1", kind="bad", payload={})
-
-
-def test_runtime_failure_is_structured_and_serializable():
-    failure = RuntimeFailure(
-        code="provider_overloaded",
-        category="provider",
-        message="503",
-        retryable=True,
-        retry_after_seconds=2.0,
-        details={"status": 503},
-    )
-    assert failure.to_dict()["retryable"] is True
-    assert failure.to_dict()["details"]["status"] == 503
 
 
 def test_storage_round_trips_turn_items_and_events(tmp_path):

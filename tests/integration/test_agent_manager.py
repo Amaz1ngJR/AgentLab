@@ -12,17 +12,7 @@ from app.agent.delegation_policy import delegation_allowed
 from app.agent.runtime import AgentSession
 from app.models.protocol import ModelResponse, ToolCall, ToolResult
 from app.tools.registry import ToolExecutionError
-from tests.unit.test_execution_plan import FakeRouter, registry, response
-
-
-class ForkRouter(FakeRouter):
-    def fork(self):
-        return FakeRouter([response("CHILD_FINDING")])
-
-
-def manager(tmp_path, **kwargs):
-    return AgentManager(llm=ForkRouter([]), tools=registry(), approval=AutoApprove(),
-                        workspace=tmp_path, cancel=CancelToken(), allowed=True, **kwargs)
+from tests.support.delegation import FakeRouter, ForkRouter, manager, registry, response
 
 
 def test_parallel_nonblocking_spawn_and_id_isolation(tmp_path):

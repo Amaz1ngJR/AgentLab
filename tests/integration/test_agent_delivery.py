@@ -11,8 +11,7 @@ from app.models.protocol import ModelResponse, ToolCall
 from app.tools.builtin.files import default_tools
 from app.tools.builtin.shell import SHELL
 from app.tools.registry import ToolRegistry, ToolExecutionError
-from tests.unit.test_subagents import git_repo
-from tests.unit.test_execution_plan import FakeRouter, response
+from tests.support.delegation import FakeRouter, response
 
 
 class WriterRouter(FakeRouter):
@@ -422,7 +421,7 @@ from app.models.protocol import ModelResponse
 from app.storage import Storage
 from app.tools.builtin.files import default_tools
 from app.tools.registry import ToolRegistry
-from tests.unit.test_execution_plan import FakeRouter, response
+from tests.support.delegation import FakeRouter, response
 class CrashChild(FakeRouter):
     def create_message(self, messages, **kwargs):
         os._exit(0)  # No finally/persist_current; kill parent and child threads together.
