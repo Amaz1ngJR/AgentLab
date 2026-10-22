@@ -18,7 +18,7 @@ from app.tools.builtin.code_search import (
     _build_symbol_pattern,
     _code_search,
 )
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolExecutionError, ToolRegistry
 
 
 def _force_python_backend(monkeypatch):
@@ -27,10 +27,17 @@ def _force_python_backend(monkeypatch):
 
 
 def _search(monkeypatch, tmp_path, **args):
-    """设好 workspace 后调用工具,成功时返回解析后的 dict。"""
+    """设好 workspace 后调用工具,成功时返回解析后的 dict。
+
+    拒绝现在以 ToolExecutionError 抛出(而不是返回 "refused:" 字符串),
+    这里统一转回字符串,既保留旧断言的表达力,也顺带验证拒绝确实是错误。
+    """
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
-    out = _code_search(args)
-    if out.startswith(("refused:", "error:", "path not found:")):
+    try:
+        out = _code_search(args)
+    except ToolExecutionError as exc:
+        return str(exc)
+    if out.startswith(("error:", "path not found:")):
         return out
     return json.loads(out)
 
@@ -110,9 +117,10 @@ def test_symbol_pattern_covers_keywords():
 def test_workspace_out_of_bounds_refused(monkeypatch, tmp_path):
     _force_python_backend(monkeypatch)
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
-    out = _code_search({"query": "x", "path": "/etc"})
-    assert out.startswith("refused:")
-    assert "outside workspace" in out
+    with pytest.raises(ToolExecutionError) as exc:
+        _code_search({"query": "x", "path": "/etc"})
+    assert str(exc.value).startswith("refused:")
+    assert "outside workspace" in str(exc.value)
 
 
 def test_workspace_out_of_bounds_allowed_after_approval(monkeypatch, tmp_path):
@@ -140,7 +148,9 @@ def test_workspace_out_of_bounds_allowed_after_approval(monkeypatch, tmp_path):
 
 
 def test_empty_query_refused():
-    assert _code_search({"query": "  "}).startswith("refused:")
+    with pytest.raises(ToolExecutionError) as exc:
+        _code_search({"query": "  "})
+    assert str(exc.value).startswith("refused:")
 
 
 def test_unknown_mode_refused(monkeypatch, tmp_path):

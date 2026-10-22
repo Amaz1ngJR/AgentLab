@@ -198,6 +198,7 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
         max_tokens=max_tokens,
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort,
+        prompt_cache_enabled=_env_bool("LLM_PROMPT_CACHE_ENABLED", default=params.get("prompt_cache_enabled") is True),
         profile_name=active_profile,
         capabilities=list(profile.capabilities),
     )

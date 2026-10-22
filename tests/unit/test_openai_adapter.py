@@ -1068,3 +1068,86 @@ def test_raw_stream_index_error_does_not_repeat_fallback():
             OpenAIAdapter(_cfg()).create_message(messages=[], _use_raw_stream=True)
     assert client.responses.create.call_count == 1
     client.responses.stream.assert_not_called()
+
+
+@pytest.mark.parametrize("null_field", ["output", "content"])
+@pytest.mark.parametrize("tool_result", [False, True])
+def test_sdk_null_list_append_error_falls_back_once(null_field, tool_result):
+    from openai import omit
+    from openai.lib.streaming.responses._responses import ResponseStreamState
+    from openai.types.responses import (
+        Response, ResponseCreatedEvent, ResponseOutputItemAddedEvent,
+        ResponseOutputMessage, ResponseContentPartAddedEvent, ResponseOutputText,
+        ResponseReasoningItem,
+    )
+
+    message = ResponseOutputMessage.model_construct(
+        id="msg-1", type="message", role="assistant", content=None,
+    )
+    created = ResponseCreatedEvent.model_construct(
+        type="response.created", sequence_number=0,
+        response=Response.model_construct(id="resp-1", output=None if null_field == "output" else [message]),
+    )
+    added = (ResponseOutputItemAddedEvent.model_construct(
+        type="response.output_item.added", output_index=0, sequence_number=1,
+        item=ResponseReasoningItem.model_construct(id="reason-1", type="reasoning", summary=[]),
+    ) if null_field == "output" else ResponseContentPartAddedEvent.model_construct(
+        type="response.content_part.added", output_index=0, content_index=0,
+        item_id="msg-1", sequence_number=1,
+        part=ResponseOutputText.model_construct(type="output_text", text="", annotations=[]),
+    ))
+
+    class BrokenSDKStream(_FakeStream):
+        def __iter__(self):
+            state = ResponseStreamState(input_tools=omit, text_format=omit)
+            yield from state.handle_event(created)
+            yield from state.handle_event(added)
+
+    with patch("openai.OpenAI") as sdk:
+        client = sdk.return_value
+        client.responses.stream.return_value = BrokenSDKStream([], None)
+        raw = MagicMock()
+        items = ([_function_call_item("call-1", "read_file", '{"path":"README.md"}')]
+                 if tool_result else [_message_item("OK")])
+        raw.__iter__.return_value = iter([_completed_event(_build_final(items))])
+        client.responses.create.return_value = raw
+        result = OpenAIAdapter(_cfg()).create_message([], prompt_cache_key="shared-group")
+    if tool_result:
+        assert result.tool_calls[0].name == "read_file"
+        assert result.tool_calls[0].arguments == {"path": "README.md"}
+    else:
+        assert result.text == "OK"
+    client.responses.stream.assert_called_once()
+    client.responses.create.assert_called_once()
+    assert client.responses.create.call_args.kwargs["prompt_cache_key"] == "shared-group"
+    raw.close.assert_called_once()
+
+
+def test_callback_none_append_error_is_not_treated_as_sdk_failure():
+    def broken_callback(text):
+        value = None
+        value.append(text)
+
+    with patch("openai.OpenAI") as sdk:
+        client = sdk.return_value
+        client.responses.stream.return_value = _FakeStream(
+            [_delta_event("OK")], _build_final([_message_item("OK")]),
+        )
+        with pytest.raises(AttributeError, match="append"):
+            OpenAIAdapter(_cfg()).create_message([], on_text_delta=broken_callback)
+    client.responses.create.assert_not_called()
+
+
+def test_raw_stream_none_append_error_does_not_repeat_fallback():
+    def broken_raw_stream():
+        value = None
+        value.append("bad")
+        yield
+
+    with patch("openai.OpenAI") as sdk:
+        client = sdk.return_value
+        client.responses.create.return_value = broken_raw_stream()
+        with pytest.raises(AttributeError, match="append"):
+            OpenAIAdapter(_cfg()).create_message([], _use_raw_stream=True)
+    client.responses.create.assert_called_once()
+    client.responses.stream.assert_not_called()

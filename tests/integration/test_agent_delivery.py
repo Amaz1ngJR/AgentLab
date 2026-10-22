@@ -202,16 +202,170 @@ def test_task_write_delivery_runs_parent_verification_before_releasing_dependent
     m.finish()
 
 
-def test_parent_cannot_write_owned_scope_or_run_arbitrary_shell(git_repo):
+def test_stopped_writer_allows_parent_verification_but_retains_file_scope(git_repo):
     from app.agent.agent_manager import DelegationRegistry
+    from app.config.loader import use_workspace_root
     m = make_manager(git_repo)
     sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     tools = DelegationRegistry(m.tools, m)
     assert tools.execute("write_file", {"path": "child.txt", "content": "oops"})[1]
-    assert tools.execute("shell", {"command": "true"})[1]
+    with use_workspace_root(git_repo):
+        output, error = tools.execute("shell", {"command": "git status --short"},
+                                      approved_action="shell")
+    assert not error, output
     assert not (git_repo / "child.txt").exists()
     m.finish()
+
+
+def test_unrelated_parent_changes_do_not_block_verified_integration(git_repo):
+    import subprocess
+    m = make_manager(git_repo)
+    try:
+        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        m.wait([sid], 3)
+        (git_repo / "parent.txt").write_text("parent work")
+        subprocess.run(["git", "add", "parent.txt"], cwd=git_repo, check=True)
+        (git_repo / "README.md").write_text("unstaged parent work")
+        (git_repo / "notes.txt").write_text("untracked notes")
+        assert m.integrate(sid, ["test -f child.txt"])["status"] == "integrated"
+        assert (git_repo / "parent.txt").read_text() == "parent work"
+        assert (git_repo / "README.md").read_text() == "unstaged parent work"
+        assert (git_repo / "notes.txt").read_text() == "untracked notes"
+        staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=git_repo,
+                                capture_output=True, text=True, check=True).stdout
+        assert staged.strip() == "parent.txt"
+    finally:
+        m.finish()
+
+
+def test_parent_file_collision_is_never_overwritten(git_repo):
+    m = make_manager(git_repo)
+    try:
+        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        m.wait([sid], 3)
+        (git_repo / "child.txt").write_text("user changes")
+        with pytest.raises(ToolExecutionError, match="workspace drifted"):
+            m.integrate(sid, ["test -f child.txt"])
+        assert (git_repo / "child.txt").read_text() == "user changes"
+        assert m.snapshot(sid)["delivery_status"] == "pending_review"
+    finally:
+        m.finish()
+
+
+@pytest.mark.parametrize("state", ["unstaged", "staged", "index_only"])
+def test_tracked_parent_changes_in_artifact_paths_require_review(git_repo, state):
+    import subprocess
+    class Editor(WriterRouter):
+        def fork(self):
+            return FakeRouter([
+                ModelResponse("", [ToolCall("edit", "write_file", {
+                    "path": "README.md", "content": "child version\n"})], {}, []),
+                response("edited"),
+            ])
+    m = make_manager(git_repo)
+    m.llm = Editor([])
+    try:
+        sid = m.spawn("edit", role="executor", file_scope=["README.md"])["child_run_id"]
+        assert m.wait([sid], 3)["agents"][0]["status"] == "succeeded"
+        (git_repo / "README.md").write_text("user version\n")
+        if state != "unstaged":
+            subprocess.run(["git", "add", "README.md"], cwd=git_repo, check=True)
+        if state == "index_only":
+            (git_repo / "README.md").write_text("base\n")
+        expected = (git_repo / "README.md").read_bytes()
+        with pytest.raises(ToolExecutionError, match="drifted in child paths"):
+            m.integrate(sid, ["test -f README.md"])
+        assert (git_repo / "README.md").read_bytes() == expected
+        if state != "unstaged":
+            indexed = subprocess.run(["git", "show", ":README.md"], cwd=git_repo,
+                                     capture_output=True, check=True).stdout
+            assert indexed == b"user version\n"
+    finally:
+        m.finish()
+
+
+def test_parent_change_during_approval_still_requires_revalidation(git_repo):
+    from app.agent.approval import ApprovalResult
+    m = make_manager(git_repo)
+    class ChangingApproval(AutoApprove):
+        def request_tool(self, tool, action, args):
+            if action == "integrate_agent":
+                (git_repo / "late.txt").write_text("changed during approval")
+            return ApprovalResult(True)
+    try:
+        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        m.wait([sid], 3)
+        m.approval = ChangingApproval()
+        with pytest.raises(ToolExecutionError, match="revalidation"):
+            m.integrate(sid, ["test -f child.txt"])
+        assert not (git_repo / "child.txt").exists()
+    finally:
+        m.finish()
+
+
+def test_pending_delivery_does_not_block_approved_external_reads(git_repo):
+    from app.agent.agent_manager import DelegationRegistry
+    from app.config.loader import use_workspace_root
+    external = git_repo.parent / (git_repo.name + "-other")
+    external.mkdir()
+    (external / "README.md").write_text("other project")
+    m = make_manager(git_repo)
+    try:
+        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        m.wait([sid], 3)
+        tools = DelegationRegistry(m.tools, m)
+        with use_workspace_root(git_repo):
+            args = {"path": str(external / "README.md")}
+            assert tools.execute("read_file", args)[1]
+            assert tools.execute("read_file", args,
+                                 approved_action="read_file_outside_workspace") == ("other project", False)
+            output, error = tools.execute("shell", {"command": "git status --short", "cwd": str(external)},
+                                          approved_action="shell_outside_workspace")
+            # The other directory is not a Git repo: the tool executes and reports
+            # Git's error, not an unrelated child-delivery lock.
+            assert error and "not a git repository" in output.lower()
+    finally:
+        m.finish()
+
+
+def test_running_and_cancelling_writer_still_blocks_shell_but_not_external_reads(git_repo, monkeypatch):
+    from app.agent.agent_manager import DelegationRegistry
+    from app.agent.subagent_runtime import SubagentRuntimeFactory
+    from app.agent.subagents import SubagentResult
+    from app.config.loader import use_workspace_root
+    entered, release = threading.Event(), threading.Event()
+
+    def wait_for_release(self, spec, workspace, cancel):
+        entered.set()
+        assert release.wait(5)
+        return SubagentResult(spec.subagent_id, spec.role, "cancelled")
+
+    monkeypatch.setattr(SubagentRuntimeFactory, "delegate", wait_for_release)
+    external = git_repo.parent / (git_repo.name + "-external.txt")
+    external.write_text("outside evidence")
+    m = make_manager(git_repo)
+    try:
+        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        assert entered.wait(2)
+        tools = DelegationRegistry(m.tools, m)
+        with use_workspace_root(git_repo):
+            for cancelling in (False, True):
+                if cancelling:
+                    m.close(sid)
+                output, error = tools.execute("shell", {"command": "git status --short"},
+                                              approved_action="shell")
+                assert error and "still running or cancelling" in output
+                assert tools.execute("read_file", {"path": str(external)},
+                                     approved_action="read_file_outside_workspace") == ("outside evidence", False)
+            release.set()
+            m.wait([sid], 3)
+            output, error = tools.execute("shell", {"command": "git status --short"},
+                                          approved_action="shell")
+            assert not error, output
+    finally:
+        release.set()
+        m.finish()
 
 
 @pytest.mark.parametrize("policy,goal,completed", [

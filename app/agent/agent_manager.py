@@ -12,6 +12,7 @@ from pathlib import Path
 
 from app.agent.cancel import CancelToken, Cancelled
 from app.agent.events import RunEvent
+from app.agent.delegation_context import CONTEXT_GUIDANCE, build_handoff
 from app.agent.subagents import SubagentResult, SubagentSpec
 from app.agent.subagent_runtime import SubagentRuntimeFactory, RestrictedToolRegistry, _fresh_approval
 from app.agent.child_approval import ChildApprovalPolicy, service_child_approvals
@@ -19,7 +20,7 @@ from app.workspace.worktree import WorktreeManager
 from app.tools.registry import Tool, ToolRegistry, ToolExecutionError
 from app.util.redact import redact_value
 
-MANAGEMENT_TOOLS = frozenset({"spawn_agent", "wait_agent", "send_input", "close_agent", "integrate_agent"})
+MANAGEMENT_TOOLS = frozenset({"spawn_agent", "resume_agent", "wait_agent", "send_input", "close_agent", "integrate_agent"})
 
 
 @dataclass
@@ -39,6 +40,12 @@ class ChildRun:
     parent_started: float = 0
     waiting_approval: threading.Event = field(default_factory=threading.Event)
     superseded_by: str | None = None
+    context_diagnostics: dict = field(default_factory=dict)
+    session_id: str = ""
+    continuation_id: str | None = None
+    retained_messages: list[dict] | None = None
+    retained_system: str | None = None
+    retained_llm: object | None = None
 
 
 class AgentManager:
@@ -128,10 +135,16 @@ class AgentManager:
               max_tool_calls: int | None = None, context: str = "", file_scope: list[str] | None = None,
               allowed_tools: list[str] | None = None, read_only: bool | None = None,
               timeout_seconds: float | None = None, output_limit: int = 20000, fork_history: bool = False,
-              before_start=None) -> dict:
+              required_tools: list[str] | None = None, before_start=None,
+              _resume_from: ChildRun | None = None, context_mode: str | None = None) -> dict:
         self.cancel.raise_if_cancelled()
         self.pump()
         with self._lock:
+            if context_mode not in {None, "brief", "snapshot", "full_prefix"}:
+                raise ToolExecutionError("invalid context_mode")
+            if fork_history and context_mode not in {None, "snapshot"}:
+                raise ToolExecutionError("fork_history conflicts with context_mode")
+            fork_history = fork_history or context_mode == "snapshot"
             if self._closed or not self.allowed:
                 raise ToolExecutionError("delegation disabled for this run")
             if not instruction.strip() or role not in {"research", "reviewer", "verifier", "executor"}:
@@ -177,7 +190,6 @@ class AgentManager:
                     if any(Path(a) == Path(b) or Path(a).is_relative_to(b) or Path(b).is_relative_to(a)
                            for a in scopes for b in existing.spec.file_scope):
                         raise ToolExecutionError("write scope conflicts with another child")
-            child_llm = fork()
             sid = f"{self.run_id}-{uuid.uuid4().hex[:12]}"
             from app.agent.execution_plan import ROLE_TOOLS
             selected = set(allowed_tools) if allowed_tools is not None else set(ROLE_TOOLS[role])
@@ -185,56 +197,75 @@ class AgentManager:
             if read_only:
                 from app.agent.execution_plan import READ_ONLY_TOOLS
                 selected &= READ_ONLY_TOOLS
+            if required_tools is not None:
+                if not isinstance(required_tools, list) or any(
+                    not isinstance(name, str) or not name.strip() for name in required_tools
+                ):
+                    raise ToolExecutionError("required_tools must be a list of tool names")
+                missing = set(required_tools) - selected
+                # A scoped executor advertises shell but cannot execute it.
+                if scopes and "shell" in required_tools:
+                    missing.add("shell")
+                if missing:
+                    raise ToolExecutionError(
+                        "required tools unavailable: " + ", ".join(sorted(missing))
+                        + "; provide evidence in context or handle this task in the parent")
+            child_llm = _resume_from.retained_llm if _resume_from is not None else fork()
             spec = SubagentSpec(sid, instruction, role=role, read_only=read_only, file_scope=scopes,
                                tools=tuple(sorted(selected)),
                                max_steps=max_steps, max_tool_calls=max_tool_calls,
                                timeout_seconds=min(timeout_seconds, self.timeout, self.deadline - time.monotonic()),
                                output_limit=min(output_limit, 20000))
-            child = ChildRun(spec, parent_run_id=self.run_id, parent_started=self.started)
+            history_context = ""
+            history_truncated = False
+            if fork_history:
+                from app.models.history import make_history_portable
+                from app.agent.subagent_runtime import bounded_result
+                # Preserve the legacy normalized text snapshot, not a native request prefix.
+                raw_history = json.dumps(redact_value(make_history_portable(self.history)), ensure_ascii=False)
+                history_context = bounded_result(raw_history, 4000)
+                history_truncated = len(raw_history) > 4000
+            handoff, diagnostics = build_handoff(
+                self.context, context, history_context, snapshot_truncated=history_truncated)
+            prefix_messages, prefix_system = None, None
+            if context_mode == "full_prefix":
+                from app.agent.prefix_fork import prepare_prefix
+                snapshot = getattr(self.llm, "fork_snapshot", lambda: None)()
+                prefix_messages, prefix_system, prefix_diagnostics = prepare_prefix(snapshot, child_llm, instruction + handoff)
+                diagnostics.update(prefix_diagnostics)
+                if prefix_messages is not None:
+                    handoff = ("你现在是新创建的子 Agent。前文是父级历史，旧任务和工具句柄并非你的当前任务。"
+                               "只执行随后指定的任务，使用你实际获得的工具。\n" + handoff)
+            child = ChildRun(spec, parent_run_id=self.run_id, parent_started=self.started,
+                             context_diagnostics=diagnostics,
+                             session_id=_resume_from.session_id if _resume_from else sid)
+            if _resume_from is not None:
+                handoff = "继续上一轮子任务。工作区可能已变化，请重新核实相关文件后再据此行动。"
+                child.context_diagnostics = {"mode": "resume", "truncated": False}
+                diagnostics = child.context_diagnostics
             worktree_manager = None
             if not read_only:
                 worktree_manager = WorktreeManager(self.workspace)
                 child.base_fingerprint = worktree_manager.state_fingerprint()
                 child.worktree = worktree_manager.create(sid, require_clean_base=True)
-            self.rounds_left -= max_steps
-            self.tools_left -= max_tool_calls
-            self.children[sid] = child
-            # Checkpoint before starting: process death leaves an interrupted record, never a live Future.
-            try:
-                if before_start is not None:
-                    before_start(sid)
-                self._save()
-            except Exception:
-                del self.children[sid]
-                self.rounds_left += max_steps
-                self.tools_left += max_tool_calls
-                raise
-            history_context = ""
-            if fork_history:
-                from app.models.history import make_history_portable
-                from app.agent.subagent_runtime import bounded_result
-                # Text-normalized snapshot contains no orphan tool messages, private
-                # reasoning blocks or image payloads. Never copy mutable parent state.
-                history_context = bounded_result(json.dumps(
-                    redact_value(make_history_portable(self.history)), ensure_ascii=False,
-                ), 4000)
+            if prefix_messages is not None:
+                handoff += (f"\n角色: {role}。工作区: {self.workspace}。不得创建子 Agent、扩权、合并或推送。"
+                            f"实际可用工具: {', '.join(sorted(selected - ({'shell'} if scopes else set())))}。")
             child_tools = RestrictedToolRegistry(self.tools, selected)
             factory = SubagentRuntimeFactory(
                 llm=child_llm, tools=child_tools,
                 approval=ChildApprovalPolicy(_fresh_approval(self.approval), self._approvals, child.token,
                                              workspace=child.worktree.path if child.worktree else self.workspace,
                                              child_run_id=sid, waiting=child.waiting_approval),
-                parent_system=self.system,
-                parent_context=redact_value(self.context[:5000] + "\n" + context[:10000] + "\n" + history_context),
+                parent_system=(_resume_from.retained_system if _resume_from else
+                               prefix_system if prefix_messages is not None else self.system),
+                parent_context=handoff,
+                initial_messages=_resume_from.retained_messages if _resume_from else prefix_messages,
+                preserve_system=_resume_from is not None or prefix_messages is not None,
                 child_token=child.token, lightweight=True, retry_until_cancelled=self.long_run,
                 max_steps=max_steps, max_tool_calls=max_tool_calls,
                 on_event=self._events.put,
             )
-            self._emit(RunEvent("subagent_started", payload={
-                "subagent_id": sid, "parent_run_id": self.run_id, "role": role,
-                "execution_status": "running", "delivery_status": "none" if read_only else "pending_review",
-            }))
-
             def invoke():
                 try:
                     result = factory.delegate(spec, child.worktree.path if child.worktree else self.workspace, child.token)
@@ -258,12 +289,57 @@ class AgentManager:
                         result.status = "cancelled" if child.token.cancelled else "blocked"
                         result.error = "子运行结束前未处理的已接受引导：" + "\n".join(pending)
                     child.result = result
+                    result.metrics["submitted_to_finish_seconds"] = max(0, time.time() - child.started)
+                    if not child.closed and not self._closed:
+                        if result.status == "succeeded":
+                            child.retained_messages = factory.retained_messages
+                            child.retained_system = factory.retained_system
+                            child.retained_llm = child_llm if factory.retained_messages is not None else None
+                        elif _resume_from is not None and result.status == "failed":
+                            # Retry only the last successful checkpoint, not a partial failed turn.
+                            child.retained_messages = _resume_from.retained_messages
+                            child.retained_system = _resume_from.retained_system
+                            child.retained_llm = child_llm
+                    if _resume_from is not None:
+                        _resume_from.retained_messages = None
+                        _resume_from.retained_llm = None
+                        _resume_from.retained_system = None
                     child.finished = time.time()
                     child.done.set()
 
             # Daemon bounds shutdown latency; unfinished writers remain cancelling
             # and the owning session retains their scope lock until actual exit.
-            threading.Thread(target=invoke, name=f"agentlab-child-{sid[-12:]}", daemon=True).start()
+            worker = threading.Thread(target=invoke, name=f"agentlab-child-{sid[-12:]}", daemon=True)
+            self.rounds_left -= max_steps
+            self.tools_left -= max_tool_calls
+            self.children[sid] = child
+            if _resume_from is not None:
+                _resume_from.continuation_id = sid
+            try:
+                if before_start is not None:
+                    before_start(sid)
+                self._save()
+                worker.start()
+            except Exception:
+                del self.children[sid]
+                self.rounds_left += max_steps
+                self.tools_left += max_tool_calls
+                if _resume_from is not None:
+                    _resume_from.continuation_id = None
+                try:
+                    self._save()
+                except Exception:
+                    pass  # Do not mask the original startup failure.
+                raise
+            try:
+                self._emit(RunEvent("subagent_started", payload={
+                    "subagent_id": sid, "parent_run_id": self.run_id, "role": role,
+                    "context_diagnostics": dict(diagnostics),
+                    "available_tools": sorted(selected - ({"shell"} if scopes else set())),
+                    "execution_status": "running", "delivery_status": "none" if read_only else "pending_review",
+                }))
+            except Exception:
+                pass  # Observers cannot make an already-started child appear unstarted.
             return self.snapshot(sid)
 
     def restore_results(self, records: list[dict], *, messages: list[dict] | None = None):
@@ -323,7 +399,10 @@ class AgentManager:
                              parent_run_id=record.get("parent_run_id", self.run_id),
                              parent_started=record.get("parent_started_at", record.get("started_at", 0)))
             child.revision = record.get("revision", 1)
+            child.session_id = record.get("session_id", sid)
+            child.continuation_id = record.get("continuation_id")
             child.superseded_by = record.get("superseded_by")
+            child.context_diagnostics = dict(record.get("context_diagnostics") or {})
             child.finished = record.get("finished_at")
             child.delivery = record.get("verification", {})
             child.base_fingerprint = record.get("base_state_fingerprint")
@@ -345,6 +424,7 @@ class AgentManager:
                 tool_calls=record.get("consumed", {}).get("tool_calls", 0),
                 elapsed_seconds=record.get("consumed", {}).get("elapsed_seconds", 0),
                 actual_model=record.get("actual_model"),
+                metrics=record.get("metrics", {}),
             )
             child.done.set()
             self.children[sid] = child
@@ -407,6 +487,12 @@ class AgentManager:
                 "parent_started_at": child.parent_started,
                 "result_id": sid, "revision": child.revision, "status": status,
                 "execution_status": status, "subagent_id": sid,
+                "context_diagnostics": dict(child.context_diagnostics),
+                "session_id": child.session_id or sid,
+                "continuation_id": child.continuation_id,
+                "resumable": bool(child.retained_messages is not None and not child.closed
+                                  and not child.continuation_id and not self._closed),
+                "available_tools": sorted(set(child.spec.tools) - ({"shell"} if child.spec.file_scope else set())),
                 "started_at": child.started, "finished_at": child.finished,
                 "changed_files": child.result.changed_files if child.result else [],
                 "verification": child.delivery,
@@ -419,6 +505,7 @@ class AgentManager:
                 "error": child.result.error if child.result else "",
                 "usage": dict(child.result.usage) if child.result else {},
                 "actual_model": child.result.actual_model if child.result else None,
+                "metrics": dict(child.result.metrics) if child.result else {},
                 "instruction": child.spec.instruction, "role": child.spec.role,
             })
 
@@ -494,6 +581,23 @@ class AgentManager:
                 agent["next_output_offset"] = original["output_offset"] + low
         return result
 
+    def resume(self, sid: str, instruction: str, *, max_steps: int | None = None,
+               max_tool_calls: int | None = None, timeout_seconds: float | None = None) -> dict:
+        """A new immutable execution/result in the same bounded, in-memory readonly session."""
+        self.pump()
+        with self._lock:
+            child = self._get(sid)
+            if (child.closed or sid in self._restored or not child.done.is_set()
+                    or not child.spec.read_only or child.continuation_id
+                    or child.result is None or child.result.status not in {"succeeded", "failed"}
+                    or child.retained_messages is None or child.retained_llm is None):
+                raise ToolExecutionError("session cannot resume; use the latest completed readonly result or create a new task")
+            return self.spawn(
+                instruction, role=child.spec.role, read_only=True,
+                allowed_tools=list(child.spec.tools), max_steps=max_steps,
+                max_tool_calls=max_tool_calls, timeout_seconds=timeout_seconds,
+                output_limit=child.spec.output_limit, _resume_from=child)
+
     def send_input(self, sid: str, text: str, mode: str = "steer") -> dict:
         child = self._get(sid)
         if sid in self._restored:
@@ -530,8 +634,13 @@ class AgentManager:
     def close(self, sid: str) -> dict:
         child = self._get(sid)
         child.closed = True
+        child.retained_messages = None
+        child.retained_llm = None
+        child.retained_system = None
         if not child.done.is_set():
             child.token.cancel()
+        if child.continuation_id:
+            self.close(child.continuation_id)
         self._save()
         return self.snapshot(sid)
 
@@ -559,8 +668,8 @@ class AgentManager:
             timer.cancel()
             unsubscribe()
         if result.get("status") == "integrated" and not result.get("already_integrated"):
-            # Only this approved, non-overlapping integration may advance sibling baselines.
-            # External drift is rejected by integrate_result before any application.
+            # Advance sibling baselines only after an approved integration. Delivery
+            # still checks each sibling's paths before accepting unrelated parent edits.
             baseline = WorktreeManager(self.workspace).state_fingerprint()
             for sibling in self.children.values():
                 if sibling is child or sibling.spec.read_only or sibling.base_fingerprint != previous_baseline:
@@ -663,8 +772,8 @@ class AgentManager:
             self.rounds_left += max(0, child.spec.max_steps - result.model_rounds)
             self.tools_left += max(0, child.spec.max_tool_calls - result.tool_calls)
             self._save()
-            for key in self.usage:
-                self.usage[key] += result.usage.get(key, 0)
+            for key, value in result.usage.items():
+                self.usage[key] = self.usage.get(key, 0) + value
             self.tool_calls += result.tool_calls
             self._emit(RunEvent("subagent_completed", payload={
                 **self.snapshot(sid), "subagent_id": sid, "execution_status": result.status,
@@ -699,9 +808,11 @@ class AgentManager:
         return delivered
 
     def unresolved(self) -> list[str]:
+        """Keep historical failures immutable; only the latest continuation gates delivery."""
         return [f"{sid}: {self.snapshot(sid)['status']}/{self.snapshot(sid)['delivery_status']}"
                 for sid, child in self.children.items()
-                if not child.superseded_by and (not child.done.is_set() or child.result.status != "succeeded"
+                if not child.superseded_by and child.continuation_id not in self.children
+                and (not child.done.is_set() or child.result.status != "succeeded"
                 or (not child.spec.read_only and child.result.delivery_status != "integrated"))]
 
     def finish(self):
@@ -712,6 +823,9 @@ class AgentManager:
         deadline = time.monotonic() + 0.25
         for child in self.children.values():
             child.done.wait(max(0, deadline - time.monotonic()))
+            child.retained_messages = None
+            child.retained_llm = None
+            child.retained_system = None
         self.pump()
         self._save()
         self._unsubscribe()
@@ -723,11 +837,15 @@ class AgentManager:
         def wrap(fn):
             return lambda args: json.dumps(fn(**args), ensure_ascii=False)
         return [
-            Tool("spawn_agent", "启动隔离子任务并立即返回 ID；预算省略时继承父配置并分配剩余额度。executor 必须声明不重叠 file_scope，写入结果需验证审批后集成。",
+            Tool("spawn_agent", "启动隔离子任务并立即返回 ID；只委派独立且有收益的任务。同模块子任务仍运行时优先 send_input 追加信息，避免重复调查；已结束的只读任务可使用 resume_agent 继续（返回新的执行 ID）。只读角色仅可读取工作区文件，无 shell/网络工具；所需材料由父级提供或自行处理。预算省略时继承父配置并分配剩余额度。executor 必须声明不重叠 file_scope，写入结果需验证审批后集成。",
                  schema({"instruction": string, "role": {"enum": ["research", "reviewer", "verifier", "executor"]},
                          "file_scope": {"type": "array", "items": string},
-                         "context": {"type": "string", "maxLength": 10000},
+                         "context": {"type": "string", "maxLength": 10000, "description": CONTEXT_GUIDANCE},
+                         "required_tools": {"type": "array", "items": string,
+                                            "description": "本任务必需的工具名；启动前检查实际能力，缺失则报错，不授予额外工具"},
                          "read_only": {"type": "boolean"},
+                         "context_mode": {"enum": ["brief", "snapshot", "full_prefix"],
+                                          "description": "默认精选交接；snapshot 是文本快照；full_prefix 尝试同模型原生前缀，不支持则回退并返回原因，工具仍受限"},
                          "fork_history": {"type": "boolean", "description": "显式附带有界脱敏的文本历史快照；默认不复制历史"},
                          "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": self.timeout},
                          "output_limit": {"type": "integer", "minimum": 1, "maximum": 20000},
@@ -738,10 +856,15 @@ class AgentManager:
                          "timeout": {"type": "number", "minimum": 0, "maximum": 30},
                          "output_offset": {"type": "integer", "minimum": 0},
                          "output_limit": {"type": "integer", "minimum": 1, "maximum": 4000}}, ["ids"]), wrap(self.wait)),
+            Tool("resume_agent", "继续本次父运行内最新可续用的只读子会话，返回新的 child_run_id 和独立结果；失败轮可从上一成功检查点显式重试；消耗剩余总预算，不重放旧用量。",
+                 schema({"sid": string, "instruction": string,
+                         "max_steps": {"type": "integer", "minimum": 1, "maximum": self.task_rounds},
+                         "max_tool_calls": {"type": "integer", "minimum": 1, "maximum": self.tool_limit}}, ["sid", "instruction"]), wrap(self.resume)),
             Tool("send_input", "向指定活动子任务排队 steer；不会消费父邮箱。",
                  schema({"sid": string, "text": string, "mode": {"enum": ["steer", "interrupt"]}}, ["sid", "text"]), wrap(self.send_input)),
             Tool("integrate_agent", "验证写入子任务、审批具体补丁并集成；不提交或推送，失败保持 pending_review。",
-                 schema({"sid": string, "checks": {"type": "array", "items": string, "minItems": 1}},
+                 schema({"sid": string, "checks": {"type": "array", "items": string, "minItems": 1,
+                         "description": "必须是实际可执行的 shell 验证命令，在子任务 worktree 运行；不是审查说明、操作计划或承诺稍后验证"}},
                         ["sid", "checks"]), wrap(self.integrate)),
             Tool("close_agent", "幂等请求取消子任务；cancelling 表示尚未退出，不删除结果或文件。",
                  schema({"sid": string}, ["sid"]), wrap(self.close)),
@@ -780,8 +903,10 @@ class DelegationRegistry(ToolRegistry):
         owned = [child for child in self.manager.children.values()
                  if not child.spec.read_only and (not child.done.is_set() or
                      child.result.delivery_status != "integrated")]
-        if owned and name == "shell":
-            return "shell unavailable while child write scopes are reserved; integrate or close/review first", True
+        if name == "shell" and any(not child.done.is_set() for child in owned):
+            return ("shell unavailable while a write subagent is still running or cancelling; "
+                    "wait for it to stop. Use read_file/list_dir/code_search to inspect files, "
+                    "including approved external paths", True)
         if owned and name in {"write_file", "edit_file"}:
             target = (self.manager.workspace / Path(args.get("path", "")).expanduser()).resolve()
             for child in owned:

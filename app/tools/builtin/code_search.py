@@ -35,7 +35,7 @@ from app.tools.builtin.files import (
     _outside_workspace_approval,
     _resolve_within_workspace,
 )
-from app.tools.registry import Tool
+from app.tools.registry import Tool, ToolExecutionError
 from app.util.redact import redact
 
 # ── 限制常量 ──────────────────────────────────────────────────────────────────
@@ -366,14 +366,20 @@ def _enforce_output_limit(result: dict) -> dict:
 
 
 def _code_search(args: dict) -> str:
-    """code_search 工具入口。返回 JSON 字符串;越界/参数错误返回 'refused:'/'error:'。"""
+    """code_search 工具入口。返回 JSON 字符串;越界/参数错误抛 ToolExecutionError。
+
+    拒绝必须表现为错误而不是普通返回值:Registry 用 is_error 判定本次调用是否
+    算"成功执行证据",而"没有进展的拒绝"若被记为成功,会让模型拿它当作任务完成
+    的依据(见 executor 的 successful_tool_calls 计数)。
+    """
     query = (args.get("query") or "").strip()
     if not query:
-        return "refused: empty query"
+        raise ToolExecutionError("refused: empty query")
 
     mode = args.get("mode") or "text"
     if mode not in ("text", "regex", "file", "symbol"):
-        return f"refused: unknown mode '{mode}' (use text/regex/file/symbol)"
+        raise ToolExecutionError(
+            f"refused: unknown mode '{mode}' (use text/regex/file/symbol)")
 
     case_sensitive = bool(args.get("case_sensitive", False))
     glob = args.get("glob") or None
@@ -392,9 +398,9 @@ def _code_search(args: dict) -> str:
     try:
         search_root = _resolve_search_root(args.get("path", "."))
     except WorkspacePathError as exc:
-        return f"refused: {exc}"
+        raise ToolExecutionError(f"refused: {exc}") from exc
     if not search_root.exists():
-        return f"path not found: {search_root}"
+        raise ToolExecutionError(f"path not found: {search_root}")
 
     summary: dict = {}
 
@@ -405,7 +411,8 @@ def _code_search(args: dict) -> str:
         try:
             regex = _compile_query(query, mode, case_sensitive)
         except Exception as exc:  # 无效正则
-            return f"refused: invalid regex: {type(exc).__name__}: {exc}"
+            raise ToolExecutionError(
+                f"refused: invalid regex: {type(exc).__name__}: {exc}") from exc
 
         rg = _find_ripgrep()
         if rg:

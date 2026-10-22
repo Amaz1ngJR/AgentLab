@@ -7,20 +7,40 @@
 安全说明:
   - 路径会被 expanduser + resolve 展开成绝对路径,支持 ~ 写法
   - workspace 内只读操作免审批;路径越界时必须通过独立的 outside_workspace 审批
-  - read_file 单次最多读 200KB,防止把超大文件全塞进模型上下文
+  - read_file 按行分页(默认 200 行 / 9000 字符),大文件不会被整个读进内存
   - write_file / edit_file 标记了 requires_approval=True,执行前会弹出人工确认;
     CLI 在确认前会展示彩色 diff。改文件优先用 edit_file(局部替换)而非 shell。
+
+数据完整性说明(重要):
+  - 读文件用 newline="" 保留原始换行符(CRLF 不会被规范化成 LF),写回也用
+    newline="" 原样落盘。否则只改一行就会把整个 Windows 检出文件的换行符重写。
+  - edit_file 以 errors="strict" 解码:文件不是合法 UTF-8 时拒绝编辑,而不是用
+    U+FFFD 替换后再写回(那会不可逆地损坏原字节)。
+  - 所有写入先落到同目录临时文件再 os.replace,崩溃/被杀不会留下半截文件。
 """
 from __future__ import annotations
 
 import json
+import os
+import stat
+import uuid
 from pathlib import Path
 
 from app.config.loader import workspace_root
 from app.tools.registry import Tool, ToolExecutionError, is_approval_granted
 
-# 单次读取上限:200KB。超出部分截断并附提示,避免撑爆模型上下文窗口。
-MAX_READ_BYTES = 200_000
+# ── 读取上限 ──────────────────────────────────────────────────────────────────
+# 单页字符上限。刻意低于 executor 的 TOOL_OUTPUT_MAX_CHARS(10_000):超过它的
+# 输出会被全局截成"头 + 省略标记 + 尾",模型既看不清中间也没法续读。分页让
+# read_file 永远输出结构化、可续读的完整页,不触发那次截断。
+MAX_READ_CHARS = 9_000
+DEFAULT_READ_LINES = 200       # 默认每页最多返回多少行
+MAX_READ_LINES = 2_000         # 单次请求的行数上限
+MAX_LINE_CHARS = 2_000         # 单行超长(压缩文件)时截断
+BINARY_PROBE_BYTES = 8_192     # 前 8KB 含 NUL 即判为二进制,拒绝读取
+
+# 目录列表上限。超出的条目不再原样返回,避免被外层截断后"中间静默消失"。
+MAX_LIST_ENTRIES = 500
 
 
 class WorkspacePathError(Exception):
@@ -84,25 +104,166 @@ def _resolve_within_workspace(
     return target
 
 
+# ── 编码 / 换行 / 原子写入 ────────────────────────────────────────────────────
+
+def read_text_preserving(path: Path, *, strict: bool = False) -> str:
+    """按原字节语义读取文本:保留 CRLF,不做通用换行转换。
+
+    newline="" 让 Python 不去翻译 \\r\\n ↔ \\n,读到的就是磁盘上的内容。这是
+    edit_file 能"只改一行"而不重写整个文件换行符的前提。
+
+    strict=True 用于写入前的读取:非 UTF-8 直接抛错,避免用 U+FFFD 替换后再
+    写回从而永久损坏原字节。strict=False 用于只读展示(预览 diff),有损但无害。
+    """
+    try:
+        with path.open("r", encoding="utf-8", newline="",
+                       errors="strict" if strict else "replace") as fh:
+            return fh.read()
+    except UnicodeDecodeError as exc:
+        raise ToolExecutionError(
+            f"refused: {path} 不是合法 UTF-8(解码失败于字节位置 {exc.start})。"
+            "整文件重写会损坏原编码,已拒绝编辑;请改用能保留原字节的处理方式,"
+            "或确认文件编码后再操作。"
+        ) from exc
+
+
+def _create_temp_sibling(directory: Path, name: str, mode: int = 0o666) -> tuple[int, Path]:
+    """在目标目录内独占创建一个临时文件,返回 (fd, path)。
+
+    用 os.open(O_CREAT|O_EXCL) 而不是 tempfile.mkstemp:mkstemp 固定建 0600,
+    要还原成用户预期权限就得读进程 umask,而 os.umask() 是**进程级全局状态**,
+    子 agent 线程并发写文件时会被短暂改坏。新文件按 0o666 与 umask 创建;
+    覆盖文件则传入已有权限,临时文件从创建开始就不比目标更宽松。
+    """
+    for _ in range(100):
+        candidate = directory / f".{name}.{uuid.uuid4().hex[:12]}.tmp"
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+            return fd, candidate
+        except FileExistsError:
+            continue
+    raise OSError(f"could not create a temporary file next to {name}")
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """原子写入:同目录临时文件 → fsync → os.replace。
+
+    直接 write_text 写到一半崩溃会留下截断的半成品文件;os.replace 在同一文件
+    系统上是原子的,读者要么看到旧内容要么看到新内容。覆盖已有文件时同时沿用
+    原文件权限位。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = None
+    fd, tmp = _create_temp_sibling(path.parent, path.name, mode if mode is not None else 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            if mode is not None:
+                # Restore bits masked by umask before writing any private content.
+                # Failure must leave the original file intact, not widen its permissions.
+                os.chmod(tmp, mode)
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _coerce_int(value, default: int, *, minimum: int, maximum: int) -> int:
+    """模型偶尔把数字写成字符串;非法值退回默认值而不是报错。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
 def _read_file(args: dict) -> str:
-    """读取文本文件内容。超过 200KB 时截断并附说明。"""
+    """按行分页读取文本文件。
+
+    返回单页内容(最多 DEFAULT_READ_LINES 行 / MAX_READ_CHARS 字符)。大文件不会
+    被整体读进内存,模型用 offset 续读下一页。
+    """
     try:
         path = _resolve_within_workspace(
             args["path"],
             "read_file_outside_workspace",
         )
     except WorkspacePathError as exc:
-        return f"refused: {exc}"
+        raise ToolExecutionError(f"refused: {exc}") from exc
     if not path.exists():
         raise ToolExecutionError(f"file not found: {path}")
     if not path.is_file():
         raise ToolExecutionError(f"not a file: {path}")
-    data = path.read_bytes()
-    truncated = len(data) > MAX_READ_BYTES
-    # errors="replace" 遇到非 UTF-8 字节时用 ? 替代,不报错
-    text = data[:MAX_READ_BYTES].decode("utf-8", errors="replace")
-    suffix = f"\n\n[...truncated, total {len(data)} bytes]" if truncated else ""
-    return text + suffix
+
+    offset = _coerce_int(args.get("offset"), 1, minimum=1, maximum=10**9)
+    limit = _coerce_int(
+        args.get("limit"), DEFAULT_READ_LINES, minimum=1, maximum=MAX_READ_LINES,
+    )
+
+    # 二进制探测:只读前 8KB。NUL 字节在文本文件里几乎不出现,出现即拒绝,
+    # 避免把二进制内容灌进模型上下文。
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(BINARY_PROBE_BYTES)
+    except OSError as exc:
+        raise ToolExecutionError(f"read failed: {exc}") from exc
+    if b"\x00" in head:
+        raise ToolExecutionError(
+            f"refused: {path} 看起来是二进制文件;read_file 只读取文本。"
+        )
+
+    lines_out: list[str] = []
+    chars = 0
+    last_line = offset - 1
+    has_more = False
+    try:
+        # newline="" 保留原始换行符;逐行迭代,不会把整个文件读进内存。
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            for lineno, line in enumerate(fh, start=1):
+                if lineno < offset:
+                    continue
+                if len(lines_out) >= limit:
+                    has_more = True
+                    break
+                if len(line) > MAX_LINE_CHARS:
+                    line = (
+                        f"{line[:MAX_LINE_CHARS]}"
+                        f"…[本行已截断,共 {len(line)} 字符]\n"
+                    )
+                if lines_out and chars + len(line) > MAX_READ_CHARS:
+                    has_more = True
+                    break
+                lines_out.append(line)
+                chars += len(line)
+                last_line = lineno
+    except OSError as exc:
+        raise ToolExecutionError(f"read failed: {exc}") from exc
+
+    if not lines_out:
+        if offset > 1:
+            return (f"{path}: offset {offset} 超出文件末尾"
+                    f"(已读到最后一行,无更多内容)。")
+        return f"{path}: (empty)"
+
+    body = "".join(lines_out)
+    # 只有真的分页了才加页眉页脚,普通小文件的返回值保持原样(向后兼容)。
+    if offset > 1 or has_more:
+        header = f"{path} (lines {offset}-{last_line})\n"
+        footer = (
+            f"\n[...单页上限 {limit} 行 / {MAX_READ_CHARS} 字符;"
+            f"继续请传 offset={last_line + 1}]"
+            if has_more else ""
+        )
+        return header + body + footer
+    return body
 
 
 def _write_file(args: dict) -> str:
@@ -113,11 +274,10 @@ def _write_file(args: dict) -> str:
             "write_file_outside_workspace",
         )
     except WorkspacePathError as exc:
-        return f"refused: {exc}"
+        raise ToolExecutionError(f"refused: {exc}") from exc
     content = args.get("content", "")
-    # parents=True 递归创建多级目录;exist_ok=True 目录已存在时不报错
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    # 原子写 + newline="":内容原样落盘,不会把模型给的 \r\n 改写成 \n。
+    atomic_write_text(path, content)
     return f"wrote {len(content)} chars to {path}"
 
 
@@ -135,6 +295,7 @@ def _edit_file(args: dict) -> str:
       - old_str 为空串表示"在文件末尾追加 new_str"(常见的加一行需求)。
       - new_str 为空串表示"删除 old_str 这段"。
       - 文件不存在时报错(新建请用 write_file)。
+      - 文件用 CRLF 而模型只给了 LF 时,自动按文件换行风格匹配,并在结果里说明。
     """
     try:
         path = _resolve_within_workspace(
@@ -142,7 +303,7 @@ def _edit_file(args: dict) -> str:
             "edit_file_outside_workspace",
         )
     except WorkspacePathError as exc:
-        return f"refused: {exc}"
+        raise ToolExecutionError(f"refused: {exc}") from exc
     if not path.exists():
         raise ToolExecutionError(f"file not found: {path}(新建文件请用 write_file)")
     if not path.is_file():
@@ -150,13 +311,24 @@ def _edit_file(args: dict) -> str:
 
     old_str = args["old_str"]
     new_str = args["new_str"]
-    text = path.read_text(encoding="utf-8", errors="replace")
+    # strict 解码 + newline="":非 UTF-8 直接拒绝,CRLF 原样保留。
+    text = read_text_preserving(path, strict=True)
 
+    converted = False
     if old_str == "":
         # 空 old_str = 末尾追加
         updated = text + new_str
     else:
         count = text.count(old_str)
+        if count == 0 and "\r\n" in text and "\r\n" not in old_str:
+            # 模型给的是 LF 版本,而文件是 CRLF:按文件风格改写 old/new 再匹配,
+            # 否则模型会陷入"read 看到 LF、edit 永远找不到"的重试循环。
+            crlf_old = old_str.replace("\r\n", "\n").replace("\n", "\r\n")
+            if text.count(crlf_old) == 1:
+                old_str = crlf_old
+                new_str = new_str.replace("\r\n", "\n").replace("\n", "\r\n")
+                count = 1
+                converted = True
         if count == 0:
             raise ToolExecutionError(
                 "old_str 未在文件中找到。请先 read_file 确认原文(注意空格/缩进/"
@@ -169,32 +341,45 @@ def _edit_file(args: dict) -> str:
 
     if updated == text:
         return "no change: old_str 与 new_str 相同,文件未改动。"
-    path.write_text(updated, encoding="utf-8")
+    atomic_write_text(path, updated)
     delta = len(updated) - len(text)
     sign = "+" if delta >= 0 else ""
-    return f"edited {path}({sign}{delta} chars)"
+    note = "（按文件 CRLF 换行匹配）" if converted else ""
+    return f"edited {path}({sign}{delta} chars){note}"
 
 
 def _list_dir(args: dict) -> str:
-    """列出目录下的所有条目。目录名末尾带 / 以便区分文件和目录。"""
+    """列出目录下的条目。目录名末尾带 / 以便区分文件和目录。
+
+    超过 MAX_LIST_ENTRIES 时只返回前 N 条并说明剩余数量,而不是原样吐几千行
+    再被外层整体截断(那样中间条目会静默消失,模型会误判目录规模)。
+    """
     try:
         path = _resolve_within_workspace(
             args.get("path", "."),
             "list_dir_outside_workspace",
         )
     except WorkspacePathError as exc:
-        return f"refused: {exc}"
+        raise ToolExecutionError(f"refused: {exc}") from exc
     if not path.exists():
         raise ToolExecutionError(f"directory not found: {path}")
     if not path.is_dir():
         raise ToolExecutionError(f"not a directory: {path}")
-    entries = []
-    for child in sorted(path.iterdir()):
-        marker = "/" if child.is_dir() else ""
-        entries.append(f"{child.name}{marker}")
+    children = sorted(path.iterdir())
+    entries = [
+        f"{child.name}{'/' if child.is_dir() else ''}"
+        for child in children[:MAX_LIST_ENTRIES]
+    ]
     if not entries:
         return f"(empty) {path}"
-    return f"{path}:\n" + "\n".join(entries)
+    output = f"{path}:\n" + "\n".join(entries)
+    remaining = len(children) - MAX_LIST_ENTRIES
+    if remaining > 0:
+        output += (
+            f"\n[...还有 {remaining} 个条目未显示;"
+            "用 code_search mode=file 或 shell 精确定位具体文件]"
+        )
+    return output
 
 
 # ── 工具实例 ──────────────────────────────────────────────────────────────────
@@ -219,12 +404,17 @@ def _write_audit_summary(args: dict, result: str) -> tuple[str, str]:
 
 READ_FILE = Tool(
     name="read_file",
-    description="读取本地文本文件的内容。返回 UTF-8 文本,超过 200KB 会截断。"
+    description="按行分页读取本地文本文件。默认返回第 1 页(最多 200 行 / 9000 字符),"
+                "更大的文件用 offset 续读下一页。二进制文件会被拒绝。"
                 "workspace 内免审批,读取外部路径前必须获得用户审批。",
     input_schema={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "文件路径,支持 ~ 表示家目录"},
+            "offset": {"type": "integer", "minimum": 1,
+                       "description": "起始行号(1-based),默认 1。续读上一页时传页脚提示的 offset"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES,
+                      "description": f"本页最多返回多少行,默认 {DEFAULT_READ_LINES}"},
         },
         "required": ["path"],
     },
@@ -241,6 +431,7 @@ READ_FILE = Tool(
 WRITE_FILE = Tool(
     name="write_file",
     description="把内容写入本地文件。会覆盖已有文件,会自动创建父目录。"
+                "内容按原样落盘(换行符不被改写),写入是原子的。"
                 "写入始终审批;外部路径使用独立的越界审批。",
     input_schema={
         "type": "object",
@@ -262,7 +453,8 @@ WRITE_FILE = Tool(
 
 LIST_DIR = Tool(
     name="list_dir",
-    description="列出目录下的所有条目,目录名带 / 后缀。不传 path 时列当前目录。"
+    description="列出目录下的条目,目录名带 / 后缀。不传 path 时列当前目录。"
+                f"超过 {MAX_LIST_ENTRIES} 个条目时只返回前 {MAX_LIST_ENTRIES} 个并说明剩余数量。"
                 "workspace 内免审批,列出外部目录前必须获得用户审批。",
     input_schema={
         "type": "object",
@@ -290,7 +482,8 @@ EDIT_FILE = Tool(
                 "优先用它(而不是 write_file 覆盖整文件,更不要用 shell 改文件)。"
                 "规则:old_str 必须在文件里唯一出现;old_str 传空串表示在末尾追加"
                 "new_str;new_str 传空串表示删除 old_str 这段。文件不存在时请改用"
-                "write_file。编辑始终审批;外部路径使用独立的越界审批。",
+                "write_file。保留原换行符;非 UTF-8 文件会被拒绝编辑。"
+                "编辑始终审批;外部路径使用独立的越界审批。",
     input_schema={
         "type": "object",
         "properties": {

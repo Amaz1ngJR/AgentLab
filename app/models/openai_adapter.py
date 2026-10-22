@@ -62,9 +62,12 @@ _MISSING_CREATED_MARKER = "Expected to have received `response.created` before"
 _MISSING_COMPLETED_MARKER = "Didn't receive a `response.completed` event"
 
 
-def _is_sdk_stream_index_error(exc: BaseException) -> bool:
-    """只识别 SDK 流式状态机自身的越界，不掩盖应用或回调的编程错误。"""
-    if not isinstance(exc, IndexError):
+def _is_sdk_stream_state_error(exc: BaseException) -> bool:
+    """Recognize SDK accumulator failures, never application/callback attribute errors."""
+    if isinstance(exc, AttributeError):
+        if exc.name != "append" or exc.obj is not None:
+            return False
+    elif not isinstance(exc, IndexError):
         return False
     tb = exc.__traceback__
     if tb is None:
@@ -286,10 +289,13 @@ class OpenAIAdapter:
         cancel: Optional[CancelToken] = None,
         reasoning_effort_override: Optional[str] = None,
         _use_raw_stream: bool = False,
+        prompt_cache_key: Optional[str] = None,
     ) -> ModelResponse:
         """带工具调用的完整对话,供 Agent 循环使用。"""
         max_tokens = max_tokens or self._cfg.max_tokens
         params = self._base_params(messages, temperature, system)
+        if prompt_cache_key:
+            params["prompt_cache_key"] = prompt_cache_key
         if reasoning_effort_override is not None:
             params["reasoning"] = {"effort": reasoning_effort_override}
         params["max_output_tokens"] = max_tokens
@@ -414,11 +420,11 @@ class OpenAIAdapter:
                             cancel.raise_if_cancelled()
                         # 仍在 with 内取最终响应：stream 关闭后 SDK 不保证还能取到。
                         final = stream.get_final_response()
-        except (RuntimeError, IndexError) as exc:
+        except (RuntimeError, IndexError, AttributeError) as exc:
             if cancel is not None:
                 cancel.raise_if_cancelled()
-            sdk_index_error = _is_sdk_stream_index_error(exc)
-            if isinstance(exc, IndexError) and not sdk_index_error:
+            sdk_state_error = _is_sdk_stream_state_error(exc)
+            if isinstance(exc, (IndexError, AttributeError)) and not sdk_state_error:
                 raise
             # SDK 状态机异常通常来自代理的事件顺序不兼容；不能返回空的正常响应，
             # 否则 Orchestrator 会误判为任务完成并停止继续处理。
@@ -431,8 +437,10 @@ class OpenAIAdapter:
             # 网关事件。都改走原始流重跑，既能拿到真实失败原因，也能兜住内容。
             # 漏 output_item.added / content_part.added 时，SDK 会按尚不存在的
             # 下标取 output/content；仅 SDK 状态机自身的越界也走这一次回退。
+            # output/content 为 null 时也会在 SDK 的 append 处失败，原始流
+            # 无需该累积列表。仅按 traceback 来源和属性名匹配，不吞回调异常。
             if not _use_raw_stream and (
-                sdk_index_error
+                sdk_state_error
                 or _MISSING_CREATED_MARKER in message
                 or _MISSING_COMPLETED_MARKER in message
             ):
@@ -448,6 +456,7 @@ class OpenAIAdapter:
                     cancel=cancel,
                     reasoning_effort_override=reasoning_effort_override,
                     _use_raw_stream=True,
+                    prompt_cache_key=prompt_cache_key,
                 )
             if _MISSING_CREATED_MARKER in message or "rate_limit" in message.lower():
                 raise ProviderStreamError(
@@ -534,6 +543,7 @@ class OpenAIAdapter:
                     on_thinking_delta=on_thinking_delta,
                     cancel=cancel,
                     reasoning_effort_override=fallback_effort,
+                    prompt_cache_key=prompt_cache_key,
                 )
                 if not retry.text.strip() and not retry.tool_calls:
                     retry_types = [
@@ -544,6 +554,9 @@ class OpenAIAdapter:
                         f" (status={retry.finish_reason}, output_types={retry_types})"
                     )
                 retry.usage["input_tokens"] += in_tokens
+                from app.models.cache_usage import cache_usage
+                for key, value in cache_usage(usage_obj, provider="openai").items():
+                    retry.usage[key] = retry.usage.get(key, 0) + value
                 retry.usage["output_tokens"] += out_tokens
                 return retry
             status = getattr(final, "status", None)
@@ -556,10 +569,11 @@ class OpenAIAdapter:
                     f"reasoning_delta={saw_reasoning_delta})"
                 )
 
+        from app.models.cache_usage import cache_usage
         return ModelResponse(
             text="".join(text_parts),
             tool_calls=tool_calls,
-            usage={"input_tokens": in_tokens, "output_tokens": out_tokens},
+            usage={"input_tokens": in_tokens, "output_tokens": out_tokens, **cache_usage(usage_obj, provider="openai")},
             # provider_payload 是 list,Runtime 用 messages.extend 追加。
             # Responses API 把 message item 与 function_call item 拆开放,
             # 下一轮把这些 item 原样作为 input 一起发,模型才能理解上下文。

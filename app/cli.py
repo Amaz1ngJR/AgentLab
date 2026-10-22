@@ -858,6 +858,9 @@ def _render_edit_file(tool_input: dict) -> None:
     在内存里模拟 _edit_file 的替换逻辑(old_str→new_str,空 old_str=末尾追加),
     算出替换后的完整内容,与旧内容做 diff。不真正写盘。old_str 不唯一 / 找不到
     时不显示 diff(交给工具执行时报错给模型)。
+
+    读取必须与工具本身一致:保留原始换行符。否则 CRLF 文件的 diff 会被整片
+    显示成"每行都改了",用户批准的依据就是假的。
     """
     try:
         path_str = tool_input.get("path", "")
@@ -868,12 +871,17 @@ def _render_edit_file(tool_input: dict) -> None:
             return
         if not path.exists() or not path.is_file():
             return
-        old_content = path.read_text(encoding="utf-8", errors="replace")
+        from app.tools.builtin.files import read_text_preserving
+        old_content = read_text_preserving(path)
         old_str = tool_input.get("old_str", "")
         new_str = tool_input.get("new_str", "")
         if old_str == "":
             new_content = old_content + new_str
         else:
+            if old_content.count(old_str) == 0 and "\r\n" in old_content and "\r\n" not in old_str:
+                # 与 _edit_file 相同的 CRLF 归一:模型给 LF 版本时按文件风格匹配。
+                old_str = old_str.replace("\r\n", "\n").replace("\n", "\r\n")
+                new_str = new_str.replace("\r\n", "\n").replace("\n", "\r\n")
             if old_content.count(old_str) != 1:
                 return  # 不唯一 / 未命中:执行时会报错,这里不猜
             new_content = old_content.replace(old_str, new_str, 1)

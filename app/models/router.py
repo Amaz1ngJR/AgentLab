@@ -6,6 +6,7 @@ import copy
 import contextvars
 import queue
 import threading
+import uuid
 from typing import Any, Callable, Optional
 
 from app.agent.cancel import CancelToken
@@ -36,13 +37,23 @@ class ModelRouter:
         self._adapter = adapter
         self._breaker = ProviderCircuitBreaker()
         self._retry_sleep = retry_sleep
+        self._last_request: dict | None = None
+        self._cache_group = uuid.uuid4().hex
+        self._cache_key_rejected = False
 
     def fork(self) -> "ModelRouter":
         """Independent SDK client and retry breaker for concurrent child runs."""
         cfg = getattr(self._adapter, "_cfg", None)
         if cfg is None:
             raise ValueError("provider does not support isolated child clients")
-        return build_model_router(copy.deepcopy(cfg))
+        child = build_model_router(copy.deepcopy(cfg))
+        child._cache_group = self._cache_group
+        child._cache_key_rejected = self._cache_key_rejected
+        return child
+
+    def fork_snapshot(self) -> dict | None:
+        """Only the last successfully completed request; never expose SDK state."""
+        return copy.deepcopy(self._last_request)
 
     @property
     def model(self) -> str:
@@ -107,13 +118,34 @@ class ModelRouter:
             "on_text_delta": on_text_delta,
             "on_thinking_delta": on_thinking_delta,
         }
+        self._last_request = None
         if cancel is not None and _accepts_keyword(self._adapter.create_message, "cancel"):
             adapter_kwargs["cancel"] = cancel
-        return call_with_retry(
-            lambda: self._adapter.create_message(
-                messages,
-                **adapter_kwargs,
-            ),
+        cfg = getattr(self._adapter, "_cfg", None)
+        if (self.provider == "openai" and getattr(cfg, "prompt_cache_enabled", False)
+                and not self._cache_key_rejected
+                and _accepts_keyword(self._adapter.create_message, "prompt_cache_key")):
+            adapter_kwargs["prompt_cache_key"] = self._cache_group
+        request = {"messages": copy.deepcopy(messages), "system": system,
+                   "tools": copy.deepcopy(tools), "provider": self.provider, "model": self.model}
+        def invoke_adapter():
+            try:
+                return self._adapter.create_message(messages, **adapter_kwargs)
+            except Exception as exc:
+                # Only an explicit unsupported-parameter response permits removing the opt-in key.
+                # Never hide authentication, rate-limit, transport, or unrelated validation errors.
+                detail = str(exc).lower()
+                if ("prompt_cache_key" not in adapter_kwargs
+                        or getattr(exc, "status_code", None) != 400
+                        or "prompt_cache_key" not in detail
+                        or not any(word in detail for word in ("unsupported", "unknown parameter", "unrecognized"))):
+                    raise
+                adapter_kwargs.pop("prompt_cache_key")
+                self._cache_key_rejected = True
+                return self._adapter.create_message(messages, **adapter_kwargs)
+
+        response = call_with_retry(
+            invoke_adapter,
             on_retry=on_retry,
             cancel=cancel,
             breaker=self._breaker,
@@ -121,6 +153,8 @@ class ModelRouter:
             sleep=self._retry_sleep,
             max_retries=None if retry_until_cancelled else 2,
         )
+        self._last_request = request
+        return response
 
     def format_tool_results(self, results: list[ToolResult]) -> list[dict]:
         """把工具执行结果转成具体 provider 要求的下一轮输入项。

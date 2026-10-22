@@ -980,3 +980,142 @@ def test_wait_bounds_eight_escaped_results_and_keeps_pages_contiguous(tmp_path):
         assert "".join(pages) == text
     finally:
         m.finish()
+
+
+@pytest.mark.parametrize("context", ["", "已确认事实：存在重试\n\n代码定位：app/models/provider_retry.py\n\n本次边界：只检查清理路径"])
+def test_delegation_brief_reaches_first_request_without_extra_round(tmp_path, context):
+    calls, events = [], []
+
+    class Child(FakeRouter):
+        def create_message(self, messages, **kwargs):
+            calls.append((json.loads(json.dumps(messages)), kwargs))
+            return response("完成交接检查")
+
+    class Parent(ForkRouter):
+        def fork(self):
+            return Child([])
+
+    m = manager(tmp_path, on_event=events.append)
+    m.llm = Parent([])
+    try:
+        sid = m.spawn("目标：检查重试", context=context)["child_run_id"]
+        record = m.wait([sid], 2)["agents"][0]
+        assert record["status"] == "succeeded"
+        assert len(calls) == 1
+        messages, kwargs = calls[0]
+        text = json.dumps(messages, ensure_ascii=False)
+        assert "目标：检查重试" in text
+        if context:
+            assert "代码定位：app/models/provider_retry.py" in text
+            assert "本次边界：只检查清理路径" in text
+        assert "避免无理由重复调查" in kwargs["system"]
+        assert "实际可用工具: read_file" in kwargs["system"]
+        assert record["available_tools"] == ["read_file"]
+        assert record["context_diagnostics"]["mode"] == "brief"
+        started = next(e for e in events if e.kind == "subagent_started")
+        assert started.payload["context_diagnostics"] == record["context_diagnostics"]
+    finally:
+        m.finish()
+
+
+def test_long_delegation_brief_keeps_tail_boundaries_and_redacts(tmp_path):
+    calls = []
+
+    class Child(FakeRouter):
+        def create_message(self, messages, **kwargs):
+            calls.append(json.loads(json.dumps(messages)))
+            return response("checked")
+
+    class Parent(ForkRouter):
+        def fork(self):
+            return Child([])
+
+    m = manager(tmp_path, context="父背景" * 3000)
+    m.llm = Parent([])
+    context = ("已完成工作：\n" + "超长日志" * 3000 +
+               "\n\n代码定位：\napp/x.py:run\n\n本次边界：\n只检查 run\n\n"
+               "已确认事实：api_key=super_secret_value")
+    try:
+        sid = m.spawn("检查 run", context=context)["child_run_id"]
+        record = m.wait([sid], 2)["agents"][0]
+        text = json.dumps(calls[0], ensure_ascii=False)
+        assert "app/x.py:run" in text and "只检查 run" in text
+        assert "有省略" in text and "super_secret_value" not in text
+        assert record["context_diagnostics"]["truncated"]
+        assert record["context_diagnostics"]["output_chars"] < 20_000
+    finally:
+        m.finish()
+
+
+def test_required_tools_fail_before_fork_or_budget_reservation(tmp_path):
+    class Parent(ForkRouter):
+        def fork(self):
+            pytest.fail("missing capability must be checked before creating a client")
+
+    m = manager(tmp_path)
+    m.llm = Parent([])
+    budget = (m.rounds_left, m.tools_left)
+    try:
+        with pytest.raises(ToolExecutionError, match="required tools unavailable.*shell"):
+            m.spawn("运行测试", required_tools=["shell"])
+        with pytest.raises(ToolExecutionError, match="required tools unavailable.*read_file"):
+            m.spawn("读取代码", allowed_tools=[], required_tools=["read_file"])
+        assert not m.children
+        assert (m.rounds_left, m.tools_left) == budget
+    finally:
+        m.finish()
+
+
+def test_required_tools_success_and_tool_descriptions(tmp_path):
+    m = manager(tmp_path)
+    try:
+        sid = m.spawn("读取代码", required_tools=["read_file"])["child_run_id"]
+        assert m.wait([sid], 2)["agents"][0]["available_tools"] == ["read_file"]
+        schema = next(t.to_schema() for t in m.tool_descriptors() if t.name == "spawn_agent")
+        assert "已确认事实" in json.dumps(schema, ensure_ascii=False)
+        assert "required_tools" in json.dumps(schema)
+        assert "send_input" in schema["description"]
+    finally:
+        m.finish()
+
+
+@pytest.mark.parametrize("required", ["read_file", [None], [""], [1]])
+def test_invalid_required_tools_do_not_start_child(tmp_path, required):
+    m = manager(tmp_path)
+    try:
+        with pytest.raises(ToolExecutionError, match="required_tools must be"):
+            m.spawn("调查", required_tools=required)
+        assert not m.children
+    finally:
+        m.finish()
+
+
+def test_scoped_executor_cannot_require_shell(tmp_path):
+    m = manager(tmp_path)
+    try:
+        with pytest.raises(ToolExecutionError, match="required tools unavailable: shell"):
+            m.spawn("测试", role="executor", file_scope=["app"], required_tools=["shell"])
+        assert not m.children  # No worktree or model invocation was started.
+    finally:
+        m.finish()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_context_diagnostics_survive_restore_without_rebilling(tmp_path, legacy):
+    m = manager(tmp_path)
+    restored = manager(tmp_path)
+    try:
+        sid = m.spawn("调查", context="代码定位：app/x.py")["child_run_id"]
+        m.wait([sid], 2)
+        records = m.records()
+        expected = m.snapshot(sid)["context_diagnostics"]
+        if legacy:
+            for record in records:
+                record.pop("context_diagnostics", None)
+            expected = {}
+        restored.restore_results(records)
+        assert restored.snapshot(sid)["context_diagnostics"] == expected
+        assert restored.usage == {"input_tokens": 0, "output_tokens": 0}
+    finally:
+        m.finish()
+        restored.finish()

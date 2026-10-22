@@ -9,13 +9,14 @@ from app.tools.builtin.files import (
     LIST_DIR,
     READ_FILE,
     WRITE_FILE,
+    _edit_file,
     _list_dir,
     _read_file,
     _resolve_within_workspace,
     _write_file,
     WorkspacePathError,
 )
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolExecutionError, ToolRegistry
 
 
 def test_resolve_within_workspace(monkeypatch, tmp_path):
@@ -45,35 +46,75 @@ def test_resolve_outside_workspace_raises(monkeypatch, tmp_path):
         _resolve_within_workspace(str(tmp_path / "outside.txt"))
 
 
-def test_read_file_outside_returns_refused(monkeypatch, tmp_path):
+def test_read_file_outside_raises_refused(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("external")
     monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
-    out = _read_file({"path": str(outside)})
-    assert out.startswith("refused:"), out
-    assert "outside workspace" in out
+    # 越界必须表现为错误(抛 ToolExecutionError),不能被当成成功执行后计入
+    # "成功工具证据";否则被拒绝的读取就能支撑模型宣称任务完成。
+    with pytest.raises(ToolExecutionError) as exc:
+        _read_file({"path": str(outside)})
+    assert str(exc.value).startswith("refused:"), exc.value
+    assert "outside workspace" in str(exc.value)
 
 
-def test_write_file_outside_returns_refused(monkeypatch, tmp_path):
+def test_write_file_outside_raises_refused(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "outside.txt"
     monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
-    out = _write_file({"path": str(outside), "content": "x"})
-    assert out.startswith("refused:"), out
+    with pytest.raises(ToolExecutionError) as exc:
+        _write_file({"path": str(outside), "content": "x"})
+    assert str(exc.value).startswith("refused:"), exc.value
     assert not outside.exists()
 
 
-def test_list_dir_outside_returns_refused(monkeypatch, tmp_path):
+def test_list_dir_outside_raises_refused(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"
     workspace.mkdir()
     outside.mkdir()
     monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
-    out = _list_dir({"path": str(outside)})
-    assert out.startswith("refused:"), out
+    with pytest.raises(ToolExecutionError) as exc:
+        _list_dir({"path": str(outside)})
+    assert str(exc.value).startswith("refused:"), exc.value
+
+
+def test_edit_file_outside_raises_refused(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("external")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
+    with pytest.raises(ToolExecutionError) as exc:
+        _edit_file({"path": str(outside), "old_str": "external", "new_str": "x"})
+    assert str(exc.value).startswith("refused:"), exc.value
+    assert outside.read_text() == "external"
+
+
+def test_granted_outside_read_succeeds(monkeypatch, tmp_path):
+    """越界读取在拿到对应审批后必须正常成功(不是被当成拒绝)。
+
+    files.py 内部的 refused 分支在 registry 路径下不可达:审批不匹配时 registry
+    已在执行前拦下,匹配时 _resolve_within_workspace 又能拿到审批。这个测试锁住
+    这条真实契约,避免把"已批准"误判成"拒绝"。
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("external")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace))
+    registry = ToolRegistry()
+    registry.register(READ_FILE)
+    output, is_error = registry.execute(
+        "read_file",
+        {"path": str(outside)},
+        approved_action="read_file_outside_workspace",
+    )
+    assert is_error is False
+    assert output == "external"
 
 
 def test_registry_requires_matching_approval_for_outside_read(monkeypatch, tmp_path):

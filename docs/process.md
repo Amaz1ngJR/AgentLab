@@ -64,6 +64,8 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.1 P0 核心 CLI Agent
 
+- OpenAI Responses 空列表兼容：运行堆栈确认 SDK `accumulate_event` 可因 `output/content: null` 在 `append` 处崩溃；仅对 traceback 来源确认为 SDK 状态机的该类 AttributeError 走一次已有原始流回退，保留正文/工具调用和请求参数。应用回调异常或原始流自身异常仍原样上抛，不做无限重试；使用真实 SDK 状态机离线覆盖两种空列表与工具恢复。
+- 流式响应与诊断兼容：Anthropic 初始消息快照的 `content: null` 在内容块到达前规范化为空列表，避免 SDK 累积器调用 `append` 崩溃，不额外重发请求、不吞回调编程错误。结构化失败保留有界的文件/行号/函数调用栈，不收集局部变量或源码行，错误消息脱敏。RTK 对复合命令、管道、重定向和替换语法回退通用处理，避免 `status; diff; log` 的混合输出被单命令过滤器误删。
 - 自动运行停止诊断：取消令牌保留首次取消来源，`turn.cancelled` 事件记录 Esc、Ctrl+C/SIGINT、EOF、API 取消等原因，CLI 在实时输入框退出后显示停止说明；单条 shell 超时仅回传工具错误，不取消整个任务，保留有界的部分输出并提示先检查已发生的改动，避免盲目重试。非交互子进程使用空 stdin，与实时输入框隔离；交互命令使用 terminal 工具。已覆盖 Direct/Task 同批次超时后继续、真实子进程超时、父取消令牌不受影响及输入取消来源的回归测试。历史会话 `31316530` 的本轮记录为 cancelled，而非正常完成；旧事件未记录取消来源，不能仅凭 180 秒超时断定根因。
 - CLI REPL：交互模式、单次 `-p/--prompt`、`--profile`、`-y` 自动审批；prompt_toolkit 输入框、spinner 进度（`✻ thinking… (3.2s · ↓ 42 tokens)`）、token/耗时统计。
 - 模型层：Anthropic Messages、OpenAI Responses、OpenAI-compatible 三种 adapter；内部协议统一 `ModelResponse / ToolCall / ToolResult`；OpenAI-compatible 具备 JSON tool call fallback；实际模型 ID 规范化 + 代理静默映射提示。
@@ -97,6 +99,8 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.4 多 Agent、Session 切换与长期记忆
 
+- 子产物集成不再要求整个父工作区保持初始状态：允许目标路径以外的已暂存/未暂存改动，逐路径检查子产物涉及的父文件和索引；同路径改动、新文件碰撞、HEAD 漂移仍拒绝合入，验证/审批期间变化仍要求重新验证。写入子任务实际退出后恢复父级 shell 的正常审批，不再被 pending_review 永久锁住；运行中/取消未完成的写线程仍阻止任意 shell，父级文件工具可在独立越界审批后读取其他工作目录。`integrate_agent.checks` 明确要求子 worktree 中可执行的验证命令，不能填写审查说明或以后验证的承诺。
+- 子 Agent 续用与缓存统计修复：父子运行、Planner/Executor 和延迟收尾路径保留可选缓存 usage，缺失不伪造为零；续用链按最新一轮判断是否交付，重试成功不再被旧失败记录永久阻塞，历史结果不改写。文件原子写入在写入内容前设置目标权限，权限设置失败时保留原文件并清理临时文件；覆盖私密文件权限和可执行位的回归测试。
 - `app/agent/profiles.py`：`AgentProfile`（agent_id/name/model_profile/system_prompt/tools/mcp_servers/memory_policy/max_steps/max_task_steps）+ `load_agent_profiles()` 读 `config/agents.yaml`。
 - `app/storage/__init__.py`：SQLite（标准库，无 ORM），表 `agent_profiles / sessions / messages / memories / tool_executions`；会话 CRUD、消息存盘/加载、记忆写入/LIKE 搜索、工具执行审计；写入经 `redact()`。
 - `app/agent/session_router.py`：`SessionRouter` 维护 session_id → AgentSession 映射；`/session` 命令族 `list / agents / new / switch / rename / archive / delete`；session 间消息完全隔离；可从 SQLite 恢复历史。

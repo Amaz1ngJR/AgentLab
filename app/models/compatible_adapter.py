@@ -215,9 +215,12 @@ class OpenAICompatibleAdapter:
         # 任意一个非空值即可记下来(OpenAI / 各代理普遍如此)
         actual_model: Optional[str] = None
 
+        cache_tokens = {}
+        from app.models.cache_usage import cache_usage
         stream = self._client.chat.completions.create(**params)
         with close_on_cancel(cancel, stream):
             for chunk in stream:
+                cache_tokens.update(cache_usage(getattr(chunk, "usage", None), provider="compatible"))
                 if cancel is not None:
                     cancel.raise_if_cancelled()
                 if actual_model is None and getattr(chunk, "model", None):
@@ -338,7 +341,7 @@ class OpenAICompatibleAdapter:
         if raw_tool_calls:
             payload["tool_calls"] = raw_tool_calls
 
-        usage_dict = {"input_tokens": in_tokens, "output_tokens": out_tokens}
+        usage_dict = {"input_tokens": in_tokens, "output_tokens": out_tokens, **cache_tokens}
 
         # provider_payload 是 list[dict],由 Runtime 调 messages.extend 追加。
         # OpenAI Chat Completions 用单条 assistant 消息表示这一轮(无论有多少

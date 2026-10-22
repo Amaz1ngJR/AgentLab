@@ -13,7 +13,7 @@ READ_ONLY_TOOLS = frozenset({"read_file", "list_dir", "code_search"})
 WRITE_TOOLS = frozenset({"write_file", "edit_file"})
 FORBIDDEN_SUBAGENT_TOOLS = frozenset({
     "delegate_subagent", "spawn_subagent", "spawn_agent", "wait_agent", "close_agent",
-    "send_input", "integrate_agent", "merge_worktree", "force_push",
+    "send_input", "resume_agent", "integrate_agent", "merge_worktree", "force_push",
 })
 ROLE_TOOLS = {
     "research": READ_ONLY_TOOLS,

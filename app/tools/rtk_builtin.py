@@ -156,11 +156,23 @@ class BuiltinRTK:
 
 
 def classify_command(command: str) -> str:
-    """保守识别单命令/常见复合命令；无法确认时返回 generic。"""
+    """只对可确认的单命令使用专用过滤器，混合输出不做语义压缩。"""
+    # Output from separate commands has no reliable boundaries. A formatter for
+    # just one segment can silently discard the other segments' evidence.
+    if any(char in command for char in "\n\r$`"):
+        return "generic"
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return "generic"
+    if any(token and all(char in ";&|<>()" for char in token) for token in tokens):
+        return "generic"
     lowered = command.strip().lower()
     if not lowered:
         return "generic"
-    # 复合命令优先识别测试类别；其他复杂管道用 generic，避免改变语义认知。
     if _contains_any(lowered, ("pytest", "python -m pytest")):
         return "pytest"
     if _contains_any(lowered, ("cargo test", "npm test", "npm run test", "pnpm test", "yarn test", "vitest", "jest", "go test")):

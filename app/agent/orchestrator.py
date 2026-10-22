@@ -296,8 +296,8 @@ class Orchestrator:
             self.last_run_error = str(exc) or "已取消(规划阶段)"
             self._emit(RunEvent(kind=events.RUN_FAILED, text=self.last_run_error))
             return "已取消。"
-        for k in ("input_tokens", "output_tokens"):
-            self.last_run_usage[k] += self._planner.last_usage.get(k, 0)
+        for key, value in self._planner.last_usage.items():
+            self.last_run_usage[key] = self.last_run_usage.get(key, 0) + value
         if self._planner.last_actual_model:
             self.last_actual_model = self._planner.last_actual_model
         for planned in (plan.execution_plan.tasks if plan.execution_plan else []):
@@ -713,8 +713,8 @@ class Orchestrator:
             "elapsed_seconds": used.get("elapsed_seconds", 0) + result.elapsed_seconds,
         }
         self.subagent_results[spec.subagent_id] = result
-        for key in ("input_tokens", "output_tokens"):
-            self.last_run_usage[key] += result.usage.get(key, 0)
+        for key, value in result.usage.items():
+            self.last_run_usage[key] = self.last_run_usage.get(key, 0) + value
         if result.actual_model:
             self.last_actual_model = result.actual_model
         summary = redact_value({

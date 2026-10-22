@@ -73,6 +73,7 @@ class SubagentResult:
     delivery_status: str = "none"
     base_state_fingerprint: str | None = None
     merge_ready: bool = False
+    metrics: dict = field(default_factory=dict)
 
     @property
     def mergeable(self) -> bool:

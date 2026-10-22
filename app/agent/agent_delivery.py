@@ -31,6 +31,30 @@ def patch_bytes(manager: WorktreeManager, worktree) -> bytes:
         Path(index + ".lock").unlink(missing_ok=True)
 
 
+def _check_parent_paths(manager: WorktreeManager, result, changed: list[str]) -> None:
+    """Allow unrelated edits, but never overwrite staged, tracked or new parent files."""
+    if manager.current_commit() != result.worktree.base_commit:
+        raise ToolExecutionError("parent workspace drifted: HEAD changed; review and rebase required")
+    paths = [f":(literal){path}" for path in changed]
+    if not paths:
+        raise ToolExecutionError("no patch to integrate")
+    for flags in ([], ["--cached"]):
+        diff = subprocess.run(
+            ["git", "diff", "--quiet", "--no-ext-diff", "--no-textconv", *flags,
+             result.worktree.base_commit, "--", *paths],
+            cwd=manager.repo_root, capture_output=True,
+        )
+        if diff.returncode:
+            raise ToolExecutionError(
+                "parent workspace drifted in child paths; review and rebase required")
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", *paths],
+        cwd=manager.repo_root, capture_output=True, check=True,
+    )
+    if untracked.stdout:
+        raise ToolExecutionError("parent workspace drifted: child paths already exist; review required")
+
+
 def integrate_result(result, *, workspace: Path, tools, approval, checks: list[str], cancel: CancelToken,
                      file_scope: tuple[str, ...] = ()):
     """Verify exact patch, approve exact artifact, revalidate baseline, then apply once."""
@@ -42,8 +66,8 @@ def integrate_result(result, *, workspace: Path, tools, approval, checks: list[s
     if not checks or any(not command.strip() for command in checks):
         raise ToolExecutionError("explicit verification commands are required")
     manager = WorktreeManager(workspace)
-    if manager.state_fingerprint() != result.base_state_fingerprint:
-        raise ToolExecutionError("parent workspace drifted; review and rebase required")
+    review_baseline = manager.state_fingerprint()
+    _check_parent_paths(manager, result, manager.changed_files(result.worktree))
     shell = tools.get("shell")
     if shell is None:
         raise ToolExecutionError("verification requires an allowed shell tool")
@@ -77,6 +101,7 @@ def integrate_result(result, *, workspace: Path, tools, approval, checks: list[s
     if file_scope and any(not any(Path(path) == Path(scope) or Path(path).is_relative_to(scope)
                                   for scope in file_scope) for path in changed):
         raise ToolExecutionError("verification changed files outside approved child scope")
+    _check_parent_paths(manager, result, changed)
     sha = hashlib.sha256(patch).hexdigest()
     approval_tool = Tool("integrate_agent", "Apply reviewed child patch to parent workspace", {},
                          lambda args: "", risk="write", requires_approval=True)
@@ -91,7 +116,7 @@ def integrate_result(result, *, workspace: Path, tools, approval, checks: list[s
     if not decision.approved:
         raise ToolExecutionError("integration approval denied")
     cancel.raise_if_cancelled()
-    if (manager.state_fingerprint() != result.base_state_fingerprint
+    if (manager.state_fingerprint() != review_baseline
             or patch_bytes(manager, result.worktree) != patch):
         raise ToolExecutionError("workspace or approved patch changed; revalidation required")
     subprocess.run(["git", "apply", "--check", "--binary", "-"], cwd=workspace,

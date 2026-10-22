@@ -292,8 +292,8 @@ class Executor:
                 )
 
             if usage_acc is not None and getattr(resp, "usage", None):
-                for k in ("input_tokens", "output_tokens"):
-                    usage_acc[k] = usage_acc.get(k, 0) + resp.usage.get(k, 0)
+                for key, value in resp.usage.items():
+                    usage_acc[key] = usage_acc.get(key, 0) + value
             if on_actual_model is not None and getattr(resp, "actual_model", None):
                 on_actual_model(resp.actual_model)
 

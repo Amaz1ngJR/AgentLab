@@ -124,7 +124,9 @@ class AnthropicAdapter:
             "max_tokens": max_tokens or self._cfg.max_tokens,
         }
         if system_text:
-            params["system"] = system_text
+            params["system"] = ([{"type": "text", "text": system_text,
+                                  "cache_control": {"type": "ephemeral"}}]
+                                if self._cfg.prompt_cache_enabled else system_text)
         if self._cfg.top_p is not None:
             params["top_p"] = self._cfg.top_p
         if tools:
@@ -143,6 +145,11 @@ class AnthropicAdapter:
                         cancel.raise_if_cancelled()
                     etype = getattr(event, "type", None)
                     if etype == "message_start":
+                        # Some gateways send null instead of the initial empty array.
+                        # Repair the SDK's accumulated copy before it appends the next block.
+                        snapshot = getattr(stream, "current_message_snapshot", None)
+                        if snapshot is not None and getattr(snapshot, "content", None) is None:
+                            snapshot.content = []
                         usage = getattr(event.message, "usage", None)
                         if usage:
                             in_tokens = getattr(usage, "input_tokens", 0) or 0
@@ -204,6 +211,8 @@ class AnthropicAdapter:
         else:
             usage = {"input_tokens": in_tokens, "output_tokens": out_tokens}
 
+        from app.models.cache_usage import cache_usage
+        usage.update(cache_usage(getattr(message, "usage", None), provider="anthropic"))
         # 用最终 usage 再发一次进度，确保 spinner 显示的数字与 [stats] 一致
         if on_progress:
             progress.set_usage(

@@ -501,7 +501,7 @@ class AgentSession:
             before = dict(previous.usage)
             previous.pump()
             for key, value in previous.usage.items():
-                self.cumulative_usage[key] += value - before.get(key, 0)
+                self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + value - before.get(key, 0)
             if any(not child.done.is_set() for child in previous.children.values()):
                 retiring.append(previous)
         self._retiring_managers = retiring
@@ -580,8 +580,8 @@ class AgentSession:
                 if any(not child.done.is_set() for child in manager.children.values()):
                     self._retiring_managers.append(manager)
                 for key, value in manager.usage.items():
-                    self.last_turn_usage[key] += value
-                    self.cumulative_usage[key] += value
+                    self.last_turn_usage[key] = self.last_turn_usage.get(key, 0) + value
+                    self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + value
             finally:
                 self.tools = source
                 if self._orch is not None:
@@ -634,8 +634,8 @@ class AgentSession:
                 )
             # 把 run 级统计拷回 session,供 CLI 展示 / 持久化
             self.last_turn_usage = dict(orch.last_run_usage)
-            for k in ("input_tokens", "output_tokens"):
-                self.cumulative_usage[k] += orch.last_run_usage.get(k, 0)
+            for key, value in orch.last_run_usage.items():
+                self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + value
             if orch.last_actual_model:
                 self.last_actual_model = orch.last_actual_model
             self.last_run_status = orch.last_run_status
@@ -745,10 +745,9 @@ class AgentSession:
                         retry_until_cancelled=self._auto_execute_enabled,
                     )
 
-                for k in ("input_tokens", "output_tokens"):
-                    v = resp.usage.get(k, 0)
-                    self.last_turn_usage[k] += v
-                    self.cumulative_usage[k] += v
+                for key, value in resp.usage.items():
+                    self.last_turn_usage[key] = self.last_turn_usage.get(key, 0) + value
+                    self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + value
 
                 # 记下服务器实际使用的模型 ID(可能被代理静默映射到别的型号)
                 if resp.actual_model:

@@ -45,6 +45,8 @@ PLANNER_SYSTEM = """你是任务规划器。把用户目标拆成可执行的子
 - 依赖只声明在任务 dependencies 中，不要在 subagent 中重复声明另一套依赖。
 - 写子任务必须填写互不重叠的相对 file_scope，只通过受限文件工具修改；验证与集成由父级审批执行。
 - 显式委派时按独立任务划分；没有独立任务或预算不足则保留主任务，并向用户说明原因。
+- 子任务 instruction 应包含目标、已确认事实及来源、代码定位、已完成工作、本次边界和交付要求；区分事实与假设，避免重复调查。
+- 先检查子任务实际工具：只读角色没有网络和 shell，需抓取外部资料或执行测试时由父级处理并提供结果，不委派缺少必要能力的任务。
 - 复杂计划请显式填写 max_steps/max_tool_calls，子任务预算总和必须给父级汇总和验证预留余量。
 - 子 Agent 不得请求 spawn_agent、wait_agent、send_input、close_agent、integrate_agent 或其他委派、合并、推送能力。
 - 不要把普通任务全部拆成子 Agent；简单目标只给一个 main_agent 任务。
@@ -157,8 +159,7 @@ class Planner:
                 cancel=cancel,
                 retry_until_cancelled=retry_until_cancelled,
             )
-            for k in ("input_tokens", "output_tokens"):
-                self.last_usage[k] = resp.usage.get(k, 0) if getattr(resp, "usage", None) else 0
+            self.last_usage.update(getattr(resp, "usage", None) or {})
             if getattr(resp, "actual_model", None):
                 self.last_actual_model = resp.actual_model
             obj = _extract_json(getattr(resp, "text", "") or "")

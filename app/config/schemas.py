@@ -42,6 +42,7 @@ class LLMConfig:
     # 导致 stop_reason=max_tokens 时正文/工具调用还没开始写。默认给足余量。
     max_tokens: int = 16384
     enable_thinking: bool = False  # 深度思考模型：是否请求并展示推理过程
+    prompt_cache_enabled: bool = False  # Opt-in OpenAI Responses cache grouping; no private headers.
     reasoning_effort: Optional[str] = None  # OpenAI Responses: low/medium/high 等推理强度
     profile_name: Optional[str] = None   # 激活的 profile 名称（如 "cloud_claude"）
     capabilities: list[str] = field(default_factory=list)  # 例 ["chat", "tools", "streaming"]

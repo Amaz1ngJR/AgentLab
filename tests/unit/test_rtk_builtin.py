@@ -3,6 +3,31 @@ import threading
 
 import pytest
 
+
+@pytest.mark.parametrize("command", [
+    "git status --short; git diff --cached --stat; git log -10 --oneline",
+    "git status --short && git log -10 --oneline",
+    "git status --short\ngit log -10 --oneline",
+    "git diff | head -40", "git status > status.txt", "echo $(git status)",
+    "pytest; git log -10 --oneline", "git status & git log",
+])
+def test_compound_commands_do_not_drop_other_commands_output(command):
+    from app.tools.rtk_builtin import BuiltinRTK, classify_command
+    output = " M app.py\n app.py | 2 +-\n 1 file changed\n123abcd fix: retain history\n"
+    assert classify_command(command) == "generic"
+    result = BuiltinRTK().compress(command, output, "", 0)
+    assert result.output == output.rstrip()
+    assert not result.applied
+
+
+@pytest.mark.parametrize("command,category", [
+    ("git status --short", "git_status"), ("git diff --stat", "git_diff"),
+    ("git log -10 --oneline", "git_log"), ("python -m pytest -q", "pytest"),
+])
+def test_single_commands_still_use_specialized_filters(command, category):
+    from app.tools.rtk_builtin import classify_command
+    assert classify_command(command) == category
+
 from app.tools.rtk_builtin import BuiltinRTK, BuiltinRTKConfig, format_status
 
 
