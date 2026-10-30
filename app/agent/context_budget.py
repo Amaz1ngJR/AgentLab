@@ -5,7 +5,7 @@
     1. 解析当前模型 profile 的上下文窗口(model_context_limit);
     2. 扣掉为输出预留的空间(reserved_output)与 system+tools 固定预算;
     3. 把剩余预算切给 memory / summary / recent / evidence 各项;
-    4. 给出 70% 警告 / 85% 强制压缩两个阈值的判定。
+    4. 在扣除输出预留后的输入预算上计算警告和压缩阈值。
 
 为什么自己估 token 而不调 tokenizer:
   AgentLab 要保持"全离线可测、零额外依赖"。各 provider 的 tokenizer 不一,
@@ -41,12 +41,10 @@ _MODEL_CONTEXT_LIMITS: dict[str, int] = {
 }
 
 # 匹配不到任何已知模型、且 profile 未声明 context_size 时的保守默认窗口。
-DEFAULT_CONTEXT_LIMIT = 8_192
+DEFAULT_CONTEXT_LIMIT = 64_000
 
-# 阈值:预计输入超过窗口的这个比例就触发对应动作(§7.3.2)。
-# 贴近 Claude Code 的做法(~92-95% 触发自动压缩):压缩有真实开销(一次模型调用),
-# 过早压缩反而浪费,所以把强制压缩点抬到 92%,留足缓冲又不撞窗口;警告点 80% 提前
-# 给用户一次预告。
+# 阈值基于扣除输出预留后的输入预算，另留 2% 给估算误差与协议开销。
+INPUT_SAFETY_RATIO = 0.98
 WARN_RATIO = 0.80
 COMPACT_RATIO = 0.92
 
@@ -141,12 +139,17 @@ class ContextBudget:
     @property
     def warn_threshold(self) -> int:
         """预计输入超过这个值就该发 context_budget_warning。"""
-        return int(self.model_context_limit * WARN_RATIO)
+        return int(self.input_budget * WARN_RATIO)
 
     @property
     def compact_threshold(self) -> int:
         """预计输入超过这个值就必须在下次模型调用前压缩旧历史。"""
-        return int(self.model_context_limit * COMPACT_RATIO)
+        return int(self.input_budget * COMPACT_RATIO)
+
+    @property
+    def safe_input_limit(self) -> int:
+        """请求前的硬上限，含估算安全余量。"""
+        return int(self.input_budget * INPUT_SAFETY_RATIO)
 
     def status_for(self, estimated_input_tokens: int) -> str:
         """根据预计输入 token 给出预算状态:ok / warn / compact。"""
@@ -176,6 +179,7 @@ class ContextBudget:
             if reserved_output_tokens is not None
             else min(8_192, max(512, int(limit * 0.25)))
         )
+        reserved = min(limit, max(0, reserved))
         usable = max(0, limit - reserved)
         # 输入预算的经验切分(总和 = usable):
         #   system+tools 15% / memory 10% / summary 15% / recent 50% / evidence 10%

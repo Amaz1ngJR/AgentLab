@@ -69,8 +69,15 @@ def redact_lines(lines: Iterable[str]) -> list[str]:
 
 
 def format_exception(exc: BaseException) -> str:
-    """格式化异常摘要(单行,适合 CLI 提示):'TypeName: message'。已脱敏。"""
-    return redact(f"{type(exc).__name__}: {exc}")
+    """格式化异常摘要(单行,适合 CLI 提示):'TypeName: message'。已脱敏。
+
+    异常没有消息时(裸 assert、或只带 args 为空的自定义异常),只打印类型名会让
+    用户完全无从排查,这里补一句说明,避免出现光秃秃的 'AssertionError'。
+    """
+    message = str(exc)
+    if not message:
+        return f"{type(exc).__name__}: (异常无消息)"
+    return redact(f"{type(exc).__name__}: {message}")
 
 
 def format_traceback(exc: BaseException) -> str:

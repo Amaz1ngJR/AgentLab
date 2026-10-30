@@ -356,6 +356,11 @@ def test_running_and_cancelling_writer_still_blocks_shell_but_not_external_reads
                 output, error = tools.execute("shell", {"command": "git status --short"},
                                               approved_action="shell")
                 assert error and "still running or cancelling" in output
+                output, error = tools.execute("write_file", {"path": "child.txt", "content": "unsafe"},
+                                              approved_action="write_file")
+                assert error and "reserved" in output
+                with pytest.raises(ToolExecutionError, match="conflicts"):
+                    m.spawn("overlap", role="executor", file_scope=["child.txt"])
                 assert tools.execute("read_file", {"path": str(external)},
                                      approved_action="read_file_outside_workspace") == ("outside evidence", False)
             release.set()
@@ -363,6 +368,8 @@ def test_running_and_cancelling_writer_still_blocks_shell_but_not_external_reads
             output, error = tools.execute("shell", {"command": "git status --short"},
                                           approved_action="shell")
             assert not error, output
+            assert not tools.execute("write_file", {"path": "child.txt", "content": "after stop"},
+                                     approved_action="write_file")[1]
     finally:
         release.set()
         m.finish()
@@ -618,3 +625,97 @@ raise SystemExit(3)  # The child must have terminated the process before return.
         assert not (git_repo / "child.txt").exists()
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed", "budget_exhausted", "cancelled"])
+def test_closed_stopped_writer_releases_scope_without_discarding_artifact(git_repo, monkeypatch, status):
+    from app.agent.agent_manager import DelegationRegistry
+    from app.agent.subagent_runtime import SubagentRuntimeFactory
+    from app.agent.subagents import SubagentResult
+    from app.config.loader import use_workspace_root
+
+    def create_artifact(self, spec, workspace, cancel):
+        (workspace / "child.txt").write_text("partial artifact")
+        return SubagentResult(spec.subagent_id, spec.role, status)
+
+    monkeypatch.setattr(SubagentRuntimeFactory, "delegate", create_artifact)
+    m = make_manager(git_repo)
+    try:
+        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        m.wait([sid], 3)
+        tools = DelegationRegistry(m.tools, m)
+        with use_workspace_root(git_repo):
+            args = {"path": "child.txt", "content": "parent replacement"}
+            assert "reserved" in tools.execute("write_file", args, approved_action="write_file")[0]
+            with pytest.raises(ToolExecutionError, match="conflicts"):
+                m.spawn("replacement", role="executor", file_scope=["child.txt"])
+            m.close(sid)
+            m.close(sid)  # Release is idempotent; artifacts and status remain intact.
+            assert m.snapshot(sid)["execution_status"] == status
+            assert m.snapshot(sid)["delivery_status"] == "pending_review"
+            assert (m.children[sid].worktree.path / "child.txt").read_text() == "partial artifact"
+            if status != "succeeded":
+                with pytest.raises(ToolExecutionError, match="only successful"):
+                    m.integrate(sid, ["test -f child.txt"])
+            replacement = m.spawn("replacement", role="executor", file_scope=["child.txt"])["child_run_id"]
+            m.wait([replacement], 3)
+            m.close(replacement)
+            assert not tools.execute("write_file", args, approved_action="write_file")[1]
+            assert not tools.execute("edit_file", {"path": "child.txt", "old_str": "parent", "new_str": "reviewed"},
+                                     approved_action="edit_file")[1]
+            assert (git_repo / "child.txt").read_text() == "reviewed replacement"
+    finally:
+        m.finish()
+
+
+def test_integrated_writer_releases_scope_for_next_writer(git_repo):
+    from app.agent.agent_manager import DelegationRegistry
+    from app.config.loader import use_workspace_root
+    import subprocess
+
+    m = make_manager(git_repo)
+    try:
+        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        m.wait([sid], 3)
+        m.integrate(sid, ["test -f child.txt"])
+        # A new writer still requires a clean baseline, independently of scope ownership.
+        subprocess.run(["git", "add", "child.txt"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "accept child"], cwd=git_repo, check=True, capture_output=True)
+        next_id = m.spawn("next", role="executor", file_scope=["child.txt"])["child_run_id"]
+        m.wait([next_id], 3)
+        m.close(next_id)
+        tools = DelegationRegistry(m.tools, m)
+        with use_workspace_root(git_repo):
+            assert not tools.execute("edit_file", {"path": "child.txt", "old_str": "hello", "new_str": "updated"},
+                                     approved_action="edit_file")[1]
+    finally:
+        m.finish()
+
+
+def test_restored_failed_artifact_does_not_reacquire_write_scope(git_repo, monkeypatch):
+    from app.agent.agent_manager import DelegationRegistry
+    from app.agent.subagent_runtime import SubagentRuntimeFactory
+    from app.agent.subagents import SubagentResult
+    from app.config.loader import use_workspace_root
+
+    def fail(self, spec, workspace, cancel):
+        (workspace / "child.txt").write_text("unfinished")
+        return SubagentResult(spec.subagent_id, spec.role, "failed")
+
+    monkeypatch.setattr(SubagentRuntimeFactory, "delegate", fail)
+    original = make_manager(git_repo)
+    restored = make_manager(git_repo)
+    try:
+        sid = original.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        original.wait([sid], 3)
+        original.close(sid)
+        restored.restore_results(original.records())
+        assert restored.snapshot(sid)["closed"]
+        with use_workspace_root(git_repo):
+            assert not DelegationRegistry(restored.tools, restored).execute(
+                "write_file", {"path": "child.txt", "content": "manual recovery"},
+                approved_action="write_file")[1]
+        assert (restored.children[sid].worktree.path / "child.txt").read_text() == "unfinished"
+    finally:
+        original.finish()
+        restored.finish()

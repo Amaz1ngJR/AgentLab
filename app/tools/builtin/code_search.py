@@ -24,8 +24,13 @@
 from __future__ import annotations
 
 import json
+import queue
+import re
 import shutil
 import subprocess
+import threading
+import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -35,7 +40,7 @@ from app.tools.builtin.files import (
     _outside_workspace_approval,
     _resolve_within_workspace,
 )
-from app.tools.registry import Tool, ToolExecutionError
+from app.tools.registry import Tool, ToolExecutionError, current_cancel_token
 from app.util.redact import redact
 
 # ── 限制常量 ──────────────────────────────────────────────────────────────────
@@ -148,41 +153,101 @@ def _rel(path: Path, root: Path) -> str:
 # ── ripgrep 后端 ─────────────────────────────────────────────────────────────
 
 def _run_ripgrep(rg: str, root: Path, query: str, mode: str, glob: Optional[str],
-                 case_sensitive: bool, timeout: int) -> tuple[list[str], bool]:
-    """调 rg --json,返回 (stdout 行列表, 是否超时)。
-
-    不在 rg 侧做 max_count / context,统一交给 Python 端处理,保证 rg 与 fallback
-    两条路径的结果格式一致、列号口径一致。
-    """
-    argv = [rg, "--json"]
+                 case_sensitive: bool, timeout: int, max_results: int = DEFAULT_MAX_RESULTS,
+                 ) -> tuple[list[str], bool, bool]:
+    """有界流式读取 rg；按实际有效命中计数，符号用途不挤占定义的限额。"""
+    argv = [rg, "--json", "--max-filesize", str(MAX_FILE_BYTES)]
     if not case_sensitive:
         argv.append("-i")
     if mode in ("text", "symbol"):
-        argv.append("-F")  # fixed-string;symbol 先用名字粗筛,再用 Python 正则定义校验
-    # 默认忽略目录(rg 已遵守 .gitignore,这里再加一层确定性排除)
-    for d in DEFAULT_IGNORE_DIRS:
-        argv += ["-g", f"!{d}/"]
+        argv.append("-F")
+    for directory in DEFAULT_IGNORE_DIRS:
+        argv += ["-g", f"!{directory}/"]
     if glob:
         argv += ["-g", glob]
+    search_directory = root if root.is_dir() else root.parent
+    argv += ["--", query, "." if root.is_dir() else root.name]
+    regex = _compile_query(query, mode, case_sensitive)
+    # 队列与单行均有界，宽泛查询不会把完整 stdout 放入内存。
+    proc = subprocess.Popen(argv, cwd=search_directory, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    chunks: queue.Queue = queue.Queue(maxsize=8)
+    stop = threading.Event()
 
-    search_term = query if mode != "symbol" else query
-    argv += ["--", search_term, str(root)]
+    def read_output():
+        try:
+            while not stop.is_set():
+                line = proc.stdout.readline(MAX_FILE_BYTES * 2 + 1)
+                if not line:
+                    break
+                while not stop.is_set():
+                    try:
+                        chunks.put(line, timeout=0.05)
+                        break
+                    except queue.Full:
+                        pass
+        finally:
+            while not stop.is_set():
+                try:
+                    chunks.put(None, timeout=0.05)
+                    break
+                except queue.Full:
+                    pass
 
+    reader = threading.Thread(target=read_output, daemon=True, name="agentlab-rg-output")
+    reader.start()
+    deadline = time.monotonic() + timeout
+    lines: list[str] = []
+    total_bytes = 0
+    timed_out = limited = False
+    cancel = current_cancel_token()
     try:
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, errors="replace",
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        partial = exc.stdout or ""
-        if isinstance(partial, bytes):
-            partial = partial.decode("utf-8", errors="replace")
-        return (partial.splitlines(), True)
-    return (proc.stdout.splitlines(), False)
+        while True:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            try:
+                raw = chunks.get(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+            except queue.Empty:
+                continue
+            if raw is None:
+                break
+            total_bytes += len(raw)
+            if total_bytes > MAX_FILE_BYTES * 2:
+                limited = True
+                break
+            line = raw.decode("utf-8", errors="replace")
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if obj.get("type") != "match":
+                continue
+            data = obj["data"]
+            if data["path"].get("text") is None:
+                continue
+            if mode == "symbol" and not regex.search(data["lines"].get("text", "")):
+                continue
+            lines.append(line)
+            if len(lines) > max_results:  # 多看一条实际命中，准确标记截断。
+                limited = True
+                break
+    finally:
+        stop.set()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        reader.join(timeout=1)
+        proc.stdout.close()
+    if not timed_out and not limited and proc.returncode not in (0, 1):
+        raise ToolExecutionError(f"ripgrep failed with exit code {proc.returncode}")
+    return lines, timed_out, limited
 
 
 def _parse_ripgrep(json_lines: list[str], root: Path, regex, mode: str,
-                   context_lines: int, max_results: int) -> tuple[list[dict], bool]:
+                   context_lines: int, max_results: int, search_root: Path | None = None,
+                   ) -> tuple[list[dict], bool]:
     """解析 rg --json 输出为结构化命中列表,返回 (matches, truncated)。
 
     对每条 rg match,用 Python regex 在该行重新定位列号:
@@ -216,6 +281,9 @@ def _parse_ripgrep(json_lines: list[str], root: Path, regex, mode: str,
         column = (m.start() + 1) if m else 1
 
         abs_path = Path(path_text)
+        if not abs_path.is_absolute():
+            base = search_root or root
+            abs_path = (base if base.is_dir() else base.parent) / abs_path
         rel = _rel(abs_path, root)
         if rel not in file_cache:
             file_cache[rel] = _read_lines(abs_path)
@@ -259,6 +327,9 @@ def _read_lines(path: Path) -> list[str]:
 
 def _iter_files(root: Path, spec):
     """遍历 root 下文件,跳过默认忽略目录和 .gitignore 命中项,yield 绝对路径。"""
+    if root.is_file():
+        yield root
+        return
     ignore = set(DEFAULT_IGNORE_DIRS)
     for dirpath, dirnames, filenames in _walk(root):
         # 原地裁剪 dirnames,os.walk 就不会下钻被忽略的目录
@@ -277,12 +348,66 @@ def _walk(root: Path):
     return os.walk(root)
 
 
+@lru_cache(maxsize=256)
+def _glob_regex(pattern: str):
+    """rg 风格路径 glob：* 不跨目录，**/ 匹配零或多层目录。"""
+    import fnmatch
+    anchored = pattern.startswith("/")
+    pattern = pattern.lstrip("/")
+    prefix = "" if anchored or "/" in pattern else "(?:.*/)?"
+
+    def translate(value):
+        parts = []
+        i = 0
+        while i < len(value):
+            char = value[i]
+            if value[i:i + 3] == "**/" and (i == 0 or value[i - 1] == "/"):
+                parts.append("(?:.*/)?")
+                i += 3
+            elif value[i:i + 2] == "**" and (i == 0 or value[i - 1] == "/") and i + 2 == len(value):
+                parts.append(".*")
+                i += 2
+            elif char == "*":
+                parts.append("[^/]*")
+                i += 1
+            elif char == "?":
+                parts.append("[^/]")
+                i += 1
+            elif char == "{":
+                end = value.find("}", i + 1)
+                if end == -1:
+                    parts.append(re.escape(char))
+                    i += 1
+                else:
+                    parts.append("(?:" + "|".join(translate(x) for x in value[i + 1:end].split(",")) + ")")
+                    i = end + 1
+            elif char == "[":
+                end = value.find("]", i + 1)
+                if end == -1:
+                    parts.append(r"\[")
+                    i += 1
+                else:
+                    translated = fnmatch.translate(value[i:end + 1])
+                    parts.append("(?!/)" + translated[4:-3])
+                    i = end + 1
+            else:
+                parts.append(re.escape(char))
+                i += 1
+        return "".join(parts)
+
+    return re.compile(prefix + translate(pattern))
+
+
+def _glob_matches(path: str, pattern: str) -> bool:
+    negative = pattern.startswith("!")
+    matched = _glob_regex(pattern[1:] if negative else pattern).fullmatch(path) is not None
+    return not matched if negative else matched
+
+
 def _search_python(root: Path, query: str, mode: str, glob: Optional[str],
                    regex, context_lines: int, max_results: int,
                    ) -> tuple[list[dict], bool, int]:
     """无 rg 时的 Python 扫描。返回 (matches, truncated, skipped_binary)。"""
-    import fnmatch
-
     spec = _load_gitignore(root)
     matches: list[dict] = []
     truncated = False
@@ -292,8 +417,8 @@ def _search_python(root: Path, query: str, mode: str, glob: Optional[str],
         if len(matches) >= max_results:
             truncated = True
             break
-        rel = _rel(abs_path, root)
-        if glob and not fnmatch.fnmatch(rel, glob) and not fnmatch.fnmatch(abs_path.name, glob):
+        rel = abs_path.name if root.is_file() else _rel(abs_path, root)
+        if glob and not _glob_matches(rel, glob):
             continue
         try:
             data = abs_path.read_bytes()
@@ -312,7 +437,7 @@ def _search_python(root: Path, query: str, mode: str, glob: Optional[str],
             m = regex.search(line)
             if m is None:
                 continue
-            matches.append(_make_match(rel, i + 1, m.start() + 1, line,
+            matches.append(_make_match(_rel(abs_path, workspace_root()), i + 1, m.start() + 1, line,
                                        lines, context_lines,
                                        "symbol" if mode == "symbol" else mode))
     return matches, truncated, skipped_binary
@@ -324,8 +449,6 @@ def _search_files(root: Path, query: str, glob: Optional[str],
                   case_sensitive: bool, max_results: int,
                   ) -> tuple[list[dict], bool]:
     """file 模式:按文件名/路径片段或 glob 匹配,line/column 置 0。"""
-    import fnmatch
-
     spec = _load_gitignore(root)
     needle = query if case_sensitive else query.lower()
     matches: list[dict] = []
@@ -335,19 +458,19 @@ def _search_files(root: Path, query: str, glob: Optional[str],
         if len(matches) >= max_results:
             truncated = True
             break
-        rel = _rel(abs_path, root)
+        rel = abs_path.name if root.is_file() else _rel(abs_path, root)
         hay = rel if case_sensitive else rel.lower()
         hit = needle in hay
         if glob:
-            hit = fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(abs_path.name, glob)
+            hit = _glob_matches(rel, glob)
         if not hit:
             continue
         matches.append({
-            "path": rel,
+            "path": _rel(abs_path, workspace_root()),
             "line": 0,
             "column": 0,
             "kind": "file",
-            "preview": rel,
+            "preview": _rel(abs_path, workspace_root()),
             "context": [],
         })
     return matches, truncated
@@ -358,7 +481,7 @@ def _search_files(root: Path, query: str, glob: Optional[str],
 def _enforce_output_limit(result: dict) -> dict:
     """序列化后超过 MAX_OUTPUT_BYTES 时,从尾部裁掉命中并标记 truncated。"""
     while result["matches"]:
-        if len(json.dumps(result, ensure_ascii=False)) <= MAX_OUTPUT_BYTES:
+        if len(json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")) <= MAX_OUTPUT_BYTES:
             break
         result["matches"].pop()
         result["truncated"] = True
@@ -416,11 +539,14 @@ def _code_search(args: dict) -> str:
 
         rg = _find_ripgrep()
         if rg:
-            json_lines, timed_out = _run_ripgrep(rg, search_root, query, mode,
-                                                  glob, case_sensitive, DEFAULT_TIMEOUT)
+            json_lines, timed_out, limited = _run_ripgrep(rg, search_root, query, mode,
+                                                  glob, case_sensitive, DEFAULT_TIMEOUT, max_results)
             matches, truncated = _parse_ripgrep(json_lines, root, regex, mode,
-                                                context_lines, max_results)
+                                                context_lines, max_results, search_root)
+            truncated = truncated or limited
             summary["backend"] = "ripgrep"
+            if limited:
+                summary["note"] = "search stopped at result or output limit"
             if timed_out:
                 truncated = True
                 summary["note"] = f"search timed out after {DEFAULT_TIMEOUT}s, results partial"
@@ -468,6 +594,7 @@ def _code_search_audit_summary(args: dict, result: str) -> tuple[str, str]:
 
 
 CODE_SEARCH = Tool(
+    parallel_safe=True,
     name="code_search",
     description=(
         "搜索代码并返回文件路径、行号、列号和上下文片段。workspace 内免审批,"

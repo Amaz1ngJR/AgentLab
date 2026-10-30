@@ -1072,13 +1072,15 @@ def test_raw_stream_index_error_does_not_repeat_fallback():
 
 @pytest.mark.parametrize("null_field", ["output", "content"])
 @pytest.mark.parametrize("tool_result", [False, True])
-def test_sdk_null_list_append_error_falls_back_once(null_field, tool_result):
+@pytest.mark.parametrize("operation", ["append", "subscript"])
+def test_sdk_null_list_state_error_falls_back_once(null_field, tool_result, operation):
     from openai import omit
     from openai.lib.streaming.responses._responses import ResponseStreamState
     from openai.types.responses import (
         Response, ResponseCreatedEvent, ResponseOutputItemAddedEvent,
         ResponseOutputMessage, ResponseContentPartAddedEvent, ResponseOutputText,
         ResponseReasoningItem,
+        ResponseTextDeltaEvent, ResponseFunctionCallArgumentsDeltaEvent,
     )
 
     message = ResponseOutputMessage.model_construct(
@@ -1096,6 +1098,17 @@ def test_sdk_null_list_append_error_falls_back_once(null_field, tool_result):
         item_id="msg-1", sequence_number=1,
         part=ResponseOutputText.model_construct(type="output_text", text="", annotations=[]),
     ))
+    if operation == "subscript":
+        if null_field == "output" and tool_result:
+            added = ResponseFunctionCallArgumentsDeltaEvent.model_construct(
+                type="response.function_call_arguments.delta", output_index=0,
+                item_id="fc-1", delta="{}", sequence_number=1,
+            )
+        else:
+            added = ResponseTextDeltaEvent.model_construct(
+                type="response.output_text.delta", output_index=0, content_index=0,
+                item_id="msg-1", delta="OK", sequence_number=1, logprobs=[],
+            )
 
     class BrokenSDKStream(_FakeStream):
         def __iter__(self):
@@ -1111,7 +1124,8 @@ def test_sdk_null_list_append_error_falls_back_once(null_field, tool_result):
                  if tool_result else [_message_item("OK")])
         raw.__iter__.return_value = iter([_completed_event(_build_final(items))])
         client.responses.create.return_value = raw
-        result = OpenAIAdapter(_cfg()).create_message([], prompt_cache_key="shared-group")
+        adapter = OpenAIAdapter(_cfg())
+        result = adapter.create_message([], prompt_cache_key="shared-group")
     if tool_result:
         assert result.tool_calls[0].name == "read_file"
         assert result.tool_calls[0].arguments == {"path": "README.md"}
@@ -1121,6 +1135,44 @@ def test_sdk_null_list_append_error_falls_back_once(null_field, tool_result):
     client.responses.create.assert_called_once()
     assert client.responses.create.call_args.kwargs["prompt_cache_key"] == "shared-group"
     raw.close.assert_called_once()
+    # Once this endpoint/client has proved incompatible, later rounds skip the
+    # SDK accumulator instead of repeatedly submitting a known-failing request.
+    raw.__iter__.return_value = iter([_completed_event(_build_final([_message_item("NEXT")]))])
+    next_result = adapter.create_message([])
+    assert next_result.text == "NEXT"
+    assert client.responses.stream.call_count == 1
+    assert client.responses.create.call_count == 2
+
+
+def test_callback_none_subscript_error_is_not_treated_as_sdk_failure():
+    def broken_callback(text):
+        value = None
+        return value[0]
+
+    with patch("openai.OpenAI") as sdk:
+        client = sdk.return_value
+        client.responses.stream.return_value = _FakeStream(
+            [_delta_event("OK")], _build_final([_message_item("OK")]),
+        )
+        adapter = OpenAIAdapter(_cfg())
+        with pytest.raises(TypeError, match="not subscriptable"):
+            adapter.create_message([], on_text_delta=broken_callback)
+    assert not adapter._raw_stream_required
+    client.responses.create.assert_not_called()
+
+
+def test_raw_stream_none_subscript_error_does_not_retry():
+    def broken_raw_stream():
+        value = None
+        yield value[0]
+
+    with patch("openai.OpenAI") as sdk:
+        client = sdk.return_value
+        client.responses.create.return_value = broken_raw_stream()
+        with pytest.raises(TypeError, match="not subscriptable"):
+            OpenAIAdapter(_cfg()).create_message([], _use_raw_stream=True)
+    client.responses.create.assert_called_once()
+    client.responses.stream.assert_not_called()
 
 
 def test_callback_none_append_error_is_not_treated_as_sdk_failure():
@@ -1150,4 +1202,98 @@ def test_raw_stream_none_append_error_does_not_repeat_fallback():
         with pytest.raises(AttributeError, match="append"):
             OpenAIAdapter(_cfg()).create_message([], _use_raw_stream=True)
     client.responses.create.assert_called_once()
+    client.responses.stream.assert_not_called()
+
+
+def _broken_state_stream(*, null_field: str = "content"):
+    """构造会在 SDK typed 流里触发裸 assert 的事件序列。
+
+    网关漏发 / 错序 content_part.added 时，handle_event 会取到不匹配的 content
+    并命中 ``assert content.type == "output_text"``（无消息文本）。这里用
+    「function_call item + output_text.delta」复现同一路径：output.type 不是
+    message，走到 handle_event 的第二处裸 assert。
+    """
+    from openai import omit
+    from openai.lib.streaming.responses._responses import ResponseStreamState
+    from openai.types.responses import (
+        Response, ResponseCreatedEvent, ResponseFunctionToolCall,
+        ResponseOutputItemAddedEvent, ResponseTextDeltaEvent,
+    )
+
+    created = ResponseCreatedEvent.model_construct(
+        type="response.created", sequence_number=0,
+        response=Response.model_construct(id="resp-1", output=[]),
+    )
+    added = ResponseOutputItemAddedEvent.model_construct(
+        type="response.output_item.added", output_index=0, sequence_number=1,
+        item=ResponseFunctionToolCall.model_construct(
+            id="fc-1", type="function_call", call_id="call-1",
+            name="shell", arguments="",
+        ),
+    )
+    delta = ResponseTextDeltaEvent.model_construct(
+        type="response.output_text.delta", output_index=0, content_index=0,
+        item_id="fc-1", delta="OK", sequence_number=2, logprobs=[],
+    )
+
+    class BrokenStateStream(_FakeStream):
+        def __iter__(self):
+            state = ResponseStreamState(input_tools=omit, text_format=omit)
+            yield from state.handle_event(created)
+            yield from state.handle_event(added)
+            yield from state.handle_event(delta)
+
+    return BrokenStateStream([], None)
+
+
+def test_sdk_bare_assertion_error_falls_back_to_raw_stream():
+    """SDK 累加器的裸 assert（消息为空）要与 IndexError 同等对待：改走原始流。"""
+    with patch("openai.OpenAI") as sdk:
+        client = sdk.return_value
+        client.responses.stream.return_value = _broken_state_stream()
+        raw = MagicMock()
+        raw.__iter__.return_value = iter(
+            [_completed_event(_build_final([_message_item("OK")]))]
+        )
+        client.responses.create.return_value = raw
+        adapter = OpenAIAdapter(_cfg())
+        result = adapter.create_message([])
+
+    assert result.text == "OK"
+    client.responses.stream.assert_called_once()
+    client.responses.create.assert_called_once()
+    assert adapter._raw_stream_required is True
+
+
+def test_assertion_error_with_message_is_not_treated_as_sdk_failure():
+    """带消息的 AssertionError 是业务断言，不能被流式兜底吞掉。"""
+    def broken_callback(text):
+        assert text == "expected", "callback invariant violated"
+
+    with patch("openai.OpenAI") as sdk:
+        client = sdk.return_value
+        client.responses.stream.return_value = _FakeStream(
+            [_delta_event("OK")], _build_final([_message_item("OK")]),
+        )
+        adapter = OpenAIAdapter(_cfg())
+        with pytest.raises(AssertionError, match="callback invariant violated"):
+            adapter.create_message([], on_text_delta=broken_callback)
+
+    assert adapter._raw_stream_required is False
+    client.responses.create.assert_not_called()
+
+
+def test_raw_stream_bare_assertion_error_does_not_repeat_fallback():
+    """已经在原始流上仍失败时不再回退，避免无限重跑。"""
+    def broken_raw_stream():
+        yield _delta_event("partial")
+        assert False
+
+    with patch("openai.OpenAI") as sdk:
+        client = sdk.return_value
+        client.responses.create.return_value = broken_raw_stream()
+        with pytest.raises(AssertionError):
+            OpenAIAdapter(_cfg()).create_message([], _use_raw_stream=True)
+
+    assert client.responses.create.call_count == 1
     client.responses.stream.assert_not_called()

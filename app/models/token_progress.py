@@ -4,10 +4,8 @@ from __future__ import annotations
 from typing import Callable
 
 
-def estimate_stream_tokens(text: str) -> int:
+def _count_stream_chars(text: str) -> tuple[int, int]:
     """按流式文本累计估算 token；CJK 约 1 token/字，其余约 4 char/token。"""
-    if not text:
-        return 0
     cjk = 0
     other = 0
     for char in text:
@@ -16,7 +14,13 @@ def estimate_stream_tokens(text: str) -> int:
             cjk += 1
         else:
             other += 1
-    return cjk + ((other + 3) // 4)
+    return cjk, other
+
+
+def estimate_stream_tokens(text: str) -> int:
+    """CJK 约 1 token/字，其余字符每四个估算一个 token。"""
+    cjk, other = _count_stream_chars(text)
+    return cjk + (other + 3) // 4
 
 
 class StreamingTokenProgress:
@@ -34,13 +38,12 @@ class StreamingTokenProgress:
         self.callback = callback
         self.input_tokens = max(0, int(input_tokens))
         self.output_tokens = 0
-        self._text = ""
-        self._reasoning = ""
+        self._counts = {"text": [0, 0], "reasoning": [0, 0]}
         self._last_emitted: tuple[int, int] | None = None
 
     def emit(self, *, force: bool = False, final: bool = False) -> None:
         current = (self.input_tokens, self.output_tokens)
-        if self.callback and (force or current != self._last_emitted):
+        if self.callback and (force or final or current != self._last_emitted):
             payload = {
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
@@ -53,14 +56,12 @@ class StreamingTokenProgress:
     def add_text(self, delta: str) -> None:
         if not delta:
             return
-        self._text += delta
-        self._update_estimate()
+        self._add_delta("text", delta)
 
     def add_reasoning(self, delta: str) -> None:
         if not delta:
             return
-        self._reasoning += delta
-        self._update_estimate()
+        self._add_delta("reasoning", delta)
 
     def set_usage(
         self,
@@ -76,8 +77,13 @@ class StreamingTokenProgress:
             self.output_tokens = max(0, int(output_tokens))
         self.emit(force=force, final=final)
 
-    def _update_estimate(self) -> None:
-        estimate = estimate_stream_tokens(self._text) + estimate_stream_tokens(self._reasoning)
+    def _add_delta(self, channel: str, delta: str) -> None:
+        cjk, other = _count_stream_chars(delta)
+        counts = self._counts[channel]
+        counts[0] += cjk
+        counts[1] += other
+        # 两个通道分别取整，不能对每个分片取整或把正文与推理混为一条流。
+        estimate = sum(c + (o + 3) // 4 for c, o in self._counts.values())
         if estimate > self.output_tokens:
             self.output_tokens = estimate
             self.emit()

@@ -426,6 +426,7 @@ READ_FILE = Tool(
     audit_redactor=_read_audit_summary,
     requires_approval=False,  # 只读,不需要确认
     approval_resolver=lambda args: _outside_workspace_approval("read_file", args),
+    parallel_safe=True,
 )
 
 WRITE_FILE = Tool(
@@ -474,6 +475,7 @@ LIST_DIR = Tool(
         "list_dir",
         args,
     ),
+    parallel_safe=True,
 )
 
 EDIT_FILE = Tool(

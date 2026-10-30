@@ -451,3 +451,82 @@ def test_plan_created_then_spinner_same_state_dedup(monkeypatch):
     # 任务内容只出现一次(PLAN_CREATED 打了,spinner 去重跳过)
     assert out.count("任务一") == 1
     assert out.count("任务二") == 1
+
+
+def _coalesced_spinner(monkeypatch):
+    import app.cli as cli
+    from unittest.mock import Mock
+    sink = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", sink)
+    clock = [100.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    spinner = _Spinner("thinking")
+    spinner._thread = Mock()  # Drive frames explicitly, without wall-clock timing.
+    spinner._erase_footer = Mock()
+    spinner._draw_footer = Mock()
+    return spinner, sink, clock
+
+
+def test_active_spinner_coalesces_text_and_metrics_then_flushes_final(monkeypatch):
+    spinner, sink, clock = _coalesced_spinner(monkeypatch)
+    written = []
+    spinner._process_streaming_highlight = lambda delta: written.append(delta) or delta
+    with spinner:
+        for index in range(1000):
+            spinner.on_text("ab")
+            spinner.update({"output_tokens": index + 1})
+        assert spinner._draw_footer.call_count == 1
+        spinner.update({"output_tokens": 900, "final": True})
+        assert spinner._metrics["output_tokens"] == 900
+        assert spinner._draw_footer.call_count == 2
+        assert "".join(written) == "ab" * 1000
+    assert not spinner._pending_stream
+
+
+def test_frame_flushes_quiet_pending_text_without_another_delta(monkeypatch):
+    spinner, sink, clock = _coalesced_spinner(monkeypatch)
+    written = []
+    spinner._write_text = written.append
+    with spinner:
+        spinner.on_text("first")
+        spinner.on_text("quiet tail")
+        assert written == ["first"]
+        clock[0] += .05
+        spinner._render()  # Same operation as the background refresh frame.
+        assert written == ["first", "quiet tail"]
+
+
+def test_exit_preserves_buffered_thinking_text_order_and_final_tail(monkeypatch):
+    spinner, sink, clock = _coalesced_spinner(monkeypatch)
+    written = []
+    spinner._write_text = lambda text: written.append(("text", text))
+    spinner._write_thinking = lambda text: written.append(("thinking", text))
+    with spinner:
+        spinner.on_thinking("think1")
+        spinner.on_thinking("think2")
+        spinner.on_text("answer1")
+        spinner.on_text("answer2")
+    assert written == [("thinking", "think1"), ("thinking", "think2"), ("text", "answer1answer2")]
+
+
+def test_retry_discards_unrendered_stream_and_markdown_state(monkeypatch):
+    spinner, sink, clock = _coalesced_spinner(monkeypatch)
+    with spinner:
+        spinner.on_text("first\n")
+        spinner.on_text("stale buffered text")
+        old_renderer = spinner._md
+        spinner.discard_text()
+        assert spinner._md is not old_renderer
+        spinner.on_text("replacement\n")
+    assert "stale buffered text" not in sink.getvalue()
+    assert "replacement" in sink.getvalue()
+
+
+def test_pending_buffer_is_bounded_when_deltas_outpace_clock(monkeypatch):
+    spinner, sink, clock = _coalesced_spinner(monkeypatch)
+    spinner._write_text = lambda text: None
+    with spinner:
+        for _ in range(10000):
+            spinner.on_text("12345678")
+            assert spinner._pending_chars < 8192
+        assert spinner._draw_footer.call_count < 12

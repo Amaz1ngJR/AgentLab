@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
 from app.agent import events
+from app.agent.tool_batch import ToolCallBatch
 from app.agent.approval import ApprovalPolicy, ApprovalResult, AutoApprove, request_tool_approval
 from app.agent.cancel import CancelToken, Cancelled, apply_steering
 from app.agent.events import RunEvent
@@ -460,8 +461,6 @@ class AgentSession:
                 orchestrate_enabled=True,
             ),
         )
-        if self._auto_execute_enabled and _requires_tool_execution(user_input):
-            return ExecutionMode.TASK
         return selected
 
     @property
@@ -837,15 +836,29 @@ class AgentSession:
                 empty_rounds = 0
                 tool_results: list[ToolResult] = []
                 resulted_ids: set[str] = set()
+                batch = ToolCallBatch(
+                    self.tools, resp.tool_calls, cancel=cancel, denied=denied_tools,
+                    on_start=lambda call: self._emit_turn_event(TurnEvent(
+                        kind="tool_call", tool_name=call.name, tool_input=call.arguments,
+                    )),
+                )
 
                 def _flush_legacy() -> None:
                     """给未执行的工具补合成 tool_result,防止 tool_use 悬空。"""
                     from app.agent.executor import INTERRUPTED_TOOL_RESULT
-                    pending = [
-                        ToolResult(tool_call_id=c.id, output=INTERRUPTED_TOOL_RESULT,
-                                   is_error=False)
-                        for c in resp.tool_calls if c.id not in resulted_ids
-                    ]
+                    pending = []
+                    for c in resp.tool_calls:
+                        if c.id in resulted_ids:
+                            continue
+                        actual = batch.pending_result(c)
+                        if actual is not None:
+                            from app.agent.executor import _truncate_tool_output
+                            actual.output = _truncate_tool_output(actual.output)
+                            self._emit_turn_event(TurnEvent(kind="tool_result", tool_name=c.name,
+                                                           tool_input=c.arguments, tool_output=actual.output,
+                                                           tool_error=actual.is_error))
+                        pending.append(actual or ToolResult(tool_call_id=c.id,
+                                                            output=INTERRUPTED_TOOL_RESULT, is_error=False))
                     if pending or tool_results:
                         self.messages.extend(
                             self.llm.format_tool_results(tool_results + pending)
@@ -860,11 +873,7 @@ class AgentSession:
                         if cancel is not None and cancel.has_steering:
                             _flush_legacy()
                             break
-                        self._emit_turn_event(TurnEvent(
-                            kind="tool_call",
-                            tool_name=call.name,
-                            tool_input=call.arguments,
-                        ))
+                        batch.announce(call)
 
                         tool = self.tools.get(call.name)
 
@@ -958,9 +967,8 @@ class AgentSession:
                             self._emit_turn_event(TurnEvent(kind="tool_denied", tool_name=call.name))
                         else:
                             t0 = time.monotonic()
-                            output, is_error = self.tools.execute(
-                                call.name,
-                                call.arguments,
+                            output, is_error = batch.execute(
+                                call,
                                 approved_action=approval_action,
                                 cancel=cancel,
                             )
@@ -980,7 +988,7 @@ class AgentSession:
                                 tool_input=call.arguments,
                                 tool_output=output,
                                 tool_error=is_error,
-                                elapsed_seconds=time.monotonic() - t0,
+                                elapsed_seconds=batch.elapsed(call, time.monotonic() - t0),
                             ))
 
                         tool_results.append(ToolResult(

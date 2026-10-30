@@ -166,8 +166,8 @@ def test_budget_from_model_sections_nonneg_and_reserved():
 
 def test_budget_thresholds_ordering():
     b = ContextBudget.from_model(declared_context_size=10_000)
-    assert b.warn_threshold == int(10_000 * WARN_RATIO)
-    assert b.compact_threshold == int(10_000 * COMPACT_RATIO)
+    assert b.warn_threshold == int(b.input_budget * WARN_RATIO)
+    assert b.compact_threshold == int(b.input_budget * COMPACT_RATIO)
     assert b.warn_threshold < b.compact_threshold
 
 
@@ -317,12 +317,13 @@ def test_compressor_redacts_secrets_in_summary():
 def test_compressor_local_fallback_on_invalid_summary():
     llm = FakeRouter([_resp_text("not json at all")])
     comp = ContextCompressor(llm, allow_local_fallback=True)
-    msgs = _long_messages(12)
+    msgs = _long_messages(20)
     result = comp.compact(msgs, keep_recent=4)
     assert result.compacted
     assert result.summary is not None
     assert "本地兜底" in result.summary.summary["current_state"]
-    assert len(msgs) == 5
+    assert len(msgs) == 13
+    assert "信息降级" in msgs[0]["content"]
 
 
 def test_summary_to_record_round_trips_fields():
@@ -368,9 +369,9 @@ def test_manager_warns_at_warn_threshold():
 
 def test_manager_compacts_over_threshold_and_emits():
     sink = []
-    llm = FakeRouter([_summary_resp()])
-    mgr = _manager(llm, limit=300, events_sink=sink.append, keep=4)
-    msgs = _long_messages(14)
+    llm = FakeRouter([_summary_resp() for _ in range(30)])
+    mgr = _manager(llm, limit=8_000, events_sink=sink.append, keep=4)
+    msgs = _long_messages(200)
     did = mgr.maybe_compact(msgs)
     assert did is True
     kinds = [e.kind for e in sink]
@@ -388,9 +389,9 @@ def test_manager_disable_auto_compact_blocks():
 
 
 def test_manager_force_compacts_even_when_disabled():
-    llm = FakeRouter([_summary_resp()])
+    llm = FakeRouter([_summary_resp() for _ in range(30)])
     # 用小 limit 让 recent_budget 也小,不至于保护所有消息
-    mgr = _manager(llm, limit=2_000, auto=False)
+    mgr = _manager(llm, limit=8_000, auto=False)
     # 用足够长的消息,让摘要确实比原前缀短(回滚保护允许压缩)
     msgs = [{"role": "user" if i % 2 == 0 else "assistant",
              "content": f"消息 {i} " + "内容很长很长很长" * 50} for i in range(14)]
@@ -401,7 +402,7 @@ def test_manager_force_compacts_even_when_disabled():
 
 def test_manager_force_compacts_history_smaller_than_recent_budget():
     """回归：手动 compact 不应因 recent_budget 足够容纳全历史而得到 split=0。"""
-    llm = FakeRouter([_summary_resp()])
+    llm = FakeRouter([_summary_resp() for _ in range(20)])
     mgr = _manager(llm, limit=256_000, auto=True, keep=6)
     # 总历史远小于 50% recent budget，但仍有大量可压缩旧消息。
     msgs = [
@@ -427,9 +428,10 @@ def test_safe_split_large_tool_history_keeps_recent_pair_boundary():
     assert not _is_tool_result_message(msgs[split])
 
 
-    llm = FakeRouter([_summary_resp()])
-    mgr = _manager(llm, limit=300, keep=4)
-    mgr.maybe_compact(_long_messages(14))
+def test_manager_drains_records_once():
+    llm = FakeRouter([_summary_resp() for _ in range(30)])
+    mgr = _manager(llm, limit=8_000, keep=4)
+    mgr.maybe_compact(_long_messages(200))
     recs = mgr.drain_records()
     assert len(recs) == 1
     assert mgr.drain_records() == []  # 取走后清空
@@ -461,6 +463,7 @@ def test_compact_before_model_call_uses_full_item_estimate():
     before = ctx.estimate(messages, system="system", tools=[{"name": "shell"}])
     assert before >= budget.compact_threshold
 
+def test_orchestrator_passes_tool_schema_to_preflight():
     """模型请求前的预检应把完整工具 Schema 传给 ContextManager。"""
     class ContextSpy:
         def __init__(self):
@@ -489,28 +492,25 @@ def test_compact_before_model_call_uses_full_item_estimate():
     assert ctx.calls[0]["tools"]
     assert ctx.calls[0]["tools"][0]["name"] == "echo"
 
-    """编排路径:历史超阈值时,任务完成后的稳定点应触发压缩(调到压缩模型)。"""
-    # Planner 返回单任务计划 → Executor 一步给出文本完成 → 稳定点压缩。
-    # 模型调用顺序:plan(规划) → summary(规划后稳定点压缩) → task_done(执行) →
-    # summary(任务后稳定点压缩)。共享队列按此顺序排好。
+def test_orchestrator_compacts_before_planning():
     plan = _resp_text(json.dumps({"tasks": [{"id": "t1", "content": "做事", "dependencies": []}]}))
-    task_done = _resp_text("任务完成")
-    llm = FakeRouter([plan, _summary_resp(), task_done, _summary_resp()])
+    class SummaryRouter(FakeRouter):
+        def create_message(self, messages, **kwargs):
+            if kwargs.get("system", "").startswith("你是上下文压缩器"):
+                return _summary_resp()
+            for key in ("cancel", "discard_partial", "on_retry", "retry_until_cancelled"):
+                kwargs.pop(key, None)
+            return super().create_message(messages, **kwargs)
 
+    llm = SummaryRouter([plan, _resp_text("任务完成")])
     sink = []
-    # 极小窗口,确保任务跑完后历史立即越 85%
-    budget = ContextBudget.from_model(declared_context_size=120)
-    comp = ContextCompressor(llm)
-    mgr = ContextManager(budget, comp, keep_recent=2, on_event=sink.append)
-
-    # 预灌一段长历史,使 estimate 必然超阈值
-    seed = _long_messages(10)
+    mgr = _manager(llm, limit=8_000, keep=2, events_sink=sink.append)
     orch = Orchestrator(llm, ToolRegistry(), planner=Planner(llm),
-                        on_event=sink.append, messages=list(seed),
+                        on_event=sink.append, messages=_long_messages(200),
                         context_manager=mgr)
     orch.run("一个目标")
-    kinds = [e.kind for e in sink]
-    assert events.CONTEXT_COMPACTION_COMPLETED in kinds
+    assert events.CONTEXT_COMPACTION_COMPLETED in [e.kind for e in sink]
+    assert mgr.estimate(orch.messages) <= mgr.budget.safe_input_limit
 
 
 def test_orchestrator_without_context_manager_unchanged():

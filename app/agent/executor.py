@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
 from app.agent import events
+from app.agent.tool_batch import ToolCallBatch
+from app.agent.context import ContextBudgetExceeded
 from app.agent.approval import (
     ApprovalPolicy,
     ApprovalResult,
@@ -263,7 +265,7 @@ class Executor:
                             on_progress=on_progress,
                             cancel=cancel,
                         )
-                    except Cancelled:
+                    except (Cancelled, ContextBudgetExceeded):
                         raise
                     except Exception:
                         pass
@@ -385,14 +387,32 @@ class Executor:
             # 记录本轮已产出结果的 tool_call id;取消/早返回时据此给剩余的补合成结果,
             # 保证 assistant 里每个 tool_use 都有配对 tool_result(否则下一轮 provider 报错)。
             resulted_ids: set[str] = set()
+            batch = ToolCallBatch(
+                self._tools, resp.tool_calls, cancel=cancel, seen=seen_tool_signatures,
+                on_start=lambda call: self._emit(RunEvent(
+                    kind=events.TOOL_REQUESTED, task_id=task.id,
+                    tool_name=call.name, tool_input=call.arguments,
+                )),
+            )
+            visited_ids: set[str] = set()
 
             def _flush_pending_tool_results() -> None:
-                """给本轮 resp.tool_calls 里还没结果的工具补合成 tool_result 并入历史。"""
-                pending = [
-                    ToolResult(tool_call_id=c.id, output=INTERRUPTED_TOOL_RESULT,
-                               is_error=False)
-                    for c in resp.tool_calls if c.id not in resulted_ids
-                ]
+                """保留已并发完成的结果，仅给未执行调用补占位结果。"""
+                nonlocal tool_calls_made
+                pending = []
+                for c in resp.tool_calls:
+                    if c.id in resulted_ids:
+                        continue
+                    actual = batch.pending_result(c)
+                    if actual is not None:
+                        actual.output = _truncate_tool_output(actual.output)
+                        if c.id not in visited_ids:
+                            tool_calls_made += 1
+                        self._emit(RunEvent(kind=events.TOOL_COMPLETED, task_id=task.id,
+                                            tool_name=c.name, tool_input=c.arguments,
+                                            tool_output=actual.output, tool_error=actual.is_error))
+                    pending.append(actual or ToolResult(tool_call_id=c.id,
+                                                        output=INTERRUPTED_TOOL_RESULT, is_error=False))
                 if pending or tool_results:
                     combined = tool_results + pending
                     messages.extend(self._llm.format_tool_results(combined))
@@ -410,6 +430,7 @@ class Executor:
                             _flush_pending_tool_results()
                             break
                     tool_calls_made += 1
+                    visited_ids.add(call.id)
                     signature = (call.name, json.dumps(call.arguments, sort_keys=True, default=repr))
                     if signature in seen_tool_signatures and not auto_execute:
                         _flush_pending_tool_results()
@@ -422,8 +443,7 @@ class Executor:
                             model_rounds=model_rounds,
                         )
                     seen_tool_signatures.add(signature)
-                    self._emit(RunEvent(kind=events.TOOL_REQUESTED, task_id=task.id,
-                                        tool_name=call.name, tool_input=call.arguments))
+                    batch.announce(call)
 
                     tool = self._tools.get(call.name)
                     validation_error = tool.validate_arguments(call.arguments) if tool else None
@@ -501,9 +521,8 @@ class Executor:
                             raise KeyboardInterrupt("用户取消操作")
                     else:
                         t0 = time.monotonic()
-                        output, is_error = self._tools.execute(
-                            call.name,
-                            call.arguments,
+                        output, is_error = batch.execute(
+                            call,
                             approved_action=approval_action,
                             cancel=cancel,
                         )
@@ -521,7 +540,7 @@ class Executor:
                             kind=events.TOOL_COMPLETED, task_id=task.id,
                             tool_name=call.name, tool_input=call.arguments,
                             tool_output=output, tool_error=is_error,
-                            elapsed_seconds=time.monotonic() - t0,
+                            elapsed_seconds=batch.elapsed(call, time.monotonic() - t0),
                         ))
                         # 工具执行出错 -> 任务失败。先补齐 tool_result 配对,再返回,
                         # 否则 assistant 的 tool_use 悬空,Replanner 重试时 provider 报错。
@@ -588,7 +607,7 @@ class Executor:
                         on_progress=on_progress,
                         cancel=cancel,
                     )
-                except Cancelled:
+                except (Cancelled, ContextBudgetExceeded):
                     raise
                 except Exception:
                     pass  # 压缩失败不能中断任务主路径

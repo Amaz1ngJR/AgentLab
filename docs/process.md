@@ -64,6 +64,8 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.1 P0 核心 CLI Agent
 
+- OpenAI Responses 裸断言兼容：运行堆栈确认 SDK typed 流在网关漏发/错序 `output_item.added`、`content_part.added` 时，会命中 `handle_event` / `accumulate_event` 里的**无消息裸 assert**（`assert content.type == "output_text"`），而适配层捕获元组缺 AssertionError，导致异常直接冒泡成终端上光秃秃的 `!! AssertionError`，被误报为“执行或输入协程异常”而中止本轮。现按 traceback 来源（SDK `_responses` 的这两个函数）与空消息双重校验，与既有 IndexError 同等走一次原始流回退；带消息的业务断言、应用回调与原始流自身断言仍原样上抛，不做无限重试。`format_exception` 对空消息异常补出“(异常无消息)”，避免只剩类型名、无从排查。
+- OpenAI Responses 空值下标兼容：补齐 SDK 状态机对 `output/content: null` 下标访问引发的 TypeError，仍同时校验异常消息与 traceback 来源；只有已确认的 SDK 协议兼容错误可进入原始流回退，回调/原始流自身错误不重试。单个 adapter 在确认不兼容后记住原始流模式，后续轮次直接解析原始流，避免重复付出一次失败请求；不影响其他独立客户端。
 - OpenAI Responses 空列表兼容：运行堆栈确认 SDK `accumulate_event` 可因 `output/content: null` 在 `append` 处崩溃；仅对 traceback 来源确认为 SDK 状态机的该类 AttributeError 走一次已有原始流回退，保留正文/工具调用和请求参数。应用回调异常或原始流自身异常仍原样上抛，不做无限重试；使用真实 SDK 状态机离线覆盖两种空列表与工具恢复。
 - 流式响应与诊断兼容：Anthropic 初始消息快照的 `content: null` 在内容块到达前规范化为空列表，避免 SDK 累积器调用 `append` 崩溃，不额外重发请求、不吞回调编程错误。结构化失败保留有界的文件/行号/函数调用栈，不收集局部变量或源码行，错误消息脱敏。RTK 对复合命令、管道、重定向和替换语法回退通用处理，避免 `status; diff; log` 的混合输出被单命令过滤器误删。
 - 自动运行停止诊断：取消令牌保留首次取消来源，`turn.cancelled` 事件记录 Esc、Ctrl+C/SIGINT、EOF、API 取消等原因，CLI 在实时输入框退出后显示停止说明；单条 shell 超时仅回传工具错误，不取消整个任务，保留有界的部分输出并提示先检查已发生的改动，避免盲目重试。非交互子进程使用空 stdin，与实时输入框隔离；交互命令使用 terminal 工具。已覆盖 Direct/Task 同批次超时后继续、真实子进程超时、父取消令牌不受影响及输入取消来源的回归测试。历史会话 `31316530` 的本轮记录为 cancelled，而非正常完成；旧事件未记录取消来源，不能仅凭 180 秒超时断定根因。

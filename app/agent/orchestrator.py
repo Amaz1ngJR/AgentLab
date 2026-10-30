@@ -24,6 +24,7 @@ from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Optional
 
 from app.agent import events
+from app.agent.context import ContextBudgetExceeded
 from app.agent.approval import ApprovalPolicy, AutoApprove
 from app.agent.cancel import Cancelled, CancelToken
 from app.agent.events import RunEvent
@@ -200,7 +201,7 @@ class Orchestrator:
                     on_progress=getattr(handle, "update", None),
                     cancel=cancel,
                 )
-        except Cancelled:
+        except (Cancelled, ContextBudgetExceeded):
             raise
         except Exception:
             pass

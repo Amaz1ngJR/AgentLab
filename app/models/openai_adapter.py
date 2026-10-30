@@ -67,6 +67,15 @@ def _is_sdk_stream_state_error(exc: BaseException) -> bool:
     if isinstance(exc, AttributeError):
         if exc.name != "append" or exc.obj is not None:
             return False
+    elif isinstance(exc, TypeError):
+        if str(exc) != "'NoneType' object is not subscriptable":
+            return False
+    elif isinstance(exc, AssertionError):
+        # SDK 累加器在 output/content 缺失时用裸 assert 兜底（如
+        # ``assert output.type == "message"``），没有消息文本。和 IndexError 同源：
+        # 网关事件序列不全，不是业务断言，必须同样改走原始流重跑。
+        if str(exc) != "":
+            return False
     elif not isinstance(exc, IndexError):
         return False
     tb = exc.__traceback__
@@ -227,6 +236,7 @@ class OpenAIAdapter:
         from openai import OpenAI
 
         self._cfg = cfg
+        self._raw_stream_required = False
         if not cfg.api_key:
             raise RuntimeError("openai provider 需要 OPENAI_API_KEY")
 
@@ -292,6 +302,7 @@ class OpenAIAdapter:
         prompt_cache_key: Optional[str] = None,
     ) -> ModelResponse:
         """带工具调用的完整对话,供 Agent 循环使用。"""
+        _use_raw_stream = _use_raw_stream or self._raw_stream_required
         max_tokens = max_tokens or self._cfg.max_tokens
         params = self._base_params(messages, temperature, system)
         if prompt_cache_key:
@@ -420,11 +431,11 @@ class OpenAIAdapter:
                             cancel.raise_if_cancelled()
                         # 仍在 with 内取最终响应：stream 关闭后 SDK 不保证还能取到。
                         final = stream.get_final_response()
-        except (RuntimeError, IndexError, AttributeError) as exc:
+        except (RuntimeError, IndexError, AttributeError, TypeError, AssertionError) as exc:
             if cancel is not None:
                 cancel.raise_if_cancelled()
             sdk_state_error = _is_sdk_stream_state_error(exc)
-            if isinstance(exc, (IndexError, AttributeError)) and not sdk_state_error:
+            if isinstance(exc, (IndexError, AttributeError, TypeError, AssertionError)) and not sdk_state_error:
                 raise
             # SDK 状态机异常通常来自代理的事件顺序不兼容；不能返回空的正常响应，
             # 否则 Orchestrator 会误判为任务完成并停止继续处理。
@@ -439,11 +450,13 @@ class OpenAIAdapter:
             # 下标取 output/content；仅 SDK 状态机自身的越界也走这一次回退。
             # output/content 为 null 时也会在 SDK 的 append 处失败，原始流
             # 无需该累积列表。仅按 traceback 来源和属性名匹配，不吞回调异常。
+            # 同样覆盖直接对 null 做下标访问的状态机 TypeError。
             if not _use_raw_stream and (
                 sdk_state_error
                 or _MISSING_CREATED_MARKER in message
                 or _MISSING_COMPLETED_MARKER in message
             ):
+                self._raw_stream_required = True
                 return self.create_message(
                     messages=messages,
                     tools=tools,

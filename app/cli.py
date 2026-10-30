@@ -377,15 +377,15 @@ class _Spinner:
          返回之后),首次绘制时一次性提交到滚动历史,之后不再重绘。
       2. footer:始终钉在屏幕最底部,持续闪动 + 实时刷新 token 计数(thinking
          阶段显示 ↑input,生成阶段显示 ↓output),直到 turn 结束才撤掉。
-      3. 正文到达:先擦掉 footer,把 delta append 到 stdout(终端自然滚动),
-         再在新位置重画 footer。这样 token 在整个 turn 全程实时刷新。
+      3. 正文和推理先合并，在刷新周期或缓冲上限到达时统一输出；
+         进度回调只更新指标，最终 usage 和退出收尾强制刷新。
 
     擦除的 *有界性* —— 这是不重影的关键:每次擦除只回收 footer 自己 + 当前那条
     还没换行的正文行(_line_buf),两者都至多几行,相对光标上移绝不越屏。已经
     换行滚走的正文永远不碰,所以不会出现旧实现"重打整段缓冲"导致的滚屏叠影。
     """
 
-    def __init__(self, label: str, task_store=None, panel_state=None):
+    def __init__(self, label: str, task_store=None, panel_state=None, *, render_interval: float = 0.05):
         self.label = label
         self._task_store = task_store  # None = 不显示任务面板
         # 跨 spinner 共享的面板去重状态({"last": <上次提交的面板签名>});
@@ -402,6 +402,11 @@ class _Spinner:
         self._tasks_committed = False  # 任务面板每步只提交一次
         self._frame_idx = 0
         self._footer_rows = 0          # 当前 footer 占用的屏幕行数(0 = 未绘制)
+        self._render_interval = max(0.01, render_interval)
+        self._last_render = float("-inf")
+        self._running = False
+        self._pending_stream: list[tuple[str, str]] = []
+        self._pending_chars = 0
         # 流式 markdown 渲染器：跨 delta 保留代码块/表格/半截行的状态
         self._md = md.MarkdownRenderer(
             color=_supports_color(), width_fn=_term_width,
@@ -409,6 +414,7 @@ class _Spinner:
 
     def __enter__(self) -> "_Spinner":
         self._t0 = time.monotonic()
+        self._running = True
         _set_active_spinner(self)
         self._thread.start()
         return self
@@ -418,7 +424,9 @@ class _Spinner:
         self._thread.join(timeout=1.0)
         with self._lock:
             _set_active_spinner(None)
+            self._running = False
             self._erase_footer()
+            self._drain_stream()
             # 模型末尾常常不带换行，按行缓冲的最后一行要在这里补出来。
             trailing = self.flush_pending()
             if trailing:
@@ -453,14 +461,38 @@ class _Spinner:
                     self._metrics["output_tokens"], incoming_out,
                 ),
             }
-            self._render()
+            if final or not self._running:
+                self._render()
 
     def on_text(self, delta: str) -> None:
+        self._queue_stream("text", delta)
+
+    def _queue_stream(self, kind: str, delta: str) -> None:
         if not delta:
             return
         with self._lock:
-            self._erase_footer()
-            self._commit_tasks()
+            self._pending_stream.append((kind, delta))
+            self._pending_chars += len(delta)
+            if (not self._running or self._pending_chars >= 8192
+                    or time.monotonic() - self._last_render >= self._render_interval):
+                self._render()
+
+    def _drain_stream(self) -> None:
+        pending, self._pending_stream = self._pending_stream, []
+        self._pending_chars = 0
+        # 连续的同类片段一次交给渲染器；保留正文/推理的交错顺序。
+        from itertools import groupby
+        for kind, group in groupby(pending, key=lambda item: item[0]):
+            delta = "".join(item[1] for item in group)
+            if kind == "text":
+                self._write_text(delta)
+            else:
+                self._write_thinking(delta)
+
+    def _write_text(self, delta: str) -> None:
+        if not delta:
+            return
+        with self._lock:
             # 思考流→正文的过渡:思考是暗色,正文是常色。换行收掉思考尾行 +
             # 空一行分隔,避免正文紧贴在灰字后面。只在首次出现正文时做一次。
             if self._any_thinking and not self._any_text:
@@ -481,8 +513,6 @@ class _Spinner:
                     self._line_buf = styled.rsplit("\n", 1)[1]
                 else:
                     self._line_buf += styled
-            self._draw_footer()
-            sys.stdout.flush()
 
     def _process_streaming_highlight(self, delta: str) -> str:
         """把流式增量交给共享的 markdown 渲染器。"""
@@ -500,6 +530,7 @@ class _Spinner:
         """
         with self._lock:
             self._erase_footer()
+            self._drain_stream()
             self._commit_tasks()
             self._close_partial_line()
             sys.stdout.write(
@@ -516,6 +547,9 @@ class _Spinner:
         内容从新一行开始（同时由 notice() 告知用户这段输出已作废）。
         """
         with self._lock:
+            self._pending_stream.clear()
+            self._pending_chars = 0
+            self._md = md.MarkdownRenderer(color=_supports_color(), width_fn=_term_width)
             self._erase_footer()
             self._close_partial_line()
             self._draw_footer()
@@ -532,6 +566,9 @@ class _Spinner:
         return self._md.flush()
 
     def on_thinking(self, delta: str) -> None:
+        self._queue_stream("thinking", delta)
+
+    def _write_thinking(self, delta: str) -> None:
         """流式打印思考(推理)过程,用暗色与正式答案区分。
 
         复用 on_text 的"擦 footer → append → 重画 footer"机制,但把每段增量包进
@@ -543,8 +580,6 @@ class _Spinner:
 
 
         with self._lock:
-            self._erase_footer()
-            self._commit_tasks()
             if not self._any_thinking:
                 # 思考段起一个灰色标题,提示这是推理而非最终答案
                 sys.stdout.write(_thinking_text("💭 思考\n"))
@@ -556,8 +591,6 @@ class _Spinner:
                 self._line_buf = _thinking_text(tail) if tail else ""
             else:
                 self._line_buf += styled
-            self._draw_footer()
-            sys.stdout.flush()
 
     def _fmt_status(self) -> str:
         elapsed = time.monotonic() - self._t0
@@ -614,8 +647,10 @@ class _Spinner:
         """擦旧 footer → (首次)提交任务面板 → 重画 footer。供动画 / token 刷新调用。"""
         self._erase_footer()
         self._commit_tasks()
+        self._drain_stream()
         self._draw_footer()
         sys.stdout.flush()
+        self._last_render = time.monotonic()
 
     def _draw_footer(self) -> None:
         """在正文下方画 footer,记录其占用行数,供 _erase_footer 复原。
@@ -665,7 +700,7 @@ class _Spinner:
         self._footer_rows = 0
 
     def _run(self) -> None:
-        while not self._stop.wait(0.1):
+        while not self._stop.wait(self._render_interval):
             with self._lock:
                 self._frame_idx += 1
                 self._render()

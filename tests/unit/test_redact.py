@@ -74,3 +74,17 @@ def test_format_traceback_redacts():
         out = format_traceback(exc)
     assert "Traceback" in out
     assert "cr_xxxxxxxxxxxxxxxxxxxx" not in out
+
+
+def test_format_exception_without_message_names_the_type():
+    """裸 assert 等无消息异常不能只渲染成光秃秃的类型名。
+
+    注意：测试文件里的 assert 会被 pytest 重写、自动带上 "assert False" 这种
+    消息，构造不出空消息；site-packages 里的 assert 不会被重写，所以直接构造
+    无参数异常来模拟 SDK 的那条路径。
+    """
+    assert format_exception(AssertionError()) == "AssertionError: (异常无消息)"
+
+
+def test_format_exception_empty_message_still_redacts_nothing_unsafe():
+    assert format_exception(RuntimeError()) == "RuntimeError: (异常无消息)"

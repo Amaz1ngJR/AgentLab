@@ -504,22 +504,18 @@ def test_orchestrated_chat_copies_run_stats_to_session():
     assert session.last_goal == "帮我做点事"
 
 
-def test_auto_execute_routes_single_step_action_to_task_mode():
-    """🚀 模式下单步修改也必须进入 Task，不能在 Direct 一次编辑后静默收口。"""
+def test_auto_execute_keeps_single_step_action_in_direct_mode():
+    """免审批策略不应增加一次 Planner 调用。"""
     router = FakeRouter([
-        _plan_json({"id": "t1", "content": "修复代码并确认结果", "dependencies": []}),
+        _resp_tool("read", "echo", {"msg": "verified"}),
         _resp_text("修复完成"),
     ])
-    session = AgentSession(
-        llm=router,
-        tools=_registry_with(_echo_tool()),
-        orchestrate=True,
-        mode="auto",
-    )
+    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()),
+                           orchestrate=True, mode="auto")
     session.enable_auto_execute()
-
     assert session.chat("请修复代码") == "修复完成"
-    assert session.execution_mode.value == "task"
+    assert session.execution_mode.value == "direct"
+    assert len(router.calls) == 2
     assert session.last_run_status == "completed"
 
 
@@ -544,7 +540,7 @@ def test_auto_execute_finishes_all_tasks_beyond_normal_global_budget():
     )
     session.enable_auto_execute()
 
-    assert session.chat("请修复代码") == "验证完成"
+    assert session.chat("修改多个文件并运行测试") == "验证完成"
     assert session.last_run_status == "completed"
     assert session.task_store.summary()["completed"] == 2
 
@@ -560,7 +556,7 @@ def test_auto_execute_bypasses_task_mode_approval():
         tools=_registry_with(_danger_tool()),
         approval=DenyAll(),
         orchestrate=True,
-        mode="auto",
+        mode="task",
         max_task_steps=2,
     )
     session.enable_auto_execute()
@@ -620,3 +616,12 @@ def test_legacy_direct_cancel_records_cancelled_status():
     answer = session.chat("hello", cancel=token)
     assert answer == "已中断。"
     assert session.last_run_status == "cancelled"
+
+
+def test_auto_execution_does_not_override_explicit_loop_acceptance_routing():
+    session = AgentSession(llm=FakeRouter([]), tools=_registry_with(_echo_tool()),
+                           orchestrate=True, mode="auto")
+    request = "请修复代码，直到测试通过"
+    normal_mode = session._select_mode(request, None, False)
+    session.enable_auto_execute()
+    assert session._select_mode(request, None, False) == normal_mode

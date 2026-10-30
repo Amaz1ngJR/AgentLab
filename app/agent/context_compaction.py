@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from app.agent.cancel import Cancelled, CancelToken
-from app.agent.context_budget import estimate_messages_tokens, estimate_message_tokens
+from app.agent.context_budget import estimate_messages_tokens, estimate_message_tokens, estimate_tokens
 from app.models.router import call_create_message
 from app.util.redact import redact
 
@@ -51,17 +51,18 @@ COMPRESSION_SYSTEM = """你是上下文压缩器。把下面这段较早的对�
 - 忠实压缩,不要编造。无法从历史中确认的事实写成 "unknown" 或留空数组,绝不臆测。
 - 引用工具结果/文件时给出来源(工具名/路径),不要把大段原文重新抄进来。
 - user_goal 与 handoff_note 必填且具体;其余字段没有内容就给空字符串或空数组。
+- 输入可能是历史分块或多份分块摘要。合并时保留约束、授权和失败证据；较晚状态优先，未覆盖的部分不要声称已完成。
 """
 
 # 摘要消息注入历史时的外层模板:明确告诉后续模型"这是被压缩的早期历史摘要"。
 _SUMMARY_MESSAGE_TEMPLATE = (
     "【上下文摘要 · 早期历史已压缩】\n"
     "以下是本会话较早部分的结构化摘要(原始消息已从模型输入中省略,但仍保留在审计记录中)。"
-    "请把它当作已经发生的事实继续推进,不要重复已完成的工作。\n\n{body}\n\n"
+    "摘要是有损的历史参考；用户原文及当前指令优先。未知或降级内容须重新核实，不要重复已确认完成的工作。\n\n{body}\n\n"
     "{skills_reminder}"
 )
 
-# 摘要必填字段:缺这些视为无效摘要,触发兜底(不压缩)。
+# 摘要必填字段：缺失时先重试，仍失败则按配置进入本地降级。
 _REQUIRED_FIELDS = ("user_goal", "handoff_note")
 
 
@@ -114,6 +115,7 @@ class ContextSummary:
         _add("失败尝试", s.get("failed_attempts"))
         _add("授权与风险", s.get("approvals_and_risks"))
         _add("交接说明", s.get("handoff_note"))
+        _add("信息降级", s.get("degradation"))
 
         # 生成 skills 提醒
         skills_reminder = ""
@@ -212,7 +214,62 @@ def _safe_split_point(
     # 直到保留侧以非 tool_result 开头(把整对都留在保留侧)。
     while split > 0 and _is_tool_result_message(messages[split]):
         split -= 1
+    # 并行调用的多个结果可能跨越边界，不能只看第一条尾部消息。
+    calls: dict[str, int] = {}
+    spans: list[tuple[int, int]] = []
+    completed: set[str] = set()
+    for index, message in enumerate(messages):
+        kind = message.get("type")
+        if kind == "function_call" and message.get("call_id"):
+            calls[message["call_id"]] = index
+        elif kind == "function_call_output" and message.get("call_id") in calls:
+            spans.append((calls[message["call_id"]], index))
+            completed.add(message["call_id"])
+        for call in message.get("tool_calls", []) or []:
+            if call.get("id"):
+                calls[call["id"]] = index
+        if message.get("role") == "tool" and message.get("tool_call_id") in calls:
+            spans.append((calls[message["tool_call_id"]], index))
+            completed.add(message["tool_call_id"])
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("id"):
+                calls[block["id"]] = index
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
+                spans.append((calls[block["tool_use_id"]], index))
+                completed.add(block["tool_use_id"])
+    # 尚未返回结果的调用也不能进入已压缩前缀。
+    split = min([split, *(index for key, index in calls.items() if key not in completed)])
+    while True:
+        crossing = [start for start, end in spans if start < split <= end]
+        if not crossing:
+            break
+        split = min(crossing)
     return max(0, split)
+
+
+def _is_real_user(message: dict[str, Any]) -> bool:
+    return (message.get("role") == "user"
+            and not _is_tool_result_message(message)
+            and not str(message.get("content", "")).startswith("【上下文摘要"))
+
+
+def _split_transcript(text: str, token_budget: int) -> list[str]:
+    """按 token 预算分块，覆盖全文，绝不静默丢弃中段。"""
+    chunks = []
+    while text:
+        lo, hi = 1, min(len(text), token_budget * 4)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if estimate_tokens(text[:mid]) <= token_budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        chunks.append(text[:lo])
+        text = text[lo:]
+    return chunks
 
 
 def _find_balanced_json(text: str, start: int) -> Optional[str]:
@@ -244,20 +301,6 @@ def _find_balanced_json(text: str, start: int) -> Optional[str]:
             if depth == 0:
                 return text[start : i + 1]
     return None
-
-
-def _bound_transcript(text: str, max_chars: int = 80_000) -> str:
-    """限制摘要模型看到的历史文本，保留头尾并明确中间省略。"""
-    if len(text) <= max_chars:
-        return text
-    head = int(max_chars * 0.60)
-    tail = max_chars - head
-    omitted = len(text) - max_chars
-    return (
-        text[:head]
-        + f"\n\n[中间历史已省略 {omitted} 个字符，仅用于摘要输入；原始历史仍保留]\n\n"
-        + text[-tail:]
-    )
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -310,7 +353,7 @@ def _is_valid_summary(obj: Optional[dict]) -> bool:
     if not isinstance(obj, dict):
         return False
     for f in _REQUIRED_FIELDS:
-        if not str(obj.get(f) or "").strip():
+        if not isinstance(obj.get(f), str) or not obj[f].strip():
             return False
     return True
 
@@ -319,7 +362,8 @@ class CompactionResult:
     """maybe 一次压缩的结果。compacted=False 表示本次未压缩(预算够 / 无可压段 / 失败)。"""
 
     def __init__(self, compacted: bool, summary: Optional[ContextSummary] = None,
-                 reason: str = ""):
+                 reason: str = "", code: str = ""):
+        self.code = code
         self.compacted = compacted
         self.summary = summary
         self.reason = reason
@@ -328,7 +372,7 @@ class CompactionResult:
 def _fallback_summary(messages: list[dict[str, Any]]) -> dict[str, Any]:
     """模型摘要失败时的本地安全兜底，不编造事实，只保留可追溯摘要。"""
     user_messages = [
-        str(m.get("content", "")) for m in messages if m.get("role") == "user"
+        str(m.get("content", "")) for m in messages if _is_real_user(m)
     ]
     assistant_messages = [
         str(m.get("content", "")) for m in messages if m.get("role") == "assistant"
@@ -346,8 +390,10 @@ def _fallback_summary(messages: list[dict[str, Any]]) -> dict[str, Any]:
         "open_tasks": ["请基于最近消息和任务面板继续确认未完成工作。"],
         "tool_evidence": [{
             "source": "local_compaction_fallback",
-            "finding": f"最近一条助手输出：{last_assistant}",
-        }],
+            "finding": f"最近一条助手输出（未重新验证）：{last_assistant}",
+        }] + [{"source": str(m.get("call_id") or m.get("tool_call_id") or "tool_result"),
+               "finding": json.dumps(m, ensure_ascii=False, default=str)[-600:]}
+              for m in messages if _is_tool_result_message(m)][-3:],
         "files_and_artifacts": [],
         "failed_attempts": [],
         "approvals_and_risks": [],
@@ -361,12 +407,16 @@ class ContextCompressor:
 
     def __init__(self, llm, system: str = COMPRESSION_SYSTEM,
                  model_profile: str = "", allow_local_fallback: bool = True,
-                 available_skills: list[str] | None = None):
+                 available_skills: list[str] | None = None,
+                 summary_input_tokens: int = 4096):
         self._llm = llm
         self._system = system
         self._model_profile = model_profile
         self._allow_local_fallback = allow_local_fallback
         self._available_skills = available_skills or []
+        if summary_input_tokens < 256:
+            raise ValueError("summary_input_tokens must be at least 256")
+        self._summary_input_tokens = summary_input_tokens
         self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
 
     def compact(
@@ -376,6 +426,9 @@ class ContextCompressor:
         keep_recent: int,
         recent_budget: Optional[int] = None,
         source_run_ids: Optional[list[str]] = None,
+        summary_budget: int = 1024,
+        input_token_budget: int | None = None,
+        target_message_tokens: int | None = None,
         on_progress=None,
         cancel: CancelToken | None = None,
     ) -> CompactionResult:
@@ -386,6 +439,8 @@ class ContextCompressor:
             超大单条消息会被挤出保留窗口、纳入可压缩区。
         返回 CompactionResult;失败/无可压段时 messages 不变、compacted=False。
         """
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         self.last_usage = {"input_tokens": 0, "output_tokens": 0}
         split = _safe_split_point(messages, keep_recent, recent_budget)
         if split <= 0:
@@ -394,26 +449,18 @@ class ContextCompressor:
         old = messages[:split]
         token_before = estimate_messages_tokens(old)
 
-        # 长历史不能作为一条 user message 原样发给摘要模型；先限制摘要输入大小。
-        # 旧消息仍保留在 SQLite，只有摘要请求的 transcript 做有界采样，避免压缩请求
-        # 本身再次触发 context overflow。优先保留最早目标和最近证据。
+        # 独立保留最近真实用户请求；即使工具循环很长也不会被摘要转述替代。
+        last_user = next((i for i in range(len(messages) - 1, -1, -1)
+                          if _is_real_user(messages[i])), None)
+        pinned = [m for i, m in enumerate(old)
+                  if m.get("role") in {"system", "developer"} or i == last_user]
+        if (target_message_tokens is not None
+                and estimate_messages_tokens([*pinned, *messages[split:]]) > target_message_tokens):
+            return CompactionResult(False, reason="受保护消息超出安全输入预算", code="budget_exceeded")
         transcript = self._render_transcript(old)
-        transcript = _bound_transcript(transcript)
         fallback_reason = ""
         try:
-            resp = call_create_message(
-                self._llm,
-                [{"role": "user", "content": transcript}],
-                tools=None,
-                system=self._system,
-                max_tokens=1024,
-                on_progress=on_progress,
-                cancel=cancel,
-            )
-            if getattr(resp, "usage", None):
-                for k in ("input_tokens", "output_tokens"):
-                    self.last_usage[k] = resp.usage.get(k, 0)
-            obj = _extract_json(getattr(resp, "text", "") or "")
+            obj = self._summarize(transcript, summary_budget, on_progress, cancel, input_token_budget)
         except Cancelled:
             raise
         except Exception as exc:  # 模型异常:进入本地兜底,不让手动 compact 失效
@@ -423,16 +470,13 @@ class ContextCompressor:
             obj = _fallback_summary(old)
             fallback_reason = f"local_fallback:{type(exc).__name__}"
 
-        # 当前 CRS 模型可能把 JSON 摘要请求误判成普通 coding prompt，甚至返回工具调用。
-        if not _is_valid_summary(obj):
-            # 强制手动压缩不能因为 CRS 返回 Markdown/截断/非 JSON 就彻底失效；
-            # 本地兜底只抽取历史中真实存在的最近用户/助手文本，不要求模型编造摘要。
-            if self._allow_local_fallback:
-                obj = _fallback_summary(old)
-                fallback_reason = "local_fallback:invalid_summary"
-            else:
-                return CompactionResult(False, reason="摘要缺必填字段或非法 JSON")
-
+        if fallback_reason:
+            pinned = [m for m in old if m.get("role") in {"system", "developer", "user"}
+                      and not _is_tool_result_message(m)]
+            obj["degradation"] = (
+                "模型摘要不可用；用户原文和已有摘要另行保留。工具历史仅保留片段，"
+                "未收录证据与执行状态须从原始审计记录重新核实。"
+            )
         obj = _redact_summary(obj)
         summary = ContextSummary(
             summary=obj,
@@ -443,7 +487,7 @@ class ContextCompressor:
         )
         # 传入 skills 列表，在压缩摘要中重新提醒模型
         summary_msg = {"role": "user", "content": summary.to_message_text(self._available_skills)}
-        summary.token_count_after = estimate_messages_tokens([summary_msg])
+        summary.token_count_after = estimate_messages_tokens([summary_msg, *pinned])
 
         # 兜底:若摘要并不比被压缩的原前缀短(短前缀 + 结构化摘要骨架开销可能反而
         # 更长),压缩没有收益,不替换 —— 否则白白消耗一次模型调用还可能让上下文变大。
@@ -453,26 +497,78 @@ class ContextCompressor:
                 reason=f"压缩后 token 数({summary.token_count_after})未减少,跳过",
             )
 
-        # 就地替换:用一条摘要消息顶掉被压缩的前缀,保留 recent tail。
-        messages[:split] = [summary_msg]
+        candidate = [summary_msg, *pinned, *messages[split:]]
+        if target_message_tokens is not None and estimate_messages_tokens(candidate) > target_message_tokens:
+            return CompactionResult(False, reason="压缩后仍超出安全输入预算，保留原始历史", code="budget_exceeded")
+        # 验证完整候选后才提交，失败或取消都不会破坏历史。
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        messages[:] = candidate
         result = CompactionResult(True, summary=summary)
         if fallback_reason:
             result.reason = fallback_reason
         return result
 
+    @property
+    def summary_system_tokens(self) -> int:
+        return estimate_tokens(self._system)
+
     @staticmethod
     def _render_transcript(messages: list[dict[str, Any]]) -> str:
         """把一段历史消息渲染成给压缩模型看的纯文本(脱敏,紧凑)。"""
-        parts: list[str] = []
-        for m in messages:
-            role = m.get("role", "?")
-            content = m.get("content", "")
-            if isinstance(content, str):
-                body = content
-            else:
-                try:
-                    body = json.dumps(content, ensure_ascii=False)
-                except (TypeError, ValueError):
-                    body = str(content)
-            parts.append(f"[{role}] {body}")
-        return redact("\n".join(parts))
+        return redact("\n".join(
+            json.dumps(m, ensure_ascii=False, default=str, separators=(",", ":"))
+            for m in messages
+        ))
+
+    def _summarize(self, transcript: str, output_tokens: int, on_progress,
+                   cancel: CancelToken | None, input_token_budget: int | None = None) -> dict:
+        output_tokens = max(256, min(4096, output_tokens))
+        text = transcript
+        input_limit = min(self._summary_input_tokens, input_token_budget or self._summary_input_tokens)
+        for _ in range(8):
+            chunks = _split_transcript(text, input_limit)
+            summaries = []
+            overflow = False
+            for chunk in chunks:
+                obj = None
+                for attempt in range(2):
+                    try:
+                        response = call_create_message(
+                            self._llm, [{"role": "user", "content": chunk}],
+                            tools=None, system=self._system, max_tokens=output_tokens,
+                            on_progress=on_progress, cancel=cancel,
+                        )
+                    except Cancelled:
+                        raise
+                    except Exception as exc:
+                        code = str(getattr(exc, "code", "")) + " " + str(exc)
+                        if any(marker in code.lower() for marker in (
+                            "context_length_exceeded", "context_window_exceeded",
+                            "maximum context length", "context window exceeded",
+                        )) and input_limit > 256:
+                            input_limit = max(256, input_limit // 2)
+                            overflow = True
+                            break
+                        # Router 负责网络退避重试，避免在压缩层重复放大重试次数。
+                        raise
+                    for key in self.last_usage:
+                        self.last_usage[key] += (getattr(response, "usage", None) or {}).get(key, 0)
+                    obj = _extract_json(getattr(response, "text", "") or "")
+                    if _is_valid_summary(obj) and getattr(response, "finish_reason", None) not in {"length", "max_tokens"}:
+                        break
+                    obj = None
+                if overflow:
+                    break
+                if not _is_valid_summary(obj):
+                    raise ValueError("invalid_summary")
+                summaries.append(obj)
+            if overflow:
+                continue  # 按更小的分块重新覆盖全文，不丢弃旧消息。
+            if len(summaries) == 1:
+                return summaries[0]
+            merged = redact(json.dumps(summaries, ensure_ascii=False))
+            if estimate_tokens(merged) >= estimate_tokens(text):
+                raise ValueError("summary_did_not_shrink")
+            text = merged
+        raise ValueError("summary_reduction_limit")

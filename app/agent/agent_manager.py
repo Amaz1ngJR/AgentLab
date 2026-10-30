@@ -47,6 +47,14 @@ class ChildRun:
     retained_system: str | None = None
     retained_llm: object | None = None
 
+    def reserves_write_scope(self) -> bool:
+        """Closing releases a stopped writer, never a worker still cancelling."""
+        if self.spec.read_only:
+            return False
+        if not self.done.is_set():
+            return True
+        return not self.closed and (self.result is None or self.result.delivery_status != "integrated")
+
 
 class AgentManager:
     """A finite run, not a detached service. Only owner thread publishes/persists results."""
@@ -185,7 +193,7 @@ class AgentManager:
                                      or ".." in Path(p).parts or p in {"", "."} for p in scopes):
                     raise ToolExecutionError("writers require explicit relative file_scope")
                 for existing in self.children.values():
-                    if existing.spec.read_only:
+                    if not existing.reserves_write_scope():
                         continue
                     if any(Path(a) == Path(b) or Path(a).is_relative_to(b) or Path(b).is_relative_to(a)
                            for a in scopes for b in existing.spec.file_scope):
@@ -866,7 +874,7 @@ class AgentManager:
                  schema({"sid": string, "checks": {"type": "array", "items": string, "minItems": 1,
                          "description": "必须是实际可执行的 shell 验证命令，在子任务 worktree 运行；不是审查说明、操作计划或承诺稍后验证"}},
                         ["sid", "checks"]), wrap(self.integrate)),
-            Tool("close_agent", "幂等请求取消子任务；cancelling 表示尚未退出，不删除结果或文件。",
+            Tool("close_agent", "幂等关闭子任务并请求取消；cancelling 表示尚未退出，仍占用写范围。关闭且实际停止后释放写范围，父级可接手；保留结果和文件，不代表补丁已集成或任务成功。",
                  schema({"sid": string}, ["sid"]), wrap(self.close)),
         ]
 
@@ -875,7 +883,7 @@ class DelegationRegistry(ToolRegistry):
     """Turn-local overlay; never register closures into a shared session registry."""
 
     def __init__(self, source: ToolRegistry, manager: AgentManager):
-        super().__init__()
+        super().__init__(max_parallel_tools=source.max_parallel_tools)
         self.source, self.manager = source, manager
         if manager.allowed:
             for tool in manager.tool_descriptors():
@@ -893,6 +901,23 @@ class DelegationRegistry(ToolRegistry):
     def schemas_for_task(self, task, **kwargs):
         return [s for s in self.source.schemas_for_task(task, **kwargs) if s["name"] not in MANAGEMENT_TOOLS] + super().schemas()
 
+    def parallel_capacity(self):
+        self.manager.pump()
+        if self.manager.allowed or getattr(self.manager, "long_run", False):
+            return max(1, min(self.max_parallel_tools, self.manager.tools_left))
+        return self.max_parallel_tools
+
+    def prepare_parallel(self, name, args, *, cancel=None):
+        if name in MANAGEMENT_TOOLS:
+            return None
+        runner = self.source.prepare_parallel(name, args, cancel=cancel)
+        if runner is None:
+            return None
+        # 管理器状态、预算与授权检查始终在父执行线程完成。
+        self.manager.pump()
+        self.manager.charge_parent_tool()
+        return runner
+
     def execute(self, name, args, **kwargs):
         self.manager.pump()
         if name in MANAGEMENT_TOOLS:
@@ -900,9 +925,7 @@ class DelegationRegistry(ToolRegistry):
                 return "delegation disabled", True
             return super().execute(name, args, **kwargs)
         self.manager.charge_parent_tool()
-        owned = [child for child in self.manager.children.values()
-                 if not child.spec.read_only and (not child.done.is_set() or
-                     child.result.delivery_status != "integrated")]
+        owned = [child for child in self.manager.children.values() if child.reserves_write_scope()]
         if name == "shell" and any(not child.done.is_set() for child in owned):
             return ("shell unavailable while a write subagent is still running or cancelling; "
                     "wait for it to stop. Use read_file/list_dir/code_search to inspect files, "

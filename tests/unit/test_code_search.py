@@ -4,11 +4,11 @@
   text/regex/file/symbol 四种模式、workspace 越界拒绝、.gitignore 与默认忽略目录、
   rg 可用与 fallback、max_results、context_lines、timeout、二进制跳过、疑似密钥脱敏。
 
-本机没有独立 rg 二进制(rg 是 shell function),所以默认走 Python fallback;
-rg 路径单独用 mock subprocess + mock _find_ripgrep 验证。
+Python fallback 用显式 mock 强制选择；rg 流式读取同时使用模拟子进程和真实 rg 验证。
 """
 import json
 import subprocess
+import io
 
 import pytest
 
@@ -208,12 +208,16 @@ def test_ripgrep_backend_parses_json(monkeypatch, tmp_path):
         json.dumps({"type": "end", "data": {}}),
     ])
 
-    def fake_run(argv, **kwargs):
-        cp = subprocess.CompletedProcess(argv, 0, stdout=rg_json, stderr="")
-        return cp
+    class FakeProcess:
+        def __init__(self, *args, **kwargs):
+            self.stdout = io.BytesIO(rg_json.encode())
+            self.returncode = 0
+        def poll(self): return self.returncode
+        def wait(self): return self.returncode
+        def kill(self): self.returncode = -9
 
     monkeypatch.setattr(code_search, "_find_ripgrep", lambda: "/fake/rg")
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", FakeProcess)
 
     out = json.loads(_code_search({"query": "call_thing", "mode": "text"}))
     assert out["summary"]["backend"] == "ripgrep"
@@ -235,11 +239,8 @@ def test_ripgrep_timeout_marks_truncated(monkeypatch, tmp_path):
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
     (tmp_path / "a.py").write_text("x = 1\n")
 
-    def fake_run(argv, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=argv, timeout=15, output="")
-
     monkeypatch.setattr(code_search, "_find_ripgrep", lambda: "/fake/rg")
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(code_search, "_run_ripgrep", lambda *args: ([], True, False))
 
     out = json.loads(_code_search({"query": "x", "mode": "text"}))
     assert out["truncated"] is True
@@ -318,3 +319,129 @@ def test_path_not_found(monkeypatch, tmp_path):
     _force_python_backend(monkeypatch)
     out = _search(monkeypatch, tmp_path, query="x", path="nonexistent_subdir")
     assert out.startswith("path not found:")
+
+
+@pytest.mark.parametrize("mode", ["text", "file"])
+def test_recursive_glob_includes_direct_and_nested_children(monkeypatch, tmp_path, mode):
+    _force_python_backend(monkeypatch)
+    for name in ("app/agent/direct.py", "app/agent/nested/deep.py", "app/other.py", "app/agent/no.txt"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("needle\n")
+    result = _search(monkeypatch, tmp_path, query="needle", mode=mode, glob="app/agent/**/*.py")
+    assert {m["path"] for m in result["matches"]} == {"app/agent/direct.py", "app/agent/nested/deep.py"}
+    result = _search(monkeypatch, tmp_path, query="needle", mode=mode, glob="app/agent/*.py")
+    assert [m["path"] for m in result["matches"]] == ["app/agent/direct.py"]
+
+
+@pytest.mark.parametrize("glob,paths", [
+    ("*.py", {"a.py", "src/b.py"}),
+    ("**/*.py", {"a.py", "src/b.py"}),
+    ("src/*.{py,ts}", {"src/b.py", "src/c.ts"}),
+    ("src/[bc].?s", {"src/c.ts"}),
+    ("!**/*.py", {"src/c.ts", "src/nested/d.txt"}),
+])
+def test_glob_shapes_do_not_cross_single_star_directory_boundaries(glob, paths):
+    candidates = {"a.py", "src/b.py", "src/c.ts", "src/nested/d.txt"}
+    assert {p for p in candidates if code_search._glob_matches(p, glob)} == paths
+
+
+def test_fallback_glob_matches_real_rg(monkeypatch, tmp_path):
+    rg = code_search._find_ripgrep()
+    if rg is None:
+        pytest.skip("ripgrep not installed; deterministic glob cases tested separately")
+    for name in ("app/agent/a.py", "app/agent/nested/b.py", "app/agent/c.ts", "app/d.py"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("needle\n")
+    for glob in ("app/agent/**/*.py", "app/agent/*.py", "*.py", "app/agent/*.{py,ts}"):
+        monkeypatch.setattr(code_search, "_find_ripgrep", lambda: rg)
+        native = _search(monkeypatch, tmp_path, query="needle", glob=glob)
+        _force_python_backend(monkeypatch)
+        fallback = _search(monkeypatch, tmp_path, query="needle", glob=glob)
+        assert {m["path"] for m in native["matches"]} == {m["path"] for m in fallback["matches"]}
+
+
+def _rg_event(path, text="needle", line=1):
+    return json.dumps({"type": "match", "data": {
+        "path": {"text": str(path)}, "lines": {"text": text}, "line_number": line,
+    }}) + "\n"
+
+
+def test_rg_stops_running_process_after_global_match_limit(monkeypatch, tmp_path):
+    import sys
+    real_popen = subprocess.Popen
+    processes = []
+    payload = _rg_event(tmp_path / "a.py")
+    script = "import sys,time\nfor i in range(1000000):\n sys.stdout.write(" + repr(payload) + ")\n sys.stdout.flush()\n time.sleep(.001)\n"
+    def launch(argv, **kwargs):
+        process = real_popen([sys.executable, "-u", "-c", script], **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    lines, timed_out, limited = code_search._run_ripgrep("rg", tmp_path, "needle", "text", None, False, 3, 2)
+    assert len(lines) == 3 and limited and not timed_out
+    assert processes[0].poll() is not None
+
+
+def test_rg_output_byte_limit_also_bounds_non_matching_symbol_uses(monkeypatch, tmp_path):
+    class Process:
+        def __init__(self, *args, **kwargs):
+            self.stdout = io.BytesIO((_rg_event(tmp_path / "a.py", "foo()" * 1000) * 1000).encode())
+            self.returncode = None
+        def poll(self): return self.returncode
+        def kill(self): self.returncode = -9
+        def wait(self): self.returncode = self.returncode or 0
+    monkeypatch.setattr(subprocess, "Popen", Process)
+    lines, timeout, limited = code_search._run_ripgrep("rg", tmp_path, "foo", "symbol", None, False, 3, 1)
+    assert lines == [] and limited and not timeout
+
+
+def test_rg_symbol_limit_counts_definitions_after_filtering(monkeypatch, tmp_path):
+    payload = "".join(_rg_event(tmp_path / "a.py", "foo()", n) for n in range(20))
+    payload += _rg_event(tmp_path / "a.py", "def foo():", 21)
+    class Process:
+        def __init__(self, *args, **kwargs):
+            self.stdout = io.BytesIO(payload.encode())
+            self.returncode = 0
+        def poll(self): return self.returncode
+        def wait(self): return self.returncode
+    monkeypatch.setattr(subprocess, "Popen", Process)
+    lines, timeout, limited = code_search._run_ripgrep("rg", tmp_path, "foo", "symbol", None, False, 3, 1)
+    assert len(lines) == 1 and not limited and not timeout
+
+
+def test_rg_timeout_kills_and_reaps_process(monkeypatch, tmp_path):
+    import sys
+    real_popen = subprocess.Popen
+    processes = []
+    def launch(argv, **kwargs):
+        process = real_popen([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    _, timeout, limited = code_search._run_ripgrep("rg", tmp_path, "needle", "text", None, False, .05, 2)
+    assert timeout and not limited
+    assert processes[0].poll() is not None
+
+
+@pytest.mark.parametrize("path", ["src", "src/a.py"])
+def test_search_subroot_returns_workspace_relative_paths_in_both_backends(monkeypatch, tmp_path, path):
+    target = tmp_path / "src" / "a.py"
+    target.parent.mkdir()
+    target.write_text("needle\n")
+    rg = code_search._find_ripgrep()
+    backends = [None, rg] if rg else [None]
+    for backend in backends:
+        monkeypatch.setattr(code_search, "_find_ripgrep", lambda: backend)
+        result = _search(monkeypatch, tmp_path, query="needle", path=path, glob="*.py")
+        assert [m["path"] for m in result["matches"]] == ["src/a.py"]
+
+
+def test_serialized_chinese_results_respect_byte_limit(monkeypatch, tmp_path):
+    _force_python_backend(monkeypatch)
+    (tmp_path / "a.py").write_text(("命中" + "中文" * 100 + "\n") * 100)
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    output = _code_search({"query": "命中", "max_results": 100, "context_lines": 2})
+    assert len(output.encode("utf-8")) <= code_search.MAX_OUTPUT_BYTES
+    assert json.loads(output)["truncated"]

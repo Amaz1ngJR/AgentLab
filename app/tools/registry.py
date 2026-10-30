@@ -25,6 +25,8 @@ from app.util.redact import redact
 ApprovalResolver = Callable[[dict[str, Any]], Optional[str]]
 AuditRedactor = Callable[[dict[str, Any], str], tuple[str, str]]
 ToolAuditSink = Callable[["ToolAuditEvent"], None]
+# 并发工具仅缓冲审计；存储/UI 回调仍在调用线程执行。
+_deferred_audits: ContextVar[list | None] = ContextVar("deferred_tool_audits", default=None)
 
 TOOL_RISKS = frozenset({
     "read",
@@ -159,6 +161,8 @@ class ToolDescriptor:
     # 调用上都会发生(executor 预检 + registry 执行各一次)；每次重建 validator
     # 并对 schema 做 check_schema 是纯浪费(实测 0.52ms/次 vs 0.008ms/次)。
     _validator: Any = field(default=None, init=False, repr=False, compare=False)
+    # 明确承诺执行器线程安全且无会话状态副作用；risk=read 本身不构成并发授权。
+    parallel_safe: bool = False
 
     def __post_init__(self) -> None:
         if self.risk not in TOOL_RISKS:
@@ -273,7 +277,8 @@ class ToolRegistry:
       3. 模型返回工具调用请求后,调用 execute() 实际运行
     """
 
-    def __init__(self, audit_sink: Optional[ToolAuditSink] = None) -> None:
+    def __init__(self, audit_sink: Optional[ToolAuditSink] = None, *, max_parallel_tools: int = 4) -> None:
+        self.max_parallel_tools = max(1, min(16, max_parallel_tools))
         # 用字典存储,key 是工具名,方便按名称 O(1) 查找
         self._tools: dict[str, ToolDescriptor] = {}
         self._audit_sink = audit_sink
@@ -435,11 +440,24 @@ class ToolRegistry:
             is_error=is_error,
             elapsed_seconds=elapsed_seconds,
         )
+        deferred = _deferred_audits.get()
+        if deferred is not None:
+            deferred.append((self._audit_sink, event))
+            return
         try:
             self._audit_sink(event)
         except Exception:
             # 审计存储故障不能把已经完成的用户操作变成工具失败。
             pass
+
+    def parallel_capacity(self) -> int:
+        return self.max_parallel_tools
+
+    def prepare_parallel(self, name: str, args: dict, *, cancel=None):
+        """主线程预检；自定义 execute 的 registry 必须自行实现此协议。"""
+        if type(self).execute is not ToolRegistry.execute:
+            return None
+        return lambda: self.execute(name, args, cancel=cancel)
 
     def execute(
         self,
