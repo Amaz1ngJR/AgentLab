@@ -5,14 +5,15 @@ import asyncio
 import contextvars
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from typing import Callable
 
 from prompt_toolkit.application import in_terminal
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
-from prompt_toolkit.patch_stdout import StdoutProxy
 
+from app.util.composer import configure_composer, NativeStdoutProxy
 from app.agent.cancel import CancelToken
 from app.util.input_arbiter import clear_background_reader, set_background_reader
 
@@ -50,8 +51,8 @@ class _LineBufferedStream:
 
 
 @contextmanager
-def _line_buffered_stdout():
-    with StdoutProxy(raw=True) as proxy:
+def _line_buffered_stdout(application):
+    with NativeStdoutProxy(application) as proxy:
         stream = _LineBufferedStream(proxy)
         stdout, stderr = sys.stdout, sys.stderr
         sys.stdout = sys.stderr = stream
@@ -72,7 +73,8 @@ class LiveTurnInput:
         self.prepare_input = prepare_input
         self.draft = ""
         self.next_input: str | None = None
-        self.status = ""
+        self.composer = configure_composer(prompt)
+        self.composer.status = "Ready · 等待输入"
         self._loop = None
         self._token = None
         self._resume = None
@@ -80,12 +82,22 @@ class LiveTurnInput:
         self._worker_thread = None
         self.on_steer = None
 
+    @property
+    def status(self):
+        return self.composer.status
+
+    @status.setter
+    def status(self, value):
+        self.composer.status = value
+
     def invalidate(self) -> None:
         self.prompt.app.invalidate()
 
     def cancel(self, reason: str = "approval_cancelled") -> None:
         if self._token is not None:
             self._token.cancel(reason)
+            self.composer.cancelled = True
+            self.status = "Stopping… · 正在收尾"
             self.invalidate()
 
     def pause(self) -> None:
@@ -101,9 +113,11 @@ class LiveTurnInput:
             self._resume = asyncio.get_running_loop().create_future()
             with set_app(self.prompt.app):
                 async with in_terminal():
+                    self.composer.suspended = True
                     ready.set()
                     await self._resume
         finally:
+            self.composer.suspended = False
             ready.set()
 
     def resume(self) -> None:
@@ -130,6 +144,12 @@ class LiveTurnInput:
     async def _run_turn(self, work: Callable[[], str], token: CancelToken) -> str:
         self._loop = asyncio.get_running_loop()
         self._token = token
+        self.composer.running = True
+        self.composer.started = time.monotonic()
+        self.composer.cancelled = False
+        self.status = "Thinking… · 启动中"
+        self.composer.activity = ""
+        self.composer.reset_usage()
         done = self._loop.create_future()
         previous_bindings = self.prompt.key_bindings
         previous_toolbar = self.prompt.bottom_toolbar
@@ -147,17 +167,16 @@ class LiveTurnInput:
             self.cancel("keyboard_interrupt")
 
         def toolbar():
-            if token.cancelled:
-                return "已请求停止，可继续编辑输入；收尾完成后发送 · Esc/Ctrl+C 停止"
-            return f"{self.status or '执行中'} · Enter 补充方向 · Esc/Ctrl+C 停止"
+            self.composer.cancelled = token.cancelled
+            return self.composer.hints()
 
-        combined_bindings = merge_key_bindings([previous_bindings or KeyBindings(), bindings])
+        combined_bindings = merge_key_bindings([previous_bindings or KeyBindings(), self.composer.navigation_bindings, bindings])
 
         async def compose():
             while not done.done():
                 try:
                     text = await self.prompt.prompt_async(
-                        self.message, style=self.style, bottom_toolbar=toolbar,
+                        self.composer.message(self.message), style=self.style, bottom_toolbar=toolbar,
                         key_bindings=combined_bindings,
                         refresh_interval=0.1,
                     )
@@ -199,7 +218,7 @@ class LiveTurnInput:
             self._loop.call_soon_threadsafe(finish, outcome)
 
         input_task = None
-        with _line_buffered_stdout():
+        with _line_buffered_stdout(self.prompt.app):
             try:
                 set_background_reader(self)
                 input_task = asyncio.create_task(compose())
@@ -223,6 +242,9 @@ class LiveTurnInput:
                 if input_task is not None:
                     input_task.cancel()
                     await asyncio.gather(input_task, return_exceptions=True)
+                self.composer.finish_turn(
+                    cancelled=token.cancelled, failed=token.reason == "input_worker_error",
+                )
                 self._token = None
                 self._worker_thread = None
                 self.prompt.key_bindings = previous_bindings

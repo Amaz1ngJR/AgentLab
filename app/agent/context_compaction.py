@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import json
 import re
+import math
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -403,21 +406,52 @@ def _fallback_summary(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 class ContextCompressor:
-    """选段 → 调模型摘要 → 校验/脱敏 → 产出摘要消息并就地替换旧历史。"""
+    """选段 → 调模型摘要 → 校验/脱敏 → 产出摘要消息并就地替换旧历史。
+
+    timeout_seconds 可显式限制整次压缩；默认按分片及合并请求数预留时间，
+    每次请求预留 120 秒，整次最多 600 秒，开始后不续期。
+    超时不使用有损本地兜底，保留原始历史；后台迟到响应由请求隔离层丢弃。
+    默认按调用方安全输入预算分片（最多 65536 tokens）；未知窗口时使用 4096。
+    """
 
     def __init__(self, llm, system: str = COMPRESSION_SYSTEM,
                  model_profile: str = "", allow_local_fallback: bool = True,
                  available_skills: list[str] | None = None,
-                 summary_input_tokens: int = 4096):
+                 summary_input_tokens: int | None = None,
+                 timeout_seconds: float | None = None):
         self._llm = llm
         self._system = system
         self._model_profile = model_profile
         self._allow_local_fallback = allow_local_fallback
         self._available_skills = available_skills or []
-        if summary_input_tokens < 256:
+        if summary_input_tokens is not None and summary_input_tokens < 256:
             raise ValueError("summary_input_tokens must be at least 256")
+        if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+            raise ValueError("timeout_seconds must be finite and positive")
+        self.timeout_seconds = timeout_seconds
         self._summary_input_tokens = summary_input_tokens
         self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+
+    def _input_limit(self, input_token_budget: int | None) -> int:
+        preferred = self._summary_input_tokens or (65536 if input_token_budget else 4096)
+        return min(preferred, input_token_budget or preferred)
+
+    def timeout_for(self, messages: list[dict[str, Any]], input_token_budget: int | None) -> float:
+        """一次性规划时间预算；包含合并轮次，不随重试或进度事件续期。"""
+        if self.timeout_seconds is not None:
+            return self.timeout_seconds
+        tokens = estimate_tokens(self._render_transcript(messages))
+        limit = self._input_limit(input_token_budget)
+        chunks = max(1, math.ceil(tokens / limit))
+        calls = chunks
+        # 按每份摘要最多 4096 tokens 预留后续合并；小窗口无法收敛时交给硬上限。
+        while chunks > 1 and calls < 5:
+            reduced = max(1, math.ceil(chunks * min(4096, limit) / limit))
+            calls += reduced
+            if reduced >= chunks:
+                break
+            chunks = reduced
+        return min(600, max(120, calls * 120))
 
     def compact(
         self,
@@ -431,6 +465,8 @@ class ContextCompressor:
         target_message_tokens: int | None = None,
         on_progress=None,
         cancel: CancelToken | None = None,
+        deadline: float | None = None,
+        on_compaction_progress=None,
     ) -> CompactionResult:
         """就地压缩 messages 的可压缩前缀。成功时 messages 被原地改短。
 
@@ -439,6 +475,8 @@ class ContextCompressor:
             超大单条消息会被挤出保留窗口、纳入可压缩区。
         返回 CompactionResult;失败/无可压段时 messages 不变、compacted=False。
         """
+        started = time.monotonic()
+        deadline = min(deadline or float("inf"), started + self.timeout_for(messages, input_token_budget))
         if cancel is not None:
             cancel.raise_if_cancelled()
         self.last_usage = {"input_tokens": 0, "output_tokens": 0}
@@ -459,9 +497,25 @@ class ContextCompressor:
             return CompactionResult(False, reason="受保护消息超出安全输入预算", code="budget_exceeded")
         transcript = self._render_transcript(old)
         fallback_reason = ""
+        request_cancel = CancelToken()
+        unsubscribe = (cancel.add_callback(lambda: request_cancel.cancel("user"))
+                       if cancel is not None else lambda: None)
+        timer = threading.Timer(max(0, deadline - time.monotonic()),
+                                lambda: request_cancel.cancel("compaction_timeout"))
+        timer.daemon = True
+        timer.start()
         try:
-            obj = self._summarize(transcript, summary_budget, on_progress, cancel, input_token_budget)
+            obj = self._summarize(
+                transcript, summary_budget, on_progress, request_cancel, input_token_budget,
+                on_compaction_progress, started, deadline,
+            )
+            request_cancel.raise_if_cancelled()
         except Cancelled:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            if request_cancel.reason == "compaction_timeout":
+                return CompactionResult(False, reason="压缩达到整体耗时上限，保留原始历史",
+                                        code="timeout")
             raise
         except Exception as exc:  # 模型异常:进入本地兜底,不让手动 compact 失效
             if not self._allow_local_fallback:
@@ -469,6 +523,13 @@ class ContextCompressor:
             # 保留诊断原因供 ContextManager/UI 展示，但继续构造本地摘要。
             obj = _fallback_summary(old)
             fallback_reason = f"local_fallback:{type(exc).__name__}"
+        finally:
+            timer.cancel()
+            unsubscribe()
+
+        if time.monotonic() >= deadline:
+            return CompactionResult(False, reason="压缩达到整体耗时上限，保留原始历史",
+                                    code="timeout")
 
         if fallback_reason:
             pinned = [m for m in old if m.get("role") in {"system", "developer", "user"}
@@ -503,6 +564,9 @@ class ContextCompressor:
         # 验证完整候选后才提交，失败或取消都不会破坏历史。
         if cancel is not None:
             cancel.raise_if_cancelled()
+        if time.monotonic() >= deadline:
+            return CompactionResult(False, reason="压缩达到整体耗时上限，保留原始历史",
+                                    code="timeout")
         messages[:] = candidate
         result = CompactionResult(True, summary=summary)
         if fallback_reason:
@@ -522,22 +586,47 @@ class ContextCompressor:
         ))
 
     def _summarize(self, transcript: str, output_tokens: int, on_progress,
-                   cancel: CancelToken | None, input_token_budget: int | None = None) -> dict:
+                   cancel: CancelToken | None, input_token_budget: int | None = None,
+                   on_compaction_progress=None, started: float = 0,
+                   deadline: float = float("inf")) -> dict:
         output_tokens = max(256, min(4096, output_tokens))
         text = transcript
-        input_limit = min(self._summary_input_tokens, input_token_budget or self._summary_input_tokens)
-        for _ in range(8):
+        # 已知安全窗口时利用可用预算，避免长历史被固定 4k 切成几十次串行请求。
+        # 未声明窗口的直接调用保持保守；显式分片限制和小模型预算仍然生效。
+        input_limit = self._input_limit(input_token_budget)
+        last_report = 0.0
+        state = {}
+
+        def report(force=False, **updates):
+            nonlocal last_report
+            cancel.raise_if_cancelled()
+            now = time.monotonic()
+            if now >= deadline:
+                cancel.cancel("compaction_timeout")
+                cancel.raise_if_cancelled()
+            state.update(updates)
+            if on_compaction_progress is not None and (force or now - last_report >= 5):
+                last_report = now
+                on_compaction_progress({**state, "elapsed_seconds": now - started,
+                                        "remaining_seconds": max(0, deadline - now)})
+
+        for round_index in range(8):
             chunks = _split_transcript(text, input_limit)
             summaries = []
             overflow = False
-            for chunk in chunks:
+            for chunk_index, chunk in enumerate(chunks, 1):
                 obj = None
                 for attempt in range(2):
+                    report(True, round=round_index + 1, chunk=chunk_index,
+                           chunks=len(chunks), attempt=attempt + 1, phase="request")
                     try:
                         response = call_create_message(
                             self._llm, [{"role": "user", "content": chunk}],
                             tools=None, system=self._system, max_tokens=output_tokens,
                             on_progress=on_progress, cancel=cancel,
+                            on_wait=report,
+                            on_retry=lambda attempt, delay, exc: report(
+                                True, phase="retry", retry=attempt, retry_delay=delay),
                         )
                     except Cancelled:
                         raise

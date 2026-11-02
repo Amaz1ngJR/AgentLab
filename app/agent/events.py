@@ -53,6 +53,7 @@ PROVIDER_RETRY = "provider_retry"
 
 # 上下文预算与压缩(§7.3)
 CONTEXT_BUDGET_WARNING = "context_budget_warning"
+CONTEXT_COMPACTION_PROGRESS = "context_compaction_progress"
 CONTEXT_COMPACTION_STARTED = "context_compaction_started"
 CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"
 CONTEXT_COMPACTION_FAILED = "context_compaction_failed"

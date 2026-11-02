@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import time
+
 from typing import Any, Callable, Optional
 
 from app.agent import events
@@ -174,6 +176,7 @@ class ContextManager:
             if status != "compact":
                 return False
 
+        compaction_started = time.monotonic()
         # 触发压缩
         self._emit(RunEvent(
             kind=events.CONTEXT_COMPACTION_STARTED,
@@ -191,6 +194,7 @@ class ContextManager:
             self._emit(RunEvent(kind=events.CONTEXT_COMPACTION_FAILED,
                                 text="模型窗口不足以容纳摘要指令和输出预留"))
             return False
+        deadline = compaction_started + self._compressor.timeout_for(messages, summary_input)
         # 先尝试常规尾部预算；若仍超限，缩减到条数下限，始终对候选执行原子校验。
         for recent_budget in ([None] if force else [effective_recent_budget, None]):
             result = self._compressor.compact(
@@ -199,6 +203,11 @@ class ContextManager:
                 summary_budget=summary_budget, input_token_budget=summary_input,
                 target_message_tokens=target,
                 source_run_ids=source_run_ids, on_progress=on_progress, cancel=cancel,
+                deadline=deadline,
+                on_compaction_progress=lambda progress: self._emit(RunEvent(
+                    kind=events.CONTEXT_COMPACTION_PROGRESS, payload={
+                        **progress, "elapsed_seconds": time.monotonic() - compaction_started,
+                    })),
             )
             if result.compacted or result.code != "budget_exceeded":
                 break

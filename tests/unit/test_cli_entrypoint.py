@@ -67,3 +67,19 @@ def test_main_rejects_missing_workspace(monkeypatch, tmp_path):
     assert exc.value.code == 2
     build_session.assert_not_called()
 
+
+
+def test_main_keeps_green_startup_on_native_stdout(monkeypatch, capsys):
+    router = MagicMock()
+    monkeypatch.setattr(cli, "_supports_color", lambda *args, **kwargs: True)
+    def build(**kwargs):
+        cli._print_init("== AgentLab vtest ==")
+        cli._print_init("model    : local-test-model")
+        return router
+    monkeypatch.setattr(cli, "_build_session", build)
+    monkeypatch.setattr(cli, "_repl", lambda current: 0)
+    assert cli.main([]) == 0
+    printed = capsys.readouterr().out
+    assert printed.count("AgentLab vtest") == 1
+    assert printed.count("local-test-model") == 1
+    assert "\x1b[32m" in printed

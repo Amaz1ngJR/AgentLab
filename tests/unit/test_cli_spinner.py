@@ -530,3 +530,41 @@ def test_pending_buffer_is_bounded_when_deltas_outpace_clock(monkeypatch):
             spinner.on_text("12345678")
             assert spinner._pending_chars < 8192
         assert spinner._draw_footer.call_count < 12
+
+
+def test_actual_compaction_reports_before_after_and_clears_live_activity(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    from app import cli
+    from app.agent.context import ContextManager
+    from app.agent.context_budget import ContextBudget
+    from app.agent.context_compaction import ContextCompressor
+    from app.models.protocol import ModelResponse
+    from app.util.composer import configure_composer
+    from tests.support.context import _VALID_SUMMARY, _long_messages
+
+    sink = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", sink)
+    with create_pipe_input() as pipe:
+        view = configure_composer(PromptSession(input=pipe, output=DummyOutput()))
+        live = SimpleNamespace(composer=view, invalidate=lambda: None)
+        monkeypatch.setattr(cli, "_LIVE_INPUT", live)
+        spinner = cli._Spinner("thinking")
+        monkeypatch.setattr(cli, "_ACTIVE_SPINNER", spinner)
+        response = ModelResponse(text=json.dumps(_VALID_SUMMARY), tool_calls=[], provider_payload=[], usage={})
+        model = SimpleNamespace(create_message=lambda *args, **kwargs: response)
+        manager = ContextManager(ContextBudget.from_model(declared_context_size=32000),
+                                 ContextCompressor(model), keep_recent=2, on_event=cli._print_run_event)
+        messages = _long_messages(20)
+        before = manager.estimate(messages)
+        view.activity = "执行 write_file"
+        assert manager.maybe_compact(messages, force=True)
+        after = manager.estimate(messages)
+        spinner.on_text("压缩后继续执行\n")
+        output = sink.getvalue()
+        assert output.count(f"约 {before:,} → {after:,} tokens") == 1
+        assert "上下文压缩完成" in output
+        assert view.activity == ""

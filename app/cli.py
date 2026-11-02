@@ -29,7 +29,7 @@ from typing import Optional
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
@@ -45,6 +45,8 @@ from app.attachments import (
 from app.agent.approval_broker import ApprovalBroker, BrokerApprovalPolicy
 from app.agent.cancel import CancelToken, Cancelled
 from app.util.live_turn import LiveTurnInput
+from app.util.composer import configure_composer, composer_output
+from app.util.progress_format import SPINNER_FRAMES as _SPINNER_FRAMES, format_duration as _fmt_duration
 from app.agent.context import ContextManager
 from app.agent.context_budget import ContextBudget
 from app.agent.context_compaction import ContextCompressor
@@ -74,8 +76,6 @@ from app.util.redact import format_exception, format_traceback
 from app.util.text import display_width as _display_width, strip_ansi as _strip_ansi
 from app.version import __version__, version_text
 
-_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
 
 def _term_width(default: int = 80) -> int:
     try:
@@ -96,18 +96,6 @@ def _count_visual_lines(text: str, term_width: int) -> int:
         w = _display_width(line)
         n += max(1, (w + term_width - 1) // term_width) if w else 1
     return n
-
-
-def _fmt_duration(seconds: float) -> str:
-    """紧凑显示耗时：秒、分秒或时分秒。"""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    total = int(seconds)
-    hours, remainder = divmod(total, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours:
-        return f"{hours}h {minutes}m {secs}s"
-    return f"{minutes}m {secs}s"
 
 
 def _fmt_tokens(n: int) -> str:
@@ -209,7 +197,8 @@ def _approval_text(text: str, *, stream=None) -> str:
 
 def _print_init(text: str = "", *, flush: bool = False) -> None:
     """渲染启动初始化信息；每行单独 reset，避免颜色泄漏到交互提示。"""
-    print(_colorize(text, _ANSI_GREEN), flush=flush)
+    rendered = _colorize(text, _ANSI_GREEN)
+    print(rendered, flush=flush)
 
 
 def _task_field(t, name: str):
@@ -395,6 +384,8 @@ class _Spinner:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._t0 = 0.0
         self._lock = threading.RLock()
+        self._usage_source = object()
+        self._metrics_final = False
         self._metrics: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self._any_text = False         # 整个 turn 是否出现过正文(决定退出收尾)
         self._any_thinking = False     # 是否出现过思考流(用于在思考→正文/摘要间分隔)
@@ -416,6 +407,8 @@ class _Spinner:
         self._t0 = time.monotonic()
         self._running = True
         _set_active_spinner(self)
+        if _LIVE_INPUT is not None:
+            _LIVE_INPUT.composer.activity = ""
         self._thread.start()
         return self
 
@@ -443,7 +436,8 @@ class _Spinner:
                 # 若只流过思考(没有正文),先换行收掉暗色尾行再打摘要。
                 if self._any_thinking and self._line_buf:
                     sys.stdout.write("\n")
-                sys.stdout.write(f"  ✻ {self.label} ({self._fmt_status()})\n")
+                if _LIVE_INPUT is None:
+                    sys.stdout.write(f"  ✻ {self.label} ({self._fmt_status()})\n")
             sys.stdout.flush()
 
     def update(self, metrics: dict[str, int]) -> None:
@@ -461,6 +455,9 @@ class _Spinner:
                     self._metrics["output_tokens"], incoming_out,
                 ),
             }
+            self._metrics_final = final
+            if _LIVE_INPUT is not None:
+                _LIVE_INPUT.composer.record_usage(self._usage_source, self._metrics, final=final)
             if final or not self._running:
                 self._render()
 
@@ -660,7 +657,10 @@ class _Spinner:
         与 footer 之间的边界,不额外占一整屏行 —— 擦除时不计入上移行数。
         """
         if _LIVE_INPUT is not None:
-            _LIVE_INPUT.status = f"{self.label} ({self._fmt_status()})"
+            _LIVE_INPUT.composer.phase = self.label
+            _LIVE_INPUT.composer.record_usage(
+                self._usage_source, self._metrics, final=self._metrics_final,
+            )
             _LIVE_INPUT.invalidate()
             return
         term_width = _term_width()
@@ -1023,6 +1023,9 @@ def _reset_shell_snapshot() -> None:
 
 def _print_event(ev: TurnEvent) -> None:
     if ev.kind == "tool_call":
+        if _LIVE_INPUT is not None:
+            _LIVE_INPUT.composer.activity = f"执行 {ev.tool_name}"
+            _LIVE_INPUT.invalidate()
         if ev.tool_name == "write_file":
             _render_write_file(ev.tool_input or {})
         elif ev.tool_name == "edit_file":
@@ -1083,6 +1086,9 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         if ev.text:
             print(f"\n{_model_text(ev.text)}\n", flush=True)
     elif kind == run_events.TOOL_REQUESTED:
+        if _LIVE_INPUT is not None:
+            _LIVE_INPUT.composer.activity = f"执行 {ev.tool_name}"
+            _LIVE_INPUT.invalidate()
         # 这里只做审批前 diff / shell 快照；黄色 tool_use 由紧随其后的
         # APPROVAL_REQUIRED 统一输出，免审批工具不冒充审批内容。
         if ev.tool_name == "write_file":
@@ -1170,14 +1176,49 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
             f"上下文已用 ~{pct}%(下个稳定点将压缩旧历史)", marker="ⓘ",
         )
     elif kind == run_events.CONTEXT_COMPACTION_STARTED:
+        if _LIVE_INPUT is not None:
+            _LIVE_INPUT.composer.activity = "压缩上下文"
+            _LIVE_INPUT.invalidate()
         _emit_progress_notice("压缩上下文 …", marker="✻")
+    elif kind == run_events.CONTEXT_COMPACTION_PROGRESS:
+        p = dict(ev.payload)
+        received_at = time.monotonic()
+
+        def detail():
+            # 网络进度事件只每 5 秒发送一次；显示计时由每帧本地时钟推进。
+            delta = max(0, time.monotonic() - received_at)
+            elapsed = p['elapsed_seconds'] + delta
+            remaining = max(0, p['remaining_seconds'] - delta)
+            text = (f"压缩上下文 · 第 {p['round']} 轮 · 分片 {p['chunk']}/{p['chunks']}"
+                    f" · 已用 {_fmt_duration(elapsed)}"
+                    f" · 剩余 {_fmt_duration(remaining)}")
+            if p.get("phase") == "retry":
+                text += f" · 网络重试 {p.get('retry', 1)}"
+            elif p.get("attempt", 1) > 1:
+                text += " · 重试摘要格式"
+            return text
+
+        if _LIVE_INPUT is not None:
+            _LIVE_INPUT.composer.activity = detail
+            _LIVE_INPUT.invalidate()
+        else:
+            _emit_progress_notice(detail(), marker="✻")
     elif kind == run_events.CONTEXT_COMPACTION_COMPLETED:
         p = ev.payload or {}
-        before, after = p.get("token_before", 0), p.get("token_after", 0)
+        before, after = p.get("token_before"), p.get("token_after")
+        if _LIVE_INPUT is not None:
+            _LIVE_INPUT.composer.activity = ""
+            _LIVE_INPUT.invalidate()
+        detail = (f"约 {before:,} → {after:,} tokens"
+                  if isinstance(before, (int, float)) and isinstance(after, (int, float))
+                  else "token 用量未返回")
         _emit_progress_notice(
-            f"已压缩旧历史(~{before} → ~{after} tokens)", marker="✓",
+            f"上下文压缩完成（{detail}）", marker="✓",
         )
     elif kind == run_events.CONTEXT_COMPACTION_FAILED:
+        if _LIVE_INPUT is not None:
+            _LIVE_INPUT.composer.activity = ""
+            _LIVE_INPUT.invalidate()
         _emit_progress_notice(f"上下文压缩跳过:{ev.text}", marker="⚠")
     # ── Loop Engineering 事件 ──
     elif kind == run_events.LOOP_STARTED:
@@ -2081,6 +2122,11 @@ def _print_stats(session: AgentSession) -> None:
 _PROMPT_STYLE = Style.from_dict({
     "prompt": "fg:#5fafff bold",
     "frame": "fg:#666666",
+    "composer.rule": "fg:#666666",
+    "composer.status": "fg:#d7af87",
+    "composer.mode": "fg:#ffd700 bold",
+    "composer.hint": "fg:#888888",
+    "bottom-toolbar": "",
 })
 
 
@@ -2472,10 +2518,15 @@ def _chat_with_cancel(
         try:
             def execute():
                 if service is not None:
-                    return service.send_message(
+                    result = service.send_message(
                         line, images=images, cancel=token, resume=resume, run_id=run_id,
                     )
-                return session.chat(line, images=images, cancel=token, resume=resume)
+                else:
+                    result = session.chat(line, images=images, cancel=token, resume=resume)
+                usage = getattr(session, "last_turn_usage", None)
+                if isinstance(usage, dict) and hasattr(live_input, "composer"):
+                    live_input.composer.set_total_usage(usage)
+                return result
             return live_input.run(execute, token)
         except (KeyboardInterrupt, Cancelled) as exc:
             token.cancel("keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "unspecified")
@@ -2735,6 +2786,13 @@ def _repl(router: RuntimeService) -> int:
         key_bindings=key_bindings,
     )
 
+    composer = None
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        composer = configure_composer(pt_session)
+        composer.mode = lambda: bool(router.current and router.current.auto_execute_enabled)
+        pt_session.bottom_toolbar = composer.hints
+        pt_session.key_bindings = merge_key_bindings([key_bindings, composer.navigation_bindings])
+
     queued_input = None
     input_draft = ""
 
@@ -2760,273 +2818,276 @@ def _repl(router: RuntimeService) -> int:
                 queued_input = live.next_input
                 input_draft = live.draft
 
-    while True:
-        _print_input_separator()
-        # 动态构建 prompt:通过 RuntimeService 获取当前 Thread 摘要。
-        thread = router.current_thread_summary()
-        session = router.current
-        if thread:
-            sess_id = thread["thread_id"]
-            title = thread.get("title") or "?"
-            # 标题可能很长，截断到合理长度
-            if len(title) > 30:
-                title = title[:27] + "..."
-            prompt_text = f"[{sess_id[:6]}·{title}]"
-            # 显示自动执行模式状态
-            if session and session.auto_execute_enabled:
-                prompt_text += " 🚀"
-            prompt_text += " ▸ "
-        else:
-            prompt_text = "▸ "
-        prompt_fragments = FormattedText([("class:prompt", prompt_text)])
-
-        try:
-            if queued_input is not None:
-                line, queued_input = queued_input.strip(), None
-            else:
-                line = pt_session.prompt(
-                    prompt_fragments, style=_PROMPT_STYLE, default=input_draft,
-                ).strip()
-            input_draft = ""
-
-            # 检测粘贴的多行文本并显示提示
-            # 注意：prompt_toolkit 默认将多行粘贴转换为单行（用空格替换换行符）
-            # 我们需要在粘贴时就检测，而不是在 prompt 返回后
-            # 但如果用户在输入框内输入了很长的文本，也可以提示
-
-        except KeyboardInterrupt:
-            # Ctrl-C: 清空当前行后继续
-            continue
-        except EOFError:
-            # Ctrl-D: 退出
-            print()
-            return 0
-
-        if not line:
-            # Ctrl+V 粘贴图片会插入可见占位符，因此这里不会误丢图片。
-            continue
-        if line in ("exit", "quit"):
-            return 0
-        if line == "/version":
-            print(version_text())
-            continue
-        if line == "/rtk":
-            print(format_rtk_status())
-            continue
-        image_action, image_payload = _image_command(line)
-        if image_action == "help":
-            print(_image_help_text())
-            continue
-        if line == "/paste-image":
-            clipboard = capture_system_clipboard()
-            if clipboard.image is None:
-                print("剪贴板中没有图片。")
-                continue
-            try:
-                current_session = router.current
-                if current_session is None or "vision" not in getattr(
-                    current_session.llm, "capabilities", [],
-                ):
-                    print(
-                        "当前模型 profile 未声明 vision 能力，不能粘贴图片；"
-                        "请先切换到视觉模型。"
-                    )
-                    continue
-                image = attachment_store.add_bytes(
-                    router.current_id or "unbound",
-                    clipboard.image.data,
-                    clipboard.image.name,
-                )
-            except AttachmentError as exc:
-                print(f"无法粘贴图片: {exc}")
-                continue
-            pending_clipboard["images"][image.attachment_id] = image
-            print(
-                f"已附加剪贴板图片 {image.attachment_id} "
-                f"({image.width}x{image.height})；下一条消息将发送该图片。"
-            )
-            continue
-        if line == "/attachments":
-            print(_format_pending_attachments(pending_clipboard))
-            continue
-        if line == "/attachments clear-session":
+    with composer_output(composer):
+        while True:
+            if composer is None:
+                _print_input_separator()
+            # 动态构建 prompt:通过 RuntimeService 获取当前 Thread 摘要。
+            thread = router.current_thread_summary()
             session = router.current
-            if session is None or router.current_id is None:
-                print("当前无活跃 session。")
-                continue
-            try:
-                approved = session.approval.request(
-                    "clear_session_images",
-                    {
-                        "session_id": router.current_id,
-                        "path": str(attachment_store.root / router.current_id),
-                        "purpose": "delete_all_session_images",
-                    },
-                )
-            except Exception as exc:
-                print(f"图片清理审批失败: {format_exception(exc)}")
-                continue
-            if not approved:
-                print("已取消清理 Session 图片。")
-                continue
-            try:
-                result = router.clear_session_images()
-            except Exception as exc:
-                print(f"清理 Session 图片失败: {format_exception(exc)}")
-                continue
-            pending_clipboard["images"].clear()
-            print(
-                f"已清理当前 Session 的全部图片：删除 {result['files']} 个文件，"
-                f"移除 {result['references']} 个历史引用。文本对话已保留。"
-            )
-            continue
-        if line == "/attachments clear":
-            pending_clipboard["images"].clear()
-            print("已清空待发送图片。")
-            continue
-
-        # 图片附件必须进入当前 session 的隔离目录；切换 session 时清空待发送队列，
-        # 避免上一会话的敏感截图被误发到另一个 Agent。
-        if line.startswith("/session"):
-            before_session = router.current_id
-            out = router.handle_session_command(line)
-            if router.current_id != before_session:
-                pending_clipboard["images"].clear()
-            if out is not None:
-                print(out)
-            continue
-
-        session = router.current
-        if session is None:
-            print("当前无活跃 session。用 /session new 创建。")
-            continue
-
-        direct_images: list[ImageAttachment] = []
-        if image_action == "path":
-            raw = image_payload or ""
-            # `--` 是唯一“立即发送”分隔符；只有路径时永远只入队，不触发 Agent。
-            path_text, separator, prompt = raw.partition(" -- ")
-            if not path_text:
-                print("用法: /image <图片路径> [-- 提示词]")
-                continue
-            try:
-                image = attachment_store.add_path(
-                    router.current_id or "unbound",
-                    path_text.strip('"\''),
-                    workspace_root=workspace_root(),
-                    approval=getattr(session, "approval", None),
-                )
-            except (AttachmentError, OSError) as exc:
-                print(f"无法附加图片: {exc}")
-                continue
-            if "vision" not in getattr(session.llm, "capabilities", []):
-                print(
-                    "当前模型 profile 未声明 vision 能力，不能发送图片；"
-                    "请先用 /model switch 切换到视觉模型并新建 session。"
-                )
-                continue
-            if separator and prompt.strip():
-                line = prompt.strip()
-                direct_images = [image]
+            if thread:
+                sess_id = thread["thread_id"]
+                title = thread.get("title") or "?"
+                # 标题可能很长，截断到合理长度
+                if len(title) > 30:
+                    title = title[:27] + "..."
+                prompt_text = f"[{sess_id[:6]}·{title}]"
+                # 显示自动执行模式状态
+                if session and session.auto_execute_enabled:
+                    prompt_text += " 🚀"
+                prompt_text += " ❯ "
             else:
+                prompt_text = "❯ "
+            prompt_fragments = FormattedText([("class:prompt", prompt_text)])
+
+            try:
+                if queued_input is not None:
+                    line, queued_input = queued_input.strip(), None
+                else:
+                    line = pt_session.prompt(
+                        composer.message(prompt_fragments) if composer else prompt_fragments,
+                        style=_PROMPT_STYLE, default=input_draft,
+                    ).strip()
+                input_draft = ""
+
+                # 检测粘贴的多行文本并显示提示
+                # 注意：prompt_toolkit 默认将多行粘贴转换为单行（用空格替换换行符）
+                # 我们需要在粘贴时就检测，而不是在 prompt 返回后
+                # 但如果用户在输入框内输入了很长的文本，也可以提示
+
+            except KeyboardInterrupt:
+                # Ctrl-C: 清空当前行后继续
+                continue
+            except EOFError:
+                # Ctrl-D: 退出
+                print()
+                return 0
+
+            if not line:
+                # Ctrl+V 粘贴图片会插入可见占位符，因此这里不会误丢图片。
+                continue
+            if line in ("exit", "quit"):
+                return 0
+            if line == "/version":
+                print(version_text())
+                continue
+            if line == "/rtk":
+                print(format_rtk_status())
+                continue
+            image_action, image_payload = _image_command(line)
+            if image_action == "help":
+                print(_image_help_text())
+                continue
+            if line == "/paste-image":
+                clipboard = capture_system_clipboard()
+                if clipboard.image is None:
+                    print("剪贴板中没有图片。")
+                    continue
+                try:
+                    current_session = router.current
+                    if current_session is None or "vision" not in getattr(
+                        current_session.llm, "capabilities", [],
+                    ):
+                        print(
+                            "当前模型 profile 未声明 vision 能力，不能粘贴图片；"
+                            "请先切换到视觉模型。"
+                        )
+                        continue
+                    image = attachment_store.add_bytes(
+                        router.current_id or "unbound",
+                        clipboard.image.data,
+                        clipboard.image.name,
+                    )
+                except AttachmentError as exc:
+                    print(f"无法粘贴图片: {exc}")
+                    continue
                 pending_clipboard["images"][image.attachment_id] = image
                 print(
-                    f"已附加 {image.original_name} ({image.width}x{image.height})；"
-                    "下一条消息将发送该图片。"
+                    f"已附加剪贴板图片 {image.attachment_id} "
+                    f"({image.width}x{image.height})；下一条消息将发送该图片。"
                 )
                 continue
-        else:
-            direct_images = []
-
-        # 其余 slash 命令也不应消耗待发送附件。
-        if line == "/reset":
-            session.reset()
-            print("(history cleared)")
-            continue
-
-        if line == "/context" or line.startswith("/context "):
-            print(_handle_context_command(session, line))
-            continue
-
-        # /model 命令:查看和切换模型配置
-        if line == "/model" or line.startswith("/model "):
-            print(_handle_model_command(router, line))
-            continue
-
-        # /goal 和 /loop 命令通过 RuntimeService 显式入口处理。
-        if line.startswith("/goal") or line.startswith("/loop"):
-            live = None
-            if line.startswith(("/loop start", "/loop resume")) and sys.stdin.isatty() and sys.stdout.isatty():
-                live = LiveTurnInput(
-                    pt_session, message=prompt_fragments, style=_PROMPT_STYLE,
-                    prepare_input=prepare_steering,
+            if line == "/attachments":
+                print(_format_pending_attachments(pending_clipboard))
+                continue
+            if line == "/attachments clear-session":
+                session = router.current
+                if session is None or router.current_id is None:
+                    print("当前无活跃 session。")
+                    continue
+                try:
+                    approved = session.approval.request(
+                        "clear_session_images",
+                        {
+                            "session_id": router.current_id,
+                            "path": str(attachment_store.root / router.current_id),
+                            "purpose": "delete_all_session_images",
+                        },
+                    )
+                except Exception as exc:
+                    print(f"图片清理审批失败: {format_exception(exc)}")
+                    continue
+                if not approved:
+                    print("已取消清理 Session 图片。")
+                    continue
+                try:
+                    result = router.clear_session_images()
+                except Exception as exc:
+                    print(f"清理 Session 图片失败: {format_exception(exc)}")
+                    continue
+                pending_clipboard["images"].clear()
+                print(
+                    f"已清理当前 Session 的全部图片：删除 {result['files']} 个文件，"
+                    f"移除 {result['references']} 个历史引用。文本对话已保留。"
                 )
-            global _LIVE_INPUT
-            _LIVE_INPUT = live
+                continue
+            if line == "/attachments clear":
+                pending_clipboard["images"].clear()
+                print("已清空待发送图片。")
+                continue
+
+            # 图片附件必须进入当前 session 的隔离目录；切换 session 时清空待发送队列，
+            # 避免上一会话的敏感截图被误发到另一个 Agent。
+            if line.startswith("/session"):
+                before_session = router.current_id
+                out = router.handle_session_command(line)
+                if router.current_id != before_session:
+                    pending_clipboard["images"].clear()
+                if out is not None:
+                    print(out)
+                continue
+
+            session = router.current
+            if session is None:
+                print("当前无活跃 session。用 /session new 创建。")
+                continue
+
+            direct_images: list[ImageAttachment] = []
+            if image_action == "path":
+                raw = image_payload or ""
+                # `--` 是唯一“立即发送”分隔符；只有路径时永远只入队，不触发 Agent。
+                path_text, separator, prompt = raw.partition(" -- ")
+                if not path_text:
+                    print("用法: /image <图片路径> [-- 提示词]")
+                    continue
+                try:
+                    image = attachment_store.add_path(
+                        router.current_id or "unbound",
+                        path_text.strip('"\''),
+                        workspace_root=workspace_root(),
+                        approval=getattr(session, "approval", None),
+                    )
+                except (AttachmentError, OSError) as exc:
+                    print(f"无法附加图片: {exc}")
+                    continue
+                if "vision" not in getattr(session.llm, "capabilities", []):
+                    print(
+                        "当前模型 profile 未声明 vision 能力，不能发送图片；"
+                        "请先用 /model switch 切换到视觉模型并新建 session。"
+                    )
+                    continue
+                if separator and prompt.strip():
+                    line = prompt.strip()
+                    direct_images = [image]
+                else:
+                    pending_clipboard["images"][image.attachment_id] = image
+                    print(
+                        f"已附加 {image.original_name} ({image.width}x{image.height})；"
+                        "下一条消息将发送该图片。"
+                    )
+                    continue
+            else:
+                direct_images = []
+
+            # 其余 slash 命令也不应消耗待发送附件。
+            if line == "/reset":
+                session.reset()
+                print("(history cleared)")
+                continue
+
+            if line == "/context" or line.startswith("/context "):
+                print(_handle_context_command(session, line))
+                continue
+
+            # /model 命令:查看和切换模型配置
+            if line == "/model" or line.startswith("/model "):
+                print(_handle_model_command(router, line))
+                continue
+
+            # /goal 和 /loop 命令通过 RuntimeService 显式入口处理。
+            if line.startswith("/goal") or line.startswith("/loop"):
+                live = None
+                if line.startswith(("/loop start", "/loop resume")) and sys.stdin.isatty() and sys.stdout.isatty():
+                    live = LiveTurnInput(
+                        pt_session, message=prompt_fragments, style=_PROMPT_STYLE,
+                        prepare_input=prepare_steering,
+                    )
+                global _LIVE_INPUT
+                _LIVE_INPUT = live
+                try:
+                    out = (
+                        router.handle_goal_command(line)
+                        if line.startswith("/goal")
+                        else router.handle_loop_command(line)
+                    )
+                except (Cancelled, KeyboardInterrupt):
+                    out = "已中断。"
+                except Exception as exc:
+                    out = format_exception(exc)
+                finally:
+                    _LIVE_INPUT = None
+                    if live is not None:
+                        queued_input, input_draft = live.next_input, live.draft
+                if out:
+                    print(out)
+                continue
+
+            # 提取粘贴文本占位符，替换为实际内容
+            line = _extract_pasted_text(line, pending_clipboard)
+
+            line, pasted_images = _extract_pasted_images(line, pending_clipboard)
+            images = direct_images + pasted_images
+            if not line and images:
+                line = "请分析这些图片。"
+
+            # /resume:继续上一轮未完成的任务(失败任务重置为 pending 重试)。
+            # 可带补充说明(/resume <提示>),否则用默认继续指令。
+            if line == "/resume" or line.startswith("/resume "):
+                store = getattr(session, "task_store", None)
+                if store is None or store.is_empty():
+                    print("没有可继续的任务(任务列表为空)。直接输入新目标即可开始。")
+                    continue
+                summary = store.summary()
+                if not summary.get("failed") and not summary.get("pending") \
+                        and not summary.get("blocked") and not summary.get("in_progress"):
+                    print("所有任务都已完成,没有需要继续的任务。")
+                    continue
+                extra = line[len("/resume"):].strip()
+                goal = extra or "继续完成上一轮未完成的任务。"
+                try:
+                    run_chat(
+                        session,
+                        goal,
+                        resume=True,
+                        images=images,
+                    )
+                except Exception as exc:
+                    print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
+                    continue
+                _print_stats(session)
+                continue
+
             try:
-                out = (
-                    router.handle_goal_command(line)
-                    if line.startswith("/goal")
-                    else router.handle_loop_command(line)
-                )
-            except (Cancelled, KeyboardInterrupt):
-                out = "已中断。"
+                repaired = _repair_dangling_tool_use(session)
+                if repaired:
+                    print(f"  ⚠ 检测到 {repaired} 个悬空 tool_use，已自动修复（历史损坏可能由上次中断引起）。",
+                          file=sys.stderr)
+                run_chat(session, line, images=images)
             except Exception as exc:
-                out = format_exception(exc)
-            finally:
-                _LIVE_INPUT = None
-                if live is not None:
-                    queued_input, input_draft = live.next_input, live.draft
-            if out:
-                print(out)
-            continue
-
-        # 提取粘贴文本占位符，替换为实际内容
-        line = _extract_pasted_text(line, pending_clipboard)
-
-        line, pasted_images = _extract_pasted_images(line, pending_clipboard)
-        images = direct_images + pasted_images
-        if not line and images:
-            line = "请分析这些图片。"
-
-        # /resume:继续上一轮未完成的任务(失败任务重置为 pending 重试)。
-        # 可带补充说明(/resume <提示>),否则用默认继续指令。
-        if line == "/resume" or line.startswith("/resume "):
-            store = getattr(session, "task_store", None)
-            if store is None or store.is_empty():
-                print("没有可继续的任务(任务列表为空)。直接输入新目标即可开始。")
-                continue
-            summary = store.summary()
-            if not summary.get("failed") and not summary.get("pending") \
-                    and not summary.get("blocked") and not summary.get("in_progress"):
-                print("所有任务都已完成,没有需要继续的任务。")
-                continue
-            extra = line[len("/resume"):].strip()
-            goal = extra or "继续完成上一轮未完成的任务。"
-            try:
-                run_chat(
-                    session,
-                    goal,
-                    resume=True,
-                    images=images,
-                )
-            except Exception as exc:
+                # 脱敏后输出,避免 Authorization / API key 等凭据泄漏到终端
                 print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
                 continue
             _print_stats(session)
-            continue
-
-        try:
-            repaired = _repair_dangling_tool_use(session)
-            if repaired:
-                print(f"  ⚠ 检测到 {repaired} 个悬空 tool_use，已自动修复（历史损坏可能由上次中断引起）。",
-                      file=sys.stderr)
-            run_chat(session, line, images=images)
-        except Exception as exc:
-            # 脱敏后输出,避免 Authorization / API key 等凭据泄漏到终端
-            print(f"  !! {format_exception(exc)}\n", file=sys.stderr)
-            continue
-        _print_stats(session)
 
 
 def _repair_dangling_tool_use(session) -> int:
@@ -3167,6 +3228,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(format_traceback(exc))
         sys.stderr.flush()
         return 1
+
 
 
 if __name__ == "__main__":

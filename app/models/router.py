@@ -194,10 +194,12 @@ def call_create_message(
     discard_partial: Optional[Callable[[BaseException], None]] = None,
     on_retry: Optional[Callable[[int, float, BaseException], None]] = None,
     retry_until_cancelled: bool = False,
+    on_wait: Optional[Callable[[], None]] = None,
 ) -> ModelResponse:
     """转发 create_message，只在目标接受时才传可选关键字参数。
 
     重试相关参数只传给支持它们的 Router。测试替身和第三方实现可以继续使用旧签名。
+    on_wait 在调用线程等待请求时执行，供调用方节流刷新进度，不转发给 SDK。
     """
     kwargs: dict[str, Any] = {
         "tools": tools,
@@ -252,6 +254,8 @@ def call_create_message(
         try:
             kind, value = mailbox.get(timeout=0.02)
         except queue.Empty:
+            if on_wait is not None:
+                on_wait()
             continue
         cancel.raise_if_cancelled()
         if kind == "callback":
