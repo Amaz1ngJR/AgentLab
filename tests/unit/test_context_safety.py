@@ -94,7 +94,7 @@ def test_chunking_covers_middle_and_every_character_within_budget():
 
 def test_map_reduce_summarizes_every_chunk_and_counts_usage():
     model = SummaryModel()
-    compressor = ContextCompressor(model, summary_input_tokens=512)
+    compressor = ContextCompressor(model, summary_input_tokens=512, max_parallel_requests=1)
     messages = history()
     result = compressor.compact(messages, keep_recent=2)
     assert result.compacted
@@ -112,7 +112,7 @@ def test_overflow_retries_with_smaller_chunks_without_dropping_history():
                 raise ValueError("context_length_exceeded")
             return super().create_message(messages, **kwargs)
     model = OverflowOnce()
-    compressor = ContextCompressor(model, summary_input_tokens=1024)
+    compressor = ContextCompressor(model, summary_input_tokens=1024, max_parallel_requests=1)
     messages = history()
     assert compressor.compact(messages, keep_recent=2).compacted
     assert estimate_tokens(model.calls[1][0][0]["content"]) <= 512
@@ -126,7 +126,7 @@ def test_invalid_summary_retries_once_then_keeps_raw_user_constraints():
             return response
     messages = history()
     model = Invalid()
-    result = ContextCompressor(model).compact(messages, keep_recent=2)
+    result = ContextCompressor(model, max_parallel_requests=1).compact(messages, keep_recent=2)
     assert result.compacted and result.reason.startswith("local_fallback:")
     assert len(model.calls) == 2
     assert messages[1] == history()[0]
@@ -283,7 +283,8 @@ def test_compaction_reports_map_reduce_progress_and_format_retry():
             return super().create_message(messages, **kwargs)
 
     updates = []
-    result = ContextCompressor(RetryModel(), summary_input_tokens=512, timeout_seconds=120).compact(
+    result = ContextCompressor(RetryModel(), summary_input_tokens=512, timeout_seconds=120,
+                               max_parallel_requests=1).compact(
         history(), keep_recent=2, on_compaction_progress=updates.append)
     assert result.compacted
     assert any(p["attempt"] == 2 for p in updates)
@@ -307,10 +308,10 @@ def test_compaction_wait_progress_is_throttled(monkeypatch):
 
     monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(module, "call_create_message", call)
-    ContextCompressor(SummaryModel()).compact(
+    ContextCompressor(SummaryModel(), max_parallel_requests=1).compact(
         history(), keep_recent=2, on_compaction_progress=updates.append)
     first = [p for p in updates if p["round"] == 1 and p["chunk"] == 1]
-    assert [p["elapsed_seconds"] for p in first] == [0, 5]
+    assert [p["elapsed_seconds"] for p in first] == [0, 0, 5, 6]  # 开始、请求、心跳、完成
 
 
 def test_compaction_progress_renders_units_and_retry(capsys):
@@ -347,7 +348,7 @@ def test_context_manager_shares_one_deadline_across_budget_attempts(monkeypatch)
     assert sum(e.kind == events.CONTEXT_COMPACTION_PROGRESS for e in emitted) == 2
 
 
-@pytest.mark.parametrize("input_budget,expected_chunks", [(65536, 2), (131072, 2), (8192, 16)])
+@pytest.mark.parametrize("input_budget,expected_chunks", [(65536, 2), (131072, 1), (8192, 16)])
 def test_automatic_chunk_size_uses_safe_budget_without_losing_transcript(input_budget, expected_chunks):
     # A long transcript needs only two map requests on a sufficiently large window.
     model = SummaryModel()
@@ -362,7 +363,7 @@ def test_automatic_chunk_size_uses_safe_budget_without_losing_transcript(input_b
     calls = model.calls[:expected_chunks]
     assert "".join(call[0][0]["content"] for call in calls) == transcript
     assert all(estimate_tokens(call[0][0]["content"]) <= input_budget for call in model.calls)
-    assert len(model.calls) == expected_chunks + 1
+    assert len(model.calls) == expected_chunks + (expected_chunks > 1)
 
 
 def test_explicit_summary_chunk_limit_still_caps_large_model_window():
@@ -390,3 +391,76 @@ def test_compaction_time_budget_includes_merge_and_has_hard_cap(monkeypatch, tok
 
 def test_explicit_compaction_timeout_overrides_workload_budget():
     assert ContextCompressor(SummaryModel(), timeout_seconds=17).timeout_for(history(), 512) == 17
+
+
+
+def test_parallel_summaries_overlap_keep_source_order_and_dispatch_callbacks_on_owner():
+    import threading
+    transcript = "A" * 1200 + "B" * 1200
+    chunks = _split_transcript(transcript, 512)
+    assert len(chunks) == 2
+    barrier = threading.Barrier(2)
+    second_done = threading.Event()
+    owner = threading.get_ident()
+    callback_threads = []
+    merge_inputs = []
+
+    class ParallelModel(SummaryModel):
+        def create_message(self, messages, **kwargs):
+            text = messages[0]["content"]
+            if text in chunks:
+                barrier.wait(timeout=2)  # 串行实现会失败。
+                if text == chunks[0]:
+                    assert second_done.wait(2)
+                    goal = "FIRST"
+                else:
+                    second_done.set()
+                    goal = "SECOND"
+                kwargs["on_progress"]({"input_tokens": 2, "output_tokens": 1})
+            else:
+                merge_inputs.append(text)
+                goal = "MERGED"
+            return ModelResponse(text=json.dumps({"user_goal": goal, "handoff_note": "继续"}),
+                                 tool_calls=[], provider_payload=[],
+                                 usage={"input_tokens": 7, "output_tokens": 3})
+
+    compressor = ContextCompressor(ParallelModel(), summary_input_tokens=512)
+    obj = compressor._summarize(transcript, 1024,
+        lambda metrics: callback_threads.append(threading.get_ident()), CancelToken())
+    assert obj["user_goal"] == "MERGED"
+    assert merge_inputs[0].index("FIRST") < merge_inputs[0].index("SECOND")
+    assert compressor.last_usage == {"input_tokens": 21, "output_tokens": 9}
+    assert callback_threads and set(callback_threads) == {owner}
+
+
+def test_parallel_compaction_timeout_keeps_history_and_drops_late_callbacks():
+    import threading
+    release = threading.Event()
+    both_started = threading.Barrier(3)
+    callbacks = []
+
+    class Blocked(SummaryModel):
+        def create_message(self, messages, **kwargs):
+            both_started.wait(timeout=2)
+            release.wait(2)
+            kwargs["on_progress"]({"input_tokens": 999})
+            return super().create_message(messages, **kwargs)
+
+    messages = history()
+    original = copy.deepcopy(messages)
+    parent = CancelToken()
+    compressor = ContextCompressor(Blocked(), timeout_seconds=0.2, summary_input_tokens=512)
+    outcome = []
+    thread = threading.Thread(target=lambda: outcome.append(compressor.compact(
+        messages, keep_recent=2, cancel=parent, on_progress=callbacks.append)))
+    try:
+        thread.start()
+        both_started.wait(timeout=2)
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert outcome[0].code == "timeout"
+        assert messages == original and not parent.cancelled
+    finally:
+        release.set()
+        thread.join(timeout=2)
+    assert callbacks == []

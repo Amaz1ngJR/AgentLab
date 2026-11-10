@@ -473,7 +473,7 @@ class Executor:
                     if needs_approval and tool is not None:
                         if manager is not None and manager.long_run:
                             auto_execute = manager.auto_execute_active
-                        if auto_execute:
+                        if auto_execute and call.name != "request_confirmation":
                             approval_result = ApprovalResult(approved=True)
                         else:
                             approval_result = request_tool_approval(

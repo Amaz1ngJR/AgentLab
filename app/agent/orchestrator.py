@@ -473,6 +473,7 @@ class Orchestrator:
                                 self.store.update_status(task.id, "in_progress")
                             spawned = manager.spawn(
                                 spec.instruction, role=spec.role, read_only=spec.read_only,
+                                workspace_mode=spec.workspace_mode,
                                 max_steps=min(spec.max_steps - used.get("model_rounds", 0),
                                               manager.child_budget()[0]),
                                 max_tool_calls=min(spec.max_tool_calls - used.get("tool_calls", 0),

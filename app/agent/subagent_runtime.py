@@ -225,8 +225,7 @@ class SubagentRuntimeFactory:
             from app.agent.context_budget import ContextBudget
             from app.agent.context_compaction import ContextCompressor
             context = ContextManager(
-                ContextBudget.from_model(getattr(self.llm, "model", None),
-                                         getattr(self.llm, "context_size", None)),
+                ContextBudget.from_llm(self.llm),
                 ContextCompressor(model), on_event=forward,
             )
 

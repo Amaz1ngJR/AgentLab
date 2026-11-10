@@ -80,6 +80,7 @@ def _parse_spec(item: dict[str, Any], task_id: str, defaults: dict[str, Any]) ->
         role=role,
         dependencies=dependencies,
         read_only=bool(raw.get("read_only", role != "executor")),
+        workspace_mode=_as_str(raw.get("workspace_mode")) or "shared",
         worktree_id=_as_str(raw.get("worktree_id")) or None,
         tools=requested_tools,
         max_steps=max(1, _int(raw.get("max_steps"), defaults.get("max_steps", 8))),

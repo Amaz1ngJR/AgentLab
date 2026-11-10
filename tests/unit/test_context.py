@@ -136,14 +136,13 @@ def test_resolve_limit_prefers_declared():
     assert resolve_context_limit("claude-opus-4-8", declared_context_size=4096) == 4096
 
 
-def test_resolve_limit_by_model_prefix():
-    assert resolve_context_limit("claude-opus-4-8") == 200_000
-    assert resolve_context_limit("qwen2.5-coder:7b-instruct") == 32_000
+def test_resolve_limit_does_not_infer_from_model_name():
+    assert resolve_context_limit("claude-opus-4-8") == DEFAULT_CONTEXT_LIMIT
+    assert resolve_context_limit("qwen2.5-coder:7b-instruct") == DEFAULT_CONTEXT_LIMIT
 
 
-def test_resolve_limit_longest_prefix_wins():
-    # "claude-opus-4" 比 "claude" 更长,应优先(两者都映射 200k,这里验证不报错)
-    assert resolve_context_limit("claude-3-5-sonnet") == 200_000
+def test_new_model_in_known_family_uses_default():
+    assert resolve_context_limit("claude-3-5-sonnet") == DEFAULT_CONTEXT_LIMIT
 
 
 def test_resolve_limit_unknown_falls_back():
@@ -156,7 +155,7 @@ def test_resolve_limit_unknown_falls_back():
 
 def test_budget_from_model_sections_nonneg_and_reserved():
     b = ContextBudget.from_model("claude-opus-4-8")
-    assert b.model_context_limit == 200_000
+    assert b.model_context_limit == DEFAULT_CONTEXT_LIMIT
     assert b.reserved_output_tokens > 0
     for v in (b.system_and_tools_budget, b.memory_budget, b.summary_budget,
               b.recent_messages_budget, b.evidence_budget):

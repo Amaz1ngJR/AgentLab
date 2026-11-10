@@ -138,6 +138,22 @@ class OpenAICompatibleAdapter:
             timeout=cfg.timeout_seconds,
         )
 
+    def fetch_context_size(self) -> int | None:
+        # Ollama 的运行时分配可能小于模型训练窗口，只采信 /api/ps 的实际值。
+        # 其他兼容服务没有统一窗口字段，不猜测私有字段或抓取网页。
+        if self._cfg.provider != "ollama":
+            return None
+        import httpx
+        base_url = str(self._client.base_url).rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        client = self._client.with_options(base_url=base_url + "/", timeout=3, max_retries=0)
+        response = client.get("/api/ps", cast_to=httpx.Response)
+        for model in response.json().get("models", []):
+            if model.get("model") in {self.model, self.model + ":latest"}:
+                return model.get("context_length")
+        return None
+
     @property
     def model(self) -> str:
         return self._cfg.model

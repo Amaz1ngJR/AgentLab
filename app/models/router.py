@@ -10,6 +10,7 @@ import uuid
 from typing import Any, Callable, Optional
 
 from app.agent.cancel import CancelToken
+from app.models.context_window import ContextWindow, ContextWindowResolver
 from app.config.schemas import LLMConfig
 from app.models.provider_retry import ProviderCircuitBreaker, call_with_retry
 from app.models.protocol import (
@@ -35,6 +36,7 @@ class ModelRouter:
         retry_sleep: Callable[[float], None] = time.sleep,
     ):
         self._adapter = adapter
+        self._context_window = ContextWindowResolver(adapter)
         self._breaker = ProviderCircuitBreaker()
         self._retry_sleep = retry_sleep
         self._last_request: dict | None = None
@@ -80,8 +82,12 @@ class ModelRouter:
         return getattr(getattr(self._adapter, "_cfg", None), "profile_name", None)
 
     @property
-    def context_size(self) -> int | None:
-        return getattr(getattr(self._adapter, "_cfg", None), "context_size", None)
+    def context_size(self) -> int:
+        return self.context_window.tokens
+
+    @property
+    def context_window(self) -> ContextWindow:
+        return self._context_window.resolve()
 
     @property
     def capabilities(self) -> list[str]:

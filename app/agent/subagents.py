@@ -48,6 +48,7 @@ class SubagentSpec:
     file_scope: tuple[str, ...] = ()
     retry_limit: int = 0
     output_limit: int = 20_000
+    workspace_mode: str = "worktree"
 
 
 @dataclass

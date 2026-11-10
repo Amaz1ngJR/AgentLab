@@ -2,15 +2,79 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import tempfile
+import stat
 from pathlib import Path
 
 from app.agent.approval import request_tool_approval
 from app.agent.cancel import CancelToken
 from app.tools.registry import Tool, ToolExecutionError
 from app.workspace.worktree import WorktreeManager
+
+
+def scope_state(workspace: Path, scopes: tuple[str, ...]) -> dict[str, str]:
+    """Fingerprint scoped working files, independently of Git/index and other writers."""
+    workspace = workspace.resolve()
+    state = {}
+    for scope in scopes:
+        root = workspace / scope
+        if not root.resolve().is_relative_to(workspace):
+            raise ToolExecutionError("write scope escapes workspace")
+        paths = [root] if root.is_symlink() or not root.is_dir() else root.rglob("*")
+        for path in paths:
+            relative = path.relative_to(workspace)
+            if any(part.casefold() == ".git" for part in relative.parts):
+                continue
+            if path.is_symlink():
+                data = b"symlink:" + os.fsencode(os.readlink(path))
+            elif path.is_file():
+                data = b"file:" + path.read_bytes()
+            else:
+                continue
+            mode = stat.S_IMODE(path.lstat().st_mode)
+            state[relative.as_posix()] = hashlib.sha256(str(mode).encode() + b":" + data).hexdigest()
+    return state
+
+
+def _integrate_shared(result, *, workspace, tools, approval, checks, cancel, file_scope):
+    """Shared writes already exist: verify their frozen state, never replay a patch."""
+    from app.config.loader import use_workspace_root
+    expected = result.metrics.get("shared_artifact")
+    if not file_scope or expected is None or scope_state(workspace, file_scope) != expected:
+        raise ToolExecutionError("shared workspace artifact changed; review required")
+    shell = tools.get("shell")
+    if shell is None:
+        raise ToolExecutionError("verification requires an allowed shell tool")
+    evidence = []
+    for command in checks:
+        cancel.raise_if_cancelled()
+        args = {"command": command, "cwd": str(workspace), "timeout": 60}
+        with use_workspace_root(workspace):
+            action = shell.approval_action(args)
+            if action:
+                decision = request_tool_approval(approval, shell, action, args)
+                if decision.cancelled or decision.feedback:
+                    from app.agent.cancel import Cancelled
+                    raise Cancelled(decision.feedback or "verification approval cancelled")
+                if not decision.approved:
+                    raise ToolExecutionError("verification approval denied")
+            output, error = tools.execute("shell", args, approved_action=action, cancel=cancel)
+        evidence.append({"command": command, "output": output[:4000], "error": error})
+        if scope_state(workspace, file_scope) != expected:
+            raise ToolExecutionError("verification changed the deliverable; review required")
+        if error:
+            return {"status": "verification_failed", "workspace_mode": "shared", "evidence": evidence}
+    cancel.raise_if_cancelled()
+    if scope_state(workspace, file_scope) != expected:
+        raise ToolExecutionError("shared workspace artifact changed; review required")
+    result.delivery_status = "integrated"
+    artifact_sha = hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()
+    return {"status": "integrated", "workspace_mode": "shared", "artifact_sha256": artifact_sha,
+            "changed_files": result.changed_files,
+            "verification": evidence}
 
 
 def patch_bytes(manager: WorktreeManager, worktree) -> bytes:
@@ -33,11 +97,25 @@ def patch_bytes(manager: WorktreeManager, worktree) -> bytes:
 
 def _check_parent_paths(manager: WorktreeManager, result, changed: list[str]) -> None:
     """Allow unrelated edits, but never overwrite staged, tracked or new parent files."""
-    if manager.current_commit() != result.worktree.base_commit:
+    if manager.current_commit() != (result.worktree.parent_commit or result.worktree.base_commit):
         raise ToolExecutionError("parent workspace drifted: HEAD changed; review and rebase required")
     paths = [f":(literal){path}" for path in changed]
     if not paths:
         raise ToolExecutionError("no patch to integrate")
+    if result.worktree.parent_commit is not None:
+        # Baseline contains parent unstaged/untracked content, not merely HEAD/index.
+        current_tree = manager.snapshot_tree()
+        diff = manager._run_git("diff", "--quiet", result.worktree.base_commit,
+                                current_tree, "--", *paths, check=False)
+        if diff.returncode:
+            raise ToolExecutionError("parent workspace drifted in child paths; review required")
+        if result.worktree.parent_index_tree:
+            index_tree = manager._run_git("write-tree").stdout.strip()
+            diff = manager._run_git("diff", "--quiet", result.worktree.parent_index_tree,
+                                    index_tree, "--", *paths, check=False)
+            if diff.returncode:
+                raise ToolExecutionError("parent workspace drifted in child paths; index changed")
+        return
     for flags in ([], ["--cached"]):
         diff = subprocess.run(
             ["git", "diff", "--quiet", "--no-ext-diff", "--no-textconv", *flags,
@@ -61,10 +139,15 @@ def integrate_result(result, *, workspace: Path, tools, approval, checks: list[s
     from app.config.loader import use_workspace_root
     if result.delivery_status == "integrated":
         return {"status": "integrated", "already_integrated": True}
-    if result.status != "succeeded" or result.worktree is None:
+    if result.status != "succeeded":
         raise ToolExecutionError("only successful write results may be integrated")
     if not checks or any(not command.strip() for command in checks):
         raise ToolExecutionError("explicit verification commands are required")
+    if result.worktree is None:
+        if result.delivery_status != "applied_unverified":
+            raise ToolExecutionError("only successful write results may be integrated")
+        return _integrate_shared(result, workspace=workspace, tools=tools, approval=approval,
+                                 checks=checks, cancel=cancel, file_scope=file_scope)
     manager = WorktreeManager(workspace)
     review_baseline = manager.state_fingerprint()
     _check_parent_paths(manager, result, manager.changed_files(result.worktree))

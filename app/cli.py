@@ -1192,6 +1192,9 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
             text = (f"压缩上下文 · 第 {p['round']} 轮 · 分片 {p['chunk']}/{p['chunks']}"
                     f" · 已用 {_fmt_duration(elapsed)}"
                     f" · 剩余 {_fmt_duration(remaining)}")
+            if p.get("parallel", 1) > 1:
+                text = text.replace(f"分片 {p['chunk']}/{p['chunks']}",
+                                    f"分片完成 {p.get('completed', 0)}/{p['chunks']} · 并发 {p['parallel']}")
             if p.get("phase") == "retry":
                 text += f" · 网络重试 {p.get('retry', 1)}"
             elif p.get("attempt", 1) > 1:
@@ -1283,6 +1286,7 @@ def _handle_context_command(session: AgentSession, line: str) -> str:
         lines = [
             f"模型窗口   : {rep['model_context_limit']} tokens"
             f"(预留输出 {rep['reserved_output_tokens']})",
+            f"窗口来源   : {rep['context_limit_source']}",
             f"预计输入   : ~{rep['estimated_input_tokens']} tokens(~{pct}%) "
             f"[{rep['status']}]",
             f"输入构成   : 消息 ~{rep['message_tokens']} / system ~{rep['system_tokens']} / "
@@ -1571,10 +1575,7 @@ def _handle_model_command(router: SessionRouter, line: str) -> str:
 
             # 更新上下文管理器的预算和压缩器
             if router.current.context_manager is not None:
-                new_budget = ContextBudget.from_model(
-                    model=target_cfg.model,
-                    declared_context_size=target_cfg.context_size,
-                )
+                new_budget = ContextBudget.from_llm(new_llm)
                 # 获取可用的 skills 列表
                 available_skills = []
                 catalog = getattr(router.current, "skill_catalog", None)
@@ -1931,11 +1932,9 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         with_skills = skill_catalog.inject(base_prompt, agent_profile.skills)
         sys_prompt = inject_memories(with_skills, recent)
         # ── 上下文预算 + 压缩(§7.3)──────────────────────────────────────────
-        # 按当前模型窗口(profile 声明的 context_size 优先,否则按模型名查表)派生
+        # 按显式配置、提供方元数据、默认值解析模型窗口
         # 预算,在编排稳定点接近 85% 时自动压缩旧历史,避免长 run 撞 token 上限。
-        ctx_budget = ContextBudget.from_model(
-            model=cfg.model, declared_context_size=cfg.context_size,
-        )
+        ctx_budget = ContextBudget.from_llm(llm)
         # 获取可用的 skills 列表（skill_id）
         available_skills = [s.skill_id for s in skill_catalog.all()]
         ctx_manager = ContextManager(
@@ -2720,6 +2719,19 @@ def _format_pending_attachments(pending_clipboard: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _prompt_fragments(router: RuntimeService, label: str) -> FormattedText:
+    """每次重绘都重新读自动执行状态。
+
+    prompt_toolkit 支持 message 为可调用对象，会在每帧求值。若在轮次开始时把
+    文案固化成字符串快照，Ctrl+A 或审批菜单里的切换就不会反映到提示符上：
+    关闭后 🚀 继续留着，开启后又看不到 🚀，直到下一轮重新构建提示符。
+    """
+    session = router.current
+    if label and session is not None and session.auto_execute_enabled:
+        label += " 🚀"
+    return FormattedText([("class:prompt", f"{label} ❯ " if label else "❯ ")])
+
+
 def _repl(router: RuntimeService) -> int:
     """交互式对话。
 
@@ -2800,6 +2812,22 @@ def _repl(router: RuntimeService) -> int:
         # Image placeholders remain queued for the next turn; steering is text-only.
         return _IMAGE_PLACEHOLDER_RE.sub("", _extract_pasted_text(text, pending_clipboard)).strip()
 
+    def thread_label() -> str:
+        """Thread 摘要要查存储，按轮取一次即可：标题不会在一轮之内变化。"""
+        thread = router.current_thread_summary()
+        if not thread:
+            return ""
+        title = thread.get("title") or "?"
+        # 标题可能很长，截断到合理长度
+        if len(title) > 30:
+            title = title[:27] + "..."
+        return f"[{thread['thread_id'][:6]}·{title}]"
+
+    prompt_label = ""
+
+    def prompt_fragments():
+        return _prompt_fragments(router, prompt_label)
+
     def run_chat(session, text, *, resume=False, images=None):
         nonlocal queued_input, input_draft
         live = None
@@ -2823,22 +2851,7 @@ def _repl(router: RuntimeService) -> int:
             if composer is None:
                 _print_input_separator()
             # 动态构建 prompt:通过 RuntimeService 获取当前 Thread 摘要。
-            thread = router.current_thread_summary()
-            session = router.current
-            if thread:
-                sess_id = thread["thread_id"]
-                title = thread.get("title") or "?"
-                # 标题可能很长，截断到合理长度
-                if len(title) > 30:
-                    title = title[:27] + "..."
-                prompt_text = f"[{sess_id[:6]}·{title}]"
-                # 显示自动执行模式状态
-                if session and session.auto_execute_enabled:
-                    prompt_text += " 🚀"
-                prompt_text += " ❯ "
-            else:
-                prompt_text = "❯ "
-            prompt_fragments = FormattedText([("class:prompt", prompt_text)])
+            prompt_label = thread_label()
 
             try:
                 if queued_input is not None:

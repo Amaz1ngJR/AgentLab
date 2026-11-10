@@ -119,7 +119,7 @@ _STREAM_FAILURE_EVENT_TYPES = frozenset({
 _RETRYABLE_STREAM_FAILURE_CODES = frozenset({
     "server_error", "internal_error", "overloaded", "overloaded_error",
     "rate_limit_exceeded", "rate_limit", "timeout", "unavailable",
-    "service_unavailable",
+    "service_unavailable", "upstream_stream_read_error",
 })
 
 # 失败消息里出现这些字眼同样按瞬时故障处理。

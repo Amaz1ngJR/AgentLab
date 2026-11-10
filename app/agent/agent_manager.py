@@ -142,12 +142,15 @@ class AgentManager:
     def spawn(self, instruction: str, *, role: str = "research", max_steps: int | None = None,
               max_tool_calls: int | None = None, context: str = "", file_scope: list[str] | None = None,
               allowed_tools: list[str] | None = None, read_only: bool | None = None,
+              workspace_mode: str = "shared",
               timeout_seconds: float | None = None, output_limit: int = 20000, fork_history: bool = False,
               required_tools: list[str] | None = None, before_start=None,
               _resume_from: ChildRun | None = None, context_mode: str | None = None) -> dict:
         self.cancel.raise_if_cancelled()
         self.pump()
         with self._lock:
+            if workspace_mode not in {"shared", "worktree"}:
+                raise ToolExecutionError("invalid workspace_mode")
             if context_mode not in {None, "brief", "snapshot", "full_prefix"}:
                 raise ToolExecutionError("invalid context_mode")
             if fork_history and context_mode not in {None, "snapshot"}:
@@ -219,7 +222,7 @@ class AgentManager:
                         "required tools unavailable: " + ", ".join(sorted(missing))
                         + "; provide evidence in context or handle this task in the parent")
             child_llm = _resume_from.retained_llm if _resume_from is not None else fork()
-            spec = SubagentSpec(sid, instruction, role=role, read_only=read_only, file_scope=scopes,
+            spec = SubagentSpec(sid, instruction, role=role, read_only=read_only, file_scope=scopes, workspace_mode=workspace_mode,
                                tools=tuple(sorted(selected)),
                                max_steps=max_steps, max_tool_calls=max_tool_calls,
                                timeout_seconds=min(timeout_seconds, self.timeout, self.deadline - time.monotonic()),
@@ -252,10 +255,14 @@ class AgentManager:
                 child.context_diagnostics = {"mode": "resume", "truncated": False}
                 diagnostics = child.context_diagnostics
             worktree_manager = None
-            if not read_only:
+            shared_before = None
+            if not read_only and workspace_mode == "shared":
+                from app.agent.agent_delivery import scope_state
+                shared_before = scope_state(self.workspace, scopes)
+            if workspace_mode == "worktree":
                 worktree_manager = WorktreeManager(self.workspace)
                 child.base_fingerprint = worktree_manager.state_fingerprint()
-                child.worktree = worktree_manager.create(sid, require_clean_base=True)
+                child.worktree = worktree_manager.create(sid, detached=True, include_uncommitted=True)
             if prefix_messages is not None:
                 handoff += (f"\n角色: {role}。工作区: {self.workspace}。不得创建子 Agent、扩权、合并或推送。"
                             f"实际可用工具: {', '.join(sorted(selected - ({'shell'} if scopes else set())))}。")
@@ -285,9 +292,21 @@ class AgentManager:
                     result.worktree = child.worktree
                     result.workspace = child.worktree.path
                     result.base_state_fingerprint = child.base_fingerprint
-                    result.delivery_status = "pending_review"
+                    result.delivery_status = "none" if read_only else "pending_review"
                     try:
                         result.changed_files = worktree_manager.changed_files(child.worktree)
+                    except Exception as exc:
+                        result.status = "failed"
+                        result.error = f"artifact collection failed: {exc}"
+                if shared_before is not None:
+                    from app.agent.agent_delivery import scope_state
+                    result.workspace = self.workspace
+                    result.delivery_status = "applied_unverified"
+                    try:
+                        after = scope_state(self.workspace, scopes)
+                        result.changed_files = sorted(path for path in shared_before.keys() | after.keys()
+                                                      if shared_before.get(path) != after.get(path))
+                        result.metrics["shared_artifact"] = after
                     except Exception as exc:
                         result.status = "failed"
                         result.error = f"artifact collection failed: {exc}"
@@ -398,6 +417,8 @@ class AgentManager:
             raw = record.get("spec")
             if not isinstance(raw, dict) or record.get("parent_workspace") != str(self.workspace):
                 continue
+            raw = {**raw, "workspace_mode": raw.get("workspace_mode") or (
+                "worktree" if record.get("worktree") else "shared")}
             spec = SubagentSpec(**raw)
             sid = record["child_run_id"]
             status = record.get("execution_status", record.get("status", "interrupted"))
@@ -496,6 +517,7 @@ class AgentManager:
                 "result_id": sid, "revision": child.revision, "status": status,
                 "execution_status": status, "subagent_id": sid,
                 "context_diagnostics": dict(child.context_diagnostics),
+                "workspace_mode": child.spec.workspace_mode,
                 "session_id": child.session_id or sid,
                 "continuation_id": child.continuation_id,
                 "resumable": bool(child.retained_messages is not None and not child.closed
@@ -601,7 +623,7 @@ class AgentManager:
                     or child.retained_messages is None or child.retained_llm is None):
                 raise ToolExecutionError("session cannot resume; use the latest completed readonly result or create a new task")
             return self.spawn(
-                instruction, role=child.spec.role, read_only=True,
+                instruction, role=child.spec.role, read_only=True, workspace_mode=child.spec.workspace_mode,
                 allowed_tools=list(child.spec.tools), max_steps=max_steps,
                 max_tool_calls=max_tool_calls, timeout_seconds=timeout_seconds,
                 output_limit=child.spec.output_limit, _resume_from=child)
@@ -675,7 +697,7 @@ class AgentManager:
         finally:
             timer.cancel()
             unsubscribe()
-        if result.get("status") == "integrated" and not result.get("already_integrated"):
+        if child.worktree is not None and result.get("status") == "integrated" and not result.get("already_integrated"):
             # Advance sibling baselines only after an approved integration. Delivery
             # still checks each sibling's paths before accepting unrelated parent edits.
             baseline = WorktreeManager(self.workspace).state_fingerprint()
@@ -845,13 +867,14 @@ class AgentManager:
         def wrap(fn):
             return lambda args: json.dumps(fn(**args), ensure_ascii=False)
         return [
-            Tool("spawn_agent", "启动隔离子任务并立即返回 ID；只委派独立且有收益的任务。同模块子任务仍运行时优先 send_input 追加信息，避免重复调查；已结束的只读任务可使用 resume_agent 继续（返回新的执行 ID）。只读角色仅可读取工作区文件，无 shell/网络工具；所需材料由父级提供或自行处理。预算省略时继承父配置并分配剩余额度。executor 必须声明不重叠 file_scope，写入结果需验证审批后集成。",
+            Tool("spawn_agent", "启动子任务并立即返回 ID；默认共享父工作区，独立隔离可选 workspace_mode=worktree；只委派独立且有收益的任务。同模块子任务仍运行时优先 send_input 追加信息，避免重复调查；已结束的只读任务可使用 resume_agent 继续（返回新的执行 ID）。只读角色仅可读取工作区文件，无 shell/网络工具；所需材料由父级提供或自行处理。预算省略时继承父配置并分配剩余额度。executor 必须声明不重叠 file_scope。共享模式改动立即可见，integrate_agent 验证后确认交付；worktree 模式验证审批后应用补丁。",
                  schema({"instruction": string, "role": {"enum": ["research", "reviewer", "verifier", "executor"]},
                          "file_scope": {"type": "array", "items": string},
                          "context": {"type": "string", "maxLength": 10000, "description": CONTEXT_GUIDANCE},
                          "required_tools": {"type": "array", "items": string,
                                             "description": "本任务必需的工具名；启动前检查实际能力，缺失则报错，不授予额外工具"},
                          "read_only": {"type": "boolean"},
+                         "workspace_mode": {"enum": ["shared", "worktree"], "description": "默认 shared；worktree 使用包含当前改动的独立快照"},
                          "context_mode": {"enum": ["brief", "snapshot", "full_prefix"],
                                           "description": "默认精选交接；snapshot 是文本快照；full_prefix 尝试同模型原生前缀，不支持则回退并返回原因，工具仍受限"},
                          "fork_history": {"type": "boolean", "description": "显式附带有界脱敏的文本历史快照；默认不复制历史"},
@@ -870,9 +893,9 @@ class AgentManager:
                          "max_tool_calls": {"type": "integer", "minimum": 1, "maximum": self.tool_limit}}, ["sid", "instruction"]), wrap(self.resume)),
             Tool("send_input", "向指定活动子任务排队 steer；不会消费父邮箱。",
                  schema({"sid": string, "text": string, "mode": {"enum": ["steer", "interrupt"]}}, ["sid", "text"]), wrap(self.send_input)),
-            Tool("integrate_agent", "验证写入子任务、审批具体补丁并集成；不提交或推送，失败保持 pending_review。",
+            Tool("integrate_agent", "验证写入子任务：共享模式确认已在父工作区的成果；worktree 模式审批并应用补丁。不提交或推送。",
                  schema({"sid": string, "checks": {"type": "array", "items": string, "minItems": 1,
-                         "description": "必须是实际可执行的 shell 验证命令，在子任务 worktree 运行；不是审查说明、操作计划或承诺稍后验证"}},
+                         "description": "必须是实际可执行的 shell 验证命令，在子任务实际工作区运行；不是审查说明、操作计划或承诺稍后验证"}},
                         ["sid", "checks"]), wrap(self.integrate)),
             Tool("close_agent", "幂等关闭子任务并请求取消；cancelling 表示尚未退出，仍占用写范围。关闭且实际停止后释放写范围，父级可接手；保留结果和文件，不代表补丁已集成或任务成功。",
                  schema({"sid": string}, ["sid"]), wrap(self.close)),

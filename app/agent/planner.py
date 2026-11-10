@@ -43,7 +43,7 @@ PLANNER_SYSTEM = """你是任务规划器。把用户目标拆成可执行的子
 - subagent 对象格式为 {"id":"sa1","role":"research|reviewer|verifier|executor","instruction":"...","read_only":true,"tools":["read_file"]}。
 - research/reviewer/verifier 必须只读，只允许 read_file/list_dir/code_search；写入任务只能 role=executor，系统会在独立 worktree 中执行。
 - 依赖只声明在任务 dependencies 中，不要在 subagent 中重复声明另一套依赖。
-- 写子任务必须填写互不重叠的相对 file_scope，只通过受限文件工具修改；验证与集成由父级审批执行。
+- 写子任务必须填写互不重叠的相对 file_scope，只通过受限文件工具修改。默认 workspace_mode=shared，共享父工作区，改动立即可见但仍须父级验证确认；独立实验可选 worktree，快照包含当前未提交改动，父级验证审批后应用新增补丁。
 - 显式委派时按独立任务划分；没有独立任务或预算不足则保留主任务，并向用户说明原因。
 - 子任务 instruction 应包含目标、已确认事实及来源、代码定位、已完成工作、本次边界和交付要求；区分事实与假设，避免重复调查。
 - 先检查子任务实际工具：只读角色没有网络和 shell，需抓取外部资料或执行测试时由父级处理并提供结果，不委派缺少必要能力的任务。

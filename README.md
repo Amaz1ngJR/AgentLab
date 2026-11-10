@@ -392,6 +392,10 @@ SQLite 中的历史消息；旧消息仍保留图片路径引用，恢复该会�
 - 所有斜杠命令支持 Tab 自动补全；`/model switch` 会补全 `config/models.yaml` 里的 profile 名
 - `/model switch` 只改后续新建 session 的模型，当前会话不受影响；切完接 `/session new` 生效，或重启 `agentlab` 全局切换
 
+### 方案确认选项
+
+需要用户决定具体方案时，Agent 使用 `request_confirmation` 显示“同意”“拒绝”“修改方案”“完全托管自动执行”四个选项。选择修改方案会暂停当前轮，回到输入框补充要求；完全托管会开启当前会话自动执行。普通工具审批继续沿用已有授权规则。显式方案确认在自动执行模式下仍需用户选择，无交互终端时会停止等待人工处理，不会自动代答。
+
 ## 内置 RTK Shell 输出压缩
 
 AgentLab 内置了受 [RTK（Rust Token Killer）](https://github.com/rtk-ai/rtk)
@@ -461,6 +465,12 @@ agents:
 - `read_write` — 同 read，且会话结束时把对话摘要写入记忆，下次可检索
 
 会话、消息、记忆、工具执行审计存在 `data/agentlab.db`（SQLite，已 gitignore）。
+
+### 子 Agent 工作区
+
+`spawn_agent` 默认 `workspace_mode="shared"`，继承父工作区，能读取父级未提交的修改。写任务必须声明不重叠的 `file_scope`；改动立即出现在父工作区，状态为 `applied_unverified`，仍需父级调用 `integrate_agent` 提供验证命令后确认交付。运行中或取消中的写任务继续占用文件范围，父级不能同时改写该范围。关闭任务不会回滚已有文件改动。
+
+独立实验可显式设置 `workspace_mode="worktree"`。它创建 detached HEAD 工作区，以私有 Git 快照带入暂存、未暂存和未忽略的未跟踪文件，不要求父工作区干净，不创建命名分支，也不改变父分支或索引。交付时只应用子任务相对快照的新增补丁，父级相关文件或索引发生变化会阻止回收。忽略文件不自动复制。两种工作区模式均可用于只读任务；是否只读仍单独由 `read_only` 控制。
 
 ## 浏览器控制（Playwright MCP）
 
@@ -532,6 +542,14 @@ WORKSPACE_ROOT=/Users/you/some-project
 | `config/models.yaml` | （直接用） | 模型 profile 注册表 |
 | `config/agents.example.yaml` | `config/agents.yaml` | 多 Agent 定义 |
 | `config/mcp_servers.example.yaml` | `config/mcp_servers.yaml` | MCP server（如 Playwright） |
+
+### 上下文窗口来源
+
+窗口按 `LLM_CONTEXT_SIZE` 环境变量 → profile 的 `params.context_size` → 提供方元数据 → 默认 `64000` tokens 的顺序解析，不再按模型名称猜测。
+
+当前支持 Anthropic Models API 的 `max_input_tokens`，以及 Ollama `/api/ps` 返回的已加载模型实际 `context_length`。OpenAI 和其他兼容服务没有统一可用的窗口元数据时，使用显式配置或默认值。代理返回 HTML、接口缺失、字段非法或查询失败也会回退。默认值是未验证的兜底值，不代表模型的真实窗口；已知部署上限时应显式配置。
+
+元数据按路由器实例隔离缓存：成功 10 分钟、缺失或失败 1 分钟。查询使用 3 秒超时并关闭自动重试；显式配置不会触发查询。`/context` 显示窗口来源：`config`、`provider` 或 `default`。
 
 ## 安全
 

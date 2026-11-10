@@ -182,6 +182,9 @@ class AgentSession:
         self.tools = tools
         self.approval: ApprovalPolicy = approval or AutoApprove()
         self.system_prompt = system_prompt
+        if tools.get("request_confirmation") is not None:
+            from app.tools.builtin.confirmation import CONFIRMATION_GUIDANCE
+            self.system_prompt += "\n\n" + CONFIRMATION_GUIDANCE
         if max_steps <= 0:
             raise ValueError("max_steps 必须 > 0")
         if max_task_steps is not None and max_task_steps <= 0:
@@ -281,6 +284,10 @@ class AgentSession:
         self.system_prompt = (
             f"{base_prompt}\n\n{workflow}" if workflow else base_prompt
         )
+        if self.tools.get("request_confirmation") is not None:
+            from app.tools.builtin.confirmation import CONFIRMATION_GUIDANCE
+            if CONFIRMATION_GUIDANCE not in self.system_prompt:
+                self.system_prompt += "\n\n" + CONFIRMATION_GUIDANCE
         if self._orch is not None:
             self._orch._system = self.system_prompt
 
@@ -912,7 +919,7 @@ class AgentSession:
                         approval_result = None
                         if approval_action and tool is not None:
                             # 全自动执行模式：跳过审批直接放行
-                            if self._auto_execute_enabled:
+                            if self._auto_execute_enabled and call.name != "request_confirmation":
                                 approval_result = ApprovalResult(approved=True)
                             else:
                                 approval_result = request_tool_approval(

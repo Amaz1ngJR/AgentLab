@@ -23,6 +23,9 @@ import re
 import math
 import threading
 import time
+import queue
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -411,14 +414,16 @@ class ContextCompressor:
     timeout_seconds 可显式限制整次压缩；默认按分片及合并请求数预留时间，
     每次请求预留 120 秒，整次最多 600 秒，开始后不续期。
     超时不使用有损本地兜底，保留原始历史；后台迟到响应由请求隔离层丢弃。
-    默认按调用方安全输入预算分片（最多 65536 tokens）；未知窗口时使用 4096。
+    默认利用调用方的完整安全输入预算；未知窗口时使用 4096。
+    必须分片时最多并发两个摘要请求，合并仍按原始历史顺序。
     """
 
     def __init__(self, llm, system: str = COMPRESSION_SYSTEM,
                  model_profile: str = "", allow_local_fallback: bool = True,
                  available_skills: list[str] | None = None,
                  summary_input_tokens: int | None = None,
-                 timeout_seconds: float | None = None):
+                 timeout_seconds: float | None = None,
+                 max_parallel_requests: int = 2):
         self._llm = llm
         self._system = system
         self._model_profile = model_profile
@@ -428,12 +433,15 @@ class ContextCompressor:
             raise ValueError("summary_input_tokens must be at least 256")
         if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
             raise ValueError("timeout_seconds must be finite and positive")
+        if max_parallel_requests < 1:
+            raise ValueError("max_parallel_requests must be positive")
+        self.max_parallel_requests = max_parallel_requests
         self.timeout_seconds = timeout_seconds
         self._summary_input_tokens = summary_input_tokens
         self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
 
     def _input_limit(self, input_token_budget: int | None) -> int:
-        preferred = self._summary_input_tokens or (65536 if input_token_budget else 4096)
+        preferred = self._summary_input_tokens or (input_token_budget or 4096)
         return min(preferred, input_token_budget or preferred)
 
     def timeout_for(self, messages: list[dict[str, Any]], input_token_budget: int | None) -> float:
@@ -610,53 +618,121 @@ class ContextCompressor:
                 on_compaction_progress({**state, "elapsed_seconds": now - started,
                                         "remaining_seconds": max(0, deadline - now)})
 
+        def request(index, chunk, emit, token):
+            usage = {"input_tokens": 0, "output_tokens": 0}
+            for attempt in range(2):
+                token.raise_if_cancelled()
+                emit("status", {"chunk": index, "attempt": attempt + 1, "phase": "request"})
+                response = call_create_message(
+                    self._llm, [{"role": "user", "content": chunk}],
+                    tools=None, system=self._system, max_tokens=output_tokens,
+                    on_progress=lambda metrics: emit("metrics", (index, metrics)), cancel=token,
+                    on_wait=lambda: emit("wait", {}),
+                    on_retry=lambda attempt, delay, exc: emit("status", {
+                        "chunk": index, "phase": "retry", "retry": attempt, "retry_delay": delay}),
+                )
+                for key in usage:
+                    usage[key] += (getattr(response, "usage", None) or {}).get(key, 0)
+                obj = _extract_json(getattr(response, "text", "") or "")
+                if (_is_valid_summary(obj)
+                        and getattr(response, "finish_reason", None) not in {"length", "max_tokens"}):
+                    return obj, usage
+            raise ValueError("invalid_summary")
+
         for round_index in range(8):
             chunks = _split_transcript(text, input_limit)
-            summaries = []
-            overflow = False
-            for chunk_index, chunk in enumerate(chunks, 1):
-                obj = None
-                for attempt in range(2):
-                    report(True, round=round_index + 1, chunk=chunk_index,
-                           chunks=len(chunks), attempt=attempt + 1, phase="request")
+            results = [None] * len(chunks)
+            snapshots = {}
+            finished_indices = set()
+            base_usage = dict(self.last_usage)
+            completed = 0
+            report(True, round=round_index + 1, chunk=1, chunks=len(chunks),
+                   completed=0, parallel=min(len(chunks), self.max_parallel_requests),
+                   attempt=1, phase="request")
+
+            def emit(kind, value):
+                if kind == "metrics":
+                    index, metrics = value
+                    if index in finished_indices:
+                        return
+                    snapshots[index] = metrics
+                    if on_progress is not None:
+                        on_progress({key: base_usage[key] + sum(
+                            metrics.get(key, 0) for metrics in snapshots.values())
+                            for key in base_usage})
+                elif kind == "status":
+                    if value.get("chunk") not in finished_indices:
+                        report(True, **value)
+                else:
+                    report()
+
+            def accept(index, result):
+                nonlocal completed
+                obj, usage = result
+                results[index - 1] = obj
+                for key in self.last_usage:
+                    self.last_usage[key] += usage[key]
+                completed += 1
+                # 最终实际用量覆盖该分片的流式估算，其他分片继续保留。
+                emit("metrics", (index, usage))
+                finished_indices.add(index)
+                report(True, chunk=index, completed=completed, phase="completed")
+
+            try:
+                if len(chunks) == 1 or self.max_parallel_requests == 1:
+                    for index, chunk in enumerate(chunks, 1):
+                        accept(index, request(index, chunk, emit, cancel))
+                else:
+                    mailbox = queue.Queue()
+                    batch_cancel = CancelToken()
+                    unsubscribe = cancel.add_callback(lambda: batch_cancel.cancel("parent"))
+                    pool = ThreadPoolExecutor(max_workers=self.max_parallel_requests,
+                                              thread_name_prefix="agentlab-summary")
+                    pending = {}
+                    next_index = 1
+
+                    def launch(index):
+                        context = contextvars.copy_context()
+                        pending[pool.submit(context.run, request, index, chunks[index - 1],
+                                            lambda kind, value: mailbox.put((kind, value)),
+                                            batch_cancel)] = index
+
                     try:
-                        response = call_create_message(
-                            self._llm, [{"role": "user", "content": chunk}],
-                            tools=None, system=self._system, max_tokens=output_tokens,
-                            on_progress=on_progress, cancel=cancel,
-                            on_wait=report,
-                            on_retry=lambda attempt, delay, exc: report(
-                                True, phase="retry", retry=attempt, retry_delay=delay),
-                        )
-                    except Cancelled:
-                        raise
-                    except Exception as exc:
-                        code = str(getattr(exc, "code", "")) + " " + str(exc)
-                        if any(marker in code.lower() for marker in (
-                            "context_length_exceeded", "context_window_exceeded",
-                            "maximum context length", "context window exceeded",
-                        )) and input_limit > 256:
-                            input_limit = max(256, input_limit // 2)
-                            overflow = True
-                            break
-                        # Router 负责网络退避重试，避免在压缩层重复放大重试次数。
-                        raise
-                    for key in self.last_usage:
-                        self.last_usage[key] += (getattr(response, "usage", None) or {}).get(key, 0)
-                    obj = _extract_json(getattr(response, "text", "") or "")
-                    if _is_valid_summary(obj) and getattr(response, "finish_reason", None) not in {"length", "max_tokens"}:
-                        break
-                    obj = None
-                if overflow:
-                    break
-                if not _is_valid_summary(obj):
-                    raise ValueError("invalid_summary")
-                summaries.append(obj)
-            if overflow:
-                continue  # 按更小的分块重新覆盖全文，不丢弃旧消息。
-            if len(summaries) == 1:
-                return summaries[0]
-            merged = redact(json.dumps(summaries, ensure_ascii=False))
+                        while next_index <= min(len(chunks), self.max_parallel_requests):
+                            launch(next_index)
+                            next_index += 1
+                        while pending:
+                            report()
+                            try:
+                                emit(*mailbox.get(timeout=0.02))
+                            except queue.Empty:
+                                pass
+                            for future in list(pending):
+                                if future.done():
+                                    index = pending.pop(future)
+                                    accept(index, future.result())
+                                    if next_index <= len(chunks):
+                                        launch(next_index)
+                                        next_index += 1
+                        # 丢弃最后已完成分片的旧流式快照，避免覆盖实际累计用量。
+                    finally:
+                        batch_cancel.cancel("batch_finished")
+                        unsubscribe()
+                        pool.shutdown(wait=False, cancel_futures=True)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                code = str(getattr(exc, "code", "")) + " " + str(exc)
+                if any(marker in code.lower() for marker in (
+                    "context_length_exceeded", "context_window_exceeded",
+                    "maximum context length", "context window exceeded",
+                )) and input_limit > 256:
+                    input_limit = max(256, input_limit // 2)
+                    continue
+                raise
+            if len(results) == 1:
+                return results[0]
+            merged = redact(json.dumps(results, ensure_ascii=False))
             if estimate_tokens(merged) >= estimate_tokens(text):
                 raise ValueError("summary_did_not_shrink")
             text = merged

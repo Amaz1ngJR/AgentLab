@@ -104,5 +104,28 @@ def test_legacy_path_ignores_unset_cancel_token():
     assert llm.create_message.called
 
 
+def test_prompt_rocket_follows_live_toggle():
+    """提示符每次重绘都要读实时状态，不能在轮次开始时固化成快照。
+
+    回归测试：Ctrl+A 在 prompt 渲染之后才切换模式时，关掉后 🚀 仍留在提示符上，
+    打开后又看不到 🚀，要等下一轮重新构建提示符才刷新。
+    """
+    from types import SimpleNamespace
+    from app import cli
+
+    session = SimpleNamespace(auto_execute_enabled=False)
+    router = SimpleNamespace(current=session)
+
+    def text():
+        return cli._prompt_fragments(router, "[61fbbd·zlm_1]")[0][1]
+
+    assert text() == "[61fbbd·zlm_1] ❯ "
+    session.auto_execute_enabled = True
+    assert "🚀" in text()
+    session.auto_execute_enabled = False
+    assert "🚀" not in text()
+    assert cli._prompt_fragments(SimpleNamespace(current=None), "")[0][1] == "❯ "
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

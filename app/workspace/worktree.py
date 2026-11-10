@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +34,9 @@ class WorktreeInfo:
     base_commit: str
     is_dirty: bool = False
     auto_cleanup: bool = True
+    detached: bool = False
+    parent_commit: str | None = None
+    parent_index_tree: str | None = None
 
 
 class WorktreeManager:
@@ -83,7 +88,25 @@ class WorktreeManager:
         result = self._run_git("status", "--porcelain", "--", ".", ":(exclude)data/worktrees")
         return bool(result.stdout.strip())
 
-    def create(self, worktree_id: str, require_clean_base: bool = False) -> WorktreeInfo:
+    def snapshot_tree(self) -> str:
+        """Capture working files and nonignored untracked files using a temporary index."""
+        fd, index = tempfile.mkstemp(prefix="agentlab-baseline-")
+        os.close(fd)
+        os.unlink(index)
+        env = {**os.environ, "GIT_INDEX_FILE": index}
+        try:
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=self.repo_root, env=env,
+                                      capture_output=True, check=True).stdout.decode().strip()
+            git("read-tree", "HEAD")
+            git("add", "-A", "--", ".", ":(exclude)data/worktrees")
+            return git("write-tree")
+        finally:
+            Path(index).unlink(missing_ok=True)
+            Path(index + ".lock").unlink(missing_ok=True)
+
+    def create(self, worktree_id: str, require_clean_base: bool = False, *,
+               detached: bool = False, include_uncommitted: bool = False) -> WorktreeInfo:
         """创建隔离 worktree。
 
         Args:
@@ -110,6 +133,19 @@ class WorktreeManager:
 
         base_branch = self._get_current_branch()
         base_commit = self._get_current_commit()
+        parent_commit = base_commit if include_uncommitted else None
+        parent_index_tree = self._run_git("write-tree").stdout.strip() if include_uncommitted else None
+        if include_uncommitted:
+            fingerprint = self.state_fingerprint()
+            tree = self.snapshot_tree()
+            # A private Git object, not a commit on the user's branch or index.
+            base_commit = self._run_git(
+                "-c", "user.name=AgentLab", "-c", "user.email=agentlab@localhost",
+                "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", parent_commit,
+                "-m", "AgentLab isolated workspace baseline",
+            ).stdout.strip()
+            if self.state_fingerprint() != fingerprint:
+                raise ValueError("工作区在快照期间发生变化，请重试")
 
         # worktree 路径：data/worktrees/<worktree_id>
         worktree_path = self.repo_root / "data" / "worktrees" / worktree_id
@@ -122,7 +158,10 @@ class WorktreeManager:
         # 创建新分支并关联 worktree
         branch_name = f"worktree/{worktree_id}"
         try:
-            self._run_git("worktree", "add", "-b", branch_name, str(worktree_path), base_commit)
+            if detached:
+                self._run_git("worktree", "add", "--detach", str(worktree_path), base_commit)
+            else:
+                self._run_git("worktree", "add", "-b", branch_name, str(worktree_path), base_commit)
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(f"创建 worktree 失败: {exc.stderr}") from exc
 
@@ -131,6 +170,7 @@ class WorktreeManager:
             path=worktree_path,
             base_branch=base_branch,
             base_commit=base_commit,
+            detached=detached, parent_commit=parent_commit, parent_index_tree=parent_index_tree,
             is_dirty=False,
         )
 
@@ -278,9 +318,10 @@ class WorktreeManager:
             args.append(str(worktree.path))
             self._run_git(*args)
 
-            # 删除分支
-            branch_name = f"worktree/{worktree.worktree_id}"
-            self._run_git("branch", "-D", branch_name, check=False)
+            # Detached worktrees never own a named branch.
+            if not worktree.detached:
+                branch_name = f"worktree/{worktree.worktree_id}"
+                self._run_git("branch", "-D", branch_name, check=False)
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(f"删除 worktree 失败: {exc.stderr}") from exc
 
@@ -295,6 +336,8 @@ class WorktreeManager:
         Returns:
             合并命令建议
         """
+        if worktree.detached:
+            return "独立快照工作区没有命名分支；请使用 integrate_agent 验证并回收新增补丁。"
         branch_name = f"worktree/{worktree.worktree_id}"
         if self.check_dirty(worktree):
             return (

@@ -84,6 +84,7 @@ class ContextManager:
         b = self.budget
         return {
             "model_context_limit": b.model_context_limit,
+            "context_limit_source": b.context_limit_source,
             "reserved_output_tokens": b.reserved_output_tokens,
             "safe_input_limit": b.safe_input_limit,
             "input_budget": b.input_budget,

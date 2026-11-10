@@ -90,6 +90,11 @@ class AutoApprove:
         action: str,
         tool_input: dict[str, Any],
     ) -> ApprovalResult:
+        if tool.name == "request_confirmation":
+            import sys
+            if not sys.stdin.isatty():
+                return ApprovalResult(False, feedback="该方案需要用户交互确认，请在交互终端继续。", cancelled=True)
+            return InteractivePolicy().request_tool(tool, action, tool_input)
         return ApprovalResult(approved=True)
 
 
@@ -144,7 +149,7 @@ class InteractivePolicy:
     # workspace 越界和交互终端执行必须逐次确认，不能被会话白名单吞掉。
     # workspace 内 shell 可在用户明确选择后按受限命令前缀记住到当前 session。
     _NON_PERSISTENT_ACTIONS = {
-        "shell", "bash", "terminal_open", "terminal_send", "clear_session_images", "integrate_agent",
+        "shell", "bash", "terminal_open", "terminal_send", "clear_session_images", "integrate_agent", "request_confirmation",
     }
     _NON_PERSISTENT_RISKS = {
         "browser_control",
@@ -162,6 +167,10 @@ class InteractivePolicy:
     def _format_tool_args(self, tool_name: str, tool_input: dict[str, Any]) -> list[str]:
         """格式化工具参数，参考 Claude Code 简洁风格。"""
         lines = []
+
+        if tool_name == "request_confirmation":
+            return ["● " + str(tool_input.get("summary", "确认方案")),
+                    str(tool_input.get("details", ""))]
 
         # shell/bash: 显示 command + 其他参数
         if tool_name in ("shell", "bash") and "command" in tool_input:
@@ -266,6 +275,10 @@ class InteractivePolicy:
 
         返回 (choices, persist_label) 元组。
         """
+        if tool_name == "request_confirmation":
+            return [("同意，执行该方案", "yes"), ("拒绝该方案", "no"),
+                    ("修改方案（返回输入框补充要求）", "modify"),
+                    ("完全托管自动执行（当前会话）", "enable_auto_execute")], ""
         choices = [("接受", "yes")]
 
         # "自动执行"固定放在第二位：用户要求每个审批对话框都能一眼看到这个入口。

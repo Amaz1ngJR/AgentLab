@@ -19,29 +19,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Optional
 
-# ── 模型上下文窗口表 ──────────────────────────────────────────────────────────
-# 云端模型的窗口不写在 config/models.yaml 里(那里只有本地模型的 context_size),
-# 所以按模型名前缀给一张保守的查找表。匹配不到时退回 DEFAULT_CONTEXT_LIMIT。
-# 数值取"安全可用"而非厂商标称上限,给 provider 端的隐藏 token 留余量。
-_MODEL_CONTEXT_LIMITS: dict[str, int] = {
-    "claude-opus-4": 200_000,
-    "claude-sonnet-4": 200_000,
-    "claude-haiku-4": 200_000,
-    "claude-3-5": 200_000,
-    "claude-3": 200_000,
-    "claude": 200_000,
-    "gpt-5": 256_000,
-    "gpt-4o": 128_000,
-    "gpt-4-turbo": 128_000,
-    "gpt-4": 128_000,
-    "gpt-3.5": 16_000,
-    "qwen2.5": 32_000,
-    "qwen": 32_000,
-    "deepseek": 64_000,
-}
-
-# 匹配不到任何已知模型、且 profile 未声明 context_size 时的保守默认窗口。
-DEFAULT_CONTEXT_LIMIT = 64_000
+from app.models.context_window import DEFAULT_CONTEXT_LIMIT, ContextWindow, positive_int
 
 # 阈值基于扣除输出预留后的输入预算，另留 2% 给估算误差与协议开销。
 INPUT_SAFETY_RATIO = 0.98
@@ -53,25 +31,8 @@ def resolve_context_limit(
     model: str | None = None,
     declared_context_size: Optional[int] = None,
 ) -> int:
-    """决定当前模型可用的上下文窗口(token 数)。
-
-    优先级:
-      1. profile 显式声明的 context_size(本地模型在 models.yaml 里有)——最可信,
-         因为本地模型的窗口是用户在 Ollama/部署时定死的。
-      2. 按模型名前缀查 _MODEL_CONTEXT_LIMITS(云端模型用)。
-      3. 都没有 → DEFAULT_CONTEXT_LIMIT(偏小,促使更早压缩,安全)。
-    """
-    if declared_context_size and declared_context_size > 0:
-        return int(declared_context_size)
-    name = (model or "").lower().replace(".", "-").replace("_", "-")
-    # 前缀匹配:取最长匹配前缀,避免 "claude" 抢在 "claude-opus-4" 前面命中
-    best: tuple[int, int] | None = None  # (前缀长度, limit)
-    for prefix, limit in _MODEL_CONTEXT_LIMITS.items():
-        norm_prefix = prefix.replace(".", "-").replace("_", "-")
-        if name.startswith(norm_prefix):
-            if best is None or len(norm_prefix) > best[0]:
-                best = (len(norm_prefix), limit)
-    return best[1] if best else DEFAULT_CONTEXT_LIMIT
+    """纯离线兼容入口；模型名称不用于猜测窗口。运行时使用 from_llm。"""
+    return positive_int(declared_context_size) or DEFAULT_CONTEXT_LIMIT
 
 
 # ── token 估算 ────────────────────────────────────────────────────────────────
@@ -130,6 +91,7 @@ class ContextBudget:
     summary_budget: int
     recent_messages_budget: int
     evidence_budget: int
+    context_limit_source: str = "default"
 
     @property
     def input_budget(self) -> int:
@@ -160,6 +122,16 @@ class ContextBudget:
         return "ok"
 
     @classmethod
+    def from_llm(cls, llm) -> "ContextBudget":
+        """使用路由器已解析的能力；旧测试替身仍可只提供 context_size。"""
+        window = getattr(llm, "context_window", None)
+        if isinstance(window, ContextWindow):
+            budget = cls.from_model(declared_context_size=window.tokens)
+            budget.context_limit_source = window.source
+            return budget
+        return cls.from_model(declared_context_size=getattr(llm, "context_size", None))
+
+    @classmethod
     def from_model(
         cls,
         model: str | None = None,
@@ -185,6 +157,7 @@ class ContextBudget:
         #   system+tools 15% / memory 10% / summary 15% / recent 50% / evidence 10%
         return cls(
             model_context_limit=limit,
+            context_limit_source="config" if positive_int(declared_context_size) else "default",
             reserved_output_tokens=reserved,
             system_and_tools_budget=int(usable * 0.15),
             memory_budget=int(usable * 0.10),

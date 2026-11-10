@@ -251,3 +251,31 @@ def test_provider_retry_maps_to_structured_item():
     # RunEvent.payload 会被整体收进 item.payload 的 "payload" 字段
     assert item.payload["payload"]["attempt"] == 1
     assert item.payload["payload"]["delay"] == 1.5
+
+
+def test_upstream_failed_event_retries_and_discards_partial_output():
+    from types import SimpleNamespace
+    from app.models.openai_adapter import ProviderStreamError, _stream_failure
+
+    class Gateway(StreamingCutThenOk):
+        def create_message(self, messages, **kwargs):
+            try:
+                return super().create_message(messages, **kwargs)
+            except RemoteProtocolError:
+                detail, retryable = _stream_failure(SimpleNamespace(
+                    type="response.failed", response=SimpleNamespace(error=SimpleNamespace(
+                        code="upstream_stream_read_error", message="Upstream response stream was interrupted"))))
+                raise ProviderStreamError(detail, retryable=retryable)
+
+    adapter = Gateway()
+    chunks, retries, discards = [], [], []
+    def discard(exc):
+        discards.append(type(exc).__name__)
+        chunks.clear()
+    response = make_router(adapter).create_message(
+        [{"role": "user", "content": "hello"}], on_text_delta=chunks.append,
+        on_retry=lambda *args: retries.append(args), discard_partial=discard,
+    )
+    assert adapter.calls == 2
+    assert len(retries) == 1 and discards == ["ProviderStreamError"]
+    assert response.text == adapter.full == "".join(chunks)

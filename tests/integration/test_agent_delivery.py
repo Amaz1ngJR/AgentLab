@@ -30,9 +30,13 @@ def make_manager(git_repo):
                         workspace=git_repo, cancel=CancelToken(), allowed=True)
 
 
+def spawn_isolated(manager, *args, **kwargs):
+    return manager.spawn(*args, workspace_mode="worktree", **kwargs)
+
+
 def test_writer_validates_and_integrates_once_without_parent_commit(git_repo):
     m = make_manager(git_repo)
-    sid = m.spawn("创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
     assert m.wait([sid], 3)["agents"][0]["status"] == "succeeded"
     assert not (git_repo / "child.txt").exists()
     result = m.integrate(sid, ["test -f child.txt"])
@@ -44,7 +48,7 @@ def test_writer_validates_and_integrates_once_without_parent_commit(git_repo):
 
 def test_integration_denial_or_failed_verification_never_applies_patch(git_repo):
     m = make_manager(git_repo)
-    sid = m.spawn("创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     assert m.integrate(sid, ["exit 1"])["status"] == "verification_failed"
     assert not (git_repo / "child.txt").exists()
@@ -55,22 +59,19 @@ def test_integration_denial_or_failed_verification_never_applies_patch(git_repo)
     m.finish()
 
 
-def test_writer_rejects_dirty_baseline_and_overlapping_scopes(git_repo):
+def test_writer_accepts_dirty_baseline_but_rejects_overlapping_scopes(git_repo):
     m = make_manager(git_repo)
     (git_repo / "dirty.txt").write_text("user changes")
-    with pytest.raises(ValueError, match="未提交"):
-        m.spawn("write", role="executor", file_scope=["child.txt"])
-    (git_repo / "dirty.txt").unlink()
-    sid = m.spawn("创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     with pytest.raises(ToolExecutionError, match="conflicts"):
-        m.spawn("again", role="executor", file_scope=["child.txt"])
+        spawn_isolated(m, "again", role="executor", file_scope=["child.txt"])
     m.finish()
 
 
 def test_validation_cannot_change_the_artifact_it_claimed_to_validate(git_repo):
     m = make_manager(git_repo)
-    sid = m.spawn("创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     with pytest.raises(ToolExecutionError, match="verification changed"):
         m.integrate(sid, ["printf changed > child.txt"])
@@ -81,7 +82,7 @@ def test_validation_cannot_change_the_artifact_it_claimed_to_validate(git_repo):
 
 def test_delivery_record_contains_artifact_and_revision(git_repo):
     m = make_manager(git_repo)
-    sid = m.spawn("创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     assert m.unresolved()
     assert m.snapshot(sid)["changed_files"] == ["child.txt"]
@@ -97,13 +98,13 @@ def test_delivery_record_contains_artifact_and_revision(git_repo):
 def test_git_metadata_is_not_a_permitted_write_scope(git_repo):
     m = make_manager(git_repo)
     with pytest.raises(ToolExecutionError, match="metadata"):
-        m.spawn("overwrite", role="executor", file_scope=[".git"])
+        spawn_isolated(m, "overwrite", role="executor", file_scope=[".git"])
     m.finish()
 
 
 def test_resume_can_integrate_saved_artifact_without_reexecuting_writer(git_repo):
     m = make_manager(git_repo)
-    sid = m.spawn("创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     saved = m.records()
     m.finish()
@@ -120,7 +121,7 @@ def test_resume_can_integrate_saved_artifact_without_reexecuting_writer(git_repo
 
 def test_interrupted_recovery_does_not_claim_worker_is_alive(git_repo):
     m = make_manager(git_repo)
-    sid = m.spawn("创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     saved = m.records()
     saved[0]["status"] = saved[0]["execution_status"] = "cancelling"
@@ -149,8 +150,8 @@ def test_two_disjoint_writers_can_integrate_sequentially_without_baseline_false_
             ])
     m = make_manager(git_repo)
     m.llm = Writers()
-    a = m.spawn("create a", role="executor", file_scope=["file1.txt"])["child_run_id"]
-    b = m.spawn("create b", role="executor", file_scope=["file2.txt"])["child_run_id"]
+    a = spawn_isolated(m, "create a", role="executor", file_scope=["file1.txt"])["child_run_id"]
+    b = spawn_isolated(m, "create b", role="executor", file_scope=["file2.txt"])["child_run_id"]
     for sid in [a, b]:
         m.wait([sid], 3)
     assert m.integrate(a, ["test -f file1.txt"])["status"] == "integrated"
@@ -186,7 +187,7 @@ def test_task_write_delivery_runs_parent_verification_before_releasing_dependent
                     {"id": "finish", "content": "verify integrated", "dependencies": ["write"]},
                 ]}))
             text = json.dumps(messages, ensure_ascii=False)
-            if "patch_sha256" in text:
+            if "patch_sha256" in text or "artifact_sha256" in text:
                 return response("integrated and verified")
             import re
             sid = re.search(r'[a-f0-9]{32}-[a-f0-9]{12}', text)[0]
@@ -195,7 +196,7 @@ def test_task_write_delivery_runs_parent_verification_before_releasing_dependent
     m = make_manager(git_repo)
     session = AgentSession(Parent([]), m.tools, approval=AutoApprove(), orchestrate=True, max_steps=16)
     with use_workspace_root(git_repo):
-        assert session.chat("多个 agent 实现并验证") == "integrated and verified"
+        assert session.chat("多个 agent 实现并验证") == "integrated and verified", (session.last_run_status, session.task_store.snapshot())
     assert session.last_run_status == "completed"
     assert (git_repo / "child.txt").read_text() == "hello"
     assert all(t["status"] == "completed" for t in session.task_store.snapshot())
@@ -206,7 +207,7 @@ def test_stopped_writer_allows_parent_verification_but_retains_file_scope(git_re
     from app.agent.agent_manager import DelegationRegistry
     from app.config.loader import use_workspace_root
     m = make_manager(git_repo)
-    sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     tools = DelegationRegistry(m.tools, m)
     assert tools.execute("write_file", {"path": "child.txt", "content": "oops"})[1]
@@ -222,7 +223,7 @@ def test_unrelated_parent_changes_do_not_block_verified_integration(git_repo):
     import subprocess
     m = make_manager(git_repo)
     try:
-        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
         m.wait([sid], 3)
         (git_repo / "parent.txt").write_text("parent work")
         subprocess.run(["git", "add", "parent.txt"], cwd=git_repo, check=True)
@@ -242,7 +243,7 @@ def test_unrelated_parent_changes_do_not_block_verified_integration(git_repo):
 def test_parent_file_collision_is_never_overwritten(git_repo):
     m = make_manager(git_repo)
     try:
-        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
         m.wait([sid], 3)
         (git_repo / "child.txt").write_text("user changes")
         with pytest.raises(ToolExecutionError, match="workspace drifted"):
@@ -266,7 +267,7 @@ def test_tracked_parent_changes_in_artifact_paths_require_review(git_repo, state
     m = make_manager(git_repo)
     m.llm = Editor([])
     try:
-        sid = m.spawn("edit", role="executor", file_scope=["README.md"])["child_run_id"]
+        sid = spawn_isolated(m, "edit", role="executor", file_scope=["README.md"])["child_run_id"]
         assert m.wait([sid], 3)["agents"][0]["status"] == "succeeded"
         (git_repo / "README.md").write_text("user version\n")
         if state != "unstaged":
@@ -294,7 +295,7 @@ def test_parent_change_during_approval_still_requires_revalidation(git_repo):
                 (git_repo / "late.txt").write_text("changed during approval")
             return ApprovalResult(True)
     try:
-        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
         m.wait([sid], 3)
         m.approval = ChangingApproval()
         with pytest.raises(ToolExecutionError, match="revalidation"):
@@ -312,7 +313,7 @@ def test_pending_delivery_does_not_block_approved_external_reads(git_repo):
     (external / "README.md").write_text("other project")
     m = make_manager(git_repo)
     try:
-        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
         m.wait([sid], 3)
         tools = DelegationRegistry(m.tools, m)
         with use_workspace_root(git_repo):
@@ -346,7 +347,7 @@ def test_running_and_cancelling_writer_still_blocks_shell_but_not_external_reads
     external.write_text("outside evidence")
     m = make_manager(git_repo)
     try:
-        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
         assert entered.wait(2)
         tools = DelegationRegistry(m.tools, m)
         with use_workspace_root(git_repo):
@@ -360,7 +361,7 @@ def test_running_and_cancelling_writer_still_blocks_shell_but_not_external_reads
                                               approved_action="write_file")
                 assert error and "reserved" in output
                 with pytest.raises(ToolExecutionError, match="conflicts"):
-                    m.spawn("overlap", role="executor", file_scope=["child.txt"])
+                    spawn_isolated(m, "overlap", role="executor", file_scope=["child.txt"])
                 assert tools.execute("read_file", {"path": str(external)},
                                      approved_action="read_file_outside_workspace") == ("outside evidence", False)
             release.set()
@@ -387,7 +388,7 @@ def test_task_resume_saved_writer_uses_authorization_and_never_replays(git_repo,
     from app.config.loader import use_workspace_root
     from app.storage import Storage
     m = make_manager(git_repo)
-    sid = m.spawn("创建文件", role="executor", file_scope=["child.txt"], max_steps=3)["child_run_id"]
+    sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"], max_steps=3)["child_run_id"]
     m.wait([sid], 3)
     db = Storage(git_repo.parent / (git_repo.name + "-resume.db"))
     db.create_session("s", "default", "fake")
@@ -421,7 +422,7 @@ def test_task_resume_saved_writer_uses_authorization_and_never_replays(git_repo,
 
 def test_integrated_retry_is_free_even_after_parent_budget_exhaustion(git_repo):
     m = make_manager(git_repo)
-    sid = m.spawn("创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     m.integrate(sid, ["test -f child.txt"])
     revision = m.snapshot(sid)["revision"]
@@ -475,7 +476,7 @@ def test_unstopped_writer_blocks_next_session_turn_until_real_exit(git_repo, mon
 
 def test_child_deadline_includes_queued_approval_wait(git_repo):
     m = make_manager(git_repo)
-    sid = m.spawn("create", role="executor", file_scope=["child.txt"], timeout_seconds=0.1)["child_run_id"]
+    sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"], timeout_seconds=0.1)["child_run_id"]
     # Deliberately don't pump the owner approval queue.
     assert m.children[sid].done.wait(2)
     assert m.snapshot(sid)["execution_status"] == "timed_out"
@@ -492,7 +493,7 @@ def test_integration_deadline_prevents_late_patch_application(git_repo, expire_a
     from app.agent.approval import ApprovalResult
     from app.tools.registry import Tool, current_cancel_token
     m = make_manager(git_repo)
-    sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+    sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
     m.wait([sid], 3)
     if expire_at == "verification":
         def verify(args):
@@ -543,7 +544,7 @@ def test_accepted_late_writer_steering_continues_same_worktree_and_budget(git_re
     m = make_manager(git_repo)
     m.llm = Writer([])
     try:
-        sid = m.spawn("create", role="executor", file_scope=["child.txt"], max_steps=4, max_tool_calls=2)["child_run_id"]
+        sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"], max_steps=4, max_tool_calls=2)["child_run_id"]
         # Service the first write approval, then stop at Executor's completion boundary.
         import time
         deadline = time.monotonic() + 2
@@ -641,14 +642,14 @@ def test_closed_stopped_writer_releases_scope_without_discarding_artifact(git_re
     monkeypatch.setattr(SubagentRuntimeFactory, "delegate", create_artifact)
     m = make_manager(git_repo)
     try:
-        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
         m.wait([sid], 3)
         tools = DelegationRegistry(m.tools, m)
         with use_workspace_root(git_repo):
             args = {"path": "child.txt", "content": "parent replacement"}
             assert "reserved" in tools.execute("write_file", args, approved_action="write_file")[0]
             with pytest.raises(ToolExecutionError, match="conflicts"):
-                m.spawn("replacement", role="executor", file_scope=["child.txt"])
+                spawn_isolated(m, "replacement", role="executor", file_scope=["child.txt"])
             m.close(sid)
             m.close(sid)  # Release is idempotent; artifacts and status remain intact.
             assert m.snapshot(sid)["execution_status"] == status
@@ -657,7 +658,7 @@ def test_closed_stopped_writer_releases_scope_without_discarding_artifact(git_re
             if status != "succeeded":
                 with pytest.raises(ToolExecutionError, match="only successful"):
                     m.integrate(sid, ["test -f child.txt"])
-            replacement = m.spawn("replacement", role="executor", file_scope=["child.txt"])["child_run_id"]
+            replacement = spawn_isolated(m, "replacement", role="executor", file_scope=["child.txt"])["child_run_id"]
             m.wait([replacement], 3)
             m.close(replacement)
             assert not tools.execute("write_file", args, approved_action="write_file")[1]
@@ -675,13 +676,13 @@ def test_integrated_writer_releases_scope_for_next_writer(git_repo):
 
     m = make_manager(git_repo)
     try:
-        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
         m.wait([sid], 3)
         m.integrate(sid, ["test -f child.txt"])
         # A new writer still requires a clean baseline, independently of scope ownership.
         subprocess.run(["git", "add", "child.txt"], cwd=git_repo, check=True)
         subprocess.run(["git", "commit", "-m", "accept child"], cwd=git_repo, check=True, capture_output=True)
-        next_id = m.spawn("next", role="executor", file_scope=["child.txt"])["child_run_id"]
+        next_id = spawn_isolated(m, "next", role="executor", file_scope=["child.txt"])["child_run_id"]
         m.wait([next_id], 3)
         m.close(next_id)
         tools = DelegationRegistry(m.tools, m)
@@ -706,7 +707,7 @@ def test_restored_failed_artifact_does_not_reacquire_write_scope(git_repo, monke
     original = make_manager(git_repo)
     restored = make_manager(git_repo)
     try:
-        sid = original.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        sid = spawn_isolated(original, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
         original.wait([sid], 3)
         original.close(sid)
         restored.restore_results(original.records())
@@ -719,3 +720,120 @@ def test_restored_failed_artifact_does_not_reacquire_write_scope(git_repo, monke
     finally:
         original.finish()
         restored.finish()
+
+
+
+def test_default_shared_writer_works_with_dirty_non_git_workspace(tmp_path):
+    from app.config.loader import use_workspace_root
+    (tmp_path / "user.txt").write_text("uncommitted user work")
+    m = make_manager(tmp_path)
+    try:
+        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        result = m.wait([sid], 3)["agents"][0]
+        assert result["status"] == "succeeded"
+        assert m.snapshot(sid)["workspace_mode"] == "shared"
+        assert m.children[sid].worktree is None
+        assert (tmp_path / "child.txt").read_text() == "hello"
+        assert result["changed_files"] == ["child.txt"]
+        assert result["delivery_status"] == "applied_unverified"
+        assert (tmp_path / "user.txt").read_text() == "uncommitted user work"
+        assert m.integrate(sid, ["test -f child.txt"])["status"] == "integrated"
+        assert m.integrate(sid, ["exit 1"])["already_integrated"]
+    finally:
+        m.finish()
+
+
+def test_shared_artifact_drift_and_verification_mutation_are_detected(tmp_path):
+    m = make_manager(tmp_path)
+    try:
+        sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        m.wait([sid], 3)
+        (tmp_path / "child.txt").write_text("user correction")
+        with pytest.raises(ToolExecutionError, match="artifact changed"):
+            m.integrate(sid, ["test -f child.txt"])
+        assert (tmp_path / "child.txt").read_text() == "user correction"
+        (tmp_path / "child.txt").write_text("hello")
+        with pytest.raises(ToolExecutionError, match="verification changed"):
+            m.integrate(sid, ["printf changed > child.txt"])
+        assert m.snapshot(sid)["delivery_status"] == "applied_unverified"
+    finally:
+        m.finish()
+
+
+def test_shared_results_survive_recovery_without_reapplying_files(tmp_path):
+    m = make_manager(tmp_path)
+    sid = m.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+    m.wait([sid], 3)
+    saved = m.records()
+    m.finish()
+    restored = make_manager(tmp_path)
+    try:
+        restored.restore_results(saved)
+        assert restored.integrate(sid, ["test -f child.txt"])["status"] == "integrated"
+        assert (tmp_path / "child.txt").read_text() == "hello"
+    finally:
+        restored.finish()
+
+
+def test_isolated_dirty_snapshot_keeps_parent_index_and_branches_unchanged(git_repo):
+    import subprocess
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=git_repo, check=True, capture_output=True).stdout
+    (git_repo / "README.md").write_text("staged parent version")
+    git("add", "README.md")
+    (git_repo / "README.md").write_text("unstaged parent version")
+    (git_repo / "new-parent.txt").write_text("new parent file")
+    before = (git("rev-parse", "HEAD"), git("write-tree"), git("branch", "--format=%(refname)"))
+    m = make_manager(git_repo)
+    try:
+        sid = spawn_isolated(m, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        assert m.wait([sid], 3)["agents"][0]["status"] == "succeeded"
+        wt = m.children[sid].worktree
+        assert wt.detached
+        assert (wt.path / "README.md").read_text() == "unstaged parent version"
+        assert (wt.path / "new-parent.txt").read_text() == "new parent file"
+        assert (git("rev-parse", "HEAD"), git("write-tree"), git("branch", "--format=%(refname)")) == before
+        assert not (git_repo / "child.txt").exists()
+        assert m.snapshot(sid)["changed_files"] == ["child.txt"]
+        assert m.integrate(sid, ["test -f child.txt"])["status"] == "integrated"
+        assert git("show", ":README.md") == b"staged parent version"
+        assert (git_repo / "README.md").read_text() == "unstaged parent version"
+        assert (git_repo / "new-parent.txt").read_text() == "new parent file"
+    finally:
+        m.finish()
+
+
+
+def test_detached_cleanup_does_not_delete_an_unowned_named_branch(git_repo):
+    from app.workspace.worktree import WorktreeManager
+    manager = WorktreeManager(git_repo)
+    wt = manager.create("detached-cleanup", detached=True, include_uncommitted=True)
+    manager._run_git("branch", "worktree/detached-cleanup")
+    manager.remove(wt)
+    assert manager._run_git("rev-parse", "--verify", "refs/heads/worktree/detached-cleanup").returncode == 0
+
+
+def test_isolated_child_can_edit_parent_dirty_file_without_touching_parent_index(git_repo):
+    import subprocess
+    (git_repo / "README.md").write_text("parent staged")
+    subprocess.run(["git", "add", "README.md"], cwd=git_repo, check=True)
+    (git_repo / "README.md").write_text("parent unstaged")
+    class Editor(WriterRouter):
+        def fork(self):
+            return FakeRouter([
+                ModelResponse("", [ToolCall("edit", "write_file", {
+                    "path": "README.md", "content": "parent unstaged plus child"})], {}, []),
+                response("edited"),
+            ])
+    m = make_manager(git_repo)
+    m.llm = Editor([])
+    try:
+        sid = spawn_isolated(m, "edit", role="executor", file_scope=["README.md"])["child_run_id"]
+        assert m.wait([sid], 3)["agents"][0]["status"] == "succeeded"
+        assert m.integrate(sid, ["test -f README.md"])["status"] == "integrated"
+        assert (git_repo / "README.md").read_text() == "parent unstaged plus child"
+        indexed = subprocess.run(["git", "show", ":README.md"], cwd=git_repo,
+                                 capture_output=True, check=True).stdout
+        assert indexed == b"parent staged"
+    finally:
+        m.finish()

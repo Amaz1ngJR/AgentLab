@@ -941,12 +941,16 @@ def test_response_failed_surfaces_real_gateway_error():
     assert caught.value.retryable is False
 
 
-def test_response_failed_raw_stream_is_retryable_for_server_error():
+@pytest.mark.parametrize("code,message", [
+    ("server_error", "upstream model error"),
+    ("upstream_stream_read_error", "Upstream response stream was interrupted"),
+])
+def test_response_failed_raw_stream_is_retryable_for_server_error(code, message):
     """原始流里的服务端瞬时故障要标成可重试。"""
     def _fake_raw_stream():
         err = MagicMock()
-        err.code = "server_error"
-        err.message = "upstream model error"
+        err.code = code
+        err.message = message
         resp = MagicMock()
         resp.error = err
         resp.usage = None
@@ -982,7 +986,7 @@ def test_response_failed_raw_stream_is_retryable_for_server_error():
                 messages=[{"role": "user", "content": "hello"}],
             )
 
-    assert "upstream model error" in str(caught.value)
+    assert message in str(caught.value)
     assert caught.value.retryable is True
 
 

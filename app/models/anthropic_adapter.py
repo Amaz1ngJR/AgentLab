@@ -65,6 +65,11 @@ class AnthropicAdapter:
         self._client = Anthropic(**kwargs)
         self._cfg = cfg
 
+    def fetch_context_size(self) -> int | None:
+        """Use the Models API's declared input limit; never infer it from a model ID."""
+        info = self._client.with_options(timeout=3, max_retries=0).models.retrieve(self.model)
+        return getattr(info, "max_input_tokens", None)
+
     @property
     def model(self) -> str:
         return self._cfg.model
