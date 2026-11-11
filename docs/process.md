@@ -155,7 +155,7 @@ AgentLab 是一个可运行的本地 CLI Agent：支持模型 profile 切换、�
 
 ### 3.10 上下文构建与压缩(§7.3 / §6.13)
 
-- `app/agent/context_budget.py`:`estimate_tokens`(CJK 友好、偏保守的离线字符启发式,不依赖 tokenizer/网络)、`resolve_context_limit`(profile 声明的 context_size 优先,否则按模型名前缀查表,未知退 8192)、`ContextBudget.from_model`(派生 reserved_output / system_and_tools / memory / summary / recent / evidence 各项预算)、70% 警告 / 85% 强制压缩阈值与 `status_for`。
+- `app/agent/context_budget.py`:`estimate_tokens`(CJK 友好、偏保守的离线字符启发式,不依赖 tokenizer/网络)、`ContextBudget.from_llm`(显式配置优先,其次提供方元数据,未知退 64000)、`ContextBudget.from_context_size`(派生 reserved_output / system_and_tools / memory / summary / recent / evidence 各项预算)、70% 警告 / 85% 强制压缩阈值与 `status_for`。
 - `app/agent/context_compaction.py`:`ContextSummary`(§7.3.3 结构化字段 + source_message_range/source_run_ids/token_before/after/compression_model_profile 审计元数据)、`ContextCompressor`:`_safe_split_point` 选段(保留最近窗口 + 不切开 tool_use/tool_result 对,避免悬空 tool_call)→ 调模型产出结构化 JSON 摘要 → 必填字段校验(user_goal/handoff_note)+ 递归脱敏 → 用一条摘要消息就地顶掉旧前缀;摘要非法/模型异常/无可压段时不压缩(保留原始尾部)。
 - `app/agent/context.py`:`ContextManager` 黏合 budget + compressor。`maybe_compact` 在稳定点检查预算:ok 不动 / warn 发 `context_budget_warning` / compact 触发压缩并发 `context_compaction_started/completed/failed`;`report()` 供 `/context` 展示预算+recent window+摘要状态;`drain_records()` 把压缩摘要交给持久化;`force=True` 供 `/context compact` 手动压缩;`auto_compact` 开关。
 - `app/agent/events.py`:新增 `context_budget_warning / context_compaction_started / context_compaction_completed / context_compaction_failed` 四个 RunEvent kind。

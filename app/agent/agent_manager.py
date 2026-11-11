@@ -953,6 +953,18 @@ class DelegationRegistry(ToolRegistry):
             return ("shell unavailable while a write subagent is still running or cancelling; "
                     "wait for it to stop. Use read_file/list_dir/code_search to inspect files, "
                     "including approved external paths", True)
+        if owned and name == "apply_patch":
+            from app.tools.builtin.patch import patch_paths
+            try:
+                targets = patch_paths(args)
+            except Exception as exc:
+                return str(exc), True
+            for child in owned:
+                for scope in child.spec.file_scope:
+                    reserved = (self.manager.workspace / scope).resolve()
+                    if any(target == reserved or target.is_relative_to(reserved) or reserved.is_relative_to(target)
+                           for target in targets):
+                        return "path reserved by a write subagent", True
         if owned and name in {"write_file", "edit_file"}:
             target = (self.manager.workspace / Path(args.get("path", "")).expanduser()).resolve()
             for child in owned:

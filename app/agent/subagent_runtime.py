@@ -60,6 +60,59 @@ class RestrictedToolRegistry(ToolRegistry):
     def schemas_for_task(self, task: str, *, mode: str = "task", **kwargs) -> list[dict[str, Any]]:
         return self.schemas()
 
+    def parallel_capacity(self):
+        return min(self.max_parallel_tools, max(0, self.max_calls - self.calls),
+                   self._source.parallel_capacity())
+
+    def _read_path_error(self, name, args):
+        if self.workspace is None:
+            return False
+        if name == "read_files":
+            paths = [item.get("path", "") for item in args.get("requests", [])]
+        elif name in {"read_file", "list_dir", "code_search"}:
+            paths = [args.get("path") or "."]
+        else:
+            return False
+        return any(not (self.workspace / Path(path).expanduser()).resolve().is_relative_to(self.workspace)
+                   for path in paths)
+
+    def _record_read(self, name, args, result):
+        if name in {"read_file", "read_files", "code_search", "list_dir"} and not result[1]:
+            normalized = dict(args)
+            if self.workspace is not None and name != "read_files":
+                normalized["path"] = str((self.workspace / Path(args.get("path") or ".").expanduser()).resolve())
+            self.read_signatures.append(hashlib.sha256(json.dumps(
+                {"tool": name, "args": normalized, "output": result[0]},
+                sort_keys=True, ensure_ascii=False).encode()).hexdigest())
+
+    def parallel_allowed(self, name, args):
+        return (name in self._allowed and not self._read_path_error(name, args)
+                and getattr(self._source, "parallel_allowed", lambda name, args: True)(name, args))
+
+    def prepare_parallel(self, name, args, *, cancel=None):
+        # Called only by the owner thread: reserve budgets before workers start.
+        tool = self.get(name)
+        if (tool is None or not tool.parallel_safe or tool.risk != "read"
+                or tool.validate_arguments(args) or tool.approval_action(args) is not None
+                or self._read_path_error(name, args) or self.calls >= self.max_calls):
+            return None
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        runner = self._source.prepare_parallel(name, args, cancel=cancel)
+        if runner is None:
+            return None
+        self.calls += 1
+        def run():
+            # Recheck resolved paths immediately before dispatch as symlinks can change.
+            if self._read_path_error(name, args):
+                return "read outside child workspace is not allowed", True
+            result = runner()
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            self._record_read(name, args, result)
+            return result
+        return run
+
     def execute(self, name: str, args: dict[str, Any], *, approved_action: str | None = None,
                 cancel: CancelToken | None = None):
         if cancel is not None:
@@ -68,10 +121,19 @@ class RestrictedToolRegistry(ToolRegistry):
             return f"tool not allowed for this subagent: {name}", True
         if self.calls >= self.max_calls:
             raise Cancelled("budget_exhausted: tool call limit")
-        if self.workspace is not None and name in {"read_file", "list_dir", "code_search"}:
-            path = Path(args.get("path") or ".").expanduser()
-            if not (self.workspace / path).resolve().is_relative_to(self.workspace):
-                return "read outside child workspace is not allowed", True
+        if self._read_path_error(name, args):
+            return "read outside child workspace is not allowed", True
+        if name == "apply_patch" and self.workspace is not None:
+            from app.tools.builtin.patch import patch_paths
+            try:
+                targets = patch_paths(args)
+            except Exception as exc:
+                return str(exc), True
+            scopes = [(self.workspace / scope).resolve() for scope in self.file_scope]
+            if any(not target.is_relative_to(self.workspace) or (
+                    scopes and not any(target == scope or target.is_relative_to(scope) for scope in scopes))
+                   for target in targets):
+                return "write outside child file_scope", True
         if name in {"write_file", "edit_file"} and self.workspace is not None:
             path = Path(args.get("path", "")).expanduser()
             target = (self.workspace / path).resolve()
@@ -87,13 +149,7 @@ class RestrictedToolRegistry(ToolRegistry):
             return "shell is unavailable with file_scope; use scoped file tools", True
         self.calls += 1
         result = self._source.execute(name, args, approved_action=approved_action, cancel=cancel)
-        if name in {"read_file", "code_search", "list_dir"} and not result[1]:
-            normalized = dict(args)
-            if self.workspace is not None:
-                normalized["path"] = str((self.workspace / Path(args.get("path") or ".").expanduser()).resolve())
-            self.read_signatures.append(hashlib.sha256(json.dumps(
-                {"tool": name, "args": normalized, "output": result[0]},
-                sort_keys=True, ensure_ascii=False).encode()).hexdigest())
+        self._record_read(name, args, result)
         return result
 
 

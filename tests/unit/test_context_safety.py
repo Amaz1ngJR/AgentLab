@@ -154,7 +154,7 @@ def test_cancel_does_not_fallback_or_mutate_history():
 
 
 def test_preflight_rejects_unshrinkable_tail_even_when_auto_disabled():
-    manager = ContextManager(ContextBudget.from_model(declared_context_size=8192),
+    manager = ContextManager(ContextBudget.from_context_size(context_size=8192),
                              ContextCompressor(SummaryModel()), auto_compact=False)
     messages = [{"role": "user", "content": "不可截断的请求" * 2000}]
     with pytest.raises(ContextBudgetExceeded):
@@ -162,7 +162,7 @@ def test_preflight_rejects_unshrinkable_tail_even_when_auto_disabled():
 
 
 def test_preflight_counts_system_tools_and_does_not_commit_oversize_candidate():
-    manager = ContextManager(ContextBudget.from_model(declared_context_size=8192),
+    manager = ContextManager(ContextBudget.from_context_size(context_size=8192),
                              ContextCompressor(SummaryModel()), keep_recent=2)
     messages = history()
     original = copy.deepcopy(messages)
@@ -174,7 +174,7 @@ def test_preflight_counts_system_tools_and_does_not_commit_oversize_candidate():
 
 
 def test_preflight_success_fits_complete_request_budget():
-    manager = ContextManager(ContextBudget.from_model(declared_context_size=8192),
+    manager = ContextManager(ContextBudget.from_context_size(context_size=8192),
                              ContextCompressor(SummaryModel()), keep_recent=2)
     messages = history()
     tools = [{"name": "shell", "description": "run command"}]
@@ -190,7 +190,7 @@ def test_agent_paths_do_not_swallow_budget_error_or_send_model_request(path):
     from app.tools.registry import ToolRegistry
 
     model = SummaryModel()
-    manager = ContextManager(ContextBudget.from_model(declared_context_size=8192),
+    manager = ContextManager(ContextBudget.from_context_size(context_size=8192),
                              ContextCompressor(model), auto_compact=False)
     messages = [{"role": "user", "content": "用户约束" * 3000}]
     with pytest.raises(ContextBudgetExceeded):
@@ -207,7 +207,7 @@ def test_agent_paths_do_not_swallow_budget_error_or_send_model_request(path):
 def test_cancelled_manager_preserves_cancellation_when_history_over_budget():
     cancel = CancelToken()
     cancel.cancel()
-    manager = ContextManager(ContextBudget.from_model(declared_context_size=8192),
+    manager = ContextManager(ContextBudget.from_context_size(context_size=8192),
                              ContextCompressor(SummaryModel()), keep_recent=2)
     with pytest.raises(Cancelled):
         manager.compact_before_model_call(history(), cancel=cancel)
@@ -331,7 +331,7 @@ def test_context_manager_shares_one_deadline_across_budget_attempts(monkeypatch)
     from app.agent.context_compaction import CompactionResult
     from app.agent import events
     compressor = ContextCompressor(SummaryModel())
-    manager = ContextManager(ContextBudget.from_model(declared_context_size=32000), compressor, keep_recent=2)
+    manager = ContextManager(ContextBudget.from_context_size(context_size=32000), compressor, keep_recent=2)
     deadlines = []
     emitted = []
     monkeypatch.setattr(manager, "_emit", emitted.append)

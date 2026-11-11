@@ -168,6 +168,14 @@ class InteractivePolicy:
         """格式化工具参数，参考 Claude Code 简洁风格。"""
         lines = []
 
+        if tool_name == "apply_patch":
+            from app.tools.builtin.patch import preview_patch
+            from app.tools.registry import ToolExecutionError
+            try:
+                preview = preview_patch(tool_input)
+            except (OSError, ValueError, RuntimeError, ToolExecutionError) as exc:
+                preview = f"补丁预检失败：{exc}"
+            return ["● 多文件补丁", preview]
         if tool_name == "request_confirmation":
             return ["● " + str(tool_input.get("summary", "确认方案")),
                     str(tool_input.get("details", ""))]

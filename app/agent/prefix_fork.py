@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import json
 
-from app.agent.context_budget import estimate_messages_tokens, estimate_tokens, resolve_context_limit
+from app.agent.context_budget import estimate_messages_tokens, estimate_tokens, ContextBudget
 from app.util.redact import redact_value
 
 
@@ -43,7 +43,7 @@ def prepare_prefix(snapshot: dict | None, llm, instruction: str) -> tuple[list[d
         return fallback("incomplete_tool_pairs")
     system = snapshot.get("system") or ""
     size = estimate_messages_tokens(messages) + estimate_tokens(system + instruction + json.dumps(snapshot.get("tools")))
-    limit = resolve_context_limit(getattr(llm, "model", None), getattr(llm, "context_size", None))
+    limit = ContextBudget.from_llm(llm).model_context_limit
     if size + max(4096, limit // 5) > limit:
         return fallback("context_capacity")
     return copy.deepcopy(messages), system, {

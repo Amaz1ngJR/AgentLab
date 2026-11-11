@@ -38,6 +38,7 @@ class ToolCallBatch:
     def eligible(self, call):
         tool = self.tools.get(call.name)
         return (tool is not None and getattr(tool, "parallel_safe", False) and tool.risk == "read"
+                and getattr(self.tools, "parallel_allowed", lambda name, args: True)(call.name, call.arguments)
                 and call.name not in self.denied
                 and not tool.validate_arguments(call.arguments)
                 and tool.approval_action(call.arguments) is None)

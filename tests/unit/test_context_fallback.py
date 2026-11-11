@@ -12,7 +12,7 @@ class TimeoutLLM:
 
 def test_timeout_uses_local_fallback_and_replaces_history():
     manager = ContextManager(
-        ContextBudget.from_model(declared_context_size=256_000),
+        ContextBudget.from_context_size(context_size=256_000),
         ContextCompressor(TimeoutLLM(), allow_local_fallback=True),
         keep_recent=4,
     )

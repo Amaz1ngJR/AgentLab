@@ -556,7 +556,7 @@ def test_actual_compaction_reports_before_after_and_clears_live_activity(monkeyp
         monkeypatch.setattr(cli, "_ACTIVE_SPINNER", spinner)
         response = ModelResponse(text=json.dumps(_VALID_SUMMARY), tool_calls=[], provider_payload=[], usage={})
         model = SimpleNamespace(create_message=lambda *args, **kwargs: response)
-        manager = ContextManager(ContextBudget.from_model(declared_context_size=32000),
+        manager = ContextManager(ContextBudget.from_context_size(context_size=32000),
                                  ContextCompressor(model), keep_recent=2, on_event=cli._print_run_event)
         messages = _long_messages(20)
         before = manager.estimate(messages)

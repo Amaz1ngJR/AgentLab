@@ -172,7 +172,7 @@ class ToolDescriptor:
             )
         capabilities = set(self.capabilities)
         if not capabilities:
-            if self.name in {"read_file", "list_dir"}:
+            if self.name in {"read_file", "read_files", "list_dir"}:
                 capabilities.update({"inspect", "filesystem_read"})
             elif self.name == "code_search":
                 capabilities.update({"inspect", "code_search", "filesystem_read"})
@@ -363,8 +363,8 @@ class ToolRegistry:
         """按执行阶段选择工具；阶段规则优先于模糊任务关键词。"""
         normalized = (stage or "direct").lower()
         stage_tools = {
-            "inspect": {"read_file", "list_dir", "code_search"},
-            "analysis": {"read_file", "list_dir", "code_search"},
+            "inspect": {"read_file", "read_files", "list_dir", "code_search"},
+            "analysis": {"read_file", "read_files", "list_dir", "code_search"},
             "plan": set(),
             "direct": None,
             "task": None,
@@ -513,7 +513,7 @@ class ToolRegistry:
             if (
                 cancel is not None and tool.origin == "builtin"
                 and tool.risk in {"read", "observe", "network"}
-                and name in {"web_search", "web_fetch", "code_search", "read_file", "list_dir"}
+                and name in {"web_search", "web_fetch", "code_search", "read_file", "read_files", "list_dir"}
             ):
                 import copy
                 from app.agent.cancel import run_read_only_cancellable

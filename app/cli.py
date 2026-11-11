@@ -1215,6 +1215,10 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         detail = (f"约 {before:,} → {after:,} tokens"
                   if isinstance(before, (int, float)) and isinstance(after, (int, float))
                   else "token 用量未返回")
+        parts = [("摘要", "summary_tokens"), ("受保护内容", "protected_tokens"),
+                 ("近期原文", "recent_tokens"), ("system/工具", "fixed_tokens")]
+        if all(isinstance(p.get(key), int) for _, key in parts):
+            detail += "；" + " · ".join(f"{label} {p[key]:,}" for label, key in parts)
         _emit_progress_notice(
             f"上下文压缩完成（{detail}）", marker="✓",
         )
@@ -1293,10 +1297,16 @@ def _handle_context_command(session: AgentSession, line: str) -> str:
             f"tools ~{rep['tool_schema_tokens']}",
             f"阈值       : 警告 {rep['warn_threshold']} / 强制压缩 {rep['compact_threshold']}",
             f"消息条数   : {rep['messages']}(压缩时至少保留最近 {rep['keep_recent']} 条)",
+            f"近期预算   : {rep['recent_messages_budget']} tokens（软上限，保护最近消息和工具调用对）",
             f"自动压缩   : {'开' if rep['auto_compact'] else '关'}",
             f"已生成摘要 : {rep['summaries']} 段"
             f"{'(有生效摘要)' if rep['has_summary'] else ''}",
         ]
+        retry = rep.get("compaction_retry")
+        if retry and retry["blocked"]:
+            lines.append(f"压缩重试   : 暂缓（{retry['reason']}）；冷却剩余 "
+                         f"{_fmt_duration(retry['remaining_seconds'])}，输入需变化至少 "
+                         f"{retry['required_change_tokens']} tokens；/context compact 可立即手动重试")
         return "\n".join(lines)
 
     if sub == "compact":

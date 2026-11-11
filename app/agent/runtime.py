@@ -111,7 +111,7 @@ def _looks_like_pseudo_tool_call(text: str, *, action_request: bool) -> bool:
     if re.search(r"(?m)^\s*\\?\[历史工具调用\s+\w+\]", text):
         return True
     return action_request and bool(re.search(
-        r"(?m)^\s*(?:edit_file|write_file|shell)\s*\(", text,
+        r"(?m)^\s*(?:edit_file|write_file|apply_patch|shell)\s*\(", text,
     ))
 
 
@@ -181,10 +181,8 @@ class AgentSession:
         self._delegation_allowed = False
         self.tools = tools
         self.approval: ApprovalPolicy = approval or AutoApprove()
-        self.system_prompt = system_prompt
-        if tools.get("request_confirmation") is not None:
-            from app.tools.builtin.confirmation import CONFIRMATION_GUIDANCE
-            self.system_prompt += "\n\n" + CONFIRMATION_GUIDANCE
+        from app.tools.builtin import with_tool_guidance
+        self.system_prompt = with_tool_guidance(system_prompt, tools)
         if max_steps <= 0:
             raise ValueError("max_steps 必须 > 0")
         if max_task_steps is not None and max_task_steps <= 0:
@@ -281,13 +279,10 @@ class AgentSession:
         catalog.record_disclosure(
             catalog.index(profile_skills), loaded, len(skill_index), len(workflow),
         )
-        self.system_prompt = (
-            f"{base_prompt}\n\n{workflow}" if workflow else base_prompt
+        from app.tools.builtin import with_tool_guidance
+        self.system_prompt = with_tool_guidance(
+            f"{base_prompt}\n\n{workflow}" if workflow else base_prompt, self.tools,
         )
-        if self.tools.get("request_confirmation") is not None:
-            from app.tools.builtin.confirmation import CONFIRMATION_GUIDANCE
-            if CONFIRMATION_GUIDANCE not in self.system_prompt:
-                self.system_prompt += "\n\n" + CONFIRMATION_GUIDANCE
         if self._orch is not None:
             self._orch._system = self.system_prompt
 

@@ -7,6 +7,8 @@ SQLite round-trip 另见 tests/integration/test_context_storage.py。
 """
 from __future__ import annotations
 
+import pytest
+
 import json
 
 from app.agent import events
@@ -19,7 +21,6 @@ from app.agent.context_budget import (
     estimate_message_tokens,
     estimate_messages_tokens,
     estimate_tokens,
-    resolve_context_limit,
 )
 from app.agent.context_compaction import (
     ContextCompressor,
@@ -132,29 +133,24 @@ def test_estimate_messages_tokens_sums():
 # ── 窗口解析 ──────────────────────────────────────────────────────────────────
 
 
-def test_resolve_limit_prefers_declared():
-    assert resolve_context_limit("claude-opus-4-8", declared_context_size=4096) == 4096
+def test_explicit_context_size_is_used():
+    budget = ContextBudget.from_context_size(4096)
+    assert budget.model_context_limit == 4096
+    assert budget.context_limit_source == "config"
 
 
-def test_resolve_limit_does_not_infer_from_model_name():
-    assert resolve_context_limit("claude-opus-4-8") == DEFAULT_CONTEXT_LIMIT
-    assert resolve_context_limit("qwen2.5-coder:7b-instruct") == DEFAULT_CONTEXT_LIMIT
-
-
-def test_new_model_in_known_family_uses_default():
-    assert resolve_context_limit("claude-3-5-sonnet") == DEFAULT_CONTEXT_LIMIT
-
-
-def test_resolve_limit_unknown_falls_back():
-    assert resolve_context_limit("totally-unknown-model") == DEFAULT_CONTEXT_LIMIT
-    assert resolve_context_limit(None) == DEFAULT_CONTEXT_LIMIT
+@pytest.mark.parametrize("size", [None, 0, -1, True])
+def test_missing_or_invalid_context_size_uses_default(size):
+    budget = ContextBudget.from_context_size(size)
+    assert budget.model_context_limit == DEFAULT_CONTEXT_LIMIT
+    assert budget.context_limit_source == "default"
 
 
 # ── ContextBudget ─────────────────────────────────────────────────────────────
 
 
 def test_budget_from_model_sections_nonneg_and_reserved():
-    b = ContextBudget.from_model("claude-opus-4-8")
+    b = ContextBudget.from_context_size()
     assert b.model_context_limit == DEFAULT_CONTEXT_LIMIT
     assert b.reserved_output_tokens > 0
     for v in (b.system_and_tools_budget, b.memory_budget, b.summary_budget,
@@ -164,14 +160,14 @@ def test_budget_from_model_sections_nonneg_and_reserved():
 
 
 def test_budget_thresholds_ordering():
-    b = ContextBudget.from_model(declared_context_size=10_000)
+    b = ContextBudget.from_context_size(context_size=10_000)
     assert b.warn_threshold == int(b.input_budget * WARN_RATIO)
     assert b.compact_threshold == int(b.input_budget * COMPACT_RATIO)
     assert b.warn_threshold < b.compact_threshold
 
 
 def test_budget_status_for():
-    b = ContextBudget.from_model(declared_context_size=1000)
+    b = ContextBudget.from_context_size(context_size=1000)
     assert b.status_for(10) == "ok"
     assert b.status_for(b.warn_threshold) == "warn"
     assert b.status_for(b.compact_threshold) == "compact"
@@ -340,7 +336,7 @@ def test_summary_to_record_round_trips_fields():
 
 
 def _manager(llm, limit, *, events_sink=None, auto=True, keep=4):
-    budget = ContextBudget.from_model(declared_context_size=limit)
+    budget = ContextBudget.from_context_size(context_size=limit)
     comp = ContextCompressor(llm)
     return ContextManager(budget, comp, keep_recent=keep, auto_compact=auto,
                           on_event=events_sink)
@@ -452,7 +448,7 @@ def test_manager_report_shape():
 
 
 def test_compact_before_model_call_uses_full_item_estimate():
-    budget = ContextBudget.from_model(declared_context_size=1000)
+    budget = ContextBudget.from_context_size(context_size=1000)
     comp = ContextCompressor(FakeRouter([_summary_resp()]))
     ctx = ContextManager(budget, comp, keep_recent=1)
     messages = [

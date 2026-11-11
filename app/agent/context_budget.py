@@ -25,14 +25,7 @@ from app.models.context_window import DEFAULT_CONTEXT_LIMIT, ContextWindow, posi
 INPUT_SAFETY_RATIO = 0.98
 WARN_RATIO = 0.80
 COMPACT_RATIO = 0.92
-
-
-def resolve_context_limit(
-    model: str | None = None,
-    declared_context_size: Optional[int] = None,
-) -> int:
-    """纯离线兼容入口；模型名称不用于猜测窗口。运行时使用 from_llm。"""
-    return positive_int(declared_context_size) or DEFAULT_CONTEXT_LIMIT
+MAX_RECENT_MESSAGES_TOKENS = 32_768
 
 
 # ── token 估算 ────────────────────────────────────────────────────────────────
@@ -123,29 +116,23 @@ class ContextBudget:
 
     @classmethod
     def from_llm(cls, llm) -> "ContextBudget":
-        """使用路由器已解析的能力；旧测试替身仍可只提供 context_size。"""
+        """从运行时模型能力构造预算，窗口来源由路由器解析。"""
         window = getattr(llm, "context_window", None)
         if isinstance(window, ContextWindow):
-            budget = cls.from_model(declared_context_size=window.tokens)
-            budget.context_limit_source = window.source
-            return budget
-        return cls.from_model(declared_context_size=getattr(llm, "context_size", None))
+            return cls.from_context_size(window.tokens, source=window.source)
+        return cls.from_context_size(getattr(llm, "context_size", None))
 
     @classmethod
-    def from_model(
+    def from_context_size(
         cls,
-        model: str | None = None,
-        declared_context_size: Optional[int] = None,
+        context_size: Optional[int] = None,
         *,
         reserved_output_tokens: Optional[int] = None,
+        source: str | None = None,
     ) -> "ContextBudget":
-        """按模型窗口派生一份预算。各项按窗口大小成比例切分,小窗口也保证非负。
-
-        reserved_output_tokens 默认取窗口的 25%(上限 8k):为最终回答、工具参数
-        和重规划留输出空间。其余输入预算按经验比例分给 system+tools / memory /
-        summary / recent / evidence。
-        """
-        limit = resolve_context_limit(model, declared_context_size)
+        """按已解析的窗口计算预算；默认预留窗口的25%输出空间，最多8192。"""
+        declared = positive_int(context_size)
+        limit = declared or DEFAULT_CONTEXT_LIMIT
         reserved = (
             reserved_output_tokens
             if reserved_output_tokens is not None
@@ -153,15 +140,15 @@ class ContextBudget:
         )
         reserved = min(limit, max(0, reserved))
         usable = max(0, limit - reserved)
-        # 输入预算的经验切分(总和 = usable):
-        #   system+tools 15% / memory 10% / summary 15% / recent 50% / evidence 10%
+        # 各项为建议上限；近期原文额外封顶，避免大窗口保留几十万 token。
+        # 完整请求仍统一受 safe_input_limit 约束。
         return cls(
             model_context_limit=limit,
-            context_limit_source="config" if positive_int(declared_context_size) else "default",
+            context_limit_source=source or ("config" if declared else "default"),
             reserved_output_tokens=reserved,
             system_and_tools_budget=int(usable * 0.15),
             memory_budget=int(usable * 0.10),
             summary_budget=int(usable * 0.15),
-            recent_messages_budget=int(usable * 0.50),
+            recent_messages_budget=min(MAX_RECENT_MESSAGES_TOKENS, int(usable * 0.50)),
             evidence_budget=int(usable * 0.10),
         )

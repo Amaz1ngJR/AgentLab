@@ -13,7 +13,7 @@ from typing import Any, Callable, Optional
 
 from app.agent import events
 from app.agent.cancel import Cancelled, CancelToken
-from app.agent.context_budget import ContextBudget, estimate_messages_tokens
+from app.agent.context_budget import ContextBudget, estimate_messages_tokens, estimate_message_tokens
 from app.agent.context_compaction import ContextCompressor, ContextSummary
 from app.agent.events import RunEvent
 
@@ -47,6 +47,26 @@ class ContextManager:
         # 最近一次有效摘要(供 /context summary 查看)。
         self.last_summary: Optional[ContextSummary] = None
         self._warned = False  # 避免同一段历史反复发 warning
+        self._failed_compaction: dict | None = None
+
+    def _remember_failure(self, estimated: int, reason: str) -> None:
+        self._failed_compaction = {
+            "input_tokens": estimated, "retry_at": time.monotonic() + 300,
+            "reason": reason,
+            "budget": (self.budget.model_context_limit, self.budget.safe_input_limit, id(self._compressor)),
+        }
+
+    def retry_status(self, estimated: int) -> dict:
+        failure = self._failed_compaction
+        if not failure or failure["budget"] != (
+                self.budget.model_context_limit, self.budget.safe_input_limit, id(self._compressor)):
+            return {}
+        growth = max(1024, int(self.budget.input_budget * 0.05))
+        remaining = max(0, failure["retry_at"] - time.monotonic())
+        changed = abs(estimated - failure["input_tokens"]) >= growth
+        return {"reason": failure["reason"], "remaining_seconds": remaining,
+                "required_change_tokens": growth, "input_changed": changed,
+                "blocked": remaining > 0 or not changed}
 
     # ── 查询 ──────────────────────────────────────────────────────────────────
 
@@ -98,9 +118,11 @@ class ContextManager:
             "usage_ratio": (est / b.model_context_limit) if b.model_context_limit else 0.0,
             "messages": len(messages),
             "keep_recent": self.keep_recent,
+            "recent_messages_budget": b.recent_messages_budget,
             "auto_compact": self.auto_compact,
             "summaries": len(self._pending_records),
             "has_summary": self.last_summary is not None,
+            "compaction_retry": self.retry_status(est),
         }
 
     def compact_before_model_call(
@@ -138,6 +160,13 @@ class ContextManager:
     ) -> None:
         estimated = self.estimate(messages, system=system, tools=tools)
         if estimated > self.budget.safe_input_limit:
+            retry = self.retry_status(estimated)
+            if retry.get("blocked"):
+                raise ContextBudgetExceeded(
+                    f"上次上下文压缩失败：{retry['reason']}。当前预计输入 {estimated} token，"
+                    f"已超过安全预算 {self.budget.safe_input_limit} token；已阻止重复压缩和超限请求。"
+                    "请手动 /context compact 重试，或缩短上下文、切换模型后继续。"
+                )
             raise ContextBudgetExceeded(
                 f"上下文无法安全压缩：预计输入 {estimated} token，安全预算 "
                 f"{self.budget.safe_input_limit} token。请缩短请求、工具定义或切换更大窗口模型。"
@@ -160,8 +189,12 @@ class ContextManager:
 
         force=True 时无视阈值与 auto_compact 直接尝试压缩(供 /context compact)。
         """
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         est = self.estimate(messages, system=system, tools=tools)
         status = self.budget.status_for(est)
+        if status == "ok":
+            self._failed_compaction = None
 
         if not force:
             if not self.auto_compact:
@@ -174,7 +207,7 @@ class ContextManager:
                     payload=self.report(messages, system=system, tools=tools),
                 ))
                 return False
-            if status != "compact":
+            if status != "compact" or self.retry_status(est).get("blocked"):
                 return False
 
         compaction_started = time.monotonic()
@@ -192,6 +225,7 @@ class ContextManager:
         summary_budget = max(256, min(4096, self.budget.summary_budget))
         summary_input = self.budget.safe_input_limit - self._compressor.summary_system_tokens - summary_budget - 64
         if summary_input < 256:
+            self._remember_failure(est, "模型窗口不足以容纳摘要指令和输出预留")
             self._emit(RunEvent(kind=events.CONTEXT_COMPACTION_FAILED,
                                 text="模型窗口不足以容纳摘要指令和输出预留"))
             return False
@@ -213,9 +247,10 @@ class ContextManager:
             if result.compacted or result.code != "budget_exceeded":
                 break
         if not result.compacted or result.summary is None:
+            self._remember_failure(est, result.reason or "压缩未发生")
             self._emit(RunEvent(
                 kind=events.CONTEXT_COMPACTION_FAILED,
-                text=result.reason or "压缩未发生",
+                text=(result.reason or "压缩未发生") + "；自动重试至少间隔5分钟且输入需有明显变化，/context compact 可手动重试",
             ))
             return False
 
@@ -225,16 +260,24 @@ class ContextManager:
                 text=f"摘要模型不可用，已使用本地兜底压缩 ({result.reason.split(':', 1)[1]})",
             ))
 
+        self._failed_compaction = None
         self._pending_records.append(result.summary)
         self.last_summary = result.summary
         self._warned = False  # 压缩后重置,下一轮增长可再次预警
         after = self.estimate(messages, system=system, tools=tools)
+        message_tokens = estimate_messages_tokens(messages)
+        summary_tokens = estimate_message_tokens(messages[0]) if messages else 0
         self._emit(RunEvent(
             kind=events.CONTEXT_COMPACTION_COMPLETED,
             text="已压缩旧历史",
             payload={
                 "token_before": est,
                 "token_after": after,
+                "summarized_before": result.summary.token_count_before,
+                "summary_tokens": summary_tokens,
+                "protected_tokens": result.summary.token_count_after - summary_tokens,
+                "recent_tokens": message_tokens - result.summary.token_count_after,
+                "fixed_tokens": after - message_tokens,
                 "source_message_range": list(result.summary.source_message_range),
                 "summary": result.summary.summary,
             },

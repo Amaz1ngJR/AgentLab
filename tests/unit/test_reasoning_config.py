@@ -54,10 +54,9 @@ def test_crs_profile_declares_context_window(monkeypatch):
     cfg = load_config("crs_gpt")
     assert cfg.context_size is not None and cfg.context_size > 8192
 
-    from app.agent.context_budget import ContextBudget, resolve_context_limit
+    from app.agent.context_budget import ContextBudget
     # 声明值优先于按名查表：即使模型名匹配不到任何前缀，也用 profile 的窗口。
-    assert resolve_context_limit(cfg.model, cfg.context_size) == cfg.context_size
-    assert ContextBudget.from_model(cfg.model, cfg.context_size).model_context_limit > 8192
+    assert ContextBudget.from_context_size(cfg.context_size).model_context_limit > 8192
 
 
 def test_context_size_env_overrides_profile(monkeypatch):

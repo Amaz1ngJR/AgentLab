@@ -24,6 +24,8 @@ import json
 import os
 import stat
 import uuid
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 from app.config.loader import workspace_root
@@ -145,7 +147,7 @@ def _create_temp_sibling(directory: Path, name: str, mode: int = 0o666) -> tuple
     raise OSError(f"could not create a temporary file next to {name}")
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str, *, permissions: int | None = None) -> None:
     """原子写入:同目录临时文件 → fsync → os.replace。
 
     直接 write_text 写到一半崩溃会留下截断的半成品文件;os.replace 在同一文件
@@ -157,6 +159,8 @@ def atomic_write_text(path: Path, text: str) -> None:
         mode = stat.S_IMODE(path.stat().st_mode)
     except FileNotFoundError:
         mode = None
+    if permissions is not None:
+        mode = permissions
     fd, tmp = _create_temp_sibling(path.parent, path.name, mode if mode is not None else 0o666)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
@@ -185,7 +189,22 @@ def _coerce_int(value, default: int, *, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, number))
 
 
-def _read_file(args: dict) -> str:
+# Only seek offsets are cached; never cache file contents. Replacement invalidates offsets.
+_READ_OFFSETS = OrderedDict()
+_READ_OFFSETS_LOCK = threading.Lock()
+
+
+def _read_start(path, offset):
+    info = path.stat()
+    version = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    key = (str(path), version)
+    with _READ_OFFSETS_LOCK:
+        points = {1: 0, **_READ_OFFSETS.get(key, {})}
+    line = max((line for line in points if line <= offset), default=1)
+    return key, points, line, points.get(line, 0)
+
+
+def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS):
     """按行分页读取文本文件。
 
     返回单页内容(最多 DEFAULT_READ_LINES 行 / MAX_READ_CHARS 字符)。大文件不会
@@ -224,10 +243,18 @@ def _read_file(args: dict) -> str:
     chars = 0
     last_line = offset - 1
     has_more = False
+    key, points, start_line, cookie = _read_start(path, offset)
     try:
-        # newline="" 保留原始换行符;逐行迭代,不会把整个文件读进内存。
+        # newline="" 保留原始换行符；readline 允许保存 TextIO seek cookie。
         with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
-            for lineno, line in enumerate(fh, start=1):
+            opened = os.fstat(fh.fileno())
+            version = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+            if version != key[1]:
+                key, points, start_line, cookie = (str(path), version), {1: 0}, 1, 0
+            fh.seek(cookie)
+            for lineno, line in enumerate(iter(fh.readline, ""), start=start_line):
+                if lineno % 256 == 0 or lineno == offset - 1:
+                    points[lineno + 1] = fh.tell()
                 if lineno < offset:
                     continue
                 if len(lines_out) >= limit:
@@ -238,22 +265,43 @@ def _read_file(args: dict) -> str:
                         f"{line[:MAX_LINE_CHARS]}"
                         f"…[本行已截断,共 {len(line)} 字符]\n"
                     )
-                if lines_out and chars + len(line) > MAX_READ_CHARS:
+                if chars + len(line) > max_chars:
                     has_more = True
                     break
                 lines_out.append(line)
                 chars += len(line)
                 last_line = lineno
+                points[lineno + 1] = fh.tell()
     except OSError as exc:
         raise ToolExecutionError(f"read failed: {exc}") from exc
 
-    if not lines_out:
+    # Check the version again: offsets from a concurrently rewritten file are discarded.
+    if _read_start(path, 1)[0] == key:
+        with _READ_OFFSETS_LOCK:
+            # Limit both the number of files and checkpoints per file.
+            merged = {**_READ_OFFSETS.get(key, {}), **points}
+            _READ_OFFSETS[key] = dict(sorted(merged.items())[-2048:])
+            _READ_OFFSETS.move_to_end(key)
+            while len(_READ_OFFSETS) > 128:
+                _READ_OFFSETS.popitem(last=False)
+
+    return path, {"content": "".join(lines_out), "start_line": offset, "end_line": last_line,
+                  "next_offset": last_line + 1 if has_more else None, "truncated": has_more}
+
+
+def _read_file(args: dict) -> str:
+    path, page = _read_page(args)
+    offset = page["start_line"]
+    last_line = page["end_line"]
+    has_more = page["truncated"]
+    limit = _coerce_int(args.get("limit"), DEFAULT_READ_LINES, minimum=1, maximum=MAX_READ_LINES)
+    if not page["content"]:
         if offset > 1:
             return (f"{path}: offset {offset} 超出文件末尾"
                     f"(已读到最后一行,无更多内容)。")
         return f"{path}: (empty)"
 
-    body = "".join(lines_out)
+    body = page["content"]
     # 只有真的分页了才加页眉页脚,普通小文件的返回值保持原样(向后兼容)。
     if offset > 1 or has_more:
         header = f"{path} (lines {offset}-{last_line})\n"
