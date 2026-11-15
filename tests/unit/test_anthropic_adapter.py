@@ -44,6 +44,57 @@ def _config():
                      context_size=8192, timeout_seconds=30, stream=True)
 
 
+def test_fable_52_does_not_send_nondefault_temperature():
+    from app.models.anthropic_adapter import AnthropicAdapter
+    cfg = _config()
+    cfg.model = "claude-fable-5-2"
+    stream, _ = _sdk_stream([])
+    with patch("anthropic.Anthropic") as sdk:
+        sdk.return_value.messages.stream.return_value = stream
+        AnthropicAdapter(cfg).create_message([])
+        assert "temperature" not in sdk.return_value.messages.stream.call_args.kwargs
+        assert cfg.temperature == 0.2
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_explicit_temperature_rejection_retries_once_without_parameter(streaming):
+    import httpx
+    from types import SimpleNamespace
+    from anthropic import BadRequestError
+    from app.models.anthropic_adapter import AnthropicAdapter
+    error = BadRequestError("claude-test does not support non-default temperature",
+        response=httpx.Response(400, request=httpx.Request("POST", "https://example.test/v1/messages")), body={})
+    with patch("anthropic.Anthropic") as sdk:
+        adapter = AnthropicAdapter(_config())
+        if streaming:
+            response, _ = _sdk_stream([])
+            method = sdk.return_value.messages.stream
+            method.side_effect = [error, response]
+            result = adapter.create_message([]).text
+        else:
+            method = sdk.return_value.messages.create
+            method.side_effect = [error, SimpleNamespace(content=[SimpleNamespace(type="text", text="OK")])]
+            result = adapter.chat([])
+        assert result == "OK"
+        assert len(method.call_args_list) == 2
+        assert method.call_args_list[0].kwargs["temperature"] == 0.2
+        assert "temperature" not in method.call_args_list[1].kwargs
+        assert adapter._omit_temperature is True
+
+
+def test_unrelated_bad_request_is_not_retried():
+    import httpx
+    from anthropic import BadRequestError
+    from app.models.anthropic_adapter import AnthropicAdapter
+    error = BadRequestError("invalid messages", response=httpx.Response(400,
+        request=httpx.Request("POST", "https://example.test/v1/messages")), body={})
+    with patch("anthropic.Anthropic") as sdk:
+        sdk.return_value.messages.create.side_effect = error
+        with pytest.raises(BadRequestError):
+            AnthropicAdapter(_config()).chat([])
+        assert sdk.return_value.messages.create.call_count == 1
+
+
 @pytest.mark.parametrize("initial_content", [None, []])
 @pytest.mark.parametrize("tool", [False, True])
 def test_null_initial_content_with_real_sdk_does_not_require_a_retry(initial_content, tool):

@@ -353,18 +353,21 @@ class MarkdownRenderer:
             for i in range(columns)
         ]
 
-        out = []
+        def border(left, middle, right):
+            return self._base + left + middle.join("─" * (w + 2) for w in widths) + right + RESET
+
+        out = [border("┌", "┬", "┐")]
         for index, row in enumerate(rendered):
-            padded = [
-                cell + " " * (widths[i] - display_width(strip_ansi(cell)))
-                for i, cell in enumerate(row)
-            ]
-            # 表格列分隔符使用正常颜色
-            sep = f"{self._base} │{RESET}{self._base} "
-            out.append(f"{self._base}{sep.join(padded)}{RESET}")
-            if index == 0:
-                # 分隔行使用正常颜色
-                out.append(self._base + "─┼─".join("─" * w for w in widths) + RESET)
+            padded = []
+            for i, cell in enumerate(row):
+                space = widths[i] - display_width(strip_ansi(cell))
+                left = space // 2 if index == 0 else 0
+                padded.append(" " * (left + 1) + cell + " " * (space - left + 1))
+            sep = f"{self._base}│{RESET}{self._base}"
+            out.append(f"{self._base}│{sep.join(padded)}{self._base}│{RESET}")
+            if index < len(rendered) - 1:
+                out.append(border("├", "┼", "┤"))
+        out.append(border("└", "┴", "┘"))
         return "\n".join(out) + "\n"
 
     # ── 行内 ────────────────────────────────────────────────────────────────

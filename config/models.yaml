@@ -1,4 +1,10 @@
 models:
+  chatgpt_codex:
+    provider: openai_chatgpt
+    model: gpt-6.1-sol
+    capabilities: [chat, tools]
+    params:
+      reasoning_effort: medium
 
   # ── 本地模型（Ollama）────────────────────────────────────────────────────────
   local_qwen3_14b:
@@ -17,7 +23,7 @@ models:
   # 直连官方时设置 ANTHROPIC_API_KEY。
   cloud_claude_opus:
     provider: anthropic
-    model: ${ANTHROPIC_MODEL:-claude-fable-5.1}
+    model: ${ANTHROPIC_MODEL:-claude-fable-5-2}
     auth_token_env: ANTHROPIC_AUTH_TOKEN
     api_key_env: ANTHROPIC_API_KEY
     base_url_env: ANTHROPIC_BASE_URL

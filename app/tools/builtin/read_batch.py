@@ -38,6 +38,11 @@ def read_files(args):
             entry["end_line"] = entry["start_line"] + len(lines) - 2
             entry["next_offset"] = entry["end_line"] + 1
             entry["truncated"] = True
+            if not entry["content"]:
+                entry["end_line"] = entry["start_line"] - 1
+                entry["next_offset"] = entry["start_line"]
+                entry["next_column"] = item.get("column_offset", 0)
+                entry["note"] = "本项预算不足，请用 read_file 按 next_offset/next_column 续读。"
         if size() > MAX_OUTPUT - 100:
             result["files"].pop()
             result["pending_indices"].extend(range(index, len(requests)))
@@ -46,12 +51,13 @@ def read_files(args):
 
 READ_FILES = Tool(
     "read_files", "批量读取工作区内多个文件或同文件多个行段，一次调用返回带路径和行号的结果。"
-    "requests 最多12项，每项 path/offset/limit（默认200行）；总输出最多9000字符，共享预算。"
+    "requests 最多12项，每项 path/offset/limit（默认80行）；总输出最多9000字符，共享预算。"
     "每项 next_offset 为续读起始行，pending_indices 是尚未返回的请求索引。外部路径用 read_file 单独审批。",
     {"type": "object", "properties": {"requests": {"type": "array", "minItems": 1, "maxItems": 12,
         "items": {"type": "object", "properties": {
             "path": {"type": "string", "minLength": 1, "maxLength": 2048},
             "offset": {"type": "integer", "minimum": 1},
+            "column_offset": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 2000}},
             "required": ["path"], "additionalProperties": False}}},
      "required": ["requests"], "additionalProperties": False},
@@ -62,6 +68,7 @@ READ_FILES = Tool(
 
 READ_GUIDANCE = """【高效读取】
 先规划已知需要的文件和行段；独立读取放在同一轮工具调用中，或在提供 read_files 工具时一次提交多个路径/行段。
+默认每页80行；优先 code_search 精确定位并显式填写 offset/limit。超长行按 next_column/column_offset 续读，不丢弃中间字符。
 只有下一步依赖当前结果时才逐次读取。先 code_search 定位再读相关区域，避免从头逐页扫描整个项目。
 read_files 有共享输出预算，检查各项 next_offset、truncated 和 pending_indices；没有返回的内容不能假设已读。
 """

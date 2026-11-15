@@ -1006,9 +1006,6 @@ def _render_shell_diff() -> None:
                 is_new = (old == "") and _os.path.exists(path_str)
                 _emit_file_diff(path_str, old, new, is_new, width)
                 change_count += 1
-        # 命令跑了但没改任何文件:明确告知(避免用户疑惑"diff 去哪了")
-        if change_count == 0 and (_SHELL_TREE_BEFORE is not None or _SHELL_TARGETS):
-            print(f"  {_ANSI_DIM}(本次命令未改动任何文件){_ANSI_RESET}", flush=True)
     except Exception:
         pass
     finally:
@@ -1021,10 +1018,19 @@ def _reset_shell_snapshot() -> None:
     _SHELL_TARGETS.clear()
 
 
+def _print_tool_result(ev) -> None:
+    from app.util.tool_display import render_tool_result
+    block = render_tool_result(ev.tool_name, ev.tool_input, ev.tool_output,
+          error=ev.tool_error, elapsed=ev.elapsed_seconds, width=min(_term_width(), 120))
+    block = block.replace("●", _colorize("●", _ANSI_RED if ev.tool_error else _ANSI_GREEN), 1)
+    print(block, flush=True)
+
+
 def _print_event(ev: TurnEvent) -> None:
     if ev.kind == "tool_call":
         if _LIVE_INPUT is not None:
-            _LIVE_INPUT.composer.activity = f"执行 {ev.tool_name}"
+            from app.util.tool_display import activity_label
+            _LIVE_INPUT.composer.activity = f"执行 {activity_label(ev.tool_name, ev.tool_input)}"
             _LIVE_INPUT.invalidate()
         if ev.tool_name == "write_file":
             _render_write_file(ev.tool_input or {})
@@ -1034,10 +1040,7 @@ def _print_event(ev: TurnEvent) -> None:
             _snapshot_shell_targets(ev.tool_input or {})
         # 不在这里打印 tool_use，审批对话框会显示详细信息
     elif ev.kind == "tool_result":
-        preview = (ev.tool_output.splitlines()[:1] or [""])[0][:120]
-        tag = "ERR" if ev.tool_error else "ok"
-        t = f" ({ev.elapsed_seconds * 1000:.0f}ms)" if ev.elapsed_seconds < 1 else f" ({ev.elapsed_seconds:.1f}s)"
-        print(f"    [{tag}]{t} {preview}", flush=True)
+        _print_tool_result(ev)
         if ev.tool_name == "shell" and not ev.tool_error:
             _render_shell_diff()
         # write_file/edit_file 允许后关闭 VS Code diff
@@ -1087,7 +1090,8 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
             print(f"\n{_model_text(ev.text)}\n", flush=True)
     elif kind == run_events.TOOL_REQUESTED:
         if _LIVE_INPUT is not None:
-            _LIVE_INPUT.composer.activity = f"执行 {ev.tool_name}"
+            from app.util.tool_display import activity_label
+            _LIVE_INPUT.composer.activity = f"执行 {activity_label(ev.tool_name, ev.tool_input)}"
             _LIVE_INPUT.invalidate()
         # 这里只做审批前 diff / shell 快照；黄色 tool_use 由紧随其后的
         # APPROVAL_REQUIRED 统一输出，免审批工具不冒充审批内容。
@@ -1102,21 +1106,7 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         # 审批对话框会显示详细信息，这里不再重复打印
         pass
     elif kind == run_events.TOOL_COMPLETED:
-        # 最多显示 3 行，每行限 120 字符；超过 3 行时最后一行末尾加省略号
-        lines = (ev.tool_output or "").splitlines()
-        if not lines:
-            preview_lines = [""]
-        elif len(lines) <= 3:
-            preview_lines = [line[:120] for line in lines[:3]]
-        else:
-            preview_lines = [line[:120] for line in lines[:2]]
-            third_line = lines[2][:117] + "..." if len(lines[2]) > 117 else lines[2] + "..."
-            preview_lines.append(third_line)
-        preview = "\n    ".join(preview_lines)  # 保持缩进对齐
-        tag = "ERR" if ev.tool_error else "ok"
-        t = (f" ({ev.elapsed_seconds * 1000:.0f}ms)" if ev.elapsed_seconds < 1
-             else f" ({ev.elapsed_seconds:.1f}s)")
-        print(f"    [{tag}]{t} {preview}", flush=True)
+        _print_tool_result(ev)
         if ev.tool_name == "shell" and not ev.tool_error:
             _render_shell_diff()
         # write_file/edit_file 允许后关闭 VS Code diff(与 Claude Code 对齐)
@@ -1782,6 +1772,9 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     _check_local_endpoint(cfg)
 
     llm = build_model_router(cfg)
+    if cfg.provider == "openai_chatgpt":
+        from app.auth.chatgpt import TokenManager
+        TokenManager(cfg.chatgpt_account).access_token()
 
     _print_init(f"== AgentLab v{__version__} ==")
     _print_init(f"provider : {cfg.provider}")
@@ -1790,6 +1783,10 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         _print_init(f"base_url : {cfg.base_url}")
     if cfg.profile_name:
         _print_init(f"profile  : {cfg.profile_name}")
+    if cfg.provider == "openai_chatgpt":
+        window = llm.context_window
+        _print_init(f"账号     : {cfg.chatgpt_account}")
+        _print_init(f"上下文   : {window.tokens:,} tokens（来源: {window.source}）")
     if cfg.capabilities:
         _print_init(f"能力     : {', '.join(cfg.capabilities)}")
     from app.config.loader import workspace_root
@@ -1839,7 +1836,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         # 浏览器/桌面控制 + 云端模型时,页面快照/截图/DOM/表单内容会进 LLM 上下文
         # → 离开本机。带 named profile(--user-data-dir,而非默认 --isolated)的话,
         # 用户登录态下的真实数据更敏感。这条提示必须在首次观察之前给到用户。
-        cloud_providers = {"anthropic", "openai"}
+        cloud_providers = {"anthropic", "openai", "openai_chatgpt"}
         browser_servers = [s for s in mcp_servers
                            if any(t.name.startswith("browser_") for t in mcp_manager.tools()
                                   if t.server == s.name)]
@@ -3188,6 +3185,11 @@ def _workspace_directory(value: str) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import sys
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "auth":
+        from app.auth.cli import main as auth_main
+        return auth_main(argv[1:])
     parser = argparse.ArgumentParser(prog="agentlab")
     parser.add_argument(
         "--version",
@@ -3248,7 +3250,7 @@ def main(argv: list[str] | None = None) -> int:
         raise
     except Exception as exc:
         # 顶层兜底:打印脱敏后的 traceback,避免凭据泄漏
-        sys.stderr.write(format_traceback(exc))
+        sys.stderr.write((str(exc) + "\n") if getattr(exc, "user_actionable", False) else format_traceback(exc))
         sys.stderr.flush()
         return 1
 

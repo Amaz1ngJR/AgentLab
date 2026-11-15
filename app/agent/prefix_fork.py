@@ -14,10 +14,15 @@ def prepare_prefix(snapshot: dict | None, llm, instruction: str) -> tuple[list[d
     def fallback(reason):
         return None, None, {**diagnostics, "fallback_reason": reason}
 
-    if not snapshot or snapshot.get("provider") != "openai" or getattr(llm, "provider", None) != "openai":
+    provider = getattr(llm, "provider", None)
+    if not snapshot or provider not in {"openai", "openai_chatgpt"} or snapshot.get("provider") != provider:
         return fallback("unsupported_provider_or_missing_request")
     if snapshot.get("model") != getattr(llm, "model", None):
         return fallback("model_mismatch")
+    if provider == "openai_chatgpt":
+        account = getattr(getattr(llm, "_adapter", None), "_cfg", None)
+        if snapshot.get("chatgpt_account") != getattr(account, "chatgpt_account", None):
+            return fallback("account_mismatch")
     messages = snapshot.get("messages", [])
     if not messages:
         return fallback("empty_history")
@@ -31,6 +36,13 @@ def prepare_prefix(snapshot: dict | None, llm, instruction: str) -> tuple[list[d
             calls.add(item.get("call_id"))
         elif kind == "function_call_output":
             outputs.add(item.get("call_id"))
+        elif kind == "additional_tools" and provider == "openai_chatgpt":
+            if item.get("role") != "developer" or not isinstance(item.get("tools"), list):
+                return fallback("non_replayable_tools")
+        elif kind == "reasoning" and provider == "openai_chatgpt":
+            if not (isinstance(item.get("encrypted_content"), str) and item["encrypted_content"]
+                    and isinstance(item.get("id"), str) and item["id"]):
+                return fallback("non_replayable_reasoning")
         elif kind in (None, "message") and item.get("role") in {"user", "assistant", "system", "developer"}:
             content = item.get("content", "")
             if not isinstance(content, str) and not (

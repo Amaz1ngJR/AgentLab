@@ -8,7 +8,7 @@
   - cwd 默认是 workspace;指定外部 cwd 时使用独立的越界审批
   - timeout 默认 30s,超时后子进程被杀掉
   - 输出先经过 AgentLab 内置 RTK 风格过滤器（无需外部二进制），失败时回退原文
-  - 最终仍截断到 8KB，避免巨型日志撑爆模型上下文
+  - 模型预览最多4000字符，完整长输出留存在工作区供分页读取
 
 跨平台说明:
   - Unix(macOS / Linux): 用 ["bash", "-c", command],利用 shell 解析管道、
@@ -35,8 +35,8 @@ from app.tools.registry import Tool, ToolExecutionError, current_cancel_token
 from app.tools.rtk_builtin import BuiltinRTK
 from app.util.process import run_process
 
-# 单次输出上限:8KB。超出截断并附说明,避免让模型上下文吞下兆级 log。
-MAX_OUTPUT_BYTES = 8_000
+# 单次预览上限（字符）；完整输出由 output_archive 留存。
+MAX_OUTPUT_BYTES = 4_000
 
 # 默认超时:30 秒。模型可在 args 里指定更长(比如 pytest 大概要 60s+)。
 DEFAULT_TIMEOUT = 30
@@ -93,6 +93,8 @@ def _run_shell(args: dict) -> str:
             if part:
                 details.append(part.rstrip())
         partial = "\n".join(details)
+        from app.tools.output_archive import archive_output, output_reference
+        partial_path = archive_output(partial) if len(partial) > MAX_OUTPUT_BYTES else None
         if len(partial) > MAX_OUTPUT_BYTES:
             partial = "[...truncated partial output]\n" + partial[-MAX_OUTPUT_BYTES:]
         message = (
@@ -102,6 +104,8 @@ def _run_shell(args: dict) -> str:
         )
         if partial:
             message += "\n[partial output]\n" + partial
+        if partial_path:
+            message += "\n" + output_reference(partial_path)
         raise ToolExecutionError(message) from exc
     except FileNotFoundError as exc:
         # 没装 bash / powershell 时
@@ -117,11 +121,16 @@ def _run_shell(args: dict) -> str:
         returncode,
     )
     body = compression.output
+    from app.tools.output_archive import archive_output, output_reference
+    full = (stdout or "") + ("\n[stderr]\n" + stderr if stderr else "")
+    archive = archive_output(full) if compression.applied or len(body) > MAX_OUTPUT_BYTES else None
+    if compression.applied and archive is None:
+        body = full  # Do not discard evidence if full-output retention failed.
 
     parts: list[str] = []
     if body:
         parts.append(body.rstrip())
-    if compression.applied:
+    if compression.applied and archive:
         parts.append(
             f"[rtk: {compression.category}, "
             f"{compression.original_bytes}->{compression.output_bytes} bytes, "
@@ -134,10 +143,14 @@ def _run_shell(args: dict) -> str:
     # 截断超长输出。把截断标记放末尾,模型能看见"原始输出多大",决定要不要
     # 改命令(比如加 head / tail)
     if len(output) > MAX_OUTPUT_BYTES:
-        truncated = output[:MAX_OUTPUT_BYTES]
+        truncated = output[:MAX_OUTPUT_BYTES * 3 // 4] + "\n…\n" + output[-MAX_OUTPUT_BYTES // 4:]
         output = f"{truncated}\n\n[...truncated, total {len(output)} bytes]\n[exit code: {returncode}]"
     if returncode != 0:
+        if archive:
+            output += "\n" + output_reference(archive)
         raise ToolExecutionError(output)
+    if archive:
+        output += "\n" + output_reference(archive)
     return output
 
 

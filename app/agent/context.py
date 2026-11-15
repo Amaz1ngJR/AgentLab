@@ -236,6 +236,7 @@ class ContextManager:
                 messages, keep_recent=self.keep_recent,
                 recent_budget=recent_budget,
                 summary_budget=summary_budget, input_token_budget=summary_input,
+                current_system=system, current_tools=tools,
                 target_message_tokens=target,
                 source_run_ids=source_run_ids, on_progress=on_progress, cancel=cancel,
                 deadline=deadline,
@@ -266,7 +267,8 @@ class ContextManager:
         self._warned = False  # 压缩后重置,下一轮增长可再次预警
         after = self.estimate(messages, system=system, tools=tools)
         message_tokens = estimate_messages_tokens(messages)
-        summary_tokens = estimate_message_tokens(messages[0]) if messages else 0
+        summary_message = next((m for m in messages if m.get("_agentlab_summary")), messages[0] if messages else None)
+        summary_tokens = estimate_message_tokens(summary_message) if summary_message else 0
         self._emit(RunEvent(
             kind=events.CONTEXT_COMPACTION_COMPLETED,
             text="已压缩旧历史",

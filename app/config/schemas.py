@@ -46,3 +46,4 @@ class LLMConfig:
     reasoning_effort: Optional[str] = None  # OpenAI Responses: low/medium/high 等推理强度
     profile_name: Optional[str] = None   # 激活的 profile 名称（如 "cloud_claude"）
     capabilities: list[str] = field(default_factory=list)  # 例 ["chat", "tools", "streaming"]
+    chatgpt_account: str = "default"  # Credential reference only, never OAuth tokens.

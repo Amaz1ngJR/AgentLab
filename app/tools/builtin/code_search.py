@@ -44,10 +44,10 @@ from app.tools.registry import Tool, ToolExecutionError, current_cancel_token
 from app.util.redact import redact
 
 # ── 限制常量 ──────────────────────────────────────────────────────────────────
-DEFAULT_MAX_RESULTS = 50          # 默认最多返回多少条命中
-DEFAULT_CONTEXT_LINES = 2         # 默认每条命中上下各取几行
+DEFAULT_MAX_RESULTS = 20          # 先定位，再用 read_file 精读；可显式扩大
+DEFAULT_CONTEXT_LINES = 1         # 默认只保留必要邻行；可显式扩大
 DEFAULT_TIMEOUT = 15              # rg 子进程超时(秒)
-MAX_OUTPUT_BYTES = 16_000         # 序列化后 JSON 的硬上限,超出从尾部裁剪命中
+MAX_OUTPUT_BYTES = 6_000          # 低于 Runtime 通用截断线，保证返回完整合法 JSON
 MAX_FILE_BYTES = 1_000_000        # 单个文件超过 1MB 跳过(疑似数据/产物文件)
 MAX_PREVIEW_CHARS = 300           # 单行 preview 截断,避免压缩行(minified)撑爆
 
@@ -481,7 +481,7 @@ def _search_files(root: Path, query: str, glob: Optional[str],
 def _enforce_output_limit(result: dict) -> dict:
     """序列化后超过 MAX_OUTPUT_BYTES 时,从尾部裁掉命中并标记 truncated。"""
     while result["matches"]:
-        if len(json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= MAX_OUTPUT_BYTES:
             break
         result["matches"].pop()
         result["truncated"] = True
@@ -567,9 +567,14 @@ def _code_search(args: dict) -> str:
     }
     if summary:
         result["summary"] = summary
+    if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_OUTPUT_BYTES:
+        from app.tools.output_archive import archive_output
+        path = archive_output(json.dumps(result, ensure_ascii=False, indent=2))
+        if path:
+            result["full_output_path"] = path
     result = _enforce_output_limit(result)
     result["count"] = len(result["matches"])
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 def _code_search_audit_summary(args: dict, result: str) -> tuple[str, str]:

@@ -7,7 +7,7 @@
 安全说明:
   - 路径会被 expanduser + resolve 展开成绝对路径,支持 ~ 写法
   - workspace 内只读操作免审批;路径越界时必须通过独立的 outside_workspace 审批
-  - read_file 按行分页(默认 200 行 / 9000 字符),大文件不会被整个读进内存
+  - read_file 按行分页(默认 80 行 / 9000 字符),超长行支持列偏移续读
   - write_file / edit_file 标记了 requires_approval=True,执行前会弹出人工确认;
     CLI 在确认前会展示彩色 diff。改文件优先用 edit_file(局部替换)而非 shell。
 
@@ -36,7 +36,7 @@ from app.tools.registry import Tool, ToolExecutionError, is_approval_granted
 # 输出会被全局截成"头 + 省略标记 + 尾",模型既看不清中间也没法续读。分页让
 # read_file 永远输出结构化、可续读的完整页,不触发那次截断。
 MAX_READ_CHARS = 9_000
-DEFAULT_READ_LINES = 200       # 默认每页最多返回多少行
+DEFAULT_READ_LINES = 80        # 默认先精读小行段，limit 可显式扩大
 MAX_READ_LINES = 2_000         # 单次请求的行数上限
 MAX_LINE_CHARS = 2_000         # 单行超长(压缩文件)时截断
 BINARY_PROBE_BYTES = 8_192     # 前 8KB 含 NUL 即判为二进制,拒绝读取
@@ -223,6 +223,8 @@ def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS):
         raise ToolExecutionError(f"not a file: {path}")
 
     offset = _coerce_int(args.get("offset"), 1, minimum=1, maximum=10**9)
+    column_offset = _coerce_int(args.get("column_offset"), 0, minimum=0, maximum=10**9)
+    next_column = None
     limit = _coerce_int(
         args.get("limit"), DEFAULT_READ_LINES, minimum=1, maximum=MAX_READ_LINES,
     )
@@ -260,13 +262,16 @@ def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS):
                 if len(lines_out) >= limit:
                     has_more = True
                     break
-                if len(line) > MAX_LINE_CHARS:
-                    line = (
-                        f"{line[:MAX_LINE_CHARS]}"
-                        f"…[本行已截断,共 {len(line)} 字符]\n"
-                    )
+                column = column_offset if lineno == offset else 0
+                if column > len(line):
+                    raise ToolExecutionError("column_offset 超出当前行长度")
+                line = line[column:]
                 if chars + len(line) > max_chars:
                     has_more = True
+                    if not lines_out:
+                        lines_out.append(line[:max_chars])
+                        last_line = lineno
+                        next_column = column + max_chars
                     break
                 lines_out.append(line)
                 chars += len(line)
@@ -286,7 +291,8 @@ def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS):
                 _READ_OFFSETS.popitem(last=False)
 
     return path, {"content": "".join(lines_out), "start_line": offset, "end_line": last_line,
-                  "next_offset": last_line + 1 if has_more else None, "truncated": has_more}
+                  "next_offset": (last_line if next_column is not None else last_line + 1) if has_more else None,
+                  "next_column": next_column, "truncated": has_more}
 
 
 def _read_file(args: dict) -> str:
@@ -307,7 +313,8 @@ def _read_file(args: dict) -> str:
         header = f"{path} (lines {offset}-{last_line})\n"
         footer = (
             f"\n[...单页上限 {limit} 行 / {MAX_READ_CHARS} 字符;"
-            f"继续请传 offset={last_line + 1}]"
+            f"继续请传 offset={page['next_offset']}"
+            + (f" column_offset={page['next_column']}" if page.get("next_column") is not None else "") + "]"
             if has_more else ""
         )
         return header + body + footer
@@ -414,18 +421,20 @@ def _list_dir(args: dict) -> str:
     if not path.is_dir():
         raise ToolExecutionError(f"not a directory: {path}")
     children = sorted(path.iterdir())
+    offset = _coerce_int(args.get("offset"), 0, minimum=0, maximum=len(children))
+    limit = _coerce_int(args.get("limit"), 60, minimum=1, maximum=MAX_LIST_ENTRIES)
     entries = [
         f"{child.name}{'/' if child.is_dir() else ''}"
-        for child in children[:MAX_LIST_ENTRIES]
+        for child in children[offset:offset + limit]
     ]
     if not entries:
         return f"(empty) {path}"
     output = f"{path}:\n" + "\n".join(entries)
-    remaining = len(children) - MAX_LIST_ENTRIES
+    remaining = len(children) - offset - limit
     if remaining > 0:
         output += (
             f"\n[...还有 {remaining} 个条目未显示;"
-            "用 code_search mode=file 或 shell 精确定位具体文件]"
+            f"下页使用 list_dir offset={offset + limit} limit={limit}]"
         )
     return output
 
@@ -452,7 +461,7 @@ def _write_audit_summary(args: dict, result: str) -> tuple[str, str]:
 
 READ_FILE = Tool(
     name="read_file",
-    description="按行分页读取本地文本文件。默认返回第 1 页(最多 200 行 / 9000 字符),"
+    description="按行分页读取本地文本文件。默认返回第 1 页(最多 80 行 / 9000 字符),"
                 "更大的文件用 offset 续读下一页。二进制文件会被拒绝。"
                 "workspace 内免审批,读取外部路径前必须获得用户审批。",
     input_schema={
@@ -461,6 +470,7 @@ READ_FILE = Tool(
             "path": {"type": "string", "description": "文件路径,支持 ~ 表示家目录"},
             "offset": {"type": "integer", "minimum": 1,
                        "description": "起始行号(1-based),默认 1。续读上一页时传页脚提示的 offset"},
+            "column_offset": {"type": "integer", "minimum": 0, "description": "超长行的字符偏移，按页脚提示续读，默认0"},
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES,
                       "description": f"本页最多返回多少行,默认 {DEFAULT_READ_LINES}"},
         },
@@ -503,12 +513,14 @@ WRITE_FILE = Tool(
 LIST_DIR = Tool(
     name="list_dir",
     description="列出目录下的条目,目录名带 / 后缀。不传 path 时列当前目录。"
-                f"超过 {MAX_LIST_ENTRIES} 个条目时只返回前 {MAX_LIST_ENTRIES} 个并说明剩余数量。"
+                f"默认每页60项，可用 offset/limit 续读，limit 最大 {MAX_LIST_ENTRIES}。"
                 "workspace 内免审批,列出外部目录前必须获得用户审批。",
     input_schema={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "目录路径,默认为当前目录 '.'"},
+            "offset": {"type": "integer", "minimum": 0, "description": "目录条目起始偏移，默认0"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_ENTRIES, "description": "每页条目，默认60"},
         },
         "required": [],  # path 是可选参数
     },

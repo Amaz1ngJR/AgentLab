@@ -125,6 +125,10 @@ class ModelRouter:
             "on_thinking_delta": on_thinking_delta,
         }
         self._last_request = None
+        if self.provider == "openai_chatgpt":
+            from app.models.append_prefix import prepare_history
+            prepare_history(messages, tools, system)
+            adapter_kwargs["system"] = None
         if cancel is not None and _accepts_keyword(self._adapter.create_message, "cancel"):
             adapter_kwargs["cancel"] = cancel
         cfg = getattr(self._adapter, "_cfg", None)
@@ -134,6 +138,8 @@ class ModelRouter:
             adapter_kwargs["prompt_cache_key"] = self._cache_group
         request = {"messages": copy.deepcopy(messages), "system": system,
                    "tools": copy.deepcopy(tools), "provider": self.provider, "model": self.model}
+        if self.provider == "openai_chatgpt":
+            request["chatgpt_account"] = getattr(cfg, "chatgpt_account", "default")
         def invoke_adapter():
             try:
                 return self._adapter.create_message(messages, **adapter_kwargs)
@@ -157,7 +163,8 @@ class ModelRouter:
             breaker=self._breaker,
             discard_partial=discard_partial,
             sleep=self._retry_sleep,
-            max_retries=None if retry_until_cancelled else 2,
+            # ChatGPT plan admission failures must remain bounded even for long runs.
+            max_retries=None if retry_until_cancelled and self.provider != "openai_chatgpt" else 2,
         )
         self._last_request = request
         return response
@@ -175,6 +182,7 @@ class ModelRouter:
 
 
 _PROVIDERS = {
+    "openai_chatgpt":            "openai_chatgpt",
     "anthropic":                "anthropic",
     "openai":                   "openai",
     "openai_compatible":        "openai_compatible",
@@ -274,6 +282,14 @@ def call_create_message(
         elif kind == "error":
             raise value
         else:
+            # OAuth prefix updates were prepared inside the isolated request copy.
+            # Commit only append-only protocol updates on successful, uncancelled
+            # completion; late requests may never mutate the live conversation.
+            additions = snapshot[len(messages):]
+            if (additions and snapshot[:len(messages)] == messages
+                    and all(m.get("_agentlab_instruction") or m.get("type") == "additional_tools"
+                            for m in additions)):
+                messages.extend(copy.deepcopy(additions))
             return value
 
 
@@ -306,7 +322,10 @@ def build_model_router(cfg: Optional[LLMConfig] = None) -> ModelRouter:
     if canonical is None:
         raise ValueError(f"未知的 provider='{cfg.provider}'，支持: {sorted(_PROVIDERS)}")
 
-    if canonical == "anthropic":
+    if canonical == "openai_chatgpt":
+        from app.models.chatgpt_adapter import ChatGPTAdapter
+        adapter = ChatGPTAdapter(cfg)
+    elif canonical == "anthropic":
         from app.models.anthropic_adapter import AnthropicAdapter
         adapter = AnthropicAdapter(cfg)
     elif canonical == "openai":

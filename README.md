@@ -20,8 +20,12 @@
 - **可中断执行**：执行中按 Esc 或 Ctrl-C 停下，可直接输入新指令调整方向；`/resume` 继续上一轮未完成任务
 - **模型切换**：`--profile` 或 `.env` 切换本地 / 云端，不改代码；`/model` 命令族运行时查看和切换模型；本地端点不通时给出可执行修复指引
 - **进度可见**：LLM 调用期间 `✻ thinking… (3.2s · ↓ 42 tokens)` 实时刷新；每轮末尾打印耗时与 token
+- **执行日志**：工具名、命令或文件路径最多显示两行，末尾保留耗时；下面缩进预览最多四行结果，省略行数放在第四行末尾；批量读文件展示路径与正文。
 
 ## 安装
+
+ChatGPT 订阅账号可通过独立 OAuth 授权接入 `gpt-6.1-sol`，继续使用 AgentLab
+的工具、记忆和审批。配置与验证步骤见 [ChatGPT OAuth 接入](docs/chatgpt_oauth.md)。
 
 需要 **Python 3.11+**。
 
@@ -444,9 +448,24 @@ AGENTLAB_RTK_ULTRA_COMPACT=false
 [exit code: 0]
 ```
 
-需要完整原始输出时，可把 `AGENTLAB_RTK_ENABLED=false` 后重启 AgentLab；也可以
-改用更精确的命令缩小输出。该功能是 AgentLab 面向自身工具、审批和审计架构实现的
-独立 Python 适配版本。
+常见的 `env`、`command`、绝对路径、`rtk proxy` 和 `sh/bash -c/-lc` 包装会先解析
+再分类；复合命令、管道、脚本正文和无法可靠识别的远程命令不会误套单一语义过滤器。
+PTY 终端只做保守的进度/重复清理，不将暂时读完的输出解释为执行成功。
+
+shell/终端的长输出预览最多4000字符，保留头尾，不对混合输出做未经验证的语义删减。
+被压缩或截断的结果附有 `.agentlab/tool-output/<hash>.txt` 路径，可用 `read_file`
+按行读取完整留存输出。文件按内容寻址，不覆盖旧结果；只保留最近24小时的输出，
+每次写入归档时清理过期文件，相同内容再次使用会刷新保留时间。停止运行期间不会
+后台清理，下次归档时执行；旧会话中超过保留期的引用可能失效。
+留存失败时不会假装存在完整输出。摘要中的退出码和错误状态保持不变。
+
+其他高频工具也采用小页结果：`code_search` 默认20条命中、上下各1行，返回紧凑
+JSON，超过结果预算时提供本次已获取结果的完整输出路径（不代表已搜索全部匹配）；
+`list_dir` 默认60项，支持 `offset/limit`；`read_file/read_files` 默认80行，支持
+指定行段，超长行通过 `column_offset` 续读，不删除中间源码字符。
+
+这些处理只发生在新工具结果首次进入历史之前，不反复改写已发送的旧结果。
+终端的四行预览仅控制界面展示，与模型收到的工具结果预算分别处理。
 
 ## 多 Agent 与长期记忆
 
@@ -515,6 +534,57 @@ python -m app
 
 > 注：Playwright 用的是自带的 Chromium，不接管你日常的 Chrome/Safari，也不读你日常浏览器的登录态。
 
+## ChatGPT OAuth 登录与多账号切换
+
+使用 `chatgpt_codex` profile 调用 `gpt-6.1-sol`，保留 AgentLab 的工具、记忆和审批。
+首次登录默认账号：
+
+```bash
+agentlab auth login chatgpt --account default
+```
+
+每个真实账号使用不同标签，授权会分别保存。例如新增工作账号，在浏览器中选择
+另一个 ChatGPT 账号完成授权：
+
+```bash
+agentlab auth login chatgpt --account work
+```
+
+macOS / Linux 可在启动时临时选择账号，无需先退出其他账号：
+
+```bash
+# 原账号
+CHATGPT_ACCOUNT=default agentlab --profile chatgpt_codex
+
+# 工作账号
+CHATGPT_ACCOUNT=work agentlab --profile chatgpt_codex
+```
+
+Windows PowerShell 使用 `$env:CHATGPT_ACCOUNT="work"` 后运行
+`agentlab --profile chatgpt_codex`；切回原账号时将该环境变量改为 `default`。
+
+若要固定默认账号，在 `.env` 中设置并重新启动 AgentLab：
+
+```dotenv
+ACTIVE_PROFILE=chatgpt_codex
+CHATGPT_ACCOUNT=work
+```
+
+进程环境变量优先于 `.env`，若终端已设置 `CHATGPT_ACCOUNT`，需先修改或清除该变量。
+目前账号切换在重新启动后生效，运行中的任务继续使用原账号。
+
+查看或退出指定账号：
+
+```bash
+agentlab auth status chatgpt --account work
+agentlab auth logout chatgpt --account work
+```
+
+日常来回切换无需执行 logout。已有标签重新登录时会校验身份，不能覆盖成另一个
+真实账号；请为新账号使用新标签。令牌由 AgentLab 自动保存和续期，不要写入 `.env`。
+这里管理的是 AgentLab 的 ChatGPT OAuth 授权，Codex 桌面应用的登录独立管理。
+更多验证命令与存储说明见 [ChatGPT OAuth 接入](docs/chatgpt_oauth.md)。
+
 ## 配置
 
 模型配置入口：`.env` + `config/models.yaml`。
@@ -536,6 +606,7 @@ WORKSPACE_ROOT=/Users/you/some-project
 
 | Profile | 说明 | 需要的环境变量 |
 |---|---|---|
+| `chatgpt_codex` | ChatGPT OAuth + GPT-6.1 Sol | 先运行 `agentlab auth login chatgpt`；`CHATGPT_ACCOUNT` 可选择账号标签 |
 | `cloud_claude` | Anthropic Claude Sonnet | `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY` |
 | `cloud_claude_opus` | Anthropic Claude Opus | 同上 |
 | `gpt_official` | OpenAI 官方 GPT（Responses API） | `OPENAI_API_KEY`（可选 `OPENAI_MODEL` 覆盖型号） |

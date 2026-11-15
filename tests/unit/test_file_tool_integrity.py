@@ -200,7 +200,7 @@ def test_read_file_pages_large_file(monkeypatch, tmp_path):
     # 一路翻到最后一页,确认能完整读到文件末尾。
     offset = DEFAULT_READ_LINES + 1
     page = second
-    for _ in range(10):
+    for _ in range(1000 // DEFAULT_READ_LINES + 1):
         marker = "继续请传 offset="
         if marker not in page:
             break
@@ -235,7 +235,7 @@ def test_list_dir_caps_huge_directory(monkeypatch, tmp_path):
     for i in range(MAX_LIST_ENTRIES + 25):
         (tmp_path / f"f{i:04d}.txt").touch()
 
-    out = _list_dir({"path": str(tmp_path)})
+    out = _list_dir({"path": str(tmp_path), "limit": MAX_LIST_ENTRIES})
 
     assert f"还有 25 个条目未显示" in out
     assert out.count(".txt") == MAX_LIST_ENTRIES

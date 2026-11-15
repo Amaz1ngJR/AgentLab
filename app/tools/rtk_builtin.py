@@ -125,6 +125,20 @@ class BuiltinRTK:
         self._record_stats(result)
         return result
 
+    def compress_terminal(self, command: str, text: str) -> str:
+        """A PTY read is a partial stream, not a successful process exit."""
+        if not self.config.enabled:
+            return text
+        category = classify_command(command)
+        clean = _clean_common(text, preserve_leading=True)
+        if category in {"pytest", "test", "diagnostics", "table", "listing", "grep"}:
+            clean = "\n".join(_collapse_repeated(clean.splitlines(), self.config.ultra_compact))
+        if len(clean) >= len(text) * .9:
+            return text
+        from app.tools.output_archive import archive_output, output_reference
+        path = archive_output(text)
+        return clean + "\n" + output_reference(path) if path else text
+
     def _record_stats(self, result: CompressionResult) -> None:
         """记录单次压缩结果到全局统计。"""
         with self._stats_lock:
@@ -155,11 +169,11 @@ class BuiltinRTK:
             cls._stats.total_output_bytes = 0
 
 
-def classify_command(command: str) -> str:
+def classify_command(command: str, _depth: int = 0) -> str:
     """只对可确认的单命令使用专用过滤器，混合输出不做语义压缩。"""
     # Output from separate commands has no reliable boundaries. A formatter for
     # just one segment can silently discard the other segments' evidence.
-    if any(char in command for char in "\n\r$`"):
+    if _depth >= 8 or any(char in command for char in "\n\r$`"):
         return "generic"
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
@@ -170,30 +184,43 @@ def classify_command(command: str) -> str:
         return "generic"
     if any(token and all(char in ";&|<>()" for char in token) for token in tokens):
         return "generic"
-    lowered = command.strip().lower()
-    if not lowered:
+    # Unwrap only wrappers whose argv boundaries are unambiguous. Never search
+    # script bodies/quoted arguments for words such as "pytest" or "git diff".
+    for _ in range(8):
+        while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+            tokens = tokens[1:]
+        if not tokens:
+            return "generic"
+        executable = os.path.basename(tokens[0]).lower()
+        if executable in {"bash", "sh", "zsh"} and len(tokens) == 3 and tokens[1] in {"-c", "-lc"}:
+            return classify_command(tokens[2], _depth + 1)
+        if executable == "rtk" and len(tokens) > 2 and tokens[1] == "proxy":
+            tokens = tokens[2:]
+        elif executable in {"env", "command"}:
+            tokens = tokens[1:]
+            if tokens[:1] == ["--"]:
+                tokens = tokens[1:]
+            if tokens and tokens[0].startswith("-"):
+                return "generic"
+        else:
+            break
+    else:
         return "generic"
-    if _contains_any(lowered, ("pytest", "python -m pytest")):
+    executable = os.path.basename(tokens[0]).lower()
+    args = tokens[1:]
+    if executable.startswith("python") and args[:2] == ["-m", "pytest"] or executable == "pytest":
         return "pytest"
-    if _contains_any(lowered, ("cargo test", "npm test", "npm run test", "pnpm test", "yarn test", "vitest", "jest", "go test")):
+    if executable in {"vitest", "jest"} or executable in {"cargo", "go", "npm", "pnpm", "yarn"} and (args[:1] == ["test"] or args[:2] == ["run", "test"]):
         return "test"
-    if re.search(r"(^|[;&|]\s*)git\s+status\b", lowered):
-        return "git_status"
-    if re.search(r"(^|[;&|]\s*)git\s+diff\b", lowered):
-        return "git_diff"
-    if re.search(r"(^|[;&|]\s*)git\s+log\b", lowered):
-        return "git_log"
-    if re.search(r"(^|[;&|]\s*)(rg|grep)\b", lowered):
-        return "grep"
-    if re.search(r"(^|[;&|]\s*)(ls|tree|find)\b", lowered):
-        return "listing"
-    if re.search(r"(^|[;&|]\s*)(cat|head|tail)\b", lowered):
-        return "read"
-    if re.search(r"(^|[;&|]\s*)(docker|kubectl|oc)\b", lowered):
-        return "table"
-    if re.search(r"(^|[;&|]\s*)(ruff|mypy|eslint|tsc|golangci-lint)\b", lowered):
-        return "diagnostics"
-    return "generic"
+    if executable == "git":
+        while args and args[0] in {"-C", "-c", "--no-pager", "--no-optional-locks"}:
+            args = args[2:] if args[0] in {"-C", "-c"} else args[1:]
+        return {"status": "git_status", "diff": "git_diff", "log": "git_log"}.get(args[0] if args else "", "generic")
+    return ({"rg": "grep", "grep": "grep", "ls": "listing", "tree": "listing", "find": "listing",
+             "cat": "read", "head": "read", "tail": "read", "sed": "read",
+             "docker": "table", "kubectl": "table", "oc": "table", "nerdctl": "table",
+             "ruff": "diagnostics", "mypy": "diagnostics", "eslint": "diagnostics", "tsc": "diagnostics",
+             "golangci-lint": "diagnostics"}).get(executable, "generic")
 
 
 def format_status(config: BuiltinRTKConfig | None = None) -> str:

@@ -4,6 +4,7 @@
 auth_token 用于自建代理 / Claude Code 网关。
 """
 from __future__ import annotations
+from functools import wraps
 
 from typing import Any, Optional
 
@@ -48,6 +49,25 @@ def _materialize_anthropic_messages(messages: list[dict]) -> list[dict]:
     return converted
 
 
+def _temperature_compatible(method):
+    @wraps(method)
+    def invoke(self, *args, **kwargs):
+        from anthropic import BadRequestError
+        try:
+            return method(self, *args, **kwargs)
+        except BadRequestError as exc:
+            message = str(exc).lower()
+            if (getattr(self, "_omit_temperature", False) or "temperature" not in message
+                    or not any(marker in message for marker in ("does not support non-default temperature", "temperature is not supported", "unsupported parameter: temperature"))):
+                raise
+            cancel = kwargs.get("cancel")
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            self._omit_temperature = True
+            return method(self, *args, **kwargs)
+    return invoke
+
+
 class AnthropicAdapter:
     def __init__(self, cfg: LLMConfig):
         from anthropic import Anthropic
@@ -64,6 +84,7 @@ class AnthropicAdapter:
             kwargs["base_url"] = cfg.base_url
         self._client = Anthropic(**kwargs)
         self._cfg = cfg
+        self._omit_temperature = cfg.model == "claude-fable-5-2"
 
     def fetch_context_size(self) -> int | None:
         """Use the Models API's declared input limit; never infer it from a model ID."""
@@ -90,6 +111,7 @@ class AnthropicAdapter:
                 rest.append(msg)
         return ("\n\n".join(parts) if parts else None), rest
 
+    @_temperature_compatible
     def chat(self, messages: list[dict], temperature: Optional[float] = None) -> str:
         system_text, converted = self._split_system(messages)
         converted = _materialize_anthropic_messages(converted)
@@ -103,9 +125,12 @@ class AnthropicAdapter:
             params["system"] = system_text
         if self._cfg.top_p is not None:
             params["top_p"] = self._cfg.top_p
+        if self._omit_temperature:
+            params.pop("temperature", None)
         msg = self._client.messages.create(**params)
         return "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
 
+    @_temperature_compatible
     def create_message(
         self,
         messages: list[dict],
@@ -136,6 +161,8 @@ class AnthropicAdapter:
             params["top_p"] = self._cfg.top_p
         if tools:
             params["tools"] = tools
+        if self._omit_temperature:
+            params.pop("temperature", None)
 
         in_tokens = 0
         out_tokens = 0

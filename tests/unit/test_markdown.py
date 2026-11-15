@@ -91,8 +91,13 @@ def test_table_columns_align_on_wide_characters():
         "| 归 | O(n) |\n"
     )
     rows = [line for line in out.splitlines() if "│" in line]
-    assert len(rows) == 3  # 表头 + 两行数据（分隔行是 ─┼─，不含 │）
-    assert len({display_width(r) for r in rows}) == 1, rows
+    assert len(rows) == 3  # 表头 + 两行数据
+    lines = out.strip().splitlines()
+    assert lines[0].startswith("┌") and lines[0].endswith("┐")
+    assert lines[-1].startswith("└") and lines[-1].endswith("┘")
+    assert sum(line.startswith("├") and line.endswith("┤") for line in lines) == 2
+    assert all(row.startswith("│") and row.endswith("│") for row in rows)
+    assert len({display_width(r) for r in lines}) == 1, lines
 
 
 def test_table_rows_do_not_leave_blank_lines_while_buffering():

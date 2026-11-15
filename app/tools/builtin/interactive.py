@@ -45,7 +45,7 @@ if not _IS_WINDOWS:
     import select
 
 # 单次返回给模型的输出上限,避免巨型日志撑爆上下文。
-MAX_OUTPUT_BYTES = 8_000
+MAX_OUTPUT_BYTES = 4_000
 # 读取时:输出静默多久就认为"程序在等输入了"(秒)。
 DEFAULT_IDLE = 0.5
 # open / send 的硬超时(秒):再久也返回,防止干等。
@@ -69,7 +69,10 @@ def _normalize(raw: bytes) -> str:
 def _clip(text: str) -> str:
     if len(text) <= MAX_OUTPUT_BYTES:
         return text
-    return f"{text[:MAX_OUTPUT_BYTES]}\n\n[...truncated, total {len(text)} bytes]"
+    from app.tools.output_archive import archive_output, output_reference
+    path = archive_output(text)
+    preview = text[:MAX_OUTPUT_BYTES // 2] + "\n…\n" + text[-MAX_OUTPUT_BYTES // 2:]
+    return f"{preview}\n[...truncated, total {len(text)} characters]" + ("\n" + output_reference(path) if path else "")
 
 
 class PtySession:
@@ -259,7 +262,8 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             idle=idle, timeout=timeout, cancel=current_cancel_token(),
         )
         status = "" if session.alive else "\n[session 已结束]"
-        body = initial.strip() or "(无输出)"
+        from app.tools.rtk_builtin import BuiltinRTK
+        body = BuiltinRTK().compress_terminal(command, initial.strip()) or "(无输出)"
         return f"[session {sid}]\n{_clip(body)}{status}"
 
     def _send(args: dict) -> str:
@@ -291,7 +295,8 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             idle=idle, timeout=timeout, cancel=current_cancel_token(),
         )
         status = "" if session.alive else f"\n[session {sid} 已结束]"
-        body = out.strip() or "(无输出)"
+        from app.tools.rtk_builtin import BuiltinRTK
+        body = BuiltinRTK().compress_terminal(str(data), out.strip()) or "(无输出)"
         return f"{_clip(body)}{status}"
 
     def _close(args: dict) -> str:

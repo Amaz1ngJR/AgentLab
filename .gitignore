@@ -49,3 +49,4 @@ docs/代码剖析.md
 
 # 虚拟环境 
 agentlab/
+.agentlab/tool-output/

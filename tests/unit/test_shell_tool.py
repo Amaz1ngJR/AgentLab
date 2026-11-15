@@ -176,7 +176,7 @@ def test_run_shell_truncates_long_output(monkeypatch, tmp_path):
     out = _run_shell({"command": "yes"})
     assert "truncated" in out
     # 截断后总长度应该接近 MAX_OUTPUT_BYTES + 截断说明
-    assert len(out) < MAX_OUTPUT_BYTES + 200
+    assert len(out) < MAX_OUTPUT_BYTES + 500  # 截断说明及完整输出引用
 
 
 def test_run_shell_empty_command_refused():

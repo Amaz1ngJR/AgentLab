@@ -377,11 +377,12 @@ def test_explicit_summary_chunk_limit_still_caps_large_model_window():
 
 
 @pytest.mark.parametrize("tokens,budget,expected", [
-    (60000, 65536, 120),
-    (100000, 65536, 360),
-    (200000, 65536, 600),
-    (1000000, 65536, 600),
-    (100000, 8192, 600),
+    (60000, 65536, 600),
+    (100000, 65536, 900),
+    (200000, 65536, 1500),
+    (1000000, 65536, 1800),
+    (100000, 8192, 1800),
+    (400000, 500000, 1200),
 ])
 def test_compaction_time_budget_includes_merge_and_has_hard_cap(monkeypatch, tokens, budget, expected):
     from app.agent import context_compaction as module
@@ -391,6 +392,35 @@ def test_compaction_time_budget_includes_merge_and_has_hard_cap(monkeypatch, tok
 
 def test_explicit_compaction_timeout_overrides_workload_budget():
     assert ContextCompressor(SummaryModel(), timeout_seconds=17).timeout_for(history(), 512) == 17
+
+
+def test_compaction_timeout_environment_and_explicit_precedence(monkeypatch):
+    monkeypatch.setenv("AGENTLAB_COMPACTION_TIMEOUT_SECONDS", "1200")
+    assert ContextCompressor(SummaryModel()).timeout_for(history(), 512) == 1200
+    assert ContextCompressor(SummaryModel(), timeout_seconds=17).timeout_for(history(), 512) == 17
+    for value in ("0", "-1", "nan", "inf", "invalid"):
+        monkeypatch.setenv("AGENTLAB_COMPACTION_TIMEOUT_SECONDS", value)
+        with pytest.raises(ValueError):
+            ContextCompressor(SummaryModel())
+
+
+def test_summary_request_timeout_is_isolated_from_chat_timeout(monkeypatch):
+    import time
+    from types import SimpleNamespace
+    from app.models.router import ModelRouter
+    import app.models.router as routing
+    cfg = SimpleNamespace(timeout_seconds=120)
+    router = ModelRouter(SimpleNamespace(_cfg=cfg))
+    summary_model = SummaryModel()
+    configs = []
+    def build(config):
+        configs.append(config)
+        return summary_model
+    monkeypatch.setattr(routing, "build_model_router", build)
+    ContextCompressor(router)._summarize("old transcript", 4096, None, CancelToken(),
+        input_token_budget=65536, deadline=time.monotonic() + 900)
+    assert len(configs) == 1 and configs[0].timeout_seconds >= 899
+    assert cfg.timeout_seconds == 120
 
 
 

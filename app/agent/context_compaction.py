@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import json
+import os
+import copy
 import re
 import math
 import threading
@@ -412,7 +414,7 @@ class ContextCompressor:
     """选段 → 调模型摘要 → 校验/脱敏 → 产出摘要消息并就地替换旧历史。
 
     timeout_seconds 可显式限制整次压缩；默认按分片及合并请求数预留时间，
-    每次请求预留 120 秒，整次最多 600 秒，开始后不续期。
+    默认至少 600 秒，按输入量及分片/合并次数增加，最多 1800 秒，开始后不续期。
     超时不使用有损本地兜底，保留原始历史；后台迟到响应由请求隔离层丢弃。
     默认利用调用方的完整安全输入预算；未知窗口时使用 4096。
     必须分片时最多并发两个摘要请求，合并仍按原始历史顺序。
@@ -429,6 +431,8 @@ class ContextCompressor:
         self._model_profile = model_profile
         self._allow_local_fallback = allow_local_fallback
         self._available_skills = available_skills or []
+        if timeout_seconds is None and os.getenv("AGENTLAB_COMPACTION_TIMEOUT_SECONDS", "").strip():
+            timeout_seconds = float(os.environ["AGENTLAB_COMPACTION_TIMEOUT_SECONDS"])
         if summary_input_tokens is not None and summary_input_tokens < 256:
             raise ValueError("summary_input_tokens must be at least 256")
         if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
@@ -459,7 +463,9 @@ class ContextCompressor:
             if reduced >= chunks:
                 break
             chunks = reduced
-        return min(600, max(120, calls * 120))
+        # A single large-context request still needs substantial time before its
+        # first output; chunk count alone is not a sufficient workload estimate.
+        return min(1800, max(600, calls * 300, math.ceil(tokens / 10000) * 30))
 
     def compact(
         self,
@@ -475,6 +481,8 @@ class ContextCompressor:
         cancel: CancelToken | None = None,
         deadline: float | None = None,
         on_compaction_progress=None,
+        current_system: str | None = None,
+        current_tools: list[dict] | None = None,
     ) -> CompactionResult:
         """就地压缩 messages 的可压缩前缀。成功时 messages 被原地改短。
 
@@ -493,6 +501,7 @@ class ContextCompressor:
             return CompactionResult(False, reason="无可安全压缩的前缀")
 
         old = messages[:split]
+        from app.models.append_prefix import INSTRUCTION, rebuild_compacted_history
         token_before = estimate_messages_tokens(old)
 
         # 独立保留最近真实用户请求；即使工具循环很长也不会被摘要转述替代。
@@ -500,10 +509,13 @@ class ContextCompressor:
                           if _is_real_user(messages[i])), None)
         pinned = [m for i, m in enumerate(old)
                   if m.get("role") in {"system", "developer"} or i == last_user]
+        protected = rebuild_compacted_history([*pinned, *messages[split:]], messages,
+                                             system=current_system, tools=current_tools)
         if (target_message_tokens is not None
-                and estimate_messages_tokens([*pinned, *messages[split:]]) > target_message_tokens):
+                and estimate_messages_tokens(protected) > target_message_tokens):
             return CompactionResult(False, reason="受保护消息超出安全输入预算", code="budget_exceeded")
-        transcript = self._render_transcript(old)
+        transcript = self._render_transcript([
+            m for m in old if not m.get(INSTRUCTION) and m.get("type") != "additional_tools"])
         fallback_reason = ""
         request_cancel = CancelToken()
         unsubscribe = (cancel.add_callback(lambda: request_cancel.cancel("user"))
@@ -555,8 +567,13 @@ class ContextCompressor:
             compression_model_profile=self._model_profile,
         )
         # 传入 skills 列表，在压缩摘要中重新提醒模型
-        summary_msg = {"role": "user", "content": summary.to_message_text(self._available_skills)}
-        summary.token_count_after = estimate_messages_tokens([summary_msg, *pinned])
+        summary_msg = {"role": "user", "content": summary.to_message_text(self._available_skills),
+                       "_agentlab_summary": True}
+        candidate = rebuild_compacted_history([summary_msg, *pinned, *messages[split:]], messages,
+                                              system=current_system, tools=current_tools)
+        # Include all protected runtime state in the benefit/budget checks.
+        tail_ids = {id(m) for m in messages[split:]}
+        summary.token_count_after = estimate_messages_tokens([m for m in candidate if id(m) not in tail_ids])
 
         # 兜底:若摘要并不比被压缩的原前缀短(短前缀 + 结构化摘要骨架开销可能反而
         # 更长),压缩没有收益,不替换 —— 否则白白消耗一次模型调用还可能让上下文变大。
@@ -566,7 +583,6 @@ class ContextCompressor:
                 reason=f"压缩后 token 数({summary.token_count_after})未减少,跳过",
             )
 
-        candidate = [summary_msg, *pinned, *messages[split:]]
         if target_message_tokens is not None and estimate_messages_tokens(candidate) > target_message_tokens:
             return CompactionResult(False, reason="压缩后仍超出安全输入预算，保留原始历史", code="budget_exceeded")
         # 验证完整候选后才提交，失败或取消都不会破坏历史。
@@ -590,7 +606,7 @@ class ContextCompressor:
         """把一段历史消息渲染成给压缩模型看的纯文本(脱敏,紧凑)。"""
         return redact("\n".join(
             json.dumps(m, ensure_ascii=False, default=str, separators=(",", ":"))
-            for m in messages
+            for m in messages if m.get("type") != "reasoning"
         ))
 
     def _summarize(self, transcript: str, output_tokens: int, on_progress,
@@ -602,6 +618,14 @@ class ContextCompressor:
         # 已知安全窗口时利用可用预算，避免长历史被固定 4k 切成几十次串行请求。
         # 未声明窗口的直接调用保持保守；显式分片限制和小模型预算仍然生效。
         input_limit = self._input_limit(input_token_budget)
+        request_model = self._llm
+        from app.models.router import ModelRouter, build_model_router
+        if isinstance(request_model, ModelRouter) and math.isfinite(deadline):
+            # Isolate the SDK timeout from ordinary chat. Never unwrap bounded
+            # child models: their accounting/permission wrappers must stay intact.
+            cfg = copy.deepcopy(request_model._adapter._cfg)
+            cfg.timeout_seconds = max(cfg.timeout_seconds, deadline - time.monotonic())
+            request_model = build_model_router(cfg)
         last_report = 0.0
         state = {}
 
@@ -624,7 +648,7 @@ class ContextCompressor:
                 token.raise_if_cancelled()
                 emit("status", {"chunk": index, "attempt": attempt + 1, "phase": "request"})
                 response = call_create_message(
-                    self._llm, [{"role": "user", "content": chunk}],
+                    request_model, [{"role": "user", "content": chunk}],
                     tools=None, system=self._system, max_tokens=output_tokens,
                     on_progress=lambda metrics: emit("metrics", (index, metrics)), cancel=token,
                     on_wait=lambda: emit("wait", {}),
