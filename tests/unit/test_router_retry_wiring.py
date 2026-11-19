@@ -253,7 +253,8 @@ def test_provider_retry_maps_to_structured_item():
     assert item.payload["payload"]["delay"] == 1.5
 
 
-def test_upstream_failed_event_retries_and_discards_partial_output():
+@pytest.mark.parametrize("code", ["upstream_stream_read_error", "rate_limit_exceeded"])
+def test_upstream_failed_event_retries_and_discards_partial_output(code):
     from types import SimpleNamespace
     from app.models.openai_adapter import ProviderStreamError, _stream_failure
 
@@ -264,7 +265,7 @@ def test_upstream_failed_event_retries_and_discards_partial_output():
             except RemoteProtocolError:
                 detail, retryable = _stream_failure(SimpleNamespace(
                     type="response.failed", response=SimpleNamespace(error=SimpleNamespace(
-                        code="upstream_stream_read_error", message="Upstream response stream was interrupted"))))
+                        code=code, message="Upstream response stream was interrupted"))))
                 raise ProviderStreamError(detail, retryable=retryable)
 
     adapter = Gateway()

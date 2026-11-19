@@ -141,6 +141,8 @@ class ChatGPTAdapter:
         final = None
         request_id = None
         reasoning = []
+        completed_items = {}
+        streamed_text = {}
         try:
             if cancel:
                 cancel.raise_if_cancelled()
@@ -159,6 +161,7 @@ class ChatGPTAdapter:
                             raise ChatGPTError(code, status=getattr(response, "status_code", None),
                                 request_id=request_id, param=getattr(error, "param", None))
                         if kind == "response.output_text.delta":
+                            streamed_text.setdefault(event.output_index, []).append(event.delta)
                             if on_text_delta:
                                 on_text_delta(event.delta)
                             progress.add_text(event.delta)
@@ -169,6 +172,8 @@ class ChatGPTAdapter:
                             progress.add_reasoning(event.delta)
                         elif kind == "response.function_call_arguments.delta":
                             progress.add_text(event.delta)
+                        elif kind == "response.output_item.done":
+                            completed_items[event.output_index] = event.item
                         elif kind == "response.completed":
                             final = event.response
         except APIStatusError as exc:
@@ -200,25 +205,39 @@ class ChatGPTAdapter:
         bindings = (tool_bindings(messages, tools) if any(m.get(INSTRUCTION) for m in messages)
                     else {t["name"]: t["name"] for t in tools or []})
         call_ids = set()
-        for item in final.output or []:
-            value = item.model_dump(exclude_none=True)
+        # Some streams omit output items from the terminal response. Only recover
+        # after a successful completion, and never build tool calls from deltas.
+        items = {index: item.model_dump(exclude_none=True)
+                 for index, item in completed_items.items()}
+        items.update({index: item.model_dump(exclude_none=True)
+                      for index, item in enumerate(final.output or [])})
+        for index, chunks in streamed_text.items():
+            value = items.get(index)
+            if value is None:
+                items[index] = {"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "".join(chunks)}]}
+            elif value.get("type") == "message" and not any(
+                    part.get("text") or part.get("refusal") for part in value.get("content") or []):
+                value["content"] = [{"type": "output_text", "text": "".join(chunks)}]
+        for index in sorted(items):
+            value = items[index]
             output.append(value)
-            if item.type == "message":
-                for part in item.content or []:
-                    text.append(getattr(part, "text", None) or getattr(part, "refusal", "") or "")
-            elif item.type == "function_call":
-                if item.name not in bindings or getattr(item, "namespace", None) not in {None, NAMESPACE}:
+            if value["type"] == "message":
+                for part in value.get("content") or []:
+                    text.append(part.get("text") or part.get("refusal") or "")
+            elif value["type"] == "function_call":
+                if value["name"] not in bindings or value.get("namespace") not in {None, NAMESPACE}:
                     raise ProviderStreamError("ChatGPT 返回了未声明的工具或 namespace")
-                if not item.call_id or item.call_id in call_ids:
+                if not value.get("call_id") or value["call_id"] in call_ids:
                     raise ProviderStreamError("ChatGPT 返回了缺失或重复的工具调用 ID；未执行工具")
-                call_ids.add(item.call_id)
+                call_ids.add(value["call_id"])
                 try:
-                    arguments = json.loads(item.arguments)
+                    arguments = json.loads(value["arguments"])
                     if not isinstance(arguments, dict):
                         raise ValueError()
                 except ValueError:
                     raise ProviderStreamError("ChatGPT 返回了无效的工具参数；未执行工具") from None
-                calls.append(ToolCall(id=item.call_id, name=bindings[item.name], arguments=arguments))
+                calls.append(ToolCall(id=value["call_id"], name=bindings[value["name"]], arguments=arguments))
         usage = final.usage
         if not calls and not any(text):
             raise ProviderStreamError("ChatGPT 已结束但没有返回文本或工具调用，不能判定任务完成")

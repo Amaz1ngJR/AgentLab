@@ -15,13 +15,10 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Iterator, Optional
 
-import yaml
 from dotenv import load_dotenv
 
+from app.config.paths import CONFIG_DIR, PROJECT_ROOT, load_yaml
 from app.config.schemas import LLMConfig, ModelProfile
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-CONFIG_DIR = PROJECT_ROOT / "config"
 
 # 临时覆盖 workspace_root() 的根目录(线程/协程局部)。Loop 模式在隔离 worktree 内
 # 执行任务时,用 use_workspace_root() 把文件/shell 工具的根目录临时指向 worktree,
@@ -102,7 +99,7 @@ def load_profiles() -> dict[str, ModelProfile]:
     path = CONFIG_DIR / "models.yaml"
     if not path.exists():
         return {}
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw = load_yaml(path)
     profiles: dict[str, ModelProfile] = {}
     for name, body in (raw.get("models") or {}).items():
         body = body or {}

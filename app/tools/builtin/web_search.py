@@ -26,6 +26,7 @@ from typing import Optional
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 from app.tools.registry import Tool
+from app.tools.audit import audit_summary
 from app.util.redact import redact
 
 # ── 限制常量 ──────────────────────────────────────────────────────────────────
@@ -261,25 +262,17 @@ def _web_search(args: dict) -> str:
 
 
 def _web_search_audit_summary(args: dict, result: str) -> tuple[str, str]:
-    safe_args = {
-        key: args.get(key)
-        for key in ("query", "max_results", "engine", "timeout")
-        if key in args
-    }
-    try:
-        body = json.loads(result)
-        result_summary = json.dumps(
-            {
-                "engine": body.get("engine", ""),
-                "count": body.get("count", 0),
-                "truncated": body.get("truncated", False),
-                "error": body.get("error", ""),
-            },
-            ensure_ascii=False,
-        )
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        result_summary = result
-    return json.dumps(safe_args, ensure_ascii=False), result_summary
+    return audit_summary(
+        args,
+        result,
+        keys=("query", "max_results", "engine", "timeout"),
+        projector=lambda body: {
+            "engine": body.get("engine", ""),
+            "count": body.get("count", 0),
+            "truncated": body.get("truncated", False),
+            "error": body.get("error", ""),
+        },
+    )
 
 
 WEB_SEARCH = Tool(

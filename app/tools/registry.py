@@ -113,6 +113,16 @@ def current_cancel_token() -> Optional[CancelToken]:
     return _cancel_token.get()
 
 
+def delegated_manager(tools: Any) -> Any:
+    """读取 registry 上挂的委派/预算管理器；没挂则返回 None。
+
+    `manager` 是可选契约：ToolRegistry 会初始化它，但测试和轻量场景会用不带该
+    属性的 stub 顶替 registry。用函数统一读取，既避免各处直接点属性炸 AttributeError，
+    也不用再把 `getattr(tools, "manager", None)` 抄 17 遍。
+    """
+    return getattr(tools, "manager", None)
+
+
 @dataclass
 class ToolAuditEvent:
     """一次工具执行或拒绝的结构化审计事件。"""
@@ -284,6 +294,12 @@ class ToolRegistry:
         self._audit_sink = audit_sink
         # 本会话已被模型调用过的工具。动态暴露必须对它们单调:历史里已有 tool_use。
         self._used_tools: set[str] = set()
+        # 委派/预算管理器。registry 自身不关心它做什么，只是执行器、编排器和
+        # 运行时都要按需取用；显式声明成成员后，上层不必再反复 getattr 探测
+        # （原先三处共写了 17 次 `getattr(tools, "manager", None)`）。
+        # 注意这仍是**可选**契约：测试会用不带该属性的轻量 stub 顶替 registry，
+        # 所以上层一律通过下面的 delegated_manager() 读取，不要直接点属性。
+        self.manager: Any = None
 
     def register(self, tool: ToolDescriptor) -> None:
         """注册一个工具。同名工具会覆盖旧的。"""
@@ -363,13 +379,13 @@ class ToolRegistry:
         """按执行阶段选择工具；阶段规则优先于模糊任务关键词。"""
         normalized = (stage or "direct").lower()
         stage_tools = {
-            "inspect": {"read_file", "read_files", "list_dir", "code_search"},
-            "analysis": {"read_file", "read_files", "list_dir", "code_search"},
+            "inspect": {"read_file", "read_files", "read_tool_output", "list_dir", "code_search"},
+            "analysis": {"read_file", "read_files", "read_tool_output", "list_dir", "code_search"},
             "plan": set(),
             "direct": None,
             "task": None,
             "loop": None,
-            "verify": {"shell", "read_file", "code_search"},
+            "verify": {"shell", "read_file", "read_tool_output", "code_search"},
         }
         selected = stage_tools.get(normalized)
         if selected is None:

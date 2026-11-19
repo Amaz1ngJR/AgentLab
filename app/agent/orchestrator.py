@@ -37,7 +37,7 @@ from app.agent.subagent_runtime import SubagentRuntimeFactory
 from app.agent.subagents import SubagentCoordinator, SubagentResult, SubagentSpec
 from app.config.loader import workspace_root
 from app.workspace.worktree import WorktreeManager
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolRegistry, delegated_manager
 
 ProgressFn = Callable[[str], ContextManager[Any]]
 
@@ -268,7 +268,7 @@ class Orchestrator:
                     from app.agent.planner import TaskPlan
                     plan = TaskPlan(goal=goal)
                 else:
-                    manager = getattr(self._tools, "manager", None)
+                    manager = delegated_manager(self._tools)
                     if isinstance(self._planner, Planner):
                         self._planner.max_child_steps = self._max_steps
                         self._planner.budget_defaults = {
@@ -340,7 +340,7 @@ class Orchestrator:
         # ── 2. 执行 + 重规划循环 ──────────────────────────────────────────────
         rounds_left: int | None = None if auto_execute else self._max_steps
         last_text = ""
-        manager = getattr(self._tools, "manager", None)
+        manager = delegated_manager(self._tools)
         planned_running: dict[str, str] = {}
         from app.agent.execution_plan import ExecutionPolicy
         policy = plan.execution_plan.policy if plan.execution_plan else ExecutionPolicy()

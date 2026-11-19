@@ -7,6 +7,12 @@ import pytest
 _TESTS_ROOT = Path(__file__).resolve().parent
 
 
+@pytest.fixture(autouse=True)
+def isolated_output_cache(tmp_path, monkeypatch):
+    """Tests must never populate or evict the real user's output cache."""
+    monkeypatch.setenv("AGENTLAB_OUTPUT_CACHE_DIR", str(tmp_path / "output-cache"))
+
+
 def pytest_collection_modifyitems(items):
     for item in items:
         path = Path(item.path).resolve()

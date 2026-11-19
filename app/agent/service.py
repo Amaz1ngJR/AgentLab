@@ -28,6 +28,7 @@ from app.protocol.handshake import (
     negotiate_capabilities,
 )
 from app.protocol.subscription import EventQueueOverloaded, EventSubscription
+from app.util.subscribers import SubscriberList
 
 
 @dataclass(frozen=True)
@@ -84,8 +85,9 @@ class RuntimeService:
         self._lock = threading.RLock()
         self._runs: dict[str, _ActiveRun] = {}
         self._session_runs: dict[str, str] = {}
-        self._subscribers: list[Callable[[RuntimeEvent], None]] = []
-        self._protocol_subscribers: list[Callable[[EventEnvelope], None]] = []
+        # 与 _lock 共享同一把锁：注册订阅者要和 _ensure_open 检查处于同一临界区。
+        self._subscribers = SubscriberList[RuntimeEvent](self._lock)
+        self._protocol_subscribers = SubscriberList[EventEnvelope](self._lock)
         self._queue_subscribers: dict[str, EventSubscription] = {}
         self._clients: dict[str, ClientInfo] = {}
         self._sequences: dict[str, int] = {}
@@ -107,14 +109,7 @@ class RuntimeService:
         """订阅 Runtime 事件，并返回取消订阅函数。"""
         with self._lock:
             self._ensure_open()
-            self._subscribers.append(callback)
-
-        def unsubscribe() -> None:
-            with self._lock:
-                if callback in self._subscribers:
-                    self._subscribers.remove(callback)
-
-        return unsubscribe
+            return self._subscribers.add(callback)
 
     def initialize_client(self, client: ClientInfo) -> InitializeResult:
         """执行一次进程内 Protocol 握手，并返回协商后的能力。"""
@@ -177,14 +172,7 @@ class RuntimeService:
                     callback(EventEnvelope(**row))
         with self._lock:
             self._ensure_open()
-            self._protocol_subscribers.append(callback)
-
-        def unsubscribe() -> None:
-            with self._lock:
-                if callback in self._protocol_subscribers:
-                    self._protocol_subscribers.remove(callback)
-
-        return unsubscribe
+            return self._protocol_subscribers.add(callback)
 
     def replay_events(
         self, thread_id: str, *, after_sequence: int = 0,
@@ -260,7 +248,7 @@ class RuntimeService:
     def _dispatch_protocol(self, event: EventEnvelope) -> None:
         """把已落库的事件派发给协议订阅者和有界队列。"""
         with self._lock:
-            subscribers = list(self._protocol_subscribers)
+            subscribers = self._protocol_subscribers.snapshot()
             queue_subscribers = list(self._queue_subscribers.items())
         for callback in subscribers:
             try:
@@ -328,7 +316,7 @@ class RuntimeService:
         # 旧 callback 仍收到原事件，避免 CLI/第三方迁移期间行为变化。
         legacy = RuntimeEvent(source, thread_id, turn_id, event)
         with self._lock:
-            legacy_subscribers = list(self._subscribers)
+            legacy_subscribers = self._subscribers.snapshot()
         for callback in legacy_subscribers:
             try:
                 callback(legacy)
@@ -347,7 +335,7 @@ class RuntimeService:
         """发布兼容事件，并在有 thread_id 时同步发布 Protocol v1 事件。"""
         event = RuntimeEvent(kind, session_id, run_id, payload)
         with self._lock:
-            subscribers = list(self._subscribers)
+            subscribers = self._subscribers.snapshot()
         for callback in subscribers:
             try:
                 callback(event)

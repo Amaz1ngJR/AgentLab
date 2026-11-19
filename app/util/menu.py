@@ -307,7 +307,12 @@ def select_menu(
     # 独占 stdin:暂停后台 Esc 监听线程,否则它会抢走菜单的按键字节,
     # 导致"选 1 / Enter 要按很多次才生效"。
     from app.util.input_arbiter import foreground_stdin
-    with foreground_stdin():
+    # 菜单必须在独立的 AppSession 里跑。prompt_toolkit 的 set_app() 是直接改写
+    # 当前 AppSession 上的 app 字段;而 composer(主线程 loop)和审批菜单(工作线程
+    # 新 loop)共享同一个 AppSession 对象时,两边会互相覆盖,KeyPressEvent 于是
+    # 绑定到 composer,event.app.exit() 退的是 composer,菜单自己永远不退出。
+    from prompt_toolkit.application.current import create_app_session
+    with foreground_stdin(), create_app_session():
         app.run()
 
     if state["cancelled"]:

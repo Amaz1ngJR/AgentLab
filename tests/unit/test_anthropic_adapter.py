@@ -1,11 +1,15 @@
-"""Anthropic 图片 file 引用转换测试。"""
+"""Anthropic 图片 file 引用转换与跨 provider 历史归一化测试。"""
+import json
+
 from PIL import Image
 import pytest
 from unittest.mock import MagicMock, patch
 
 from app import attachments
 from app.attachments import AttachmentStore, build_user_content
-from app.models.anthropic_adapter import _materialize_anthropic_messages
+from app.models.anthropic_adapter import (
+    _materialize_anthropic_messages, _normalize_anthropic_messages,
+)
 
 
 def _sdk_stream(initial_content, *, tool=False):
@@ -151,3 +155,86 @@ def test_anthropic_file_image_materializes_to_base64(tmp_path, monkeypatch):
     assert image["source"]["data"]
     # 转换不修改持久化历史中的 file 引用。
     assert messages[0]["content"][1]["source"]["type"] == "file"
+
+
+# ── 跨 provider 历史归一化 ────────────────────────────────────────────────────
+# 会话在 Responses / ChatGPT / Ollama 之间迁移后，历史里会残留 function_call、
+# function_call_output、reasoning、developer 等 Anthropic 不认的条目。任何一个
+# 漏出去，网关都会整体 400：Input should be 'user', 'assistant', 'system'。
+
+
+def _foreign_history():
+    return [
+        {"type": "function_call", "call_id": "c1", "name": "shell",
+         "arguments": '{"command":"ls"}'},
+        {"type": "function_call_output", "call_id": "c1", "output": "a.txt"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "思考"}]},
+        {"type": "message", "role": "assistant",
+         "content": [{"type": "output_text", "text": "看完了"}]},
+        {"role": "developer", "content": "运行时指令"},
+        {"role": "user", "content": "继续"},
+    ]
+
+
+def test_foreign_provider_history_only_yields_anthropic_roles():
+    system, converted = _normalize_anthropic_messages(_foreign_history())
+    # 关键断言：没有任何非法 role 会被发给网关
+    assert {m["role"] for m in converted} <= {"user", "assistant"}
+    # developer 提升为顶层 system，而不是留在 messages 里
+    assert system == "运行时指令"
+    assert all("developer" not in json.dumps(m, ensure_ascii=False) for m in converted)
+
+
+def test_foreign_tool_calls_become_anthropic_blocks():
+    _, converted = _normalize_anthropic_messages(_foreign_history())
+    tool_uses = [b for m in converted for b in m["content"] if b.get("type") == "tool_use"]
+    tool_results = [b for m in converted for b in m["content"] if b.get("type") == "tool_result"]
+    assert tool_uses == [{"type": "tool_use", "id": "c1", "name": "shell",
+                          "input": {"command": "ls"}}]
+    assert tool_results[0]["tool_use_id"] == "c1"
+    assert tool_results[0]["content"] == "a.txt"
+
+
+def test_reasoning_items_are_dropped_from_replayed_input():
+    _, converted = _normalize_anthropic_messages(_foreign_history())
+    assert not any(b.get("type") == "reasoning"
+                   for m in converted for b in m["content"])
+
+
+def test_adjacent_same_role_messages_are_merged_for_alternation():
+    messages = [
+        {"role": "user", "content": "第一句"},
+        {"role": "user", "content": "第二句"},
+        {"role": "assistant", "content": "收到"},
+        {"role": "user", "content": "继续"},
+    ]
+    _, converted = _normalize_anthropic_messages(messages)
+    assert [m["role"] for m in converted] == ["user", "assistant", "user"]
+    assert [b["text"] for b in converted[0]["content"]] == ["第一句", "第二句"]
+
+
+def test_openai_chat_tool_role_becomes_tool_result():
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c9", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path":"a"}'}}]},
+        {"role": "tool", "tool_call_id": "c9", "content": "内容"},
+        {"role": "user", "content": "继续"},
+    ]
+    _, converted = _normalize_anthropic_messages(messages)
+    assert {m["role"] for m in converted} <= {"user", "assistant"}
+    blocks = [b for m in converted for b in m["content"]]
+    assert any(b.get("type") == "tool_use" and b["name"] == "read_file" for b in blocks)
+    assert any(b.get("type") == "tool_result" and b["tool_use_id"] == "c9" for b in blocks)
+
+
+def test_clean_anthropic_history_is_preserved():
+    messages = [
+        {"role": "system", "content": "系统提示"},
+        {"role": "user", "content": "问题"},
+        {"role": "assistant", "content": [{"type": "text", "text": "回答"}]},
+    ]
+    system, converted = _normalize_anthropic_messages(messages)
+    assert system == "系统提示"
+    assert [m["role"] for m in converted] == ["user", "assistant"]
+    assert converted[1]["content"] == [{"type": "text", "text": "回答"}]

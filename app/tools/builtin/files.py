@@ -204,14 +204,14 @@ def _read_start(path, offset):
     return key, points, line, points.get(line, 0)
 
 
-def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS):
+def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS, _trusted_path: Path | None = None):
     """按行分页读取文本文件。
 
     返回单页内容(最多 DEFAULT_READ_LINES 行 / MAX_READ_CHARS 字符)。大文件不会
     被整体读进内存,模型用 offset 续读下一页。
     """
     try:
-        path = _resolve_within_workspace(
+        path = _trusted_path if _trusted_path is not None else _resolve_within_workspace(
             args["path"],
             "read_file_outside_workspace",
         )

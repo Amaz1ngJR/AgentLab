@@ -431,6 +431,10 @@ class OpenAIAdapter:
                             cancel.raise_if_cancelled()
                         # 仍在 with 内取最终响应：stream 关闭后 SDK 不保证还能取到。
                         final = stream.get_final_response()
+        except ProviderStreamError:
+            # Already classified by the raw stream parser. Rewrapping would erase
+            # retryability (notably for rate_limit_exceeded, a RuntimeError subclass).
+            raise
         except (RuntimeError, IndexError, AttributeError, TypeError, AssertionError) as exc:
             if cancel is not None:
                 cancel.raise_if_cancelled()
@@ -473,7 +477,8 @@ class OpenAIAdapter:
                 )
             if _MISSING_CREATED_MARKER in message or "rate_limit" in message.lower():
                 raise ProviderStreamError(
-                    f"OpenAI Responses 流式协议异常: {message}"
+                    f"OpenAI Responses 流式协议异常: {message}",
+                    retryable="rate_limit" in message.lower(),
                 ) from exc
             raise
 
@@ -631,28 +636,6 @@ def _to_responses_tool(t: dict) -> dict:
         "description": t.get("description", ""),
         "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
     }
-
-
-def _estimate_input_tokens(messages: list[dict], system: Optional[str]) -> int:
-    """粗略估算 input token 数:把消息里所有文本字段的字符数加起来 / 3。
-
-    用于流式开始时让 spinner 显示一个非零的 input_tokens 占位值。真实数字
-    由 final.usage 在末尾覆盖。中文 1 字 ≈ 0.6 token,英文 4 字符 ≈ 1 token,
-    取折中 3 字符 ≈ 1 token。
-    """
-    char_count = 0
-    if system:
-        char_count += len(system)
-    for m in messages:
-        content = m.get("content")
-        if isinstance(content, str):
-            char_count += len(content)
-        elif isinstance(content, list):
-            # content 可能是 part list,把 text 字段加起来
-            for part in content:
-                if isinstance(part, dict):
-                    char_count += len(part.get("text", "") or "")
-    return char_count // 3
 
 
 def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:

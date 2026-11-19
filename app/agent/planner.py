@@ -12,14 +12,13 @@
 """
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass, field
 
 from app.agent.cancel import Cancelled, CancelToken
 from app.agent.tasks import PENDING, Task
 from app.agent.execution_plan import ExecutionPlan, PlannedTask, parse_execution_plan, validate_execution_plan
 from app.models.router import call_create_message
+from app.util.json_extract import extract_json_object as _extract_json
 
 PLANNER_SYSTEM = """你是任务规划器。把用户目标拆成可执行的子任务清单。
 
@@ -66,32 +65,6 @@ class TaskPlan:
     goal: str
     tasks: list[Task] = field(default_factory=list)
     execution_plan: ExecutionPlan | None = None
-
-
-def _extract_json(text: str) -> dict | None:
-    """从模型输出里抠出第一个 JSON 对象。
-
-    容忍三种常见污染:① markdown ```json 围栏;② JSON 前后有解释文字;
-    ③ 纯 JSON。抠不出合法对象时返回 None。
-    """
-    if not text:
-        return None
-    # 去掉 ```json ... ``` 围栏
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    candidate = fenced.group(1) if fenced else None
-    if candidate is None:
-        # 退而求其次:抓第一个 { 到最后一个 } 的跨度
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start : end + 1]
-    if candidate is None:
-        return None
-    try:
-        obj = json.loads(candidate)
-        return obj if isinstance(obj, dict) else None
-    except (ValueError, TypeError):
-        return None
 
 
 def _parse_tasks(obj: dict) -> list[Task]:

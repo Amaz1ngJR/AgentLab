@@ -15,10 +15,11 @@ from app.agent.cancel import CancelToken, Cancelled, apply_steering
 from app.agent.events import RunEvent
 from app.agent.mode_router import ExecutionMode, ModeRouter, SessionState
 from app.agent.tasks import TaskStore
+from app.util.subscribers import SubscriberList
 from app.attachments import ImageAttachment, build_user_content
 from app.models.protocol import ToolResult
 from app.models.router import ModelRouter, call_create_message
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolRegistry, delegated_manager
 
 DEFAULT_SYSTEM_PROMPT = """你是 AgentLab,一个本地编码助手。
 
@@ -192,8 +193,8 @@ class AgentSession:
         self.messages: list[dict[str, Any]] = []
         self._on_event = on_event or (lambda e: None)
         # RuntimeService 可在不替换 CLI 原渲染回调的前提下旁路订阅完整事件流。
-        self._turn_subscribers: list[Callable[[TurnEvent], None]] = []
-        self._run_subscribers: list[Callable[[RunEvent], None]] = []
+        self._turn_subscribers = SubscriberList[TurnEvent]()
+        self._run_subscribers = SubscriberList[RunEvent]()
         self._progress: ProgressFn = progress or (lambda label: nullcontext())
         self.last_turn_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         self.cumulative_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
@@ -230,7 +231,7 @@ class AgentSession:
     def enable_auto_execute(self) -> None:
         """打开全自动执行模式：所有工具调用免审批，直到任务完成。"""
         self._auto_execute_enabled = True
-        manager = getattr(self.tools, "manager", None)
+        manager = delegated_manager(self.tools)
         if manager is not None:
             manager.enable_long_run(self.auto_max_steps, self.auto_max_tool_calls, self.auto_timeout_seconds)
             if manager.allowed:
@@ -244,7 +245,7 @@ class AgentSession:
     def disable_auto_execute(self) -> None:
         """关闭全自动执行模式，恢复正常审批流程。"""
         self._auto_execute_enabled = False
-        manager = getattr(self.tools, "manager", None)
+        manager = delegated_manager(self.tools)
         if manager is not None:
             manager.auto_execute_active = False
 
@@ -300,26 +301,31 @@ class AgentSession:
     ) -> Callable[[], None]:
         """旁路订阅事件；返回取消订阅函数，CLI 原回调保持不变。"""
         if on_turn is not None:
-            self._turn_subscribers.append(on_turn)
+            remove_turn = self._turn_subscribers.add(on_turn)
+        else:
+            remove_turn = None
         if on_run is not None:
-            self._run_subscribers.append(on_run)
+            remove_run = self._run_subscribers.add(on_run)
+        else:
+            remove_run = None
 
         def unsubscribe() -> None:
-            if on_turn in self._turn_subscribers:
-                self._turn_subscribers.remove(on_turn)
-            if on_run in self._run_subscribers:
-                self._run_subscribers.remove(on_run)
+            # 两者都幂等，重复调用无副作用。
+            if remove_turn is not None:
+                remove_turn()
+            if remove_run is not None:
+                remove_run()
 
         return unsubscribe
 
     def _emit_turn_event(self, event: TurnEvent) -> None:
         self._on_event(event)
-        for callback in list(self._turn_subscribers):
+        for callback in self._turn_subscribers.snapshot():
             callback(event)
 
     def _emit_run_event(self, event: RunEvent) -> None:
         self._on_run_event(event)
-        for callback in list(self._run_subscribers):
+        for callback in self._run_subscribers.snapshot():
             callback(event)
 
     def _emit_provider_retry(
@@ -604,7 +610,7 @@ class AgentSession:
         turn_start = time.monotonic()
         try:
             orch = self._ensure_orchestrator()
-            manager = getattr(self.tools, "manager", None)
+            manager = delegated_manager(self.tools)
             if manager is not None and manager.long_run:
                 orch._max_steps = manager.model_limit
                 orch._max_task_steps = manager.task_rounds
@@ -686,7 +692,7 @@ class AgentSession:
                     ))
                     return "已中断。"
                 steering = apply_steering(cancel, self.messages)
-                manager = getattr(self.tools, "manager", None)
+                manager = delegated_manager(self.tools)
                 if manager is not None:
                     manager.deliver(self.messages)
                     manager.charge_parent_round()
@@ -763,7 +769,7 @@ class AgentSession:
                 response_text = resp.text or "".join(streamed_parts)
 
                 if not resp.tool_calls:
-                    manager = getattr(self.tools, "manager", None)
+                    manager = delegated_manager(self.tools)
                     if manager is not None and manager.settle_before_final(self.messages):
                         continue
                     steering = apply_steering(cancel, self.messages)
@@ -865,7 +871,7 @@ class AgentSession:
                         self.messages.extend(
                             self.llm.format_tool_results(tool_results + pending)
                         )
-                        manager = getattr(self.tools, "manager", None)
+                        manager = delegated_manager(self.tools)
                         if manager is not None:
                             manager.acknowledge_tool_results(tool_results + pending)
                         tool_results.clear()
@@ -979,7 +985,7 @@ class AgentSession:
                             output = _truncate_tool_output(output)
                             # Only bind result envelopes actually retained in history.
                             if call.name == "wait_agent":
-                                binder = getattr(self.tools, "manager", None)
+                                binder = delegated_manager(self.tools)
                                 if binder is not None:
                                     binder.bind_wait_tool_result(call.id, output, is_error)
                             if not is_error and call.name not in {"todo_write", "load_skill"}:
@@ -1009,7 +1015,7 @@ class AgentSession:
                 # OpenAI Responses 三家不一样),Runtime 不关心
                 if tool_results:
                     self.messages.extend(self.llm.format_tool_results(tool_results))
-                    manager = getattr(self.tools, "manager", None)
+                    manager = delegated_manager(self.tools)
                     if manager is not None:
                         manager.acknowledge_tool_results(tool_results)
 

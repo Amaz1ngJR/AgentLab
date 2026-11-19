@@ -16,7 +16,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from app.config.paths import PROJECT_ROOT
+
 DEFAULT_ATTACHMENT_ROOT = PROJECT_ROOT / "data" / "attachments"
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000

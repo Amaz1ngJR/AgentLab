@@ -34,6 +34,7 @@ from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
 
 from app.tools.registry import Tool
+from app.tools.audit import audit_summary
 from app.util.redact import redact
 
 # ── 限制常量 ──────────────────────────────────────────────────────────────────
@@ -442,30 +443,22 @@ def _web_fetch(args: dict) -> str:
 
 
 def _web_fetch_audit_summary(args: dict, result: str) -> tuple[str, str]:
-    safe_args = {
-        key: args.get(key)
-        for key in ("url", "max_chars", "timeout")
-        if key in args
-    }
-    try:
-        body = json.loads(result)
-        result_summary = json.dumps(
-            {
-                "url": body.get("final_url", body.get("url", "")),
-                "canonical_url": body.get("canonical_url", ""),
-                "title": body.get("title", ""),
-                "extractor": body.get("extractor", ""),
-                "http_status": body.get("http_status"),
-                "retrieved_at": body.get("retrieved_at", ""),
-                "content_hash": body.get("content_hash", ""),
-                "chars": body.get("chars", 0),
-                "truncated": body.get("truncated", False),
-            },
-            ensure_ascii=False,
-        )
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        result_summary = result
-    return json.dumps(safe_args, ensure_ascii=False), result_summary
+    return audit_summary(
+        args,
+        result,
+        keys=("url", "max_chars", "timeout"),
+        projector=lambda body: {
+            "url": body.get("final_url", body.get("url", "")),
+            "canonical_url": body.get("canonical_url", ""),
+            "title": body.get("title", ""),
+            "extractor": body.get("extractor", ""),
+            "http_status": body.get("http_status"),
+            "retrieved_at": body.get("retrieved_at", ""),
+            "content_hash": body.get("content_hash", ""),
+            "chars": body.get("chars", 0),
+            "truncated": body.get("truncated", False),
+        },
+    )
 
 
 WEB_FETCH = Tool(

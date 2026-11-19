@@ -10,10 +10,8 @@ import math
 from pathlib import Path
 from typing import Optional
 
-import yaml
+from app.config.paths import CONFIG_DIR, load_yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-CONFIG_DIR = PROJECT_ROOT / "config"
 
 
 @dataclass
@@ -83,7 +81,7 @@ def load_agent_profiles(path: Optional[Path] = None) -> dict[str, AgentProfile]:
     cfg_path = path or (CONFIG_DIR / "agents.yaml")
     if not cfg_path.exists():
         return {}
-    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    raw = load_yaml(cfg_path)
     profiles: dict[str, AgentProfile] = {}
     for agent_id, body in (raw.get("agents") or {}).items():
         body = body or {}

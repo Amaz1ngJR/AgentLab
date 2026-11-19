@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 from app.agent.approval import ApprovalPolicy, ApprovalResult, request_tool_approval
+from app.util.subscribers import SubscriberList
 
 
 ApprovalDecision = Literal["approve", "deny"]
@@ -64,7 +65,7 @@ class ApprovalBroker:
         self.default_timeout = default_timeout
         self._lock = threading.RLock()
         self._pending: dict[str, _PendingApproval] = {}
-        self._subscribers: list[Callable[[ApprovalRequest], None]] = []
+        self._subscribers = SubscriberList[ApprovalRequest](self._lock)
         self._closed = False
 
     def subscribe(self, callback: Callable[[ApprovalRequest], None]) -> Callable[[], None]:
@@ -72,14 +73,7 @@ class ApprovalBroker:
         with self._lock:
             if self._closed:
                 raise RuntimeError("approval broker is closed")
-            self._subscribers.append(callback)
-
-        def unsubscribe() -> None:
-            with self._lock:
-                if callback in self._subscribers:
-                    self._subscribers.remove(callback)
-
-        return unsubscribe
+            return self._subscribers.add(callback)
 
     def pending(self) -> list[ApprovalRequest]:
         """返回当前未决请求快照，供断线重连后的前端重新获取。"""
@@ -116,7 +110,7 @@ class ApprovalBroker:
             if self._closed:
                 return ApprovalResult(False, feedback="approval broker is closed", cancelled=True)
             self._pending[request.request_id] = pending
-            subscribers = list(self._subscribers)
+            subscribers = self._subscribers.snapshot()
 
         # 订阅者异常不能破坏执行线程；前端可通过日志/事件系统单独观测自身失败。
         for callback in subscribers:

@@ -13,12 +13,41 @@ CLI 命令族：
 from __future__ import annotations
 
 import uuid
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from app.agent.profiles import AgentProfile
 from app.agent.runtime import AgentSession
 from app.config.loader import workspace_root
 from app.storage import Storage
+
+
+def _portable_for(session, messages: list[dict]) -> list[dict]:
+    """恢复历史时按目标 provider 的协议做一次转换。
+
+    换 provider 的路径不止 ``/model switch`` 一条：直接改 ``.env`` 的
+    ``ACTIVE_PROFILE`` 再重启，会在 ``resume_or_new`` → ``switch`` 里原样读回
+    旧 provider 写下的结构化条目（Responses 的 ``function_call``/``reasoning``、
+    ChatGPT 的 ``developer`` 指令）。这些条目对新 provider 是非法的，轻则语义
+    错位，重则整次请求被拒。
+
+    只在会话空闲（恢复期）执行：此时工具调用已闭合，降级成文本不会留下悬空
+    配对。provider 自身仍有边界归一化兜底，这里是把历史尽早收敛成可移植形态。
+    """
+    if not messages:
+        return messages
+    provider = str(getattr(getattr(session, "llm", None), "provider", "") or "")
+    foreign = any(
+        isinstance(m, dict) and (
+            m.get("role") in {"developer", "tool"}
+            or m.get("type") in {"function_call", "function_call_output", "reasoning"}
+        )
+        for m in messages
+    )
+    # 目标 provider 自己能安全吸收的结构化历史不必降级，避免无意义地丢失保真度。
+    if not foreign or provider == "openai":
+        return messages
+    from app.models.history import make_history_portable
+    return make_history_portable(messages)
 
 
 class SessionRouter:
@@ -68,10 +97,7 @@ class SessionRouter:
     def new(self, agent_id: Optional[str] = None, title: str = "") -> str:
         """创建并切换到新 session，返回 session_id。"""
         if self.current_id:
-            try:
-                self._save_session_state(self.current_id)
-            except Exception:
-                pass
+            self._save_session_state_quietly(self.current_id)
         aid = agent_id or self._default_profile_id
         profile = self._profiles.get(aid)
         if profile is None:
@@ -107,10 +133,7 @@ class SessionRouter:
         if session_id == self.current_id:
             return True
         if self.current_id:
-            try:
-                self._save_session_state(self.current_id)
-            except Exception:
-                pass
+            self._save_session_state_quietly(self.current_id)
         if session_id not in self._sessions:
             # 尝试从 SQLite 恢复
             row = self._storage.get_session(session_id)
@@ -125,7 +148,7 @@ class SessionRouter:
                     mode="auto",
                 )
             session = self._factory(profile, session_id)
-            session.messages = self._storage.load_messages(session_id)
+            session.messages = _portable_for(session, self._storage.load_messages(session_id))
             session.child_records = self._storage.load_child_runs(session_id)
             self._bind_checkpoint(session, session_id)
             # 恢复任务快照(若有):让 /session switch 后任务面板与编排状态接上
@@ -157,10 +180,7 @@ class SessionRouter:
     def archive(self) -> None:
         if self.current_id:
             sid = self.current_id
-            try:
-                self._save_session_state(sid)
-            except Exception:
-                pass
+            self._save_session_state_quietly(sid)
             self._storage.archive_session(sid)
             session = self._sessions.pop(sid, None)
             if session:
@@ -176,10 +196,7 @@ class SessionRouter:
             return False
         session = self._sessions.get(session_id)
         if session:
-            try:
-                self._save_session_state(session_id)
-            except Exception:
-                pass
+            self._save_session_state_quietly(session_id)
             self._sessions.pop(session_id, None)
             session.close()
         self._storage.delete_session(session_id)
@@ -266,6 +283,19 @@ class SessionRouter:
         self.persist(session_id)
         self._save_memory_summary(session_id, sess)
 
+    def _save_session_state_quietly(self, session_id: str) -> None:
+        """离开路径上的保存：失败不阻断用户正在做的事。
+
+        new/switch/archive/delete/close_all 的共同前提是"用户的操作必须完成"——
+        保存失败最坏只是丢掉最后一次持久化，而中断操作会让用户更困惑。这段
+        try/except 原先复制了 5 份，收敛成有名字的动作后，异常语义（吞掉）不变，
+        但只在一处需要解释。
+        """
+        try:
+            self._save_session_state(session_id)
+        except Exception:
+            pass
+
     def _save_memory_summary(self, session_id: str, session: AgentSession) -> None:
         """保存 session 摘要；workspace 缺失时不允许访问记忆。"""
         workspace_id = str(workspace_root())
@@ -283,11 +313,8 @@ class SessionRouter:
     def close_all(self) -> None:
         """关闭所有 session + 共享资源(MCP server),退出前调用。"""
         for sid in list(self._sessions):
-            try:
-                self._save_session_state(sid)
-            except Exception:
-                # 持久化/摘要失败不应阻断其他 session 的退出收尾。
-                pass
+            # 单个 session 的持久化/摘要失败不应阻断其余 session 的退出收尾。
+            self._save_session_state_quietly(sid)
             sess = self._sessions[sid]
             try:
                 sess.close()

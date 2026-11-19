@@ -17,10 +17,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import yaml
+# PROJECT_ROOT 对外转出：app/mcp/manager.py 从这里取它，避免再多一处层级算术。
+from app.config.paths import CONFIG_DIR, PROJECT_ROOT, load_yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-CONFIG_DIR = PROJECT_ROOT / "config"
 
 
 @dataclass
@@ -57,7 +56,7 @@ def load_mcp_servers(path: Optional[Path] = None) -> list[MCPServerConfig]:
     cfg_path = path or (CONFIG_DIR / "mcp_servers.yaml")
     if not cfg_path.exists():
         return []
-    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    raw = load_yaml(cfg_path)
     servers: list[MCPServerConfig] = []
     for name, body in (raw.get("servers") or {}).items():
         body = body or {}

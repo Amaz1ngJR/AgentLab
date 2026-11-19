@@ -170,15 +170,6 @@ def _lexer_for(language: str, code: str = ""):
     return TextLexer()
 
 
-def highlight_code(code: str, language: str = "") -> str:
-    """整段代码上色。失败时原样返回 —— 渲染问题不该让内容消失。"""
-    try:
-        from pygments import highlight
-        return highlight(code, _lexer_for(language, code), _formatter()).rstrip("\n")
-    except Exception:
-        return code
-
-
 # 块级标记全都出现在行首。流式时一旦提前把行首吐出去，就再没机会把这一行
 # 渲染成标题/列表/表格了 —— 所以行首像块标记就压住等换行，其余照常逐字符流。
 _BLOCK_LEAD_CHARS = "#-*+>|`~_=0123456789"

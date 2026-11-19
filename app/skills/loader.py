@@ -42,7 +42,8 @@ from typing import Optional
 
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+from app.config.paths import PROJECT_ROOT
+
 SKILLS_DIR = PROJECT_ROOT / "skills"
 
 

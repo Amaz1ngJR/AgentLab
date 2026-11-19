@@ -52,3 +52,76 @@ def test_cli_displays_retained_content_separately(capsys):
     text = capsys.readouterr().out
     assert '982,884 → 40,000' in text
     assert '摘要 4,000' in text and '近期原文 32,000' in text and 'system/工具 3,000' in text
+
+
+# ── 摘要输出预算 ──────────────────────────────────────────────────────────────
+# 曾把摘要输出硬编码成 4096：长历史的结构化摘要会被 stop_reason=max_tokens
+# 截断，JSON 不闭合 → 两次无效重试 → invalid_summary → 退化成无模型摘要。
+
+
+class _Cfg:
+    def __init__(self, max_tokens):
+        self.max_tokens = max_tokens
+
+
+class _Adapter:
+    def __init__(self, max_tokens):
+        self._cfg = _Cfg(max_tokens)
+
+
+class _RouterWithMaxTokens:
+    def __init__(self, max_tokens):
+        self._adapter = _Adapter(max_tokens)
+
+    def create_message(self, messages, **kwargs):
+        from app.models.protocol import ModelResponse
+        return ModelResponse(
+            text='{"user_goal": "目标", "handoff_note": "交接"}',
+            tool_calls=[], usage={"input_tokens": 1, "output_tokens": 1},
+            provider_payload=[],
+        )
+
+
+def test_summary_output_budget_follows_model_capacity():
+    small = ContextCompressor(_RouterWithMaxTokens(2048))
+    large = ContextCompressor(_RouterWithMaxTokens(32768))
+    # 小模型不能超过自身输出上限
+    assert small._output_limit(148_771) <= 2048
+    # 大窗口下不能仍被 4096 卡住
+    assert large._output_limit(148_771) > 4096
+    assert large._output_limit(148_771) <= 32768
+
+
+def test_summary_output_budget_never_below_floor():
+    assert ContextCompressor(_RouterWithMaxTokens(128))._output_limit(1) >= \
+        ContextCompressor.MIN_SUMMARY_OUTPUT_TOKENS
+
+
+def test_truncated_summary_retries_with_larger_budget(monkeypatch):
+    from app.models.protocol import ModelResponse
+
+    class Truncating:
+        def __init__(self):
+            self.budgets = []
+
+        def create_message(self, messages, **kwargs):
+            self.budgets.append(kwargs["max_tokens"])
+            # 第一次按预算截断，放大预算后给出完整 JSON
+            if len(self.budgets) == 1:
+                return ModelResponse(text='{"user_goal": "被截断', tool_calls=[],
+                                     usage={"input_tokens": 1, "output_tokens": 1},
+                                     provider_payload=[], finish_reason="max_tokens")
+            return ModelResponse(text='{"user_goal": "完整", "handoff_note": "交接"}',
+                                 tool_calls=[], usage={"input_tokens": 1, "output_tokens": 1},
+                                 provider_payload=[], finish_reason="end_turn")
+
+    model = Truncating()
+    compressor = ContextCompressor(model, max_parallel_requests=1)
+    obj = compressor._summarize("短历史", 1024, None, _token(), input_token_budget=8192)
+    assert obj["user_goal"] == "完整"
+    assert model.budgets[1] > model.budgets[0]
+
+
+def _token():
+    from app.agent.cancel import CancelToken
+    return CancelToken()

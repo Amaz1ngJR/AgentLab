@@ -453,14 +453,19 @@ AGENTLAB_RTK_ULTRA_COMPACT=false
 PTY 终端只做保守的进度/重复清理，不将暂时读完的输出解释为执行成功。
 
 shell/终端的长输出预览最多4000字符，保留头尾，不对混合输出做未经验证的语义删减。
-被压缩或截断的结果附有 `.agentlab/tool-output/<hash>.txt` 路径，可用 `read_file`
-按行读取完整留存输出。文件按内容寻址，不覆盖旧结果；只保留最近24小时的输出，
-每次写入归档时清理过期文件，相同内容再次使用会刷新保留时间。停止运行期间不会
-后台清理，下次归档时执行；旧会话中超过保留期的引用可能失效。
+被压缩或截断的结果附有 `out_<hash>` 输出 ID，通过 `read_tool_output(output_id, offset, limit)`
+按行读取，超长行支持 `column_offset` 续读，无需重新运行命令。
+输出脱敏后保存到用户缓存，按工作区隔离，不再写入项目 `.agentlab/`；同一工作区重启后 ID 仍可使用。
+macOS 默认位置为 `~/Library/Caches/AgentLab/tool-output/`，Linux 为
+`${XDG_CACHE_HOME:-~/.cache}/agentlab/tool-output/`，Windows 为
+`%LOCALAPPDATA%/AgentLab/Cache/tool-output/`；可用 `AGENTLAB_OUTPUT_CACHE_DIR` 覆盖缓存根目录。
+文件按内容寻址并原子写入，保留30分钟，读取和重复归档会续期。每个工作区最多256 MiB，
+超限时淘汰最久未使用的输出。读取和写入时清理过期文件，停止运行期间不后台清理。
+超过保留期或被容量淘汰的旧引用会明确报错。旧项目内的存档仍可用 `read_file` 读取，不自动搬迁或删除。
 留存失败时不会假装存在完整输出。摘要中的退出码和错误状态保持不变。
 
 其他高频工具也采用小页结果：`code_search` 默认20条命中、上下各1行，返回紧凑
-JSON，超过结果预算时提供本次已获取结果的完整输出路径（不代表已搜索全部匹配）；
+JSON，超过结果预算时提供 `full_output_id`（不代表已搜索全部匹配）；
 `list_dir` 默认60项，支持 `offset/limit`；`read_file/read_files` 默认80行，支持
 指定行段，超长行通过 `column_offset` 续读，不删除中间源码字符。
 

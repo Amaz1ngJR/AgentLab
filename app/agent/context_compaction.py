@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import os
 import copy
-import re
 import math
 import threading
 import time
@@ -34,6 +33,7 @@ from typing import Any, Optional
 from app.agent.cancel import Cancelled, CancelToken
 from app.agent.context_budget import estimate_messages_tokens, estimate_message_tokens, estimate_tokens
 from app.models.router import call_create_message
+from app.util.json_extract import extract_json_object as _extract_json
 from app.util.redact import redact
 
 # 给压缩模型的系统指令:只输出结构化 JSON 摘要,不调用工具、不写散文。
@@ -278,69 +278,6 @@ def _split_transcript(text: str, token_budget: int) -> list[str]:
         chunks.append(text[:lo])
         text = text[lo:]
     return chunks
-
-
-def _find_balanced_json(text: str, start: int) -> Optional[str]:
-    """从 text[start] 处的 '{' 起,做括号配平扫描,返回完整的 JSON 对象子串。
-
-    正确处理嵌套对象/数组,并跳过字符串字面量里的花括号(以及转义)。配不平
-    (花括号没闭合)返回 None。这是比 `\\{.*?\\}` 正则更可靠的抠取方式 —— 后者
-    非贪婪会停在第一个 '}',贪婪又可能多吞;配平扫描才能精确切出整个对象。
-    """
-    depth = 0
-    in_str = False
-    escaped = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
-
-
-def _extract_json(text: str) -> Optional[dict]:
-    """从模型输出抠出第一个 JSON 对象(容忍 markdown 围栏 / 前后散文 / 嵌套结构)。
-
-    用括号配平扫描而非非贪婪正则:模型若把含嵌套对象(如 tool_evidence)的摘要包进
-    ```json``` 围栏,`\\{.*?\\}` 会停在第一个内层 '}' 抠出残缺片段,导致必填字段丢失、
-    摘要被误判为非法。配平扫描从第一个 '{' 切到与之匹配的 '}',不受嵌套影响。
-    """
-    if not text:
-        return None
-    # 优先在 markdown 围栏内找(围栏存在时,JSON 通常完整地落在里面)
-    fenced = re.search(r"```(?:json)?\s*", text)
-    search_from = fenced.end() if fenced else 0
-    start = text.find("{", search_from)
-    if start == -1 and search_from != 0:
-        start = text.find("{")  # 围栏后没找到,退回全文找
-    if start == -1:
-        return None
-    candidate = _find_balanced_json(text, start)
-    if candidate is None:
-        # 配平失败(JSON 被截断等):退回"首 { 到末 }"的粗略切法兜底
-        end = text.rfind("}")
-        if end > start:
-            candidate = text[start : end + 1]
-        else:
-            return None
-    try:
-        obj = json.loads(candidate)
-        return obj if isinstance(obj, dict) else None
-    except (ValueError, TypeError):
-        return None
 
 
 def _redact_summary(obj: dict[str, Any]) -> dict[str, Any]:
@@ -609,11 +546,26 @@ class ContextCompressor:
             for m in messages if m.get("type") != "reasoning"
         ))
 
+    # 单次摘要请求的输出上限。历史越长，结构化摘要越长；4k 会在长历史上被
+    # stop_reason=max_tokens 截断，JSON 不闭合 → 两次重试后直接判 invalid_summary
+    # 并退化成无模型摘要的本地兜底。上限跟随模型实际可用输出预算。
+    MIN_SUMMARY_OUTPUT_TOKENS = 1024
+    MAX_SUMMARY_OUTPUT_TOKENS = 32768
+
+    def _output_limit(self, output_tokens: int) -> int:
+        """按模型能力决定单次摘要的输出上限，而不是写死 4096。"""
+        configured = getattr(getattr(self._llm, "_adapter", None), "_cfg", None)
+        model_max = int(getattr(configured, "max_tokens", 0) or 0)
+        ceiling = model_max if model_max > 0 else self.MAX_SUMMARY_OUTPUT_TOKENS
+        ceiling = max(self.MIN_SUMMARY_OUTPUT_TOKENS,
+                      min(self.MAX_SUMMARY_OUTPUT_TOKENS, ceiling))
+        return max(self.MIN_SUMMARY_OUTPUT_TOKENS, min(ceiling, output_tokens))
+
     def _summarize(self, transcript: str, output_tokens: int, on_progress,
                    cancel: CancelToken | None, input_token_budget: int | None = None,
                    on_compaction_progress=None, started: float = 0,
                    deadline: float = float("inf")) -> dict:
-        output_tokens = max(256, min(4096, output_tokens))
+        output_tokens = self._output_limit(output_tokens)
         text = transcript
         # 已知安全窗口时利用可用预算，避免长历史被固定 4k 切成几十次串行请求。
         # 未声明窗口的直接调用保持保守；显式分片限制和小模型预算仍然生效。
@@ -644,12 +596,13 @@ class ContextCompressor:
 
         def request(index, chunk, emit, token):
             usage = {"input_tokens": 0, "output_tokens": 0}
+            budget = output_tokens
             for attempt in range(2):
                 token.raise_if_cancelled()
                 emit("status", {"chunk": index, "attempt": attempt + 1, "phase": "request"})
                 response = call_create_message(
                     request_model, [{"role": "user", "content": chunk}],
-                    tools=None, system=self._system, max_tokens=output_tokens,
+                    tools=None, system=self._system, max_tokens=budget,
                     on_progress=lambda metrics: emit("metrics", (index, metrics)), cancel=token,
                     on_wait=lambda: emit("wait", {}),
                     on_retry=lambda attempt, delay, exc: emit("status", {
@@ -657,10 +610,18 @@ class ContextCompressor:
                 )
                 for key in usage:
                     usage[key] += (getattr(response, "usage", None) or {}).get(key, 0)
+                finish = getattr(response, "finish_reason", None)
                 obj = _extract_json(getattr(response, "text", "") or "")
-                if (_is_valid_summary(obj)
-                        and getattr(response, "finish_reason", None) not in {"length", "max_tokens"}):
+                if _is_valid_summary(obj) and finish not in {"length", "max_tokens"}:
                     return obj, usage
+                # 被输出上限截断时，同预算重试必然得到同样结果。放大预算再试一次，
+                # 否则长历史会稳定退化成 invalid_summary + 本地兜底。
+                if finish in {"length", "max_tokens"}:
+                    enlarged = min(self._output_limit(budget * 4),
+                                   self._output_limit(self.MAX_SUMMARY_OUTPUT_TOKENS))
+                    if enlarged > budget:
+                        budget = enlarged
+                        continue
             raise ValueError("invalid_summary")
 
         for round_index in range(8):

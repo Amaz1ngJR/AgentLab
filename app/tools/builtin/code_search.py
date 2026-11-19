@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.config.loader import workspace_root
+from app.tools.audit import audit_summary
 from app.tools.builtin.files import (
     WorkspacePathError,
     _outside_workspace_approval,
@@ -571,31 +572,23 @@ def _code_search(args: dict) -> str:
         from app.tools.output_archive import archive_output
         path = archive_output(json.dumps(result, ensure_ascii=False, indent=2))
         if path:
-            result["full_output_path"] = path
+            result["full_output_id"] = path
     result = _enforce_output_limit(result)
     result["count"] = len(result["matches"])
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 def _code_search_audit_summary(args: dict, result: str) -> tuple[str, str]:
-    safe_args = {
-        key: args.get(key)
-        for key in ("query", "mode", "path", "glob", "max_results")
-        if key in args
-    }
-    try:
-        body = json.loads(result)
-        result_summary = json.dumps(
-            {
-                "count": body.get("count", 0),
-                "truncated": body.get("truncated", False),
-                "backend": (body.get("summary") or {}).get("backend", ""),
-            },
-            ensure_ascii=False,
-        )
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        result_summary = result
-    return json.dumps(safe_args, ensure_ascii=False), result_summary
+    return audit_summary(
+        args,
+        result,
+        keys=("query", "mode", "path", "glob", "max_results"),
+        projector=lambda body: {
+            "count": body.get("count", 0),
+            "truncated": body.get("truncated", False),
+            "backend": (body.get("summary") or {}).get("backend", ""),
+        },
+    )
 
 
 CODE_SEARCH = Tool(

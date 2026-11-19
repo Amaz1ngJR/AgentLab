@@ -104,7 +104,15 @@ def adapter(tmp_path, monkeypatch):
 
 
 def item(**data):
-    return NS(**data, model_dump=lambda **kwargs: data.copy())
+    def dump(value):
+        if isinstance(value, NS):
+            return dump(vars(value))
+        if isinstance(value, dict):
+            return {key: dump(part) for key, part in value.items()}
+        if isinstance(value, list):
+            return [dump(part) for part in value]
+        return value
+    return NS(**data, model_dump=lambda **kwargs: dump(data))
 
 
 def set_events(adapter, monkeypatch, events):
@@ -151,8 +159,61 @@ def test_completed_tool_then_result_replay(adapter, monkeypatch):
 
 def test_no_completed_event_never_returns_tool_calls(adapter, monkeypatch):
     call = item(type="function_call", name="echo", call_id="c1", arguments="{}")
-    set_events(adapter, monkeypatch, [NS(type="response.output_item.done", item=call)])
+    set_events(adapter, monkeypatch, [NS(type="response.output_item.done", output_index=0, item=call)])
     with pytest.raises(ProviderStreamError, match="未完成"):
+        adapter.create_message([], tools=TOOLS)
+
+
+def test_completed_recovers_streamed_text_and_replay(adapter, monkeypatch):
+    seen = []
+    set_events(adapter, monkeypatch, [
+        NS(type="response.output_text.delta", output_index=0, delta="Hello "),
+        NS(type="response.output_text.delta", output_index=0, delta="world"),
+        complete([])])
+    result = adapter.create_message([], on_text_delta=seen.append)
+    assert seen == ["Hello ", "world"]
+    assert result.text == "Hello world"
+    assert adapter._params(result.provider_payload, None, None, None)["input"][0]["content"][0]["text"] == result.text
+
+
+def test_completed_recovers_done_items_in_order(adapter, monkeypatch):
+    msg = item(type="message", role="assistant", phase="commentary",
+               content=[NS(type="output_text", text="Checking")])
+    call = item(type="function_call", name="echo", namespace="agentlab", call_id="c1", arguments="{}")
+    set_events(adapter, monkeypatch, [
+        NS(type="response.output_item.done", output_index=1, item=call),
+        NS(type="response.output_item.done", output_index=0, item=msg), complete([])])
+    result = adapter.create_message([], tools=TOOLS)
+    assert result.text == "Checking"
+    assert result.tool_calls[0].id == "c1"
+    assert [v["type"] for v in result.provider_payload] == ["message", "function_call"]
+    assert result.provider_payload[0]["phase"] == "commentary"
+
+
+def test_terminal_text_wins_without_duplicate_deltas(adapter, monkeypatch):
+    msg = item(type="message", role="assistant", content=[NS(type="output_text", text="Final")])
+    set_events(adapter, monkeypatch, [
+        NS(type="response.output_text.delta", output_index=0, delta="Draft"),
+        NS(type="response.output_item.done", output_index=0, item=msg), complete([msg])])
+    result = adapter.create_message([])
+    assert result.text == "Final"
+    assert len(result.provider_payload) == 1
+
+
+@pytest.mark.parametrize("terminal", [None, "response.incomplete", "response.failed"])
+def test_streamed_text_does_not_mask_incomplete_response(adapter, monkeypatch, terminal):
+    events = [NS(type="response.output_text.delta", output_index=0, delta="Partial")]
+    if terminal:
+        events.append(NS(type=terminal))
+    set_events(adapter, monkeypatch, events)
+    with pytest.raises(ProviderStreamError):
+        adapter.create_message([])
+
+
+def test_argument_deltas_are_not_recovered_as_tool_calls(adapter, monkeypatch):
+    set_events(adapter, monkeypatch, [
+        NS(type="response.function_call_arguments.delta", delta="{}"), complete([])])
+    with pytest.raises(ProviderStreamError, match="没有返回文本或工具调用"):
         adapter.create_message([], tools=TOOLS)
 
 

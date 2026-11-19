@@ -20,9 +20,9 @@ from app.storage.loop_store import init_loop_tables
 from app.protocol.envelopes import EventEnvelope
 from app.protocol.items import TurnItem
 from app.protocol.models import TurnRecord
+from app.config.paths import PROJECT_ROOT
 from app.util.redact import redact, redact_value
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "agentlab.db"
 
 _SCHEMA = """

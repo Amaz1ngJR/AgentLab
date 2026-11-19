@@ -9,7 +9,7 @@ from app.agent.tasks import PENDING, Task
 
 ROLES = frozenset({"research", "reviewer", "verifier", "executor"})
 EXECUTORS = frozenset({"main_agent", "subagent"})
-READ_ONLY_TOOLS = frozenset({"read_file", "read_files", "list_dir", "code_search"})
+READ_ONLY_TOOLS = frozenset({"read_file", "read_files", "read_tool_output", "list_dir", "code_search"})
 WRITE_TOOLS = frozenset({"write_file", "edit_file", "apply_patch"})
 FORBIDDEN_SUBAGENT_TOOLS = frozenset({
     "delegate_subagent", "spawn_subagent", "spawn_agent", "wait_agent", "close_agent",

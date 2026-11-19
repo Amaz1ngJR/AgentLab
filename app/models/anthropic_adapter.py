@@ -6,6 +6,7 @@ auth_token 用于自建代理 / Claude Code 网关。
 from __future__ import annotations
 from functools import wraps
 
+import json
 from typing import Any, Optional
 
 from app.agent.cancel import CancelToken, close_on_cancel
@@ -21,6 +22,156 @@ from app.models.protocol import (
     ToolCall,
     ToolResult,
 )
+
+
+def _content_blocks(content: Any) -> list[dict]:
+    """把各 provider 的 content 表达统一成 Anthropic block 列表。
+
+    入参可能是纯字符串、Anthropic block 列表、OpenAI Responses 的
+    ``input_text``/``output_text`` 列表。图片保留原 block，交给
+    ``_materialize_anthropic_messages`` 在发请求前物化。未知类型直接丢弃，
+    避免把网关不认识的字段透传出去。
+    """
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    if not isinstance(content, list):
+        return [{"type": "text", "text": str(content)}]
+
+    blocks: list[dict] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                blocks.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        block_type = item.get("type")
+        if block_type in {"text", "input_text", "output_text"}:
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                blocks.append({"type": "text", "text": text})
+        elif block_type in {"image", "tool_use", "tool_result"}:
+            blocks.append(item)
+    return blocks
+
+
+def _text_of(content: Any) -> str:
+    """把任意 content 压成纯文本，用于 tool_result 的 content 字段。"""
+    return "\n".join(
+        block["text"] for block in _content_blocks(content) if block.get("type") == "text"
+    )
+
+
+def _tool_use_block(call_id: str, name: str, arguments: Any) -> dict:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError:
+            arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    return {"type": "tool_use", "id": call_id, "name": name, "input": arguments}
+
+
+def _normalize_anthropic_messages(
+    messages: list[dict],
+) -> tuple[Optional[str], list[dict]]:
+    """把混合 provider 历史改写成 Anthropic Messages 能接受的形状。
+
+    会话可能在 OpenAI Responses / ChatGPT OAuth / Ollama 之间迁移，恢复历史时
+    里面会残留这些 provider 的私有条目：``function_call``、``function_call_output``、
+    ``reasoning``、没有 role 的 item，以及 ``role="developer"`` 的追加指令。
+    Anthropic 只认 ``user``/``assistant``/``system``，任何一个非法条目都会让整次
+    请求 400（``Input should be 'user', 'assistant', 'system'``）——即使它排在很后面。
+    因此这里在 provider 边界做一次归一化，而不是指望上游历史永远干净：
+
+      - ``system``/``developer`` → 提升为顶层 system 参数
+      - ``function_call`` → assistant 的 ``tool_use`` block
+      - ``function_call_output`` → user 的 ``tool_result`` block
+      - ``role="tool"`` → user 的 ``tool_result`` block
+      - ``reasoning`` → 丢弃（推理过程本就不应回放进输入）
+      - 其它无法识别的条目 → 丢弃，绝不把非法 role 发给网关
+
+    相邻同角色消息会被合并，因为 Anthropic 要求 user/assistant 交替出现。
+    """
+    system_parts: list[str] = []
+    normalized: list[dict] = []
+    pending_calls: list[dict] = []
+
+    def append(role: str, blocks: list[dict]) -> None:
+        if not blocks:
+            return
+        if normalized and normalized[-1]["role"] == role:
+            normalized[-1]["content"].extend(blocks)
+        else:
+            normalized.append({"role": role, "content": list(blocks)})
+
+    def flush_calls() -> None:
+        if pending_calls:
+            append("assistant", pending_calls)
+            pending_calls.clear()
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        kind = message.get("type")
+        if kind == "reasoning":
+            continue
+        if kind == "function_call":
+            pending_calls.append(_tool_use_block(
+                str(message.get("call_id") or message.get("id") or ""),
+                str(message.get("name") or ""),
+                message.get("arguments"),
+            ))
+            continue
+        flush_calls()
+
+        if kind == "function_call_output":
+            append("user", [{
+                "type": "tool_result",
+                "tool_use_id": str(message.get("call_id") or ""),
+                "content": _text_of(message.get("output")),
+            }])
+            continue
+        if kind == "web_search_call":
+            append("assistant", [{"type": "text", "text": "[历史联网搜索记录已省略]"}])
+            continue
+
+        role = message.get("role")
+        if role in {"system", "developer"}:
+            text = "\n".join(b["text"] for b in _content_blocks(message.get("content"))
+                             if b.get("type") == "text")
+            if text:
+                system_parts.append(text)
+            continue
+        if role == "tool":
+            append("user", [{
+                "type": "tool_result",
+                "tool_use_id": str(message.get("tool_call_id") or ""),
+                "content": "\n".join(b["text"] for b in _content_blocks(message.get("content"))
+                                     if b.get("type") == "text"),
+            }])
+            continue
+        if role not in {"user", "assistant"}:
+            # 没有 role 且不是已知 Responses item 的条目无法安全表达，丢弃。
+            continue
+
+        blocks = _content_blocks(message.get("content"))
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            blocks.append(_tool_use_block(
+                str(call.get("id") or ""),
+                str(function.get("name") or ""),
+                function.get("arguments"),
+            ))
+        append(role, blocks)
+
+    flush_calls()
+    return ("\n\n".join(system_parts) if system_parts else None), normalized
 
 
 def _materialize_anthropic_messages(messages: list[dict]) -> list[dict]:
@@ -101,15 +252,8 @@ class AnthropicAdapter:
 
     @staticmethod
     def _split_system(messages: list[dict]) -> tuple[Optional[str], list[dict]]:
-        """Anthropic API 要求 system 作为顶级参数，不能混在 messages 里。"""
-        parts, rest = [], []
-        for msg in messages:
-            if msg.get("role") == "system":
-                if msg.get("content"):
-                    parts.append(msg["content"])
-            else:
-                rest.append(msg)
-        return ("\n\n".join(parts) if parts else None), rest
+        """归一化混合 provider 历史，并把 system 提升为 Anthropic 顶层参数。"""
+        return _normalize_anthropic_messages(messages)
 
     @_temperature_compatible
     def chat(self, messages: list[dict], temperature: Optional[float] = None) -> str:

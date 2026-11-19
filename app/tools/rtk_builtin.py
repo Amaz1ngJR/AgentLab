@@ -9,7 +9,6 @@ https://github.com/rtk-ai/rtk
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
@@ -479,10 +478,6 @@ def _result(output: str, applied: bool, category: str, original_bytes: int, reas
     output_bytes = len(output.encode("utf-8", errors="replace"))
     savings = ((original_bytes - output_bytes) / original_bytes * 100.0) if original_bytes else 0.0
     return CompressionResult(output, applied, category, original_bytes, output_bytes, max(0.0, savings), reason)
-
-
-def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
-    return any(needle in text for needle in needles)
 
 
 def _as_bool(value: str | None, default: bool) -> bool:

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import traceback as _tb
-from typing import Any, Iterable
+from typing import Any
 
 # 各 provider 凭据的字面量 pattern。顺序很重要:
 #   1. Bearer header 先跑,避免后续 token 字面量替换之后, "Bearer ***" 中的
@@ -61,11 +61,6 @@ def redact_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_value(item) for item in value)
     return value
-
-
-def redact_lines(lines: Iterable[str]) -> list[str]:
-    """对一组字符串逐行脱敏。"""
-    return [redact(line) for line in lines]
 
 
 def format_exception(exc: BaseException) -> str:

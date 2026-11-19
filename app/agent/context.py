@@ -222,7 +222,8 @@ class ContextManager:
         effective_recent_budget = None if force else self.budget.recent_messages_budget
         fixed_tokens = est - estimate_messages_tokens(messages)
         target = max(0, self.budget.safe_input_limit - fixed_tokens)
-        summary_budget = max(256, min(4096, self.budget.summary_budget))
+        summary_cap = getattr(self._compressor, "MAX_SUMMARY_OUTPUT_TOKENS", 4096)
+        summary_budget = max(256, min(summary_cap, self.budget.summary_budget))
         summary_input = self.budget.safe_input_limit - self._compressor.summary_system_tokens - summary_budget - 64
         if summary_input < 256:
             self._remember_failure(est, "模型窗口不足以容纳摘要指令和输出预留")

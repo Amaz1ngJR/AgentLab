@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from app.tools.rtk_builtin import BuiltinRTK, classify_command
-from app.tools.output_archive import archive_output
+from app.tools.output_archive import archive_output, read_output, _archive_dir, RETENTION_SECONDS
 from app.tools.builtin.files import _read_page, _list_dir
 
 
@@ -37,7 +37,7 @@ def test_terminal_partial_logs_are_not_fabricated_success(tmp_path, monkeypatch)
     out = BuiltinRTK().compress_terminal("pytest -q", raw)
     assert "tests passed" not in out
     assert "Enter password:" in out
-    saved = list((tmp_path / ".agentlab/tool-output").glob("*.txt"))
+    saved = list(_archive_dir().glob("*.txt"))
     assert len(saved) == 1 and saved[0].read_text() == raw
 
 
@@ -45,22 +45,27 @@ def test_archive_is_immutable_and_rejects_escape(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
     path = archive_output("complete output\n")
     assert archive_output("complete output\n") == path
-    assert (tmp_path / path).read_text() == "complete output\n"
+    assert read_output({"output_id": path}).endswith("complete output\n")
+    assert not (tmp_path / ".agentlab").exists()
     other = tmp_path / "other"
     other.mkdir()
     monkeypatch.setenv("WORKSPACE_ROOT", str(other))
-    (other / ".agentlab").symlink_to(tmp_path / ".agentlab", target_is_directory=True)
-    assert archive_output("cannot escape") is None
+    from app.tools.registry import ToolExecutionError
+    with pytest.raises(ToolExecutionError, match="unavailable"):
+        read_output({"output_id": path})
+    assert archive_output("cannot escape") is not None
 
 
-def test_archive_expires_after_one_day_and_reuse_refreshes_age(tmp_path, monkeypatch):
+def test_archive_expiry_and_reuse_refreshes_age(tmp_path, monkeypatch):
     import os
     import time
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
-    expired = tmp_path / archive_output("expired")
-    reused = tmp_path / archive_output("reused")
-    recent = tmp_path / archive_output("recent")
-    old = time.time() - 86401
+    def save(text):
+        return _archive_dir() / (archive_output(text)[4:] + ".txt")
+    expired = save("expired")
+    reused = save("reused")
+    recent = save("recent")
+    old = time.time() - RETENTION_SECONDS - 1
     for path in (expired, reused):
         os.utime(path, (old, old))
     other = expired.parent / "keep-not-an-archive.txt"
@@ -109,7 +114,7 @@ def test_shell_retains_full_output_before_filtering(tmp_path, monkeypatch):
     assert "500 passed" in out and "[exit code: 0]" in out
     assert len(out) < len(raw)
     path = re.search(r"完整输出: ([^；]+)", out).group(1)
-    assert (tmp_path / path).read_text() == raw
+    assert read_output({"output_id": path}).endswith(raw)
 
 
 def test_long_source_footer_continues_same_line(tmp_path, monkeypatch):

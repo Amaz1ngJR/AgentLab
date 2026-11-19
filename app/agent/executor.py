@@ -16,7 +16,7 @@ import hashlib
 import json
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, ContextManager, Optional
 
 from app.agent import events
@@ -33,7 +33,7 @@ from app.agent.events import RunEvent
 from app.agent.tasks import BLOCKED, COMPLETED, FAILED, Task
 from app.models.protocol import ToolResult
 from app.models.router import ModelRouter, call_create_message
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolRegistry, delegated_manager
 
 DENIED_MESSAGE = (
     "User denied execution of this tool. Do not retry without first confirming with the user."
@@ -133,6 +133,31 @@ class TaskOutcome:
     model_rounds: int = 0
 
 
+@dataclass
+class _RunCounters:
+    """run_task 里跨轮累计的计数器。
+
+    单独打包是因为它们要同时被"外层循环"和"单轮工具执行"读写；拆成独立对象后，
+    工具执行那段子过程就不必再往 run_task 里塞五六个 nonlocal。
+    """
+    tool_calls_made: int = 0
+    successful_tool_calls: int = 0
+    repeated_requests: int = 0
+
+
+@dataclass
+class _ToolCallGuard:
+    """单轮工具执行的结果：更新后的计数器 + 需要外层立即收尾的结论。
+
+    outcome 非 None 表示本轮中途就要结束任务（重复调用 / 工具失败 / 自动空转），
+    由 run_task 原样返回，避免子过程直接 return 造成的隐式控制流。
+    """
+    counters: _RunCounters
+    auto_execute: bool = False
+    denied_any: bool = False
+    outcome: Optional[TaskOutcome] = None
+
+
 class Executor:
     """按任务目标驱动有限步工具循环。"""
 
@@ -180,6 +205,308 @@ class Executor:
             },
         ))
 
+    def _call_model_round(
+        self,
+        task: Task,
+        messages: list[dict[str, Any]],
+        *,
+        system: str,
+        tools: list[dict[str, Any]] | None,
+        cancel: Optional[CancelToken],
+        auto_execute: bool,
+        usage_acc: Optional[dict[str, int]],
+        on_actual_model: Optional[Callable[[str], None]],
+    ) -> tuple[Any, str, bool]:
+        """跑一轮模型调用，返回 (resp, 本轮正文, 是否已流式打印过正文)。
+
+        这里集中处理三件和"轮次"强绑定、但与任务状态无关的事：
+          1. 开 progress handle 并接上 text / thinking / discard 三个回调；
+          2. 调用前压缩上下文（压缩失败不能中断任务主路径）；
+          3. 把 usage 累加进 run 级统计、回调真实模型 ID。
+
+        抽出来的动机是它和 runtime 里的对话路径几乎逐字相同；留在 run_task 里
+        会让那个函数被十几行与任务逻辑无关的流式样板撑长，改动风险也随之上升。
+        """
+        text_streamed = False
+        streamed_parts: list[str] = []
+
+        with self._progress("thinking") as handle:
+            on_progress = getattr(handle, "update", None)
+            raw_on_text = getattr(handle, "on_text", None)
+            raw_on_thinking = getattr(handle, "on_thinking", None)
+            on_discard = getattr(handle, "discard_text", None)
+
+            if self._ctx is not None:
+                try:
+                    self._ctx.compact_before_model_call(
+                        messages,
+                        system=system,
+                        tools=tools,
+                        on_progress=on_progress,
+                        cancel=cancel,
+                    )
+                except (Cancelled, ContextBudgetExceeded):
+                    raise
+                except Exception:
+                    pass
+
+            def _discard_partial(_exc: BaseException) -> None:
+                """重试前作废本次尝试已流出的半截文本。
+
+                重试时 adapter 会从头再流一遍，不清空的话 spinner 会把同一段内容推
+                第二遍，而 ``streamed_parts`` 里的残文还可能被当成最终答复。
+                """
+                nonlocal text_streamed
+                if not streamed_parts:
+                    return
+                streamed_parts.clear()
+                text_streamed = False
+                if on_discard is not None:
+                    on_discard()
+
+            def on_text_delta(delta: str) -> None:
+                nonlocal text_streamed
+                text_streamed = True
+                streamed_parts.append(delta)
+                if raw_on_text is not None:
+                    raw_on_text(delta)
+
+            resp = call_create_message(
+                self._llm,
+                messages,
+                tools=tools,
+                system=system,
+                on_progress=on_progress,
+                on_text_delta=on_text_delta if raw_on_text else None,
+                on_thinking_delta=raw_on_thinking,
+                cancel=cancel,
+                discard_partial=_discard_partial,
+                on_retry=lambda attempt, delay, exc: self._emit_provider_retry(
+                    task.id, attempt, delay, exc,
+                ),
+                retry_until_cancelled=auto_execute,
+            )
+
+        if usage_acc is not None and getattr(resp, "usage", None):
+            for key, value in resp.usage.items():
+                usage_acc[key] = usage_acc.get(key, 0) + value
+        if on_actual_model is not None and getattr(resp, "actual_model", None):
+            on_actual_model(resp.actual_model)
+
+        return resp, resp.text or "".join(streamed_parts), text_streamed
+
+    def _run_tool_calls(
+        self,
+        task: Task,
+        tool_calls: list[Any],
+        *,
+        messages: list[dict[str, Any]],
+        batch: ToolCallBatch,
+        tool_results: list[ToolResult],
+        resulted_ids: set[str],
+        visited_ids: set[str],
+        seen_tool_signatures: set[tuple[str, str]],
+        last_outputs: dict[tuple[str, str], bytes],
+        counters: _RunCounters,
+        cancel: Optional[CancelToken],
+        auto_execute: bool,
+        last_text: str,
+        model_rounds: int,
+        flush: Callable[[], None],
+        on_auto_execute: Optional[Callable[[], None]],
+    ) -> _ToolCallGuard:
+        """执行本轮全部工具调用。
+
+        每个调用的三种结局都写在同一处，方便对照：参数非法 → 只回灌错误让模型自行
+        纠正；需要审批 → 走审批策略，拒绝则记为 denied；否则真正执行。
+
+        控制流约定：本方法**不直接结束任务**，需要收尾时把 TaskOutcome 塞进
+        guard.outcome 交回 run_task。这样"何时退出"只在外层判断一次，读代码时不必
+        在两处 return 之间来回跳。
+        """
+        guard = _ToolCallGuard(counters=counters, auto_execute=auto_execute)
+
+        for call in tool_calls:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+                if cancel.has_steering:
+                    flush()
+                    return guard
+            counters.tool_calls_made += 1
+            visited_ids.add(call.id)
+            signature = (call.name, json.dumps(call.arguments, sort_keys=True, default=repr))
+            if signature in seen_tool_signatures and not guard.auto_execute:
+                flush()
+                guard.outcome = TaskOutcome(
+                    status=FAILED,
+                    error=f"模型重复请求工具 {call.name}，任务无进展",
+                    evidence=last_text.strip(),
+                    text=last_text.strip(),
+                    tool_calls_made=counters.tool_calls_made,
+                    model_rounds=model_rounds,
+                )
+                return guard
+            seen_tool_signatures.add(signature)
+            batch.announce(call)
+
+            tool = self._tools.get(call.name)
+            validation_error = tool.validate_arguments(call.arguments) if tool else None
+            if validation_error:
+                output, _ = self._tools.execute(call.name, call.arguments, cancel=cancel)
+                tool_results.append(ToolResult(
+                    tool_call_id=call.id, output=output, is_error=True,
+                ))
+                resulted_ids.add(call.id)
+                self._emit(RunEvent(
+                    kind=events.TOOL_COMPLETED, task_id=task.id,
+                    tool_name=call.name, tool_input=call.arguments,
+                    tool_output=output, tool_error=True,
+                ))
+                # 参数错误允许模型在剩余预算内纠正，但不审批、不执行。
+                continue
+
+            approval_action = tool.approval_action(call.arguments) if tool else None
+            needs_approval = approval_action is not None
+            if needs_approval:
+                self._emit(RunEvent(kind=events.APPROVAL_REQUIRED, task_id=task.id,
+                                    tool_name=call.name, tool_input=call.arguments,
+                                    payload={"approval_action": approval_action}))
+
+            approval_result = self._resolve_approval(
+                call, tool, approval_action, needs_approval, guard, on_auto_execute,
+            )
+
+            if approval_result and not approval_result.approved:
+                # 用户拒绝或按 ESC 取消
+                if approval_result.feedback:
+                    output = f"[denied] 用户拒绝并提供了修改建议:\n\n{approval_result.feedback}"
+                else:
+                    output = DENIED_MESSAGE
+                guard.denied_any = True
+                self._tools.record_denied(
+                    call.name,
+                    call.arguments,
+                    approval_action=approval_action,
+                )
+                self._emit(RunEvent(kind=events.TOOL_DENIED, task_id=task.id,
+                                    tool_name=call.name))
+
+                # 修改建议和 Esc 都意味着"停止当前 turn，回到主输入框"。先补齐
+                # tool_result 配对，避免历史损坏，再用协作式 Cancelled 收尾。
+                if approval_result.cancelled:
+                    tool_results.append(ToolResult(
+                        tool_call_id=call.id, output=output, is_error=False,
+                    ))
+                    resulted_ids.add(call.id)
+                    flush()
+                    if approval_result.feedback:
+                        raise Cancelled(approval_result.feedback)
+                    raise KeyboardInterrupt("用户取消操作")
+                continue
+
+            t0 = time.monotonic()
+            output, is_error = batch.execute(
+                call,
+                approved_action=approval_action,
+                cancel=cancel,
+            )
+            # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
+            # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
+            output = _truncate_tool_output(output)
+            # wait batches are bounded per result before serialization.
+            if call.name == "wait_agent":
+                binder = delegated_manager(self._tools)
+                if binder is not None:
+                    binder.bind_wait_tool_result(call.id, output, is_error)
+            if not is_error and call.name not in {"todo_write", "load_skill"}:
+                counters.successful_tool_calls += 1
+            self._emit(RunEvent(
+                kind=events.TOOL_COMPLETED, task_id=task.id,
+                tool_name=call.name, tool_input=call.arguments,
+                tool_output=output, tool_error=is_error,
+                elapsed_seconds=batch.elapsed(call, time.monotonic() - t0),
+            ))
+            # 工具执行出错 -> 任务失败。先补齐 tool_result 配对,再返回,
+            # 否则 assistant 的 tool_use 悬空,Replanner 重试时 provider 报错。
+            if is_error and not guard.auto_execute:
+                tool_results.append(ToolResult(
+                    tool_call_id=call.id, output=output, is_error=is_error,
+                ))
+                resulted_ids.add(call.id)
+                flush()
+                # flush 会给同批中已并发完成的兄弟调用补结果，并把它们计入
+                # tool_calls_made；必须在 flush 之后再读计数，否则报的是"发起时"的数量。
+                guard.outcome = TaskOutcome(
+                    status=FAILED,
+                    error=f"工具 {call.name} 执行失败: {output}",
+                    evidence=last_text.strip(),
+                    text=last_text.strip(),
+                    tool_calls_made=counters.tool_calls_made,
+                    model_rounds=model_rounds,
+                )
+                return guard
+
+            if guard.auto_execute:
+                digest = hashlib.sha256(output.encode("utf-8", errors="replace")).digest()
+                unchanged = last_outputs.get(signature) == digest
+                counters.repeated_requests = counters.repeated_requests + 1 if unchanged else 0
+                if (not unchanged and not is_error and tool is not None
+                        and (tool.risk == "write" or call.name in {"write_file", "edit_file"})):
+                    last_outputs.clear()
+                last_outputs[signature] = digest
+                if counters.repeated_requests >= 3:
+                    tool_results.append(ToolResult(call.id, output, is_error))
+                    resulted_ids.add(call.id)
+                    flush()
+                    guard.outcome = TaskOutcome(
+                        FAILED, error="重复工具调用且结果未变化，停止自动空转",
+                        text=last_text, model_rounds=model_rounds,
+                        tool_calls_made=counters.tool_calls_made,
+                    )
+                    return guard
+
+            tool_results.append(ToolResult(
+                tool_call_id=call.id, output=output, is_error=is_error,
+            ))
+            resulted_ids.add(call.id)
+
+        return guard
+
+    def _resolve_approval(
+        self,
+        call: Any,
+        tool: Any,
+        approval_action: Optional[str],
+        needs_approval: bool,
+        guard: _ToolCallGuard,
+        on_auto_execute: Optional[Callable[[], None]],
+    ) -> Optional[ApprovalResult]:
+        """按审批策略拿到本调用的审批结论；不需要审批时返回 None。"""
+        if not needs_approval or tool is None:
+            return None
+        manager = delegated_manager(self._tools)
+        if manager is not None and manager.long_run:
+            guard.auto_execute = manager.auto_execute_active
+        if guard.auto_execute and call.name != "request_confirmation":
+            return ApprovalResult(approved=True)
+
+        approval_result = request_tool_approval(
+            self._approval,
+            tool,
+            approval_action,
+            call.arguments,
+        )
+        if (
+            approval_result is not None
+            and approval_result.approved
+            and approval_result.feedback == "__enable_auto_execute__"
+        ):
+            guard.auto_execute = True
+            approval_result.feedback = None
+            if on_auto_execute is not None:
+                on_auto_execute()
+        return approval_result
+
     def run_task(
         self,
         task: Task,
@@ -212,7 +539,7 @@ class Executor:
         error_rounds = 0
         last_outputs: dict[tuple[str, str], bytes] = {}
         task_context = task.content
-        manager = getattr(self._tools, "manager", None)
+        manager = delegated_manager(self._tools)
 
         while auto_execute or (manager is not None and manager.long_run) or model_rounds < max(1, max_steps):
             if manager is not None and manager.long_run:
@@ -221,7 +548,7 @@ class Executor:
             if cancel is not None:
                 cancel.raise_if_cancelled()
             steering = apply_steering(cancel, messages)
-            manager = getattr(self._tools, "manager", None)
+            manager = delegated_manager(self._tools)
             if manager is not None:
                 manager.deliver(messages)
                 manager.charge_parent_round()
@@ -233,75 +560,19 @@ class Executor:
                 task_context += "\n" + "\n".join(steering)
 
             tools = self._tools_for_task(task_context, mode="task") or None
-            text_streamed = False
-            streamed_parts: list[str] = []
-
-            def _discard_partial(_exc: BaseException) -> None:
-                """重试前作废本次尝试已流出的半截文本。
-
-                重试时 adapter 会从头再流一遍，不清空的话 spinner 会把同一段内容推
-                第二遍，而 ``streamed_parts`` 里的残文还可能被当成最终答复。
-                """
-                nonlocal text_streamed
-                if not streamed_parts:
-                    return
-                streamed_parts.clear()
-                text_streamed = False
-                if on_discard is not None:
-                    on_discard()
-
-            with self._progress("thinking") as handle:
-                on_progress = getattr(handle, "update", None)
-                raw_on_text = getattr(handle, "on_text", None)
-                raw_on_thinking = getattr(handle, "on_thinking", None)
-                on_discard = getattr(handle, "discard_text", None)
-
-                if self._ctx is not None:
-                    try:
-                        self._ctx.compact_before_model_call(
-                            messages,
-                            system=system,
-                            tools=tools,
-                            on_progress=on_progress,
-                            cancel=cancel,
-                        )
-                    except (Cancelled, ContextBudgetExceeded):
-                        raise
-                    except Exception:
-                        pass
-
-                def on_text_delta(delta: str) -> None:
-                    nonlocal text_streamed
-                    text_streamed = True
-                    streamed_parts.append(delta)
-                    if raw_on_text is not None:
-                        raw_on_text(delta)
-
-                resp = call_create_message(
-                    self._llm,
-                    messages,
-                    tools=tools,
-                    system=system,
-                    on_progress=on_progress,
-                    on_text_delta=on_text_delta if raw_on_text else None,
-                    on_thinking_delta=raw_on_thinking,
-                    cancel=cancel,
-                    discard_partial=_discard_partial,
-                    on_retry=lambda attempt, delay, exc: self._emit_provider_retry(
-                        task.id, attempt, delay, exc,
-                    ),
-                    retry_until_cancelled=auto_execute,
-                )
-
-            if usage_acc is not None and getattr(resp, "usage", None):
-                for key, value in resp.usage.items():
-                    usage_acc[key] = usage_acc.get(key, 0) + value
-            if on_actual_model is not None and getattr(resp, "actual_model", None):
-                on_actual_model(resp.actual_model)
+            resp, response_text, text_streamed = self._call_model_round(
+                task,
+                messages,
+                system=system,
+                tools=tools,
+                cancel=cancel,
+                auto_execute=auto_execute,
+                usage_acc=usage_acc,
+                on_actual_model=on_actual_model,
+            )
 
             messages.extend(resp.provider_payload)
 
-            response_text = resp.text or "".join(streamed_parts)
             if response_text:
                 last_text = response_text
                 # 文本若已被 spinner 流式打印过,就不再发 message_delta(避免重复)
@@ -311,7 +582,7 @@ class Executor:
 
             # 没有工具调用 = 模型认为这个子任务已经做完
             if not resp.tool_calls:
-                manager = getattr(self._tools, "manager", None)
+                manager = delegated_manager(self._tools)
                 if manager is not None and manager.settle_before_final(messages):
                     continue
                 steering = apply_steering(cancel, messages)
@@ -416,168 +687,35 @@ class Executor:
                 if pending or tool_results:
                     combined = tool_results + pending
                     messages.extend(self._llm.format_tool_results(combined))
-                    manager = getattr(self._tools, "manager", None)
+                    manager = delegated_manager(self._tools)
                     if manager is not None:
                         # 合成占位结果与已绑定输出不相等,不会被误确认。
                         manager.acknowledge_tool_results(combined)
                     tool_results.clear()  # 已随 pending 一起入历史,避免下方重复 extend
 
             try:
-                for call in resp.tool_calls:
-                    if cancel is not None:
-                        cancel.raise_if_cancelled()
-                        if cancel.has_steering:
-                            _flush_pending_tool_results()
-                            break
-                    tool_calls_made += 1
-                    visited_ids.add(call.id)
-                    signature = (call.name, json.dumps(call.arguments, sort_keys=True, default=repr))
-                    if signature in seen_tool_signatures and not auto_execute:
-                        _flush_pending_tool_results()
-                        return TaskOutcome(
-                            status=FAILED,
-                            error=f"模型重复请求工具 {call.name}，任务无进展",
-                            evidence=last_text.strip(),
-                            text=last_text.strip(),
-                            tool_calls_made=tool_calls_made,
-                            model_rounds=model_rounds,
-                        )
-                    seen_tool_signatures.add(signature)
-                    batch.announce(call)
-
-                    tool = self._tools.get(call.name)
-                    validation_error = tool.validate_arguments(call.arguments) if tool else None
-                    if validation_error:
-                        output, _ = self._tools.execute(call.name, call.arguments, cancel=cancel)
-                        tool_results.append(ToolResult(
-                            tool_call_id=call.id, output=output, is_error=True,
-                        ))
-                        resulted_ids.add(call.id)
-                        self._emit(RunEvent(
-                            kind=events.TOOL_COMPLETED, task_id=task.id,
-                            tool_name=call.name, tool_input=call.arguments,
-                            tool_output=output, tool_error=True,
-                        ))
-                        # 参数错误允许模型在剩余预算内纠正，但不审批、不执行。
-                        continue
-                    approval_action = (
-                        tool.approval_action(call.arguments) if tool else None
-                    )
-                    needs_approval = approval_action is not None
-                    if needs_approval:
-                        self._emit(RunEvent(kind=events.APPROVAL_REQUIRED, task_id=task.id,
-                                            tool_name=call.name, tool_input=call.arguments,
-                                            payload={"approval_action": approval_action}))
-
-                    approval_result = None
-                    if needs_approval and tool is not None:
-                        if manager is not None and manager.long_run:
-                            auto_execute = manager.auto_execute_active
-                        if auto_execute and call.name != "request_confirmation":
-                            approval_result = ApprovalResult(approved=True)
-                        else:
-                            approval_result = request_tool_approval(
-                                self._approval,
-                                tool,
-                                approval_action,
-                                call.arguments,
-                            )
-                            if (
-                                approval_result is not None
-                                and approval_result.approved
-                                and approval_result.feedback == "__enable_auto_execute__"
-                            ):
-                                auto_execute = True
-                                approval_result.feedback = None
-                                if on_auto_execute is not None:
-                                    on_auto_execute()
-
-                    if approval_result and not approval_result.approved:
-                        # 用户拒绝或按 ESC 取消
-                        if approval_result.feedback:
-                            output = f"[denied] 用户拒绝并提供了修改建议:\n\n{approval_result.feedback}"
-                        else:
-                            output = DENIED_MESSAGE
-                        is_error = False
-                        denied_any = True
-                        self._tools.record_denied(
-                            call.name,
-                            call.arguments,
-                            approval_action=approval_action,
-                        )
-                        self._emit(RunEvent(kind=events.TOOL_DENIED, task_id=task.id,
-                                            tool_name=call.name))
-
-                        # 修改建议和 Esc 都意味着“停止当前 turn，回到主输入框”。先补齐
-                        # tool_result 配对，避免历史损坏，再用协作式 Cancelled 收尾。
-                        if approval_result.cancelled:
-                            tool_results.append(ToolResult(
-                                tool_call_id=call.id, output=output, is_error=False,
-                            ))
-                            resulted_ids.add(call.id)
-                            _flush_pending_tool_results()
-                            if approval_result.feedback:
-                                raise Cancelled(approval_result.feedback)
-                            raise KeyboardInterrupt("用户取消操作")
-                    else:
-                        t0 = time.monotonic()
-                        output, is_error = batch.execute(
-                            call,
-                            approved_action=approval_action,
-                            cancel=cancel,
-                        )
-                        # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
-                        # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
-                        output = _truncate_tool_output(output)
-                        # wait batches are bounded per result before serialization.
-                        if call.name == "wait_agent":
-                            binder = getattr(self._tools, "manager", None)
-                            if binder is not None:
-                                binder.bind_wait_tool_result(call.id, output, is_error)
-                        if not is_error and call.name not in {"todo_write", "load_skill"}:
-                            successful_tool_calls += 1
-                        self._emit(RunEvent(
-                            kind=events.TOOL_COMPLETED, task_id=task.id,
-                            tool_name=call.name, tool_input=call.arguments,
-                            tool_output=output, tool_error=is_error,
-                            elapsed_seconds=batch.elapsed(call, time.monotonic() - t0),
-                        ))
-                        # 工具执行出错 -> 任务失败。先补齐 tool_result 配对,再返回,
-                        # 否则 assistant 的 tool_use 悬空,Replanner 重试时 provider 报错。
-                        if is_error and not auto_execute:
-                            tool_results.append(ToolResult(
-                                tool_call_id=call.id, output=output, is_error=is_error,
-                            ))
-                            resulted_ids.add(call.id)
-                            _flush_pending_tool_results()
-                            return TaskOutcome(
-                                status=FAILED,
-                                error=f"工具 {call.name} 执行失败: {output}",
-                                evidence=last_text.strip(),
-                                text=last_text.strip(),
-                                tool_calls_made=tool_calls_made,
-                                model_rounds=model_rounds,
-                            )
-                        if auto_execute:
-                            digest = hashlib.sha256(output.encode("utf-8", errors="replace")).digest()
-                            unchanged = last_outputs.get(signature) == digest
-                            repeated_requests = repeated_requests + 1 if unchanged else 0
-                            if (not unchanged and not is_error and tool is not None
-                                    and (tool.risk == "write" or call.name in {"write_file", "edit_file"})):
-                                last_outputs.clear()
-                            last_outputs[signature] = digest
-                            if repeated_requests >= 3:
-                                tool_results.append(ToolResult(call.id, output, is_error))
-                                resulted_ids.add(call.id)
-                                _flush_pending_tool_results()
-                                return TaskOutcome(FAILED, error="重复工具调用且结果未变化，停止自动空转",
-                                                   text=last_text, model_rounds=model_rounds,
-                                                   tool_calls_made=tool_calls_made)
-
-                    tool_results.append(ToolResult(
-                        tool_call_id=call.id, output=output, is_error=is_error,
-                    ))
-                    resulted_ids.add(call.id)
+                guard = self._run_tool_calls(
+                    task,
+                    resp.tool_calls,
+                    messages=messages,
+                    batch=batch,
+                    tool_results=tool_results,
+                    resulted_ids=resulted_ids,
+                    visited_ids=visited_ids,
+                    seen_tool_signatures=seen_tool_signatures,
+                    last_outputs=last_outputs,
+                    counters=_RunCounters(
+                        tool_calls_made=tool_calls_made,
+                        successful_tool_calls=successful_tool_calls,
+                        repeated_requests=repeated_requests,
+                    ),
+                    cancel=cancel,
+                    auto_execute=auto_execute,
+                    last_text=last_text,
+                    model_rounds=model_rounds,
+                    flush=_flush_pending_tool_results,
+                    on_auto_execute=on_auto_execute,
+                )
             except BaseException:
                 # Cancelled / KeyboardInterrupt / 任何其他异常:
                 # 必须给本轮所有未执行的工具补合成 tool_result,保证 tool_use/tool_result
@@ -588,9 +726,17 @@ class Executor:
                 _flush_pending_tool_results()
                 raise
 
+            tool_calls_made = guard.counters.tool_calls_made
+            successful_tool_calls = guard.counters.successful_tool_calls
+            repeated_requests = guard.counters.repeated_requests
+            auto_execute = guard.auto_execute
+            denied_any = denied_any or guard.denied_any
+            if guard.outcome is not None:
+                return guard.outcome
+
             if tool_results:
                 messages.extend(self._llm.format_tool_results(tool_results))
-                manager = getattr(self._tools, "manager", None)
+                manager = delegated_manager(self._tools)
                 if manager is not None:
                     manager.acknowledge_tool_results(tool_results)
                 error_rounds = error_rounds + 1 if all(r.is_error for r in tool_results) else 0

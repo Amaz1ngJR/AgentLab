@@ -943,6 +943,7 @@ def test_response_failed_surfaces_real_gateway_error():
 
 @pytest.mark.parametrize("code,message", [
     ("server_error", "upstream model error"),
+    ("rate_limit_exceeded", "Upstream rate limit exceeded, please retry later"),
     ("upstream_stream_read_error", "Upstream response stream was interrupted"),
 ])
 def test_response_failed_raw_stream_is_retryable_for_server_error(code, message):
@@ -987,6 +988,7 @@ def test_response_failed_raw_stream_is_retryable_for_server_error(code, message)
             )
 
     assert message in str(caught.value)
+    assert "流式协议异常" not in str(caught.value)
     assert caught.value.retryable is True
 
 
@@ -1301,3 +1303,15 @@ def test_raw_stream_bare_assertion_error_does_not_repeat_fallback():
 
     assert client.responses.create.call_count == 1
     client.responses.stream.assert_not_called()
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+def test_classified_stream_error_is_preserved_without_rewrapping(retryable):
+    original = ProviderStreamError("rate_limit_exceeded", retryable=retryable)
+    with patch("openai.OpenAI") as constructor:
+        constructor.return_value.responses.create.side_effect = original
+        adapter = OpenAIAdapter(_cfg())
+        with pytest.raises(ProviderStreamError) as caught:
+            adapter.create_message([{"role": "user", "content": "hello"}], _use_raw_stream=True)
+    assert caught.value is original
+    assert caught.value.retryable is retryable

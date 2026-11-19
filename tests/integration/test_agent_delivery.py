@@ -325,7 +325,14 @@ def test_pending_delivery_does_not_block_approved_external_reads(git_repo):
                                           approved_action="shell_outside_workspace")
             # The other directory is not a Git repo: the tool executes and reports
             # Git's error, not an unrelated child-delivery lock.
-            assert error and "not a git repository" in output.lower()
+            # 不能断言 git 的文案：git 会按系统 locale 本地化（中文环境下是
+            # "致命错误：不是 git 仓库"），CI/本机 locale 不同就会假失败。
+            # 这里只关心"确实执行了 git 并失败"，以及在 shell 未获批准时会出现的
+            # 投递锁提示没有出现。
+            assert error
+            lowered = output.lower()
+            assert "not a git repository" in lowered or "不是 git 仓库" in output
+            assert "pending delivery" not in lowered and "待投递" not in output
     finally:
         m.finish()
 

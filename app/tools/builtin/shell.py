@@ -8,7 +8,7 @@
   - cwd 默认是 workspace;指定外部 cwd 时使用独立的越界审批
   - timeout 默认 30s,超时后子进程被杀掉
   - 输出先经过 AgentLab 内置 RTK 风格过滤器（无需外部二进制），失败时回退原文
-  - 模型预览最多4000字符，完整长输出留存在工作区供分页读取
+  - 模型预览最多4000字符，完整长输出留存在用户缓存供分页读取
 
 跨平台说明:
   - Unix(macOS / Linux): 用 ["bash", "-c", command],利用 shell 解析管道、
@@ -143,6 +143,8 @@ def _run_shell(args: dict) -> str:
     # 截断超长输出。把截断标记放末尾,模型能看见"原始输出多大",决定要不要
     # 改命令(比如加 head / tail)
     if len(output) > MAX_OUTPUT_BYTES:
+        if archive is None:
+            archive = archive_output(full)
         truncated = output[:MAX_OUTPUT_BYTES * 3 // 4] + "\n…\n" + output[-MAX_OUTPUT_BYTES // 4:]
         output = f"{truncated}\n\n[...truncated, total {len(output)} bytes]\n[exit code: {returncode}]"
     if returncode != 0:
@@ -159,7 +161,8 @@ SHELL = Tool(
     description=(
         "执行 shell 命令(macOS/Linux 用 bash,Windows 用 PowerShell)。"
         "cwd 默认是 workspace;外部 cwd 需要独立审批。"
-        "超过 8KB 的输出会被截断。常见开发命令会先经内置 RTK 风格过滤器压缩，"
+        "输出预览最多4000字符，完整输出通过 read_tool_output 按输出 ID 读取。"
+        "常见开发命令会先经内置 RTK 风格过滤器压缩，"
         "无需安装外部 rtk；过滤失败或收益不足时自动返回原始输出。"
         "默认超时 30 秒,可通过 timeout 字段指定更长(单位秒)。"
         "适用:跑测试、看 git 状态、构建项目、列文件等。"
