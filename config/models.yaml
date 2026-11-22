@@ -1,7 +1,7 @@
 models:
   chatgpt_codex:
     provider: openai_chatgpt
-    model: gpt-6.1-sol
+    model: gpt-6.2-sol
     capabilities: [chat, tools]
     params:
       reasoning_effort: medium
@@ -46,17 +46,6 @@ models:
     model: ${SILICONFLOW_MODEL:-nex-agi/Nex-N2-Pro}
     base_url: https://api.siliconflow.cn/v1
     api_key_env: SILICONFLOW_API_KEY
-    capabilities: [chat, tools]
-    params:
-      temperature: 0.2
-
-  # ── OpenAI 官方 GPT 模型（GPT-3.5 （gpt-3.5-turbo）/ GPT-5 （gpt-5））────────────────────────────────────
-  gpt_official:
-    provider: openai
-    model: ${OPENAI_MODEL:-gpt-3.5-turbo}
-    api_key_env: OPENAI_API_KEY
-    base_url: https://api.openai.com/v1
-    # 默认 gpt-3.5-turbo 不支持图片；若 OPENAI_MODEL 换成视觉模型，请显式加 vision。
     capabilities: [chat, tools]
     params:
       temperature: 0.2

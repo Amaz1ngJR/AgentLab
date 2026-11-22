@@ -1255,6 +1255,122 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         print(f"\n  ⏱ {ev.text}", flush=True)
 
 
+# 工具按用途分组，供 /tools 与启动横幅的"能力概览"共用。
+# 分组的唯一目的是让人一眼看出"这个会话能对世界做什么"，而不是罗列名字。
+_TOOL_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
+    ("读取", "读文件、看目录、搜代码、回看工具输出",
+     ("read_file", "read_files", "list_dir", "code_search", "read_tool_output")),
+    ("写入", "改文件、打补丁",
+     ("write_file", "edit_file", "apply_patch")),
+    ("执行", "跑命令、操作交互式终端",
+     ("shell", "terminal_open", "terminal_send", "terminal_close", "terminal_list")),
+    ("网络", "搜索与抓取网页",
+     ("web_search", "web_fetch")),
+    ("交互", "请求确认、管理任务、加载 Skill",
+     ("request_confirmation", "todo_write", "load_skill")),
+]
+
+
+def _group_tool_names(names: list[str]) -> list[tuple[str, list[str]]]:
+    """把工具名按用途分组；未登记的工具归入"其他"，不丢弃。"""
+    remaining = list(names)
+    grouped: list[tuple[str, list[str]]] = []
+    for label, _desc, members in _TOOL_GROUPS:
+        hit = [name for name in remaining if name in members]
+        if hit:
+            grouped.append((label, hit))
+            remaining = [name for name in remaining if name not in hit]
+    if remaining:
+        grouped.append(("其他", remaining))
+    return grouped
+
+
+def _tools_summary_line(tool_names: list[str], mcp_count: int = 0,
+                        skill_total: int = 0, skill_enabled: int = 0) -> str:
+    """启动横幅用的单行能力概览，替代平铺全部工具名。
+
+    只给数量与分组，细节留给 /tools：十几个工具名平铺一行读起来很吃力，
+    而且每次启动都占满整行宽度。
+    """
+    grouped = _group_tool_names(tool_names)
+    parts = [f"{label} {len(names)}" for label, names in grouped]
+    line = f"工具     : {len(tool_names)} 个（{' / '.join(parts)}）"
+    if mcp_count:
+        line += f" · MCP {mcp_count} 个 server"
+    if skill_total:
+        line += f" · Skill {skill_enabled}/{skill_total} 启用"
+    line += "  — /tools 查看详情"
+    return line
+
+
+def _handle_tools_command(session: AgentSession | None, line: str) -> str:
+    """处理 /tools：按用途列出可用工具、MCP server 与 Skill。"""
+    parts = line.split()
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    from app.tools.builtin import default_tools
+    tools = default_tools()
+    names = [t.name for t in tools]
+    described = {t.name: (t.description or "").strip() for t in tools}
+
+    if sub in {"mcp", "skills", "skill"}:
+        names = []  # 只看对应分区
+
+    lines: list[str] = []
+    if names:
+        lines.append(f"内置工具 {len(names)} 个:")
+        for label, members in _group_tool_names(names):
+            lines.append(f"  [{label}]")
+            for name in members:
+                desc = described.get(name, "")
+                # 描述只取首句，避免把整段说明塞进终端
+                brief = desc.split("。")[0].split("\n")[0]
+                if len(brief) > 60:
+                    brief = brief[:58] + "…"
+                lines.append(f"    {name:<20} {brief}")
+
+    # MCP server 与 Skill 放在同一份清单里，避免启动时分散在两处打印。
+    manager = getattr(session, "mcp_manager", None) if session is not None else None
+    mcp_servers = []
+    try:
+        from app.mcp.config import enabled_servers
+        mcp_servers = enabled_servers()
+    except Exception:
+        mcp_servers = []
+    if mcp_servers and sub not in {"skills", "skill"}:
+        lines.append("")
+        lines.append(f"MCP server {len(mcp_servers)} 个:")
+        for server in mcp_servers:
+            tool_names = []
+            if manager is not None:
+                tool_names = [t.name for t in manager.tools() if t.server == server.name]
+            lines.append(
+                f"  {server.name} [{server.transport}] risk={server.risk} "
+                f"工具 {len(tool_names)} 个"
+            )
+
+    if sub not in {"mcp"}:
+        from app.skills import SkillCatalog
+        catalog = SkillCatalog.from_dir()
+        all_skills = catalog.all()
+        if all_skills:
+            enabled_ids = {s.skill_id for s in catalog.enabled_skills()}
+            lines.append("")
+            lines.append(f"Skill {len(all_skills)} 个（默认启用 {len(enabled_ids)} 个）:")
+            for skill in all_skills:
+                mark = "✓" if skill.skill_id in enabled_ids else " "
+                lines.append(f"  [{mark}] {skill.skill_id}")
+
+    if not lines:
+        # 分区的空状态要说清"为什么空"，否则和"工具全部失效"分不开。
+        if sub == "mcp":
+            return "未启用任何 MCP server（config/mcp_servers.yaml 中 enabled: true 才会加载）。"
+        if sub in {"skills", "skill"}:
+            return "skills/ 下没有可用的 Skill。"
+        return "当前没有可用的工具。"
+    return "\n".join(lines)
+
+
 def _handle_context_command(session: AgentSession, line: str) -> str:
     """处理 /context 命令族(§7.3 的 CLI 入口)。
 
@@ -1762,6 +1878,93 @@ def _check_local_endpoint(cfg) -> None:
     sys.exit(2)
 
 
+def _window_source_warning(llm) -> str:
+    """上下文窗口来自兜底估算时给出告警。
+
+    ``source == "default"`` 表示既没有配置也没从 provider 元数据查到窗口，
+    系统按 ``DEFAULT_CONTEXT_LIMIT`` 估算。如果模型实际窗口更大，压缩会在
+    远未到齐的地方触发，白白消耗摘要请求；更小则可能直接超限报错。
+    两种都值得用户知道，因为启动横幅里的那个数字看起来"很正常"。
+    """
+    try:
+        window = llm.context_window
+    except Exception:
+        return ""
+    source = getattr(window, "source", "")
+    if source != "default":
+        return ""
+    return (
+        f"⚠ 上下文窗口未声明，按 {window.tokens:,} tokens 估算；"
+        f"若模型实际更大，压缩会过早触发、白耗摘要请求。\n"
+        f"   在 config/models.yaml 的该 profile 下设置 params.context_size 即可消除。"
+    )
+
+
+def _model_detail_lines(llm) -> list[str]:
+    """启动横幅里与模型相关的行：上下文窗口、采样参数、推理强度、输出上限。
+
+    抽成纯函数便于单测：这些值直接决定"压缩何时介入""每轮最多产出多少"，
+    是排查长任务异常时最先要核对的信息，不该只靠肉眼看启动日志。
+    """
+    lines: list[str] = []
+    window = llm.context_window
+    lines.append(f"上下文   : {window.tokens:,} tokens（来源: {window.source}）")
+    # 配置里写了 temperature 不代表它会生效：有的模型只接受默认采样温度，
+    # adapter 会把参数整个摘掉。不标注的话，用户会拿这个数字去解释采样行为差异。
+    ignored = getattr(llm, "temperature_ignored", False)
+    sampling = [
+        ("temperature", getattr(llm, "temperature", None)),
+        ("top_p", getattr(llm, "top_p", None)),
+    ]
+    shown = [
+        f"{key}={value}" + ("（模型不支持，已忽略）" if key == "temperature" and ignored else "")
+        for key, value in sampling if value is not None
+    ]
+    if shown:
+        lines.append(f"采样     : {'  '.join(shown)}")
+    # 推理强度单列一行：它直接决定延迟和思考 token 消耗，且是排查"为什么这么慢"
+    # 或"为什么额度掉得快"时最先要看的开关（none<minimal<low<medium<high<xhigh<max）。
+    effort = getattr(llm, "reasoning_effort", None)
+    if effort:
+        lines.append(f"推理强度 : {effort}")
+    max_output = getattr(getattr(getattr(llm, "_adapter", None), "_cfg", None), "max_tokens", None)
+    if max_output:
+        lines.append(f"输出上限 : {max_output:,} tokens/轮")
+    return lines
+
+
+def _session_resume_summary(messages: list[dict], limit: int) -> tuple[str, str]:
+    """恢复会话时给出历史规模，以及超阈值时的告警。
+
+    返回 ``(摘要文本, 告警文本)``；告警为空字符串表示不用提示。
+
+    历史规模直接决定每次请求要重发的输入量：大历史在小窗口模型上会频繁触发
+    压缩，在按输入计费的额度上则是实打实的花销。启动时就把这两个数摆出来，
+    避免"跑了几小时才发现上下文早就撑到几十万 token"。
+    """
+    from app.agent.context_budget import estimate_messages_tokens
+
+    detail = f"历史消息 {len(messages)} 条"
+    if not messages:
+        return detail, ""
+    estimated = estimate_messages_tokens(messages)
+    if limit:
+        # 超过窗口时如实显示真实占比，不要夹到 100% —— 否则"已满"和"超出两倍"
+        # 看起来一样，而后者根本无法发出请求。
+        pct = int(estimated * 100 / limit)
+        detail += f"，约 {estimated:,} tokens（占窗口 {pct}%）"
+    else:
+        detail += f"，约 {estimated:,} tokens"
+    if limit and estimated * 2 >= limit:
+        warning = (
+            f"⚠ 该会话历史已占用窗口 {int(estimated * 100 / limit)}%，"
+            f"每次请求都会完整重发；/context compact 可压缩，"
+            f"或 /session new 开一个干净会话。"
+        )
+        return detail, warning
+    return detail, ""
+
+
 def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     cfg = load_config(profile_name=profile)
     if cfg.provider == "anthropic" and not (cfg.auth_token or cfg.api_key):
@@ -1784,9 +1987,14 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     if cfg.profile_name:
         _print_init(f"profile  : {cfg.profile_name}")
     if cfg.provider == "openai_chatgpt":
-        window = llm.context_window
         _print_init(f"账号     : {cfg.chatgpt_account}")
-        _print_init(f"上下文   : {window.tokens:,} tokens（来源: {window.source}）")
+    # 上下文窗口决定压缩何时介入，是排查"上下文涨到多大"时最先要看的值；
+    # 来源标明它出自显式配置还是估算兜底，避免把兜底值当成模型真实上限。
+    for line in _model_detail_lines(llm):
+        _print_init(line)
+    window_warning = _window_source_warning(llm)
+    if window_warning:
+        _print_init(window_warning)
     if cfg.capabilities:
         _print_init(f"能力     : {', '.join(cfg.capabilities)}")
     from app.config.loader import workspace_root
@@ -1797,22 +2005,14 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     from app.tools.builtin import default_tools
     builtin_tools = default_tools()
     tool_names = [t.name for t in builtin_tools]
-    # 把 terminal_* 归纳显示
-    tool_display = []
-    for name in tool_names:
-        if name.startswith('terminal_'):
-            if 'terminal_* (交互式会话)' not in tool_display:
-                tool_display.append('terminal_* (交互式会话)')
-        else:
-            tool_display.append(name)
-
-    _print_init(f"工具     : {' / '.join(tool_display)}")
+    # 只留计数，完整清单换到 /tools：十几个工具名平铺一行读起来很吃力。
+    # 但这一行要在 MCP / Skill 解析之后才打印，才能合并成一段"能力概览"。
     _print_init(f"RTK      : {('enabled' if BuiltinRTK().config.enabled else 'disabled')} (built-in)")
     _print_init(
         "审批     : AUTO (-y)" if auto_approve else
         "审批     : 支持单次允许、工作区工具授权和 Session 命令前缀授权"
     )
-    _print_init("输入 /version 查看版本; /rtk 查看内置输出压缩; /image 或 Ctrl+V 附加图片; /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
+    _print_init("输入 /version 查看版本; /tools 查看工具/MCP/Skill; /rtk 查看内置输出压缩; /image 或 Ctrl+V 附加图片; /reset 清空会话; /resume 继续未完成任务; /model [list|current|switch] 切换模型; /session [list|new|switch|...] 管理多 Agent; exit/quit 退出.")
     _print_init("执行中可直接输入补充方向；Esc 或 Ctrl-C 停止当前任务。\n")
 
     # ── MCP server 接入 ───────────────────────────────────────────────────────
@@ -1826,10 +2026,11 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
                     f"({', '.join(s.name for s in mcp_servers)}) …", flush=True)
         mcp_manager.start()
         # 启用前展示:server、transport、发现的工具(落实 §9.2 "启用前展示可暴露能力")
+        # 详细清单交给 /tools，这里只汇总一行，避免启动时被 MCP 明细刷屏。
         for s in mcp_servers:
             tool_names = [t.name for t in mcp_manager.tools() if t.server == s.name]
             _print_init(f"           ▸ {s.name} [{s.transport}] risk={s.risk} "
-                        f"工具 {len(tool_names)} 个: {', '.join(tool_names) or '(无)'}")
+                        f"工具 {len(tool_names)} 个")
         _print_init("           动作经外部 MCP server 执行;非只读工具默认每次需审批。")
 
         # ── 云端数据边界提示(PRD §7.8.2 / §12)─────────────────────────────────
@@ -1882,12 +2083,19 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     # 扫描 skills/*/SKILL.md 生成 catalog（目录不存在则为空，行为与之前一致）。
     # Skill 只影响上下文（注入工作流说明），不授予工具权限。
     skill_catalog = SkillCatalog.from_dir()
-    if skill_catalog.all():
-        enabled = skill_catalog.enabled_skills()
-        enabled_names = ', '.join(s.skill_id for s in enabled) if enabled else '无'
-        _print_init(f"Skill    : 发现 {len(skill_catalog.all())} 个 "
-                    f"({', '.join(s.skill_id for s in skill_catalog.all())});"
-                    f" 默认启用 {len(enabled)} 个 ({enabled_names})")
+    skill_total = len(skill_catalog.all())
+    skill_enabled = len(skill_catalog.enabled_skills())
+
+    # ── 能力概览 ──────────────────────────────────────────────────────────────
+    # 把工具 / MCP / Skill 压成一行。它们原先分散在三处打印，读起来像三份互不
+    # 相干的清单；实际上都是"这个会话能用什么"，合在一起看才有意义。
+    # 完整清单用 /tools 查看。
+    _print_init(_tools_summary_line(
+        tool_names,
+        mcp_count=len(mcp_servers),
+        skill_total=skill_total,
+        skill_enabled=skill_enabled,
+    ))
 
     def _session_factory(agent_profile, session_id: str) -> AgentSession:
         """按 AgentProfile 构建一个隔离的 AgentSession:独立工具表 + 任务清单 + 记忆注入。"""
@@ -2069,9 +2277,14 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     row = storage.get_session(sid)
     title = row["title"] if row else ""
     if resumed:
-        msg_count = len(service.current.messages) if service.current else 0
-        _print_init(f"会话     : 恢复 {sid}  ({title})  历史消息 {msg_count} 条 "
+        session = service.current
+        messages = list(session.messages) if session is not None else []
+        limit = (getattr(session.llm, "context_size", 0) or 0) if session is not None else 0
+        detail, warning = _session_resume_summary(messages, limit)
+        _print_init(f"会话     : 恢复 {sid}  ({title})  {detail} "
                     f"— /session new 开新会话, /session list 看全部\n")
+        if warning:
+            _print_init(f"{warning}\n")
     else:
         _print_init(f"会话     : 新建 {sid}  ({title})\n")
     return service
@@ -2159,6 +2372,7 @@ _SLASH_COMMANDS = {
     "/goal": "定义 Loop Engineering 目标",
     "/loop": "启动/查看/停止 Loop",
     "/model": "查看和切换模型配置",
+    "/tools": "列出可用工具、MCP server 与 Skill",
 }
 _ATTACHMENT_SUBCOMMANDS = {
     "clear": "清空尚未发送的图片",
@@ -2180,6 +2394,11 @@ _CONTEXT_SUBCOMMANDS = {
     "summary": "查看当前生效的压缩摘要",
     "disable-auto-compact": "禁用本会话的自动压缩",
     "enable-auto-compact": "重新启用本会话的自动压缩",
+}
+# /tools 子命令 → 说明
+_TOOLS_SUBCOMMANDS = {
+    "mcp": "只列出 MCP server 及其工具数量",
+    "skills": "只列出 Skill 及启用状态",
 }
 # /goal 子命令 → 说明
 _GOAL_SUBCOMMANDS = {
@@ -2229,7 +2448,7 @@ class _SlashCompleter(Completer):
                     yield Completion(cmd, start_position=-len(word), display_meta=desc)
             return
 
-        if parts[0] not in ("/session", "/context", "/goal", "/loop", "/model", "/attachments"):
+        if parts[0] not in ("/session", "/context", "/goal", "/loop", "/model", "/attachments", "/tools"):
             return  # 只有这几个有更深层补全
 
         # ── 第二级:/attachments 子命令 ──
@@ -2266,6 +2485,15 @@ class _SlashCompleter(Completer):
             if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
                 prefix = parts[1] if len(parts) == 2 else ""
                 for sub, desc in _LOOP_SUBCOMMANDS.items():
+                    if sub.startswith(prefix):
+                        yield Completion(sub, start_position=-len(prefix), display_meta=desc)
+            return
+
+        # ── 第二级:/tools 子命令 ──
+        if parts[0] == "/tools":
+            if len(parts) == 1 or (len(parts) == 2 and not text.endswith(" ")):
+                prefix = parts[1] if len(parts) == 2 else ""
+                for sub, desc in _TOOLS_SUBCOMMANDS.items():
                     if sub.startswith(prefix):
                         yield Completion(sub, start_position=-len(prefix), display_meta=desc)
             return
@@ -2529,6 +2757,7 @@ def _chat_with_cancel(
                     )
                 else:
                     result = session.chat(line, images=images, cancel=token, resume=resume)
+                live_input.run_status = getattr(session, "last_run_status", "")
                 usage = getattr(session, "last_turn_usage", None)
                 if isinstance(usage, dict) and hasattr(live_input, "composer"):
                     live_input.composer.set_total_usage(usage)
@@ -3032,6 +3261,11 @@ def _repl(router: RuntimeService) -> int:
             # /model 命令:查看和切换模型配置
             if line == "/model" or line.startswith("/model "):
                 print(_handle_model_command(router, line))
+                continue
+
+            # /tools 命令:查看工具 / MCP / Skill 详情
+            if line == "/tools" or line.startswith("/tools "):
+                print(_handle_tools_command(session, line))
                 continue
 
             # /goal 和 /loop 命令通过 RuntimeService 显式入口处理。

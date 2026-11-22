@@ -15,6 +15,23 @@ from app.util.input_arbiter import foreground_stdin
 from app.util.live_turn import LiveTurnInput
 
 
+@pytest.mark.parametrize("status,title", [
+    ("completed", "Done"), ("blocked", "Blocked"), ("failed", "Failed"),
+    ("budget_exhausted", "Stopped"), ("cancelled", "Stopped"), ("", "Ended"),
+])
+def test_live_turn_displays_runtime_status(status, title):
+    with create_pipe_input() as pipe:
+        live = LiveTurnInput(PromptSession(input=pipe, output=DummyOutput()),
+                             message="> ", style=Style([]), prepare_input=lambda s: s)
+        def work():
+            live.run_status = status
+            return "answer"
+        assert live.run(work, CancelToken()) == "answer"
+        assert live.status.startswith(title + " (")
+        if status != "completed":
+            assert "已完成" not in live.status
+
+
 @pytest.mark.parametrize("key", ["\x1b", "\x03"])
 def test_live_prompt_stops_blocked_model_and_preserves_draft(key):
     release = threading.Event()

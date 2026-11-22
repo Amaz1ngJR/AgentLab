@@ -118,14 +118,21 @@ class ComposerLayout:
             return fragments
         return formatted
 
-    def finish_turn(self, *, cancelled=False, failed=False):
+    def finish_turn(self, *, cancelled=False, failed=False, run_status=None):
         details = []
         if self.started is not None:
             details.append(format_duration(time.monotonic() - self.started))
         if self.usage_summary:
             details.append(self.usage_summary)
         title, phase = (("Failed", "执行失败") if failed else
-                        ("Stopped", "已停止") if cancelled else ("Done", "已完成"))
+                        ("Stopped", "已停止") if cancelled else {
+                            "completed": ("Done", "已完成"),
+                            "failed": ("Failed", "执行失败"),
+                            "blocked": ("Blocked", "尚未完成"),
+                            "budget_exhausted": ("Stopped", "预算耗尽，尚未完成"),
+                            "cancelled": ("Stopped", "已停止"),
+                            None: ("Done", "已完成"),
+                        }.get(run_status, ("Ended", "本轮结束，完成状态未确认")))
         details.append(phase)
         self.status = f"{title} ({' · '.join(details)})"
         self.started = None

@@ -107,6 +107,16 @@ def test_off_rejects_tool_even_if_replayed(tmp_path):
     m.finish()
 
 
+@pytest.mark.parametrize("args", [None, {"sid": [], "checks": ["true"]}])
+def test_invalid_integration_arguments_are_reported_undelivered(tmp_path, args):
+    m = manager(tmp_path)
+    try:
+        result, error = DelegationRegistry(registry(), m).execute("integrate_agent", args)
+        assert error and "未交付" in result and "invalid arguments" in result
+    finally:
+        m.finish()
+
+
 def test_storage_roundtrip_preserves_execution_and_marks_interrupted(tmp_path):
     from app.storage import Storage
     db = Storage(tmp_path / "state.db")

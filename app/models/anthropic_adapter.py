@@ -14,6 +14,7 @@ from app.config.schemas import LLMConfig
 from app.attachments import materialize_image_block
 from app.models.token_progress import StreamingTokenProgress
 from app.models.stream_normalizer import StreamDeltaNormalizer
+from app.models.openai_adapter import ProviderStreamError
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -174,6 +175,99 @@ def _normalize_anthropic_messages(
     return ("\n\n".join(system_parts) if system_parts else None), normalized
 
 
+def _placeholder_block_for(delta_type: Any):
+    """按增量类型构造占位块。
+
+    补齐缺失的 content_block_start 时，占位块必须和后面要推的增量种类一致，
+    否则 SDK 的 ``build_events`` 会因为 ``content_block.type`` 不匹配而把增量
+    静默丢弃（例如给 input_json_delta 补 text 块，工具参数就整段丢失）。
+    """
+    from anthropic.types import TextBlock, ThinkingBlock, ToolUseBlock
+
+    if delta_type == "input_json_delta":
+        return ToolUseBlock(id="", type="tool_use", name="", input={})
+    if delta_type == "thinking_delta" or delta_type == "signature_delta":
+        return ThinkingBlock(type="thinking", thinking="", signature="")
+    return TextBlock(type="text", text="")
+
+
+def _iter_events_with_repaired_snapshot(stream, cancel=None):
+    """遍历 Anthropic 原始流事件，并按 index 修复 SDK 的快照。
+
+    SDK 的 ``MessageStream.__stream__`` 是「先 accumulate_event 再 yield」，
+    而 ``accumulate_event`` 用 ``current_snapshot.content[event.index]``
+    直接下标记账。网关若少发 ``content_block_start`` 或 index 跳号，就会
+    在 SDK 内部抛 IndexError/AttributeError，整轮请求失败。
+
+    这里改成自己消费 ``_raw_stream``：先把快照 content 按事件 index 补齐，
+    再交给 SDK 的 ``accumulate_event`` 更新（保持 usage/stop_reason 等字段
+    仍由 SDK 维护），最后把事件原样交给调用方。这样畸变序列也能继续跑完。
+    """
+    from anthropic.lib.streaming._messages import accumulate_event
+    from anthropic import NOT_GIVEN
+
+    raw_stream = getattr(stream, "_raw_stream", None)
+    if raw_stream is None:
+        # 结构不符预期时退回 SDK 自己的迭代器，行为与改动前一致。
+        yield from stream
+        return
+
+    output_format = getattr(stream, "_MessageStream__output_format", NOT_GIVEN)
+    # 直接读写私有字段：current_message_snapshot 属性在快照为空时会 assert。
+    snapshot_attr = "_MessageStream__final_message_snapshot"
+    for event in raw_stream:
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+        index = getattr(event, "index", None)
+        snapshot = getattr(stream, snapshot_attr, None)
+        etype = getattr(event, "type", None)
+        # 部分网关把 message_start 的 content 发成 null 而不是空数组。
+        # SDK 随后会直接对 content 调 append，所以必须先修成 list。
+        if snapshot is not None and getattr(snapshot, "content", None) is None:
+            snapshot.content = []
+        # content_block_start 由 SDK 自己 append，不预先补位，否则会多出空块。
+        if (etype != "content_block_start" and isinstance(index, int)
+                and index >= 0 and snapshot is not None):
+            content = getattr(snapshot, "content", None)
+            if content is None:
+                content = []
+                snapshot.content = content
+            if len(content) <= index:
+                # 占位块要和后面的增量类型一致，否则 SDK 会静默丢弃该增量。
+                delta = getattr(event, "delta", None)
+                delta_type = getattr(delta, "type", None)
+                if delta_type == "input_json_delta":
+                    # 工具调用的 id/name 只在 content_block_start 里，丢了这个
+                    # 事件就无法还原一次可执行的调用。补一个无名占位块只会让
+                    # 参数静默消失、模型以为调用过，比直接失败更难排查，因此
+                    # 交给重试层重新要一份完整的流。
+                    raise ProviderStreamError(
+                        "Anthropic 流式事件缺失 content_block_start（工具调用），"
+                        "无法还原调用信息",
+                        retryable=True,
+                    )
+                placeholder = _placeholder_block_for(delta_type)
+                while len(content) <= index:
+                    # 只有本次响应内承接增量，空占位块不会写回历史。
+                    content.append(_placeholder_block_for(None) if len(content) < index
+                                   else placeholder)
+        try:
+            updated = accumulate_event(
+                event=event,
+                current_snapshot=getattr(stream, snapshot_attr, None),
+                output_format=output_format,
+            )
+        except (IndexError, AttributeError) as exc:
+            raise ProviderStreamError(
+                f"Anthropic 流式事件序列无法修复: {type(exc).__name__}: {exc}",
+                retryable=True,
+            ) from exc
+        # 回写 SDK 的私有快照，否则 get_final_message()/current_message_snapshot
+        # 读到的仍是旧值（__stream__ 原本负责这次赋值）。
+        setattr(stream, snapshot_attr, updated)
+        yield event
+
+
 def _materialize_anthropic_messages(messages: list[dict]) -> list[dict]:
     """把内部 file 图片引用转换为 Anthropic Messages 的 base64 source。"""
     converted: list[dict] = []
@@ -217,6 +311,37 @@ def _temperature_compatible(method):
             self._omit_temperature = True
             return method(self, *args, **kwargs)
     return invoke
+
+
+def _accumulated_message(stream, *, events_seen: int = 0):
+    """取本次响应最终累积出的消息。
+
+    真实 ``MessageStream`` 上 ``_iter_events_with_repaired_snapshot`` 已经
+    自己维护了私有快照，直接取它；测试替身没有该字段，退回 SDK 的公开接口。
+
+    用 isinstance 而不是 hasattr/getattr：MagicMock 会为任意属性凭空返回值，
+    靠属性存在性判断会误判。
+
+    快照为空说明整条流没有产出任何可用事件（网关空响应、或全是无法解析的
+    畸变事件）。此时绝不能回退 ``get_final_message()`` —— 它内部会再 assert
+    一次，抛出没有消息的 ``AssertionError``，在 CLI 上只显示
+    "AssertionError: (异常无消息)"，完全无法定位。这里显式给出可读的、
+    可重试的错误。
+    """
+    try:
+        from anthropic.lib.streaming import MessageStream
+    except ImportError:  # pragma: no cover - 理论上不会发生
+        return stream.get_final_message()
+    if isinstance(stream, MessageStream):
+        snapshot = getattr(stream, "_MessageStream__final_message_snapshot", None)
+        if snapshot is not None:
+            return snapshot
+        raise ProviderStreamError(
+            f"Anthropic 流未产出可用事件（收到 {events_seen} 个事件但无消息快照）；"
+            f"疑似网关空响应或事件序列整体损坏",
+            retryable=True,
+        )
+    return stream.get_final_message()
 
 
 class AnthropicAdapter:
@@ -310,22 +435,29 @@ class AnthropicAdapter:
 
         in_tokens = 0
         out_tokens = 0
+        events_seen = 0
         progress = StreamingTokenProgress(on_progress)
         normalizer = StreamDeltaNormalizer()
         progress.emit(force=True)
 
         with self._client.messages.stream(**params) as stream:
             with close_on_cancel(cancel, stream):
-                for event in stream:
-                    if cancel is not None:
-                        cancel.raise_if_cancelled()
+                # 不再用 ``for event in stream``：SDK 的 MessageStream.__stream__
+                # 在 yield 之前就调用 accumulate_event()，而那里直接用
+                # ``snapshot.content[event.index]`` 取块
+                # （见 anthropic/lib/streaming/_messages.py 的
+                #  content_block_delta 与 content_block_stop 两处）。
+                # 自建代理偶尔会缺 content_block_start 或让 index 跳号，
+                # 于是整轮请求以 IndexError 结束 —— 属于传输层畸变，
+                # 重试一次通常就好，不该让 20+ 分钟的执行前功尽弃。
+                #
+                # 这里直接遍历原始事件流并自己累加快照，遇到不完整的序列
+                # 按 index 补齐占位块，既能继续解析，也不会再越界。
+                for event in _iter_events_with_repaired_snapshot(stream, cancel):
+                    events_seen += 1
                     etype = getattr(event, "type", None)
                     if etype == "message_start":
-                        # Some gateways send null instead of the initial empty array.
-                        # Repair the SDK's accumulated copy before it appends the next block.
-                        snapshot = getattr(stream, "current_message_snapshot", None)
-                        if snapshot is not None and getattr(snapshot, "content", None) is None:
-                            snapshot.content = []
+                        # content=null 已由 _iter_events_with_repaired_snapshot 修好。
                         usage = getattr(event.message, "usage", None)
                         if usage:
                             in_tokens = getattr(usage, "input_tokens", 0) or 0
@@ -355,7 +487,11 @@ class AnthropicAdapter:
 
                 if cancel is not None:
                     cancel.raise_if_cancelled()
-                message = stream.get_final_message()
+                # 事件由 _iter_events_with_repaired_snapshot 自行累加，SDK 的
+                # get_final_message() 依赖它自己 __stream__ 里写入的私有快照，
+                # 这里改为直接取那条已被我们更新过的快照。测试替身（MagicMock）
+                # 会凭空造出任意属性，因此只在确认是真实 MessageStream 时走快照。
+                message = _accumulated_message(stream, events_seen=events_seen)
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -363,9 +499,16 @@ class AnthropicAdapter:
         for block in message.content:
             btype = getattr(block, "type", None)
             if btype == "text":
+                # 补位用的占位块没有内容，不能写进历史，否则回放时会出现空文本块。
+                if not (getattr(block, "text", "") or ""):
+                    continue
                 text_parts.append(block.text)
                 raw_blocks.append({"type": "text", "text": block.text})
             elif btype == "tool_use":
+                # 正常路径下 block_start 一定带 id/name；这里只是防御：
+                # 没有它们就不是一次可执行的调用。
+                if not getattr(block, "name", "") or not getattr(block, "id", ""):
+                    continue
                 tool_calls.append(ToolCall(
                     id=block.id,
                     name=block.name,

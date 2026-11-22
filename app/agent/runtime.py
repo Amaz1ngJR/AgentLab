@@ -523,9 +523,22 @@ class AgentSession:
                 record.get("parent_started_at", record.get("started_at", 0)),
                 record.get("started_at", 0),
             )).get("parent_run_id")
-            latest_records = [record for record in self.child_records if record.get("parent_run_id") == latest_run]
+            latest_records = [record for record in self.child_records
+                              if record.get("parent_run_id") == latest_run
+                              and record.get("parent_workspace") == str(workspace_root().resolve())]
         resume_workflow = ""
-        if resume and latest_records and latest_records[-1].get("delegation_allowed"):
+        pending_delivery = any(
+            not record.get("superseded_by") and not record.get("continuation_id")
+            and (record.get("execution_status", record.get("status")) != "succeeded"
+                 or (not record.get("spec", {}).get("read_only", True)
+                     and record.get("delivery_status") != "integrated"))
+            for record in latest_records
+        )
+        newly_allowed = delegation_allowed(
+            self.delegation_policy, user_input,
+            workflow=getattr(self, "_delegation_workflow", ""),
+        )
+        if (resume or pending_delivery) and latest_records and latest_records[-1].get("delegation_allowed"):
             # Resume continues an already authorized run, not a fresh implicit delegation.
             # delegation_allowed still gives off and a new user veto precedence.
             resume_workflow = "使用子 agent 继续已授权任务"
@@ -552,11 +565,11 @@ class AgentSession:
             on_event=self._emit_run_event, checkpoint=checkpoint,
             history=self.messages,
         )
-        if resume and self._delegation_allowed:
-            manager.restore_results(latest_records, messages=self.messages)
+        if (resume or pending_delivery) and self._delegation_allowed:
+            manager.restore_results(latest_records, messages=self.messages, restore_budget=resume)
         if self._auto_execute_enabled:
             manager.enable_long_run(self.auto_max_steps, self.auto_max_tool_calls, self.auto_timeout_seconds)
-        self.tools = DelegationRegistry(source, manager)
+        self.tools = DelegationRegistry(source, manager, continuation_only=not newly_allowed)
         def report_budget():
             self.last_run_status = "budget_exhausted"
             text = manager.budget_error or "budget_exhausted"
@@ -571,11 +584,21 @@ class AgentSession:
             if manager.budget_error:
                 return report_budget()
             unresolved = manager.unresolved()
-            if unresolved and self.last_run_status == "completed":
+            if pending_delivery and not self._delegation_allowed:
+                unresolved.append("上一轮子任务仍未交付；当前委派策略或用户限制禁止恢复执行")
+            delivery_errors = list(self.tools.delivery_errors.values())
+            if (unresolved or delivery_errors) and self.last_run_status == "completed":
                 self.last_run_status = "blocked"
-                answer += "\n\n委派尚未交付：" + "; ".join(unresolved)
+                self.last_run_error = "; ".join(unresolved + delivery_errors)
+                answer += "\n\n委派尚未交付：" + self.last_run_error
                 self._emit_run_event(RunEvent(kind=events.RUN_FAILED, text=answer,
                                              payload={"children": manager.records()}))
+            open_tasks = [task.content for task in self.task_store.all() if task.status != "completed"]
+            if open_tasks and self.last_run_status == "completed":
+                self.last_run_status = "blocked"
+                self.last_run_error = "任务清单尚未完成：" + "; ".join(open_tasks)
+                answer += "\n\n" + self.last_run_error
+                self._emit_run_event(RunEvent(kind=events.RUN_FAILED, text=self.last_run_error))
             return answer
         except Cancelled:
             if manager.budget_error:

@@ -70,6 +70,17 @@ class ModelRouter:
         return getattr(getattr(self._adapter, "_cfg", None), "temperature", None)
 
     @property
+    def temperature_ignored(self) -> bool:
+        """配置里的 temperature 是否会被 provider 忽略。
+
+        部分模型（如 claude-fable-5-2）只接受默认采样温度，adapter 会把整个
+        参数从请求里去掉。启动横幅据此标注"已忽略"，避免把配置值误当成生效值。
+        """
+        if getattr(self._adapter, "_omit_temperature", False):
+            return True
+        return False
+
+    @property
     def reasoning_effort(self) -> str | None:
         return getattr(getattr(self._adapter, "_cfg", None), "reasoning_effort", None)
 

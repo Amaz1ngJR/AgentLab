@@ -28,7 +28,7 @@ def test_top_level_slash():
     c = _completer()
     assert set(_complete(c, "/")) == {
         "/paste-image", "/image", "/attachments", "/rtk", "/version", "/reset",
-        "/resume", "/session", "/context", "/goal", "/loop", "/model",
+        "/resume", "/session", "/context", "/goal", "/loop", "/model", "/tools",
     }
 
 

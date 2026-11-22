@@ -91,6 +91,24 @@ def test_chat_returns_text_when_no_tool_calls():
     assert session.cumulative_usage["output_tokens"] == 3
 
 
+def test_incomplete_task_list_prevents_false_completion():
+    from app.agent.tasks import Task
+    session = AgentSession(FakeRouter([_resp_text("本轮结束")]), _registry_with(_echo_tool()))
+    session.task_store.add(Task("unfinished", "编译验证"))
+    assert "任务清单尚未完成" in session.chat("你完成了？")
+    assert session.last_run_status == "blocked"
+
+
+def test_unknown_integration_is_explicitly_undelivered():
+    session = AgentSession(FakeRouter([
+        _resp_tool("bad", "integrate_agent", {"sid": "missing", "checks": ["true"]}),
+        _resp_text("done"),
+    ]), _registry_with(_echo_tool()))
+    result = session.chat("使用子 agent 的结果进行集成")
+    assert "未交付" in result and "unknown child" in result
+    assert session.last_run_status == "blocked"
+
+
 def test_single_tool_loop():
     router = FakeRouter([
         _resp_tool("call_1", "echo", {"msg": "world"}),

@@ -238,3 +238,217 @@ def test_clean_anthropic_history_is_preserved():
     assert system == "系统提示"
     assert [m["role"] for m in converted] == ["user", "assistant"]
     assert converted[1]["content"] == [{"type": "text", "text": "回答"}]
+
+
+# ── 网关事件序列畸变的修复与重试 ──────────────────────────────────────────────
+# SDK 的 accumulate_event 直接拿 event.index 当列表下标，网关少发
+# content_block_start 或让 index 跳号就会在 SDK 内部抛 IndexError，
+# 让整轮长任务作废。这里验证我们能在边界上修好，并把它标记为可重试。
+
+
+def _malformed_stream(events):
+    from anthropic import NOT_GIVEN
+    from anthropic.lib.streaming import MessageStream
+    raw = MagicMock()
+    raw.__iter__.return_value = iter(events)
+    return MessageStream(raw, output_format=NOT_GIVEN)
+
+
+def _message_start(content=None):
+    from anthropic.types import Message, RawMessageStartEvent, Usage
+    return RawMessageStartEvent(type="message_start", message=Message.model_construct(
+        id="m", type="message", role="assistant", model="claude-test",
+        content=content if content is not None else [],
+        usage=Usage(input_tokens=5, output_tokens=0),
+        stop_reason=None, stop_sequence=None))
+
+
+def _block_start(index, text=""):
+    from anthropic.types import RawContentBlockStartEvent, TextBlock
+    return RawContentBlockStartEvent(type="content_block_start", index=index,
+                                     content_block=TextBlock(type="text", text=text))
+
+
+def _delta(index, text):
+    from anthropic.types import RawContentBlockDeltaEvent, TextDelta
+    return RawContentBlockDeltaEvent(type="content_block_delta", index=index,
+                                     delta=TextDelta(type="text_delta", text=text))
+
+
+def _block_stop(index):
+    from anthropic.types import RawContentBlockStopEvent
+    return RawContentBlockStopEvent(type="content_block_stop", index=index)
+
+
+def _message_stop():
+    from anthropic.types import RawMessageStopEvent
+    return RawMessageStopEvent(type="message_stop")
+
+
+@pytest.mark.parametrize("events", [
+    # 缺 content_block_start，直接推 delta
+    [_message_start(), _delta(0, "hi"), _message_stop()],
+    # index 跳号：只有 block 0，却推 block 2 的增量
+    [_message_start(), _block_start(0), _delta(2, "hi"), _block_stop(2), _message_stop()],
+], ids=["missing_block_start", "index_gap"])
+def test_malformed_gateway_sequence_is_repaired_not_raised(events):
+    from app.models.anthropic_adapter import _iter_events_with_repaired_snapshot
+    stream = _malformed_stream(events)
+    consumed = [e.type for e in _iter_events_with_repaired_snapshot(stream)]
+    assert consumed == [e.type for e in events]
+    texts = [b.text for b in stream._MessageStream__final_message_snapshot.content]
+    assert "hi" in texts
+
+
+def test_normal_sequence_does_not_gain_placeholder_blocks():
+    from app.models.anthropic_adapter import _iter_events_with_repaired_snapshot
+    stream = _malformed_stream([
+        _message_start(), _block_start(0), _delta(0, "hi"), _block_stop(0), _message_stop(),
+    ])
+    list(_iter_events_with_repaired_snapshot(stream))
+    content = stream._MessageStream__final_message_snapshot.content
+    assert len(content) == 1
+    assert content[0].text == "hi"
+
+
+def test_placeholder_blocks_match_the_increment_they_carry():
+    """占位块必须和后续增量同类型，否则 SDK 会静默丢弃该增量。"""
+    from app.models.anthropic_adapter import _placeholder_block_for
+    assert _placeholder_block_for(None).type == "text"
+    assert _placeholder_block_for("text_delta").type == "text"
+    assert _placeholder_block_for("input_json_delta").type == "tool_use"
+    assert _placeholder_block_for("thinking_delta").type == "thinking"
+
+
+def test_unrepairable_stream_error_is_retryable():
+    """超出修复范围的流畸变要转成 ProviderStreamError(retryable=True)。
+
+    这类异常没有状态码，也不在重试层的文本白名单里；如果原样冒泡，
+    classify_provider_error 会判成不可重试，让整轮长任务白跑。
+    """
+    from app.models.anthropic_adapter import (
+        _iter_events_with_repaired_snapshot, AnthropicAdapter,
+    )
+    from app.models.openai_adapter import ProviderStreamError
+    from app.models.provider_retry import classify_provider_error
+    import anthropic.lib.streaming._messages as sdk_streaming
+
+    def boom(*_args, **_kwargs):
+        raise IndexError("list index out of range")
+
+    original = sdk_streaming.accumulate_event
+    sdk_streaming.accumulate_event = boom
+    try:
+        stream = _malformed_stream([_message_start(), _block_start(0), _delta(0, "hi")])
+        with pytest.raises(ProviderStreamError) as caught:
+            list(_iter_events_with_repaired_snapshot(stream))
+    finally:
+        sdk_streaming.accumulate_event = original
+
+    assert caught.value.retryable is True
+    # 有了显式标记，重试层就会按瞬时故障处理。
+    assert classify_provider_error(caught.value).retryable is True
+
+
+def test_unrelated_index_error_is_not_rewrapped():
+    """业务代码里的 IndexError 不能被当成流畸变。"""
+    from app.models.openai_adapter import ProviderStreamError
+    from app.models.provider_retry import classify_provider_error
+
+    try:
+        [][0]
+    except IndexError as exc:
+        assert not isinstance(exc, ProviderStreamError)
+        # 没有显式 retryable 标记，保持原有判定
+        assert classify_provider_error(exc).retryable is False
+
+
+def _tool_start(index, name, call_id):
+    from anthropic.types import RawContentBlockStartEvent, ToolUseBlock
+    return RawContentBlockStartEvent(type="content_block_start", index=index,
+        content_block=ToolUseBlock(id=call_id, type="tool_use", name=name, input={}))
+
+
+def _json_delta(index, partial):
+    from anthropic.types import RawContentBlockDeltaEvent, InputJSONDelta
+    return RawContentBlockDeltaEvent(type="content_block_delta", index=index,
+        delta=InputJSONDelta(type="input_json_delta", partial_json=partial))
+
+
+def test_null_content_from_gateway_is_repaired():
+    """网关把 message_start.content 发成 null 时不能让 SDK 的 append 崩掉。"""
+    from app.models.anthropic_adapter import _iter_events_with_repaired_snapshot
+    stream = _malformed_stream([
+        _message_start(content=None), _block_start(0), _delta(0, "hi"),
+        _block_stop(0), _message_stop(),
+    ])
+    list(_iter_events_with_repaired_snapshot(stream))
+    content = stream._MessageStream__final_message_snapshot.content
+    assert [b.text for b in content] == ["hi"]
+
+
+def test_parallel_tool_calls_keep_their_arguments():
+    """多个并发 tool_use 的参数必须各自落在自己的块上，不能串位。"""
+    from app.models.anthropic_adapter import _iter_events_with_repaired_snapshot
+    stream = _malformed_stream([
+        _message_start(),
+        _tool_start(0, "shell", "t0"), _tool_start(1, "read_file", "t1"),
+        _json_delta(0, '{"command":"ls"}'), _json_delta(1, '{"path":"a"}'),
+        _block_stop(0), _block_stop(1), _message_stop(),
+    ])
+    list(_iter_events_with_repaired_snapshot(stream))
+    blocks = stream._MessageStream__final_message_snapshot.content
+    by_name = {b.name: b.input for b in blocks if b.type == "tool_use"}
+    assert by_name == {"shell": {"command": "ls"}, "read_file": {"path": "a"}}
+
+
+def test_missing_tool_use_block_start_fails_retryably_instead_of_losing_arguments():
+    """工具调用缺 content_block_start 时无法还原 id/name。
+
+    补一个无名占位块会让参数静默消失、模型以为调用过，比失败更难排查，
+    因此必须显式报可重试错误，让上层重新要一份完整的流。
+    """
+    from app.models.anthropic_adapter import _iter_events_with_repaired_snapshot
+    from app.models.openai_adapter import ProviderStreamError
+    stream = _malformed_stream([
+        _message_start(), _tool_start(0, "shell", "t0"),
+        _json_delta(1, '{"command":"ls"}'), _message_stop(),
+    ])
+    with pytest.raises(ProviderStreamError) as caught:
+        list(_iter_events_with_repaired_snapshot(stream))
+    assert caught.value.retryable is True
+
+
+def test_empty_stream_raises_readable_retryable_error():
+    """网关返回空流时不能退化成无消息的 AssertionError。
+
+    原实现回退到 SDK 的 get_final_message()，它内部 assert 快照非空，
+    于是 CLI 上只剩 "AssertionError: (异常无消息)"，无法定位。
+    """
+    from app.models.anthropic_adapter import AnthropicAdapter
+    from app.models.openai_adapter import ProviderStreamError
+    from app.models.provider_retry import classify_provider_error
+
+    stream = _malformed_stream([])
+    cfg = _config()
+    with patch("anthropic.Anthropic") as sdk:
+        sdk.return_value.messages.stream.return_value.__enter__.return_value = stream
+        with pytest.raises(ProviderStreamError) as caught:
+            AnthropicAdapter(cfg).create_message([{"role": "user", "content": "hi"}])
+
+    assert "未产出可用事件" in str(caught.value)
+    assert caught.value.retryable is True
+    assert classify_provider_error(caught.value).retryable is True
+
+
+def test_accumulated_message_rejects_empty_snapshot():
+    """快照为空时必须报可读错误，而不是回退到会 assert 的公开接口。"""
+    from app.models.anthropic_adapter import _accumulated_message
+    from app.models.openai_adapter import ProviderStreamError
+
+    stream = _malformed_stream([])
+    list(stream)  # 空流，快照保持 None
+    with pytest.raises(ProviderStreamError) as caught:
+        _accumulated_message(stream, events_seen=0)
+    assert caught.value.retryable is True
+    assert "0 个事件" in str(caught.value)

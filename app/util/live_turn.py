@@ -81,6 +81,7 @@ class LiveTurnInput:
         self._suspension = None
         self._worker_thread = None
         self.on_steer = None
+        self.run_status = ""
 
     @property
     def status(self):
@@ -150,6 +151,7 @@ class LiveTurnInput:
         self.status = "Thinking… · 启动中"
         self.composer.activity = ""
         self.composer.reset_usage()
+        self.run_status = ""
         done = self._loop.create_future()
         previous_bindings = self.prompt.key_bindings
         previous_toolbar = self.prompt.bottom_toolbar
@@ -244,6 +246,7 @@ class LiveTurnInput:
                     await asyncio.gather(input_task, return_exceptions=True)
                 self.composer.finish_turn(
                     cancelled=token.cancelled, failed=token.reason == "input_worker_error",
+                    run_status=self.run_status,
                 )
                 self._token = None
                 self._worker_thread = None

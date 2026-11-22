@@ -369,8 +369,13 @@ class AgentManager:
                 pass  # Observers cannot make an already-started child appear unstarted.
             return self.snapshot(sid)
 
-    def restore_results(self, records: list[dict], *, messages: list[dict] | None = None):
-        """Restore structured receipts; parse display history only for legacy records."""
+    def restore_results(self, records: list[dict], *, messages: list[dict] | None = None,
+                        restore_budget: bool = True):
+        """Restore immutable artifacts and receipts without replaying workers.
+
+        Explicit /resume keeps the old aggregate budget. A new user turn may
+        inspect or deliver old artifacts using its own budget instead.
+        """
         def delivered_results(value):
             if isinstance(value, dict):
                 if "result_id" in value and "revision" in value:
@@ -395,7 +400,7 @@ class AgentManager:
             # Resume retains the logical parent run, including artifacts from earlier attempts.
             self.run_id = records[0].get("parent_run_id", self.run_id)
             self.started = records[0].get("parent_started_at", records[0].get("started_at", self.started))
-            budget = records[-1].get("budget", {})
+            budget = records[-1].get("budget", {}) if restore_budget else {}
             if "model_limit" in budget:
                 self.model_limit = min(self.model_limit, budget["model_limit"])
                 self.rounds_left = max(0, self.model_limit - (
@@ -866,6 +871,11 @@ class AgentManager:
         string = {"type": "string", "minLength": 1}
         def wrap(fn):
             return lambda args: json.dumps(fn(**args), ensure_ascii=False)
+        def integrate_tool(args):
+            result = self.integrate(**args)
+            if result.get("status") != "integrated":
+                raise ToolExecutionError("未交付：" + json.dumps(result, ensure_ascii=False))
+            return json.dumps(result, ensure_ascii=False)
         return [
             Tool("spawn_agent", "启动子任务并立即返回 ID；默认共享父工作区，独立隔离可选 workspace_mode=worktree；只委派独立且有收益的任务。同模块子任务仍运行时优先 send_input 追加信息，避免重复调查；已结束的只读任务可使用 resume_agent 继续（返回新的执行 ID）。只读角色仅可读取工作区文件，无 shell/网络工具；所需材料由父级提供或自行处理。预算省略时继承父配置并分配剩余额度。executor 必须声明不重叠 file_scope。共享模式改动立即可见，integrate_agent 验证后确认交付；worktree 模式验证审批后应用补丁。",
                  schema({"instruction": string, "role": {"enum": ["research", "reviewer", "verifier", "executor"]},
@@ -896,7 +906,7 @@ class AgentManager:
             Tool("integrate_agent", "验证写入子任务：共享模式确认已在父工作区的成果；worktree 模式审批并应用补丁。不提交或推送。",
                  schema({"sid": string, "checks": {"type": "array", "items": string, "minItems": 1,
                          "description": "必须是实际可执行的 shell 验证命令，在子任务实际工作区运行；不是审查说明、操作计划或承诺稍后验证"}},
-                        ["sid", "checks"]), wrap(self.integrate)),
+                        ["sid", "checks"]), integrate_tool),
             Tool("close_agent", "幂等关闭子任务并请求取消；cancelling 表示尚未退出，仍占用写范围。关闭且实际停止后释放写范围，父级可接手；保留结果和文件，不代表补丁已集成或任务成功。",
                  schema({"sid": string}, ["sid"]), wrap(self.close)),
         ]
@@ -905,11 +915,14 @@ class AgentManager:
 class DelegationRegistry(ToolRegistry):
     """Turn-local overlay; never register closures into a shared session registry."""
 
-    def __init__(self, source: ToolRegistry, manager: AgentManager):
+    def __init__(self, source: ToolRegistry, manager: AgentManager, *, continuation_only=False):
         super().__init__(max_parallel_tools=source.max_parallel_tools)
         self.source, self.manager = source, manager
+        self.delivery_errors = {}
         if manager.allowed:
             for tool in manager.tool_descriptors():
+                if continuation_only and tool.name == "spawn_agent":
+                    continue
                 self.register(tool)
 
     def get(self, name):
@@ -946,7 +959,15 @@ class DelegationRegistry(ToolRegistry):
         if name in MANAGEMENT_TOOLS:
             if not self.manager.allowed:
                 return "delegation disabled", True
-            return super().execute(name, args, **kwargs)
+            result, error = super().execute(name, args, **kwargs)
+            sid = args.get("sid", "") if isinstance(args, dict) else ""
+            sid = sid if isinstance(sid, str) else ""
+            if name == "integrate_agent" and error:
+                result = "未交付：integrate_agent 失败；" + result
+                self.delivery_errors[sid] = result
+            elif name == "integrate_agent":
+                self.delivery_errors.pop(sid, None)
+            return result, error
         self.manager.charge_parent_tool()
         owned = [child for child in self.manager.children.values() if child.reserves_write_scope()]
         if name == "shell" and any(not child.done.is_set() for child in owned):

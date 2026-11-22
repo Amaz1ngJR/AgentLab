@@ -34,6 +34,75 @@ def spawn_isolated(manager, *args, **kwargs):
     return manager.spawn(*args, workspace_mode="worktree", **kwargs)
 
 
+def test_ordinary_followup_queries_and_integrates_previous_delivery(git_repo, monkeypatch):
+    from app.agent.runtime import AgentSession
+    monkeypatch.setenv("WORKSPACE_ROOT", str(git_repo))
+    original = make_manager(git_repo)
+    sid = spawn_isolated(original, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+    original.wait([sid], 3)
+    records = original.records()
+    original.finish()
+    # Expired previous-turn budgets must not prevent a new user turn from querying an artifact.
+    records[-1]["budget"]["deadline_at"] = 0
+    records[-1]["budget"]["model_rounds_left"] = 0
+    router = FakeRouter([
+        ModelResponse("", [ToolCall("query", "wait_agent", {"ids": [sid], "timeout": 0})], {}, []),
+        response("仍待交付"),
+        ModelResponse("", [ToolCall("deliver", "integrate_agent", {"sid": sid, "checks": ["test -f child.txt"]})], {}, []),
+        response("验证并交付完成"),
+    ])
+    session = AgentSession(router, original.tools, approval=AutoApprove(), max_steps=12)
+    session.child_records = records
+    first = session.chat("你完成了？")
+    assert "unknown child" not in first and "尚未交付" in first
+    assert session.last_run_status == "blocked"
+    names = {t["name"] for t in router.calls[0]["tools"]}
+    assert "wait_agent" in names and "integrate_agent" in names and "spawn_agent" not in names
+    assert session.chat("继续验证并交付") == "验证并交付完成"
+    assert session.last_run_status == "completed"
+    assert (git_repo / "child.txt").read_text() == "hello"
+
+
+def test_failed_verification_tool_is_error_and_retry_can_deliver(git_repo):
+    from app.agent.agent_manager import DelegationRegistry
+    m = make_manager(git_repo)
+    try:
+        sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+        m.wait([sid], 3)
+        tools = DelegationRegistry(m.tools, m)
+        result, error = tools.execute("integrate_agent", {"sid": sid, "checks": ["exit 1"]})
+        assert error and "未交付" in result and "verification_failed" in result
+        assert sid in tools.delivery_errors
+        assert not (git_repo / "child.txt").exists()
+        result, error = tools.execute("integrate_agent", {"sid": sid, "checks": ["test -f child.txt"]})
+        assert not error and not tools.delivery_errors
+    finally:
+        m.finish()
+
+
+@pytest.mark.parametrize("policy,prompt", [
+    ("off", "继续交付"), ("explicit", "不要使用子 agent，查看当前状态"),
+])
+def test_followup_recovery_respects_delegation_veto(git_repo, monkeypatch, policy, prompt):
+    from app.agent.runtime import AgentSession
+    monkeypatch.setenv("WORKSPACE_ROOT", str(git_repo))
+    original = make_manager(git_repo)
+    try:
+        sid = spawn_isolated(original, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
+        original.wait([sid], 3)
+        records = original.records()
+    finally:
+        original.finish()
+    router = FakeRouter([response("状态说明")])
+    session = AgentSession(router, original.tools, delegation_policy=policy)
+    session.child_records = records
+    session.chat(prompt)
+    assert session.last_run_status == "blocked"
+    names = {t["name"] for t in router.calls[0]["tools"]}
+    assert not names.intersection({"spawn_agent", "integrate_agent", "resume_agent"})
+    assert not (git_repo / "child.txt").exists()
+
+
 def test_writer_validates_and_integrates_once_without_parent_commit(git_repo):
     m = make_manager(git_repo)
     sid = spawn_isolated(m, "创建文件", role="executor", file_scope=["child.txt"])["child_run_id"]
