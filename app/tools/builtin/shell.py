@@ -100,7 +100,7 @@ def _run_shell(args: dict) -> str:
         message = (
             f"timeout: command exceeded {timeout}s and was killed\n"
             "Only this command timed out; inspect partial changes before retrying. "
-            "Use a longer timeout or terminal_open/terminal_send for long-running work."
+            "Use a longer timeout or terminal_open with wait_for_exit=true for non-interactive long-running work."
         )
         if partial:
             message += "\n[partial output]\n" + partial

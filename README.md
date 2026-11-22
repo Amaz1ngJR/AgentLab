@@ -611,15 +611,11 @@ WORKSPACE_ROOT=/Users/you/some-project
 
 | Profile | 说明 | 需要的环境变量 |
 |---|---|---|
-| `chatgpt_codex` | ChatGPT OAuth + GPT-6.1 Sol | 先运行 `agentlab auth login chatgpt`；`CHATGPT_ACCOUNT` 可选择账号标签 |
-| `cloud_claude` | Anthropic Claude Sonnet | `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY` |
-| `cloud_claude_opus` | Anthropic Claude Opus | 同上 |
-| `gpt_official` | OpenAI 官方 GPT（Responses API） | `OPENAI_API_KEY`（可选 `OPENAI_MODEL` 覆盖型号） |
+| `chatgpt_codex` | ChatGPT OAuth + GPT-6.2 Sol | 先运行 `agentlab auth login chatgpt`；`CHATGPT_ACCOUNT` 可选择账号标签 |
+| `cloud_claude_opus` | Anthropic Claude Opus | `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY`（可用 `ANTHROPIC_MODEL` 覆盖型号） |
+| `crs_gpt` | 内部 CRS 网关 GPT-6.2 Astra | `CRS_OAI_URL` + `CRS_OAI_KEY` |
 | `siliconflow` | 硅基流动 SiliconFlow（OpenAI 兼容云端） | `SILICONFLOW_API_KEY`（可选 `SILICONFLOW_MODEL` 覆盖型号） |
-| `local_qwen` | 本机 Ollama + Qwen2.5-Coder 7B | 无（需先 `ollama pull`） |
 | `local_qwen3_14b` | 本机 Ollama + Qwen3 14B | 无（需先 `ollama pull qwen3:14b`） |
-| `local_deepseek` | 本机 Ollama + DeepSeek-R1 7B | 无（不带工具能力） |
-| `lan_qwen` | 局域网 GPU 主机 Ollama | 无（修改 profile 里的 `base_url`） |
 
 切换 profile：改 `.env` 中 `ACTIVE_PROFILE`，或临时 `python -m app --profile xxx`。
 

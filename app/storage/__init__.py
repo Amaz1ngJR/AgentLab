@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS runtime_turns (
     failure_code  TEXT,
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
+    usage_details_json TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (thread_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
@@ -238,6 +239,9 @@ class Storage:
         columns = {row["name"] for row in self._con.execute("PRAGMA table_info(tasks)")}
         if "execution_metadata" not in columns:
             self._con.execute("ALTER TABLE tasks ADD COLUMN execution_metadata TEXT NOT NULL DEFAULT '{}'")
+        columns = {row["name"] for row in self._con.execute("PRAGMA table_info(runtime_turns)")}
+        if "usage_details_json" not in columns:
+            self._con.execute("ALTER TABLE runtime_turns ADD COLUMN usage_details_json TEXT NOT NULL DEFAULT '{}'")
         self._con.execute("""CREATE TABLE IF NOT EXISTS child_runs (
             session_id TEXT NOT NULL, child_run_id TEXT NOT NULL, record TEXT NOT NULL,
             PRIMARY KEY(session_id, child_run_id),
@@ -760,13 +764,14 @@ class Storage:
             con.execute(
                 """INSERT OR REPLACE INTO runtime_turns
                    (turn_id,thread_id,status,input_text,started_at,finished_at,
-                    failure_code,input_tokens,output_tokens)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                    failure_code,input_tokens,output_tokens,usage_details_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data["turn_id"], data["thread_id"], data["status"],
                     redact(str(data["input_text"])), data["started_at"],
                     data["finished_at"], data["failure_code"],
                     int(data["input_tokens"]), int(data["output_tokens"]),
+                    json.dumps(redact_value(data["usage_details"]), ensure_ascii=False),
                 ),
             )
 
@@ -774,7 +779,11 @@ class Storage:
         row = self._con.execute(
             "SELECT * FROM runtime_turns WHERE turn_id=?", (turn_id,),
         ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        data = dict(row)
+        data["usage_details"] = json.loads(data.pop("usage_details_json"))
+        return data
 
     @staticmethod
     def _insert_runtime_item(con: sqlite3.Connection, item: TurnItem) -> None:

@@ -490,6 +490,8 @@ class AgentSession:
         否则走 Direct 多轮工具循环。两条路径均支持取消与稳定点 steering。
         resume=True 时继续上一轮未完成的任务(失败任务重置为 pending),仅编排路径生效。
         """
+        self.last_actual_model = None
+        self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self._prepare_skill_context(user_input)
         mode = self._select_mode(user_input, images, resume)
         self._last_mode = mode

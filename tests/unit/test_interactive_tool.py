@@ -5,6 +5,7 @@
 不依赖网络、不碰真实设备。
 """
 import sys
+import shlex
 import textwrap
 
 import pytest
@@ -181,6 +182,44 @@ def test_terminal_send_detects_session_end(repl_cmd):
         assert "已结束" in out
     finally:
         m.close_all()
+
+
+def test_terminal_open_waits_through_idle_and_reports_exit_code():
+    source = "import time; print('start'); time.sleep(0.35); print('done'); raise SystemExit(7)"
+    command = shlex.join([sys.executable, "-c", source])
+    manager = PtySessionManager()
+    try:
+        result = _tools(manager)["terminal_open"].executor({
+            "command": command, "wait_for_exit": True, "idle": 0.01, "timeout": 5,
+        })
+        assert "start" in result
+        assert "done" in result
+        assert "exit_code=7" in result
+    finally:
+        manager.close_all()
+
+
+def test_terminal_send_polls_without_writing_and_drains_completed_process():
+    source = (
+        "import select, sys; print('started'); "
+        "ready, _, _ = select.select([sys.stdin], [], [], 1.5); "
+        "print('unexpected input' if ready else 'finished')"
+    )
+    command = shlex.join([sys.executable, "-c", source])
+    manager = PtySessionManager()
+    try:
+        tools = _tools(manager)
+        first = tools["terminal_open"].executor({
+            "command": command, "wait_for_exit": True, "timeout": 1,
+        })
+        assert "仍在运行" in first
+        result = tools["terminal_send"].executor({"session_id": "term-1", "timeout": 5})
+        assert "finished" in result
+        assert "unexpected input" not in result
+        assert "exit_code=0" in result
+        assert "exit_code=0" in tools["terminal_send"].executor({"session_id": "term-1"})
+    finally:
+        manager.close_all()
 
 
 def test_terminal_list(repl_cmd):

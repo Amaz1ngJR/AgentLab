@@ -26,6 +26,13 @@ def test_storage_round_trips_turn_items_and_events(tmp_path):
     )
     storage.append_runtime_event(event)
     assert storage.get_runtime_turn("r1")["status"] == "running"
+    assert storage.get_runtime_turn("r1")["usage_details"] == {}
+    usage = {"provider": "openai_chatgpt", "cache_read_input_tokens": 0, "reasoning_tokens": 23}
+    storage.save_runtime_turn(TurnRecord(
+        turn_id="r1", thread_id="s1", status="completed", input_text="hello",
+        input_tokens=100, output_tokens=27, usage_details=usage,
+    ))
+    assert storage.get_runtime_turn("r1")["usage_details"] == usage
     assert storage.list_runtime_items("r1")[0]["payload"]["text"] == "hello"
     assert storage.list_runtime_events("s1")[0]["kind"] == "item.completed"
     assert storage.next_runtime_sequence("s1") == 2
@@ -38,6 +45,25 @@ def test_allocate_runtime_sequence_never_hands_out_the_same_value(tmp_path):
     assert allocated == [1, 2, 3, 4, 5]
     # 计数器持久化，新的 Storage 实例(等价于重启)不会重发已用过的序号。
     assert Storage(tmp_path / "db").allocate_runtime_sequence("s1") == 6
+
+
+def test_storage_migrates_existing_turns_without_usage_details(tmp_path):
+    path = tmp_path / "db"
+    storage = Storage(path)
+    storage.create_session("s1", "default", "fake")
+    storage.save_runtime_turn(TurnRecord(
+        turn_id="old", thread_id="s1", status="completed", input_text="hello",
+        input_tokens=500, output_tokens=13,
+    ))
+    storage.conn.execute("ALTER TABLE runtime_turns DROP COLUMN usage_details_json")
+    storage.close()
+    migrated = Storage(path)
+    try:
+        turn = migrated.get_runtime_turn("old")
+        assert (turn["input_tokens"], turn["output_tokens"]) == (500, 13)
+        assert turn["usage_details"] == {}
+    finally:
+        migrated.close()
 
 
 def test_allocate_runtime_sequence_is_serialized_across_threads(tmp_path):

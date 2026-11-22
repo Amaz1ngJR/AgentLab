@@ -14,6 +14,38 @@ from prompt_toolkit.application import run_in_terminal
 from app.util.progress_format import SPINNER_FRAMES, format_duration
 
 
+# 运行结果 → 结束横幅文案。key 是 AgentSession.last_run_status 的取值集合
+# （见 app/agent/orchestrator.py 与 runtime.py 的赋值点）。
+_RUN_STATUS_LABELS: dict[str, tuple[str, str]] = {
+    "completed": ("Done", "已完成"),
+    "failed": ("Failed", "执行失败"),
+    "blocked": ("Blocked", "尚未完成"),
+    "budget_exhausted": ("Stopped", "预算耗尽，尚未完成"),
+    "cancelled": ("Stopped", "已停止"),
+}
+
+# 既没有 run_status（旧调用方 / 交互式中断）也没有 cancelled/failed 标记时的文案。
+_UNKNOWN_END_STATE = "Ended", "本轮结束，完成状态未确认"
+
+
+def _terminated_state(*, cancelled: bool, failed: bool, run_status: str | None) -> tuple[str, str]:
+    """决定一轮结束时显示的 (标题, 阶段说明)。
+
+    ``cancelled`` / ``failed`` 是 LiveTurnInput 自己的中断标记，优先级最高：
+    worker 线程异常或用户按键时，运行状态根本来不及写入，只有这两个参数是可信的。
+    其余情况以 ``run_status`` 为准 —— 它是 AgentSession 的真实结论，能区分
+    "已完成"与"任务清单还没做完""预算耗尽"这些过去一律显示为已完成的情形。
+    """
+    if failed:
+        return "Failed", "执行失败"
+    if cancelled:
+        return "Stopped", "已停止"
+    if run_status is None:
+        # 空串表示这一轮还没写入结论；与"从未设置"同样按未知处理。
+        return "Done", "已完成"
+    return _RUN_STATUS_LABELS.get(run_status, _UNKNOWN_END_STATE)
+
+
 class NativeStdoutProxy(StdoutProxy):
     """Bind terminal writes to the owner app even on a Python 3.14 flush thread."""
     def __init__(self, application):
@@ -124,15 +156,9 @@ class ComposerLayout:
             details.append(format_duration(time.monotonic() - self.started))
         if self.usage_summary:
             details.append(self.usage_summary)
-        title, phase = (("Failed", "执行失败") if failed else
-                        ("Stopped", "已停止") if cancelled else {
-                            "completed": ("Done", "已完成"),
-                            "failed": ("Failed", "执行失败"),
-                            "blocked": ("Blocked", "尚未完成"),
-                            "budget_exhausted": ("Stopped", "预算耗尽，尚未完成"),
-                            "cancelled": ("Stopped", "已停止"),
-                            None: ("Done", "已完成"),
-                        }.get(run_status, ("Ended", "本轮结束，完成状态未确认")))
+        title, phase = _terminated_state(
+            cancelled=cancelled, failed=failed, run_status=run_status,
+        )
         details.append(phase)
         self.status = f"{title} ({' · '.join(details)})"
         self.started = None

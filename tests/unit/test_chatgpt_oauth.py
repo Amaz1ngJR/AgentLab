@@ -147,8 +147,13 @@ def test_request_constraints_and_history_namespace(adapter):
 
 def test_completed_tool_then_result_replay(adapter, monkeypatch):
     call = item(type="function_call", name="echo", namespace="agentlab", call_id="c1", arguments='{"value": 1}')
-    set_events(adapter, monkeypatch, [complete([call])])
+    completed = complete([call])
+    completed.response.usage.input_tokens_details = NS(cached_tokens=0)
+    completed.response.usage.output_tokens_details = NS(reasoning_tokens=2)
+    set_events(adapter, monkeypatch, [completed])
     first = adapter.create_message([], tools=TOOLS)
+    assert first.usage == {"input_tokens": 10, "output_tokens": 3,
+                           "cache_read_input_tokens": 0, "reasoning_tokens": 2}
     assert first.tool_calls[0].arguments == {"value": 1}
     results = adapter.format_tool_results([ToolResult("c1", "denied", True)])
     assert results[0]["output"] == "ERROR: denied"
@@ -369,7 +374,7 @@ def test_context_window_uses_account_metadata_and_caches(adapter, monkeypatch):
     get = MagicMock(return_value=httpx.Response(200,
         request=httpx.Request("GET", "https://api.openai.com/v1/models"),
         json={"models": [{"slug": "another-model", "context_window": 1000},
-                          {"slug": "gpt-6.1-sol", "context_window": 500000}]}))
+                          {"slug": adapter.model, "context_window": 500000}]}))
     monkeypatch.setattr(httpx, "get", get)
     monkeypatch.setattr(adapter.tokens, "access_token", lambda: "test-token")
     router = ModelRouter(adapter)

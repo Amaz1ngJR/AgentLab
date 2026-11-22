@@ -2316,9 +2316,13 @@ def _print_turn_separator() -> None:
 
 def _print_stats(session: AgentSession) -> None:
     t, c = session.last_turn_usage, session.cumulative_usage
+    details = "".join(f" {label}={_fmt_tokens(t[key])}" for key, label in (
+        ("cache_read_input_tokens", "cached"),
+        ("reasoning_tokens", "reasoning"),
+    ) if key in t)
     print(
         f"  [stats] turn {_fmt_duration(session.last_turn_seconds)} "
-        f"in={_fmt_tokens(t['input_tokens'])} out={_fmt_tokens(t['output_tokens'])} | "
+        f"in={_fmt_tokens(t['input_tokens'])} out={_fmt_tokens(t['output_tokens'])}{details} | "
         f"session {_fmt_duration(session.cumulative_seconds)} "
         f"in={_fmt_tokens(c['input_tokens'])} out={_fmt_tokens(c['output_tokens'])}",
         flush=True,

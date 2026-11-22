@@ -51,6 +51,8 @@ DEFAULT_IDLE = 0.5
 # open / send 的硬超时(秒):再久也返回,防止干等。
 DEFAULT_OPEN_TIMEOUT = 45
 DEFAULT_SEND_TIMEOUT = 30
+DEFAULT_PROCESS_WAIT = 120
+MAX_PROCESS_WAIT = 300
 
 # 清 ANSI 转义码(颜色、光标移动);交互式程序的提示符常带大量颜色码。
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][0-9A-Za-z]|\x1b[=>]")
@@ -93,47 +95,55 @@ class PtySession:
             except OSError:
                 os._exit(127)
         self._closed = False
+        self._eof = False
+        self.exit_code: int | None = None
+        self.wait_for_exit = False
 
     # ── 读 / 写 ──────────────────────────────────────────────────────────────
 
     def read_until_idle(
         self,
-        idle: float = DEFAULT_IDLE,
+        idle: float | None = DEFAULT_IDLE,
         timeout: float = DEFAULT_SEND_TIMEOUT,
         cancel=None,
     ) -> str:
-        """持续读输出,直到静默 `idle` 秒(程序在等输入)或到 `timeout` 硬超时。
-
-        这是通用驱动的核心:不假设任何提示符,只靠"输出停了"来判断该把控制权
-        交回给模型。慢启动的程序(ssh 建连、隧道)靠 timeout 兜住首字节延迟。
-        """
+        """读取到静默或硬超时。idle=None 时等进程退出或硬超时。"""
         chunks: list[str] = []
-        deadline = time.time() + timeout
-        last_data = time.time()
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        last_data = time.monotonic()
+        while (remaining := deadline - time.monotonic()) > 0:
             if cancel is not None:
                 cancel.raise_if_cancelled()
-            r, _, _ = select.select([self._fd], [], [], 0.1)
+            interval = min(0.1, remaining)
+            if self._eof:
+                if idle is not None or not self.alive:
+                    break
+                time.sleep(interval)
+                continue
+            r, _, _ = select.select([self._fd], [], [], interval)
             if self._fd in r:
                 try:
                     data = os.read(self._fd, 4096)
-                except OSError:
-                    self._closed = True
-                    break
-                if not data:  # EOF:子进程退出
-                    self._closed = True
-                    break
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    data = b""
+                if not data:
+                    self._eof = True
+                    continue
                 chunks.append(_normalize(data))
-                last_data = time.time()
+                last_data = time.monotonic()
             else:
+                if idle is None and not self.alive:
+                    break
                 # 没有新数据。已经读到过东西且静默够久 → 认为在等输入,返回。
-                if chunks and (time.time() - last_data) >= idle:
+                if idle is not None and chunks and time.monotonic() - last_data >= idle:
                     break
         return "".join(chunks)
 
     def send(self, data: str, append_newline: bool = True) -> None:
         """向会话写入一行输入(默认补换行,相当于"按回车")。"""
-        if self._closed:
+        if self._closed or self._eof:
             raise OSError("session closed")
         payload = data + ("\n" if append_newline and not data.endswith("\n") else "")
         os.write(self._fd, payload.encode())
@@ -141,13 +151,18 @@ class PtySession:
     # ── 状态 / 清理 ────────────────────────────────────────────────────────────
 
     @property
+    def accepts_input(self) -> bool:
+        return not self._eof and self.alive
+
+    @property
     def alive(self) -> bool:
         """子进程是否还活着(非阻塞探测)。"""
         if self._closed:
             return False
         try:
-            pid, _ = os.waitpid(self._pid, os.WNOHANG)
+            pid, status = os.waitpid(self._pid, os.WNOHANG)
             if pid == self._pid:
+                self.exit_code = os.waitstatus_to_exitcode(status)
                 self._closed = True
                 return False
         except OSError:
@@ -162,7 +177,8 @@ class PtySession:
         try:
             # Windows 上没有 SIGTERM，用 SIGINT 代替
             sig = signal.SIGTERM if hasattr(signal, 'SIGTERM') else signal.SIGINT
-            os.kill(self._pid, sig)
+            if self.alive:
+                os.kill(self._pid, sig)
         except OSError:
             pass
         try:
@@ -234,6 +250,19 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
     """返回绑定到指定 manager 的 terminal_open / send / close / list 四个工具。"""
     from app.tools.registry import Tool, current_cancel_token
 
+    def process_status(session: PtySession) -> str:
+        if session.alive:
+            return "\n[进程仍在运行；可用 terminal_send 空输入继续等待]"
+        if session.exit_code is None:
+            return "\n[进程已结束]"
+        return f"\n[进程已结束，exit_code={session.exit_code}]"
+
+    def process_wait(args: dict, default: int) -> int:
+        try:
+            return max(1, min(MAX_PROCESS_WAIT, int(args.get("timeout") or default)))
+        except (TypeError, ValueError, OverflowError):
+            return default
+
     def _open(args: dict) -> str:
         if _IS_WINDOWS:
             return (
@@ -257,11 +286,16 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             return f"refused: {exc}"
         except OSError as exc:
             return f"failed to start session: {exc}"
-        # 读启动后的首屏输出(登录横幅、提示符、REPL 欢迎语等)
+        session.wait_for_exit = bool(args.get("wait_for_exit", False))
+        if session.wait_for_exit:
+            idle = None
+            timeout = process_wait(args, DEFAULT_PROCESS_WAIT)
         initial = session.read_until_idle(
             idle=idle, timeout=timeout, cancel=current_cancel_token(),
         )
-        status = "" if session.alive else "\n[session 已结束]"
+        status = process_status(session) if session.wait_for_exit else (
+            "" if session.accepts_input else "\n[session 已结束]"
+        )
         from app.tools.rtk_builtin import BuiltinRTK
         body = BuiltinRTK().compress_terminal(command, initial.strip()) or "(无输出)"
         return f"[session {sid}]\n{_clip(body)}{status}"
@@ -273,11 +307,13 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         session = manager.get(sid)
         if session is None:
             return f"refused: 未知 session_id '{sid}'(用 terminal_list 查看活跃会话)"
-        if not session.alive:
-            return f"refused: session {sid} 已结束(用 terminal_open 重开)"
-        data = args.get("input")
+        data = args.get("input", "" if session.wait_for_exit else None)
         if data is None:
             return "refused: 缺少 input"
+        append_nl = bool(args.get("enter", not session.wait_for_exit or bool(data)))
+        polling = session.wait_for_exit and data == "" and not append_nl
+        if not polling and not session.accepts_input:
+            return f"refused: session {sid} 已结束(用 terminal_open 重开)"
         try:
             idle = float(args.get("idle") or DEFAULT_IDLE)
         except (TypeError, ValueError):
@@ -286,15 +322,20 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             timeout = int(args.get("timeout") or DEFAULT_SEND_TIMEOUT)
         except (TypeError, ValueError):
             timeout = DEFAULT_SEND_TIMEOUT
-        append_nl = bool(args.get("enter", True))
+        if polling:
+            idle = None
+            timeout = process_wait(args, MAX_PROCESS_WAIT)
         try:
-            session.send(str(data), append_newline=append_nl)
+            if not polling:
+                session.send(str(data), append_newline=append_nl)
         except OSError as exc:
             return f"failed to send: {exc}"
         out = session.read_until_idle(
             idle=idle, timeout=timeout, cancel=current_cancel_token(),
         )
-        status = "" if session.alive else f"\n[session {sid} 已结束]"
+        status = process_status(session) if session.wait_for_exit else (
+            "" if session.accepts_input else f"\n[session {sid} 已结束]"
+        )
         from app.tools.rtk_builtin import BuiltinRTK
         body = BuiltinRTK().compress_terminal(str(data), out.strip()) or "(无输出)"
         return f"{_clip(body)}{status}"
@@ -323,6 +364,8 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             "远程登录(如 zsh -ic 'vsm <device>'、ssh)、REPL(python、psql)、"
             "交互式安装器等。返回 session_id 和启动后的首屏输出。"
             "随后用 terminal_send 向该会话发命令、terminal_close 关闭。"
+            "安装、下载、构建等能自行结束的命令使用 wait_for_exit=true，"
+            "应给足 timeout，让工具等待退出码，避免按输出进度重复查询。"
             "区别于 shell:shell 跑完即结束、无交互;这个保持进程存活、可多轮对话。"
             "不要在 command 里写账号密码,远程凭据应由本机命令配置自带。"
         ),
@@ -335,12 +378,17 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": f"等待首屏输出的硬超时秒数,默认 {DEFAULT_OPEN_TIMEOUT}(远程建连较慢)",
-                    "default": DEFAULT_OPEN_TIMEOUT,
+                    "description": f"等待上限（秒）。交互模式默认 {DEFAULT_OPEN_TIMEOUT}；"
+                    f"wait_for_exit 模式默认 {DEFAULT_PROCESS_WAIT}，最多 {MAX_PROCESS_WAIT}。",
+                },
+                "wait_for_exit": {
+                    "type": "boolean",
+                    "description": "适合非交互长命令。等退出或超时，即使输出静默也会继续等待。",
+                    "default": False,
                 },
                 "idle": {
                     "type": "number",
-                    "description": f"输出静默多少秒视为就绪,默认 {DEFAULT_IDLE}",
+                    "description": f"交互模式输出静默多久返回（秒），默认 {DEFAULT_IDLE}。",
                     "default": DEFAULT_IDLE,
                 },
             },
@@ -360,6 +408,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         description=(
             "向一个已打开的交互式会话发送输入(默认末尾补回车),返回这次输入后"
             "新产生的输出。用于在 terminal_open 起的会话里逐条执行命令/回答提示。"
+            "对 wait_for_exit 会话，省略 input 或传空字符串且 enter=false 可等待进程结束。"
             "例:在 vsm 远程会话里发 'df -h';在 python REPL 里发 'print(1+1)'。"
         ),
         input_schema={
@@ -371,17 +420,16 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
                 },
                 "input": {
                     "type": "string",
-                    "description": "要发送的内容,例如 'ls -la' 或回答提示的 'y'",
+                    "description": "要发送的内容。wait_for_exit 会话可省略以等待退出。",
                 },
                 "enter": {
                     "type": "boolean",
-                    "description": "是否在末尾补回车,默认 true。发单个控制字符时可设 false",
-                    "default": True,
+                    "description": "是否补回车。默认 true；wait_for_exit 会话的空输入默认 false。",
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": f"读输出硬超时秒数,默认 {DEFAULT_SEND_TIMEOUT}",
-                    "default": DEFAULT_SEND_TIMEOUT,
+                    "description": f"读输出硬超时（秒）。交互默认 {DEFAULT_SEND_TIMEOUT}；"
+                    f"等待退出的轮询默认 {MAX_PROCESS_WAIT}，也是上限。",
                 },
                 "idle": {
                     "type": "number",
@@ -389,7 +437,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
                     "default": DEFAULT_IDLE,
                 },
             },
-            "required": ["session_id", "input"],
+            "required": ["session_id"],
         },
         executor=_send,
         risk="execute",

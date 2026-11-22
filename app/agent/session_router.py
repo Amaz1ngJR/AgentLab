@@ -46,6 +46,10 @@ def _portable_for(session, messages: list[dict]) -> list[dict]:
     # 目标 provider 自己能安全吸收的结构化历史不必降级，避免无意义地丢失保真度。
     if not foreign or provider == "openai":
         return messages
+    if provider == "openai_chatgpt":
+        from app.models.append_prefix import INSTRUCTION
+        if any(isinstance(m, dict) and m.get(INSTRUCTION) for m in messages):
+            return messages
     from app.models.history import make_history_portable
     return make_history_portable(messages)
 

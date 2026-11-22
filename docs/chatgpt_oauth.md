@@ -1,7 +1,7 @@
 # ChatGPT OAuth 模型接入
 
-AgentLab 使用自己的 ChatGPT OAuth 注册访问 Responses API，默认模型为
-`gpt-6.1-sol`。任务编排、工具执行、记忆、审批和本地会话仍由 AgentLab 管理。
+AgentLab 使用自己的 ChatGPT OAuth 注册访问 Responses API。`chatgpt_codex` profile
+配置为 `gpt-6.2-sol`，推理强度为 `medium`。任务编排、工具执行、记忆、审批和本地会话由 AgentLab 管理。
 该入口不会调用 Codex CLI，也不会读取 `~/.codex/auth.json`。
 
 ## 使用
@@ -82,6 +82,9 @@ PKCE、state、nonce 和 JWKS 签名校验用于登录验证。身份校验完�
 - 模型只能请求当前声明的工具；工具仍经 AgentLab 既有审批和执行模块处理。
 - 参数流生成期间持续更新输出估算，完成后以实际 usage 和 final 标记结算；
   reasoning summary（若服务返回）进入现有展示接口。
+- CLI 的 `[stats]` 在服务提供明细时显示 `cached` 和 `reasoning`。回合记录也保存
+  已返回的用量明细、请求模型、推理强度和服务返回的模型。推理 token 已含在输出总量里，
+  缓存命中 token 已含在该路线的输入总量里。
 - 只有完整 `response.completed` 才提交 ModelResponse；流断开、失败、
   incomplete、参数损坏或空结果均不能冒充任务成功。
 - 额度限制与账号不支持不重试；明确的暂时不可用按现有有限退避策略重试。
@@ -90,6 +93,13 @@ PKCE、state、nonce 和 JWKS 签名校验用于登录验证。身份校验完�
   额度耗尽继续作为不可重试错误处理。
 - 全前缀子任务仅允许同 provider、同模型、同账号，仍保留子任务工具限制，
   不承诺整条请求具有相同缓存前缀。重复或缺失的工具调用 ID 阻止整轮执行。
+
+## 等待长命令
+
+下载、安装和构建等非交互命令可用 `terminal_open` 的 `wait_for_exit=true` 模式。
+工具会在本地等退出或超时，并返回退出码。默认等待 120 秒，可用 `timeout` 指定
+最多 300 秒。若超时且进程仍在运行，向同一个会话调用 `terminal_send` 并省略
+`input`，即可在本地继续等待。交互式终端仍支持按输出静默时间返回。
 
 ## 验证
 

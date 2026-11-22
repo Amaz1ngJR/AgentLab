@@ -243,9 +243,13 @@ class ChatGPTAdapter:
             raise ProviderStreamError("ChatGPT 已结束但没有返回文本或工具调用，不能判定任务完成")
         in_tokens = getattr(usage, "input_tokens", 0) or 0
         out_tokens = getattr(usage, "output_tokens", 0) or 0
+        details = cache_usage(usage, provider="openai")
+        reasoning_tokens = getattr(getattr(usage, "output_tokens_details", None), "reasoning_tokens", None)
+        if isinstance(reasoning_tokens, int):
+            details["reasoning_tokens"] = reasoning_tokens
         progress.set_usage(input_tokens=in_tokens, output_tokens=out_tokens, final=True)
         return ModelResponse(text="".join(text), tool_calls=calls, provider_payload=output,
-            usage={"input_tokens": in_tokens, "output_tokens": out_tokens, **cache_usage(usage, provider="openai")},
+            usage={"input_tokens": in_tokens, "output_tokens": out_tokens, **details},
             finish_reason=final.status, actual_model=final.model, reasoning="".join(reasoning))
 
     format_tool_results = staticmethod(OpenAIAdapter.format_tool_results)

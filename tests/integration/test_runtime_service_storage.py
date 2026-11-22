@@ -8,7 +8,10 @@ from tests.support.runtime import FakeRouter, _echo_tool, _registry_with, _resp_
 
 
 def test_direct_budget_exhaustion_is_visible_persisted_and_resumable(tmp_path):
-    llm = FakeRouter([_resp_tool("c1", "echo", {"msg": "hello"}), _resp_text("done")])
+    final = _resp_text("done")
+    final.actual_model = "served-model"
+    final.usage.update(cache_read_input_tokens=0, reasoning_tokens=2)
+    llm = FakeRouter([_resp_tool("c1", "echo", {"msg": "hello"}), final])
     storage = Storage(tmp_path / "db")
     router = SessionRouter(
         storage,
@@ -35,6 +38,10 @@ def test_direct_budget_exhaustion_is_visible_persisted_and_resumable(tmp_path):
         assert service.active_runs() == []
         assert service.send_message("继续", run_id="resumed") == "done"
         assert events[-1].kind == "turn.completed"
+        assert storage.get_runtime_turn("resumed")["usage_details"] == {
+            "provider": "fake", "requested_model": "fake-model", "actual_model": "served-model",
+            "cache_read_input_tokens": 0, "reasoning_tokens": 2,
+        }
     finally:
         service.close()
         storage.close()

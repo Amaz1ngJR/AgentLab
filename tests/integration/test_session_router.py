@@ -44,6 +44,38 @@ def _profiles():
     }
 
 
+def test_switch_keeps_native_oauth_history_for_same_provider(tmp_path):
+    from app.models.append_prefix import INSTRUCTION
+
+    storage = Storage(tmp_path / "db")
+    router = _make_router(storage, _profiles())
+    sid = router.new("coder")
+    history = [
+        {"role": "user", "content": "inspect"},
+        {"type": "message", "role": "developer", "content": "rules", INSTRUCTION: True},
+        {"type": "additional_tools", "role": "developer", "tools": [{"name": "read_file"}]},
+        {"type": "function_call", "name": "read_file", "namespace": "agentlab",
+         "call_id": "call_1", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "result"},
+    ]
+    storage.save_messages(sid, history)
+    resumed = _make_router(storage, _profiles())
+    factory = resumed._factory
+
+    def oauth_factory(profile, session_id):
+        session = factory(profile, session_id)
+        session.llm.provider = "openai_chatgpt"
+        return session
+
+    resumed._factory = oauth_factory
+    assert resumed.switch(sid)
+    assert resumed.current.messages == history
+
+    other = _make_router(storage, _profiles())
+    assert other.switch(sid)
+    assert all("type" not in message for message in other.current.messages)
+
+
 def test_lifecycle_saves_read_write_summary_once(tmp_path, monkeypatch):
     from app.memory import ReadWriteMemory
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "workspace"))

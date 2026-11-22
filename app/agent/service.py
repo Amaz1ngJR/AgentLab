@@ -720,6 +720,16 @@ class RuntimeService:
             run_status = getattr(session, "last_run_status", "")
             suspended = run_status == "budget_exhausted"
             cancelled = not suspended and (token.cancelled or run_status == "cancelled")
+            usage_details = {key: usage[key] for key in (
+                "cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens",
+            ) if key in usage}
+            llm = getattr(session, "llm", None)
+            usage_details.update({key: value for key, value in {
+                "provider": getattr(llm, "provider", None),
+                "requested_model": getattr(llm, "model", None),
+                "reasoning_effort": getattr(llm, "reasoning_effort", None),
+                "actual_model": getattr(session, "last_actual_model", None),
+            }.items() if value})
             completed_turn = TurnRecord(
                 turn_id=actual_run_id,
                 thread_id=target_id,
@@ -729,6 +739,7 @@ class RuntimeService:
                 finished_at=utc_now(),
                 input_tokens=int(usage.get("input_tokens", 0)),
                 output_tokens=int(usage.get("output_tokens", 0)),
+                usage_details=usage_details,
             )
             if storage is not None:
                 storage.save_runtime_turn(completed_turn)

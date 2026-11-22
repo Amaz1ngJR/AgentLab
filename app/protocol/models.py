@@ -44,6 +44,7 @@ class TurnRecord:
     failure_code: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    usage_details: dict[str, JsonValue] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -56,4 +57,5 @@ class TurnRecord:
             "failure_code": self.failure_code,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "usage_details": self.usage_details,
         }
