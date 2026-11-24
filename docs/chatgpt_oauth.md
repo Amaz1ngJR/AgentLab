@@ -66,7 +66,8 @@ PKCE、state、nonce 和 JWKS 签名校验用于登录验证。身份校验完�
   同时保留 assistant 消息的 commentary/final_answer phase，以及工具 namespace。
   仅有摘要、缺少加密状态的 reasoning 不作为可恢复状态回放。加密状态不解密，
   也不作为普通文本发送给上下文压缩模型；压缩旧历史后不承诺继续复用旧推理。
-- 主模型请求把 AgentLab 指令作为 developer 消息保存在历史中；Skill 等指令
+- 新会话把固定 developer 指令和首批工具定义放在用户消息之前，后续保留开头的
+  顺序。已发送的旧会话保持已有顺序。Skill 等指令
   变化时追加新的完整指令，明确替代之前的临时工作流，不修改已经发送的消息。
 - 工具通过 developer-role `additional_tools` 在首次需要时追加定义；之后工具
   的移除、重排或暂时禁用只调整当前请求的 allowed_tools / none，旧定义保留。
@@ -85,6 +86,10 @@ PKCE、state、nonce 和 JWKS 签名校验用于登录验证。身份校验完�
 - CLI 的 `[stats]` 在服务提供明细时显示 `cached` 和 `reasoning`。回合记录也保存
   已返回的用量明细、请求模型、推理强度和服务返回的模型。推理 token 已含在输出总量里，
   缓存命中 token 已含在该路线的输入总量里。
+- 每次 OAuth 请求尝试写入 `model.request.finished` 事件。取同一 `call_id` 的
+  `attempt` 顺序即可对比重试结果，`model.request.retry` 记录实际安排的重试与等待时长。
+  请求事件只保存标识符、设置、结果状态和服务返回的用量。用量字段为 `null` 表示服务
+  未返回，`0` 表示明确报告为零。失败回合保留此前完成的模型调用用量。
 - 只有完整 `response.completed` 才提交 ModelResponse；流断开、失败、
   incomplete、参数损坏或空结果均不能冒充任务成功。
 - 额度限制与账号不支持不重试；明确的暂时不可用按现有有限退避策略重试。
@@ -96,10 +101,50 @@ PKCE、state、nonce 和 JWKS 签名校验用于登录验证。身份校验完�
 
 ## 等待长命令
 
+在 macOS、Linux 和 Windows 上，`exec_command` 可执行短命令并返回退出码，或在等待时间用完时
+返回仍在运行的 `session_id`。用 `write_stdin` 和空 `chars` 等待新增输出，无需重复审批；
+发送非空字符和启动命令仍走现有审批。停止会话可用 `terminal_close`。
+Windows 使用 PowerShell 和标准输入、输出管道，支持构建、下载及通过标准输入交互的进程。
+需要真实终端的应用（例如全屏 TUI）仍需要 PTY。
+
+## 进程沙箱与图片
+
+在 `.env` 中设置 `AGENTLAB_PROCESS_SANDBOX=workspace`，可让 `shell`、
+`exec_command` 和 `terminal_open` 的子进程共用系统沙箱。工作区可写，工作区现有的
+`.git`、`.agentlab`、`.codex`、`.aws`、`.ssh`、`.env*` 和
+`credentials.json` 保持只读，网络受限。需要全程只读时设置为 `read-only`。
+
+默认 `approval-only` 沿用现有审批。macOS 使用 Seatbelt，Linux 依赖支持用户命名空间
+的 bubblewrap。Windows 的系统沙箱使用 WSL2，没有配置时普通 PowerShell 命令仍可通过
+`approval-only` 运行。显式要求系统沙箱时，如果后端不可用，命令会失败。
+
+Windows 使用系统沙箱时，在 `.env` 填写 `AGENTLAB_WSL_DISTRO` 与
+`AGENTLAB_PROCESS_SANDBOX=workspace` 或 `read-only`。发行版须使用 WSL2，有
+`/usr/bin/bwrap` 和可读取的 `binfmt_misc` 状态，并在 `/etc/wsl.conf` 的
+`[interop]` 下设置 `enabled=false`
+后重启发行版。工作区须位于使用标准 `/mnt/<盘符>` 挂载的本机盘符目录。隔离模式
+执行 Bash 命令，仅将选定的 Windows 工作区挂载到 `/workspace`，不会启用 Windows 程序互操作。
+
+在支持视觉输入的模型上，`view_image` 可查看工作区内的 PNG、JPEG、WebP 或 GIF。
+图片与工具调用配对回传，SQLite 只保留受控附件引用。图片实际发送给会话所使用的模型。
+
+## 结构化提问
+
+`request_user_input` 一次可以询问一到三个问题，支持单选和自由输入。CLI 会在
+工具调用期间显示选择菜单或输入框。前端可以订阅 `user_input.requested`，用同一个
+`request_id` 调用 `answer_request`，传入按问题 ID 分组的
+`{"answers":{"scope":{"option_id":"api"},"details":{"text":"只读"}}}`。
+`user_input.completed` 表示等待结束。工具答案会回传给模型，后续执行仍走正常审批。
+
 下载、安装和构建等非交互命令可用 `terminal_open` 的 `wait_for_exit=true` 模式。
 工具会在本地等退出或超时，并返回退出码。默认等待 120 秒，可用 `timeout` 指定
 最多 300 秒。若超时且进程仍在运行，向同一个会话调用 `terminal_send` 并省略
 `input`，即可在本地继续等待。交互式终端仍支持按输出静默时间返回。
+
+## 提交说明
+
+Direct 模式下，明确只要求拟提交说明时，OAuth 路线使用简短的 Git 取证指令和
+必要的工具定义。请求实际暂存、提交、推送或执行其他工作时使用常规工具与工作流。
 
 ## 验证
 

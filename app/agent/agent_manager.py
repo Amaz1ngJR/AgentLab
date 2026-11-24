@@ -16,6 +16,7 @@ from app.agent.delegation_context import CONTEXT_GUIDANCE, build_handoff
 from app.agent.subagents import SubagentResult, SubagentSpec
 from app.agent.subagent_runtime import SubagentRuntimeFactory, RestrictedToolRegistry, _fresh_approval
 from app.agent.child_approval import ChildApprovalPolicy, service_child_approvals
+from app.models.request_audit import copy_request_observer
 from app.workspace.worktree import WorktreeManager
 from app.tools.registry import Tool, ToolRegistry, ToolExecutionError
 from app.util.redact import redact_value
@@ -336,7 +337,9 @@ class AgentManager:
 
             # Daemon bounds shutdown latency; unfinished writers remain cancelling
             # and the owning session retains their scope lock until actual exit.
-            worker = threading.Thread(target=invoke, name=f"agentlab-child-{sid[-12:]}", daemon=True)
+            audit_context = copy_request_observer()
+            worker = threading.Thread(target=audit_context.run, args=(invoke,),
+                                      name=f"agentlab-child-{sid[-12:]}", daemon=True)
             self.rounds_left -= max_steps
             self.tools_left -= max_tool_calls
             self.children[sid] = child
@@ -691,14 +694,25 @@ class AgentManager:
             self.charge_parent_tool()
         previous_baseline = child.result.base_state_fingerprint
         delivery_cancel = CancelToken()
-        unsubscribe = self.cancel.add_callback(delivery_cancel.cancel)
-        timer = threading.Timer(max(0, self.deadline - time.monotonic()), delivery_cancel.cancel)
+        unsubscribe = self.cancel.add_callback(
+            lambda: delivery_cancel.cancel(self.cancel.reason or "operation_cancelled"),
+        )
+        deadline_reason = "budget_exhausted: child integration deadline"
+        timer = threading.Timer(max(0, self.deadline - time.monotonic()),
+                                self._expire_budget, args=(deadline_reason,))
         timer.daemon = True
         timer.start()
         try:
             result = integrate_result(child.result, workspace=self.workspace, tools=self.tools,
                                       approval=self.approval, checks=checks, cancel=delivery_cancel,
                                       file_scope=child.spec.file_scope)
+        except Cancelled as exc:
+            reason = exc.reason or delivery_cancel.reason or "operation_cancelled"
+            if reason == "budget_exhausted":
+                self._expire_budget(deadline_reason)
+            else:
+                self.cancel.cancel(reason)
+            raise
         finally:
             timer.cancel()
             unsubscribe()
@@ -844,11 +858,23 @@ class AgentManager:
 
     def unresolved(self) -> list[str]:
         """Keep historical failures immutable; only the latest continuation gates delivery."""
-        return [f"{sid}: {self.snapshot(sid)['status']}/{self.snapshot(sid)['delivery_status']}"
-                for sid, child in self.children.items()
-                if not child.superseded_by and child.continuation_id not in self.children
-                and (not child.done.is_set() or child.result.status != "succeeded"
-                or (not child.spec.read_only and child.result.delivery_status != "integrated"))]
+        unresolved = []
+        for sid, child in self.children.items():
+            if child.superseded_by or child.continuation_id in self.children:
+                continue
+            if child.done.is_set():
+                result = child.result
+                if child.spec.read_only:
+                    # After the parent receives the failure, it can finish using its own evidence.
+                    if result.status == "succeeded" or (
+                        result.status == "budget_exhausted" and self.result_delivered(sid)
+                    ):
+                        continue
+                elif result.status == "succeeded" and result.delivery_status == "integrated":
+                    continue
+            snapshot = self.snapshot(sid)
+            unresolved.append(f"{sid}: {snapshot['status']}/{snapshot['delivery_status']}")
+        return unresolved
 
     def finish(self):
         self._closed = True

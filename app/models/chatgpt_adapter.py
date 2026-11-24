@@ -12,6 +12,7 @@ from app.models.openai_adapter import (
 )
 from app.models.protocol import ModelResponse, ToolCall
 from app.models.cache_usage import cache_usage
+from app.models.request_audit import emit_request_event, start_request
 from app.models.token_progress import StreamingTokenProgress
 from app.models.context_window import positive_int
 
@@ -140,14 +141,21 @@ class ChatGPTAdapter:
         progress.emit(force=True)
         final = None
         request_id = None
+        response_id = None
+        response_usage = None
+        http_status = None
+        error_code = None
+        outcome = "failed"
         reasoning = []
         completed_items = {}
         streamed_text = {}
+        if cancel:
+            cancel.raise_if_cancelled()
+        audit = start_request()
         try:
-            if cancel:
-                cancel.raise_if_cancelled()
             with self._client() as client, client.responses.create(**params) as stream:
                 response = getattr(stream, "response", None)
+                http_status = getattr(response, "status_code", None)
                 headers = getattr(response, "headers", {})
                 request_id = headers.get("x-request-id")
                 with close_on_cancel(cancel, stream):
@@ -156,7 +164,10 @@ class ChatGPTAdapter:
                             cancel.raise_if_cancelled()
                         kind = event.type
                         if kind in {"response.failed", "response.error", "error", "response.incomplete"}:
-                            error = getattr(getattr(event, "response", None), "error", None) or getattr(event, "error", None)
+                            failed = getattr(event, "response", None)
+                            response_id = getattr(failed, "id", None)
+                            response_usage = getattr(failed, "usage", None)
+                            error = getattr(failed, "error", None) or getattr(event, "error", None)
                             code = getattr(error, "code", None) or getattr(event, "code", None) or kind
                             raise ChatGPTError(code, status=getattr(response, "status_code", None),
                                 request_id=request_id, param=getattr(error, "param", None))
@@ -176,7 +187,15 @@ class ChatGPTAdapter:
                             completed_items[event.output_index] = event.item
                         elif kind == "response.completed":
                             final = event.response
+                            response_id = getattr(final, "id", None)
+                            response_usage = final.usage
+            if final is not None and final.status == "completed":
+                outcome = "completed"
+            else:
+                error_code = "stream_not_completed"
         except APIStatusError as exc:
+            request_id = exc.request_id or request_id
+            http_status = exc.status_code
             if cancel:
                 cancel.raise_if_cancelled()
             body = exc.body if isinstance(exc.body, dict) else {}
@@ -186,16 +205,32 @@ class ChatGPTAdapter:
                 code = "service_unavailable"
             if not code and exc.status_code == 429:
                 code = "rate_limit_exceeded"
+            error_code = code or "admission_denied"
             from app.models.provider_retry import _retry_after
-            raise ChatGPTError(code or "admission_denied", status=exc.status_code,
+            raise ChatGPTError(error_code, status=exc.status_code,
                                request_id=exc.request_id,
                                param=error.get("param") if isinstance(error, dict) else None,
                                retry_after=_retry_after(exc)) from None
-        except Exception:
+        except Exception as exc:
+            error_code = getattr(exc, "code", None) or type(exc).__name__
             # Closing an in-flight stream can manifest as an SDK/transport error.
             if cancel:
                 cancel.raise_if_cancelled()
             raise
+        finally:
+            if audit is not None:
+                emit_request_event("model.request.finished", {
+                    **audit, "provider": self.provider, "model": self.model,
+                    "actual_model": getattr(final, "model", None),
+                    "reasoning_effort": reasoning_effort_override or self._cfg.reasoning_effort,
+                    "request_id": request_id, "response_id": response_id,
+                    "http_status": http_status,
+                    "status": "cancelled" if cancel and cancel.cancelled and outcome != "completed" else outcome,
+                    "error_code": error_code,
+                    "input_tokens": getattr(response_usage, "input_tokens", None),
+                    "output_tokens": getattr(response_usage, "output_tokens", None),
+                    "cached_tokens": cache_usage(response_usage, provider="openai").get("cache_read_input_tokens"),
+                })
         if cancel:
             cancel.raise_if_cancelled()
         if final is None or final.status != "completed":

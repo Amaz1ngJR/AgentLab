@@ -25,20 +25,25 @@
     `zsh -ic 'vsm <device>'`,凭据留在用户 shell 配置里),工具不碰账号密码。
 
 Windows 兼容性:
-  - pty 模块只在 Unix/Linux/macOS 上存在。Windows 上会优雅降级:工具仍注册,
-    但调用时返回 "不支持" 错误而不是导入失败崩溃整个 CLI。
+  - pty 模块只在 Unix/Linux/macOS 上存在。Windows 的 exec_command 和
+    write_stdin 使用 PowerShell 子进程及 stdin/stdout 管道。
 """
 from __future__ import annotations
 
 import errno
+import json
 import os
 import platform
 import re
 import shlex
 import signal
+import threading
 import time
 
-# pty 和 select 只在 Unix 系统上存在
+from app.tools.builtin.command_pipes import PipeCommandSession
+from app.util.process_sandbox import ProcessSandboxError, sandbox_command
+
+# Windows 的 select 不支持终端文件描述符。
 _IS_WINDOWS = platform.system() == "Windows"
 if not _IS_WINDOWS:
     import pty
@@ -141,12 +146,29 @@ class PtySession:
                     break
         return "".join(chunks)
 
-    def send(self, data: str, append_newline: bool = True) -> None:
+    def send(self, data: str, append_newline: bool = True, *, cancel=None) -> None:
         """向会话写入一行输入(默认补换行,相当于"按回车")。"""
         if self._closed or self._eof:
             raise OSError("session closed")
-        payload = data + ("\n" if append_newline and not data.endswith("\n") else "")
-        os.write(self._fd, payload.encode())
+        payload = (data + ("\n" if append_newline and not data.endswith("\n") else "")).encode()
+        deadline = time.monotonic() + 1
+        sent = 0
+        os.set_blocking(self._fd, False)
+        try:
+            while sent < len(payload):
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise OSError(f"stdin write timed out after {sent} of {len(payload)} bytes")
+                _, writable, _ = select.select([], [self._fd], [], min(0.1, remaining))
+                if writable:
+                    try:
+                        sent += os.write(self._fd, payload[sent:])
+                    except BlockingIOError:
+                        continue
+        finally:
+            os.set_blocking(self._fd, True)
 
     # ── 状态 / 清理 ────────────────────────────────────────────────────────────
 
@@ -178,7 +200,11 @@ class PtySession:
             # Windows 上没有 SIGTERM，用 SIGINT 代替
             sig = signal.SIGTERM if hasattr(signal, 'SIGTERM') else signal.SIGINT
             if self.alive:
-                os.kill(self._pid, sig)
+                try:
+                    os.killpg(self._pid, sig)
+                except ProcessLookupError:
+                    # A newly forked child may still be setting up its group.
+                    os.kill(self._pid, sig)
         except OSError:
             pass
         try:
@@ -196,32 +222,51 @@ class PtySession:
                 if exc.errno == errno.ECHILD:
                     break
             time.sleep(0.05)
+        else:
+            try:
+                os.killpg(self._pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+            def reap():
+                try:
+                    os.waitpid(self._pid, 0)
+                except ChildProcessError:
+                    pass
+
+            threading.Thread(target=reap, daemon=True, name="agentlab-pty-reap").start()
         self._closed = True
 
 
 class PtySessionManager:
-    """管理一组 PtySession 的生命周期。会话级单例,挂到 AgentSession.closeables。"""
+    """管理会话内 PTY 或管道子进程的生命周期。"""
 
     def __init__(self, cwd: str | None = None):
-        self._sessions: dict[str, PtySession] = {}
+        self._sessions: dict[str, PtySession | PipeCommandSession] = {}
         self._counter = 0
         self._cwd = cwd
 
     def open(self, command: str) -> tuple[str, PtySession]:
         """启动一个新会话,返回 (session_id, session)。command 用 shlex 解析。"""
-        argv = shlex.split(command)
+        return self.open_argv(shlex.split(command))
+
+    def open_argv(
+        self, argv: list[str], *, cwd: str | None = None,
+    ) -> tuple[str, PtySession | PipeCommandSession]:
         if not argv:
             raise ValueError("empty command")
         self._counter += 1
         sid = f"term-{self._counter}"
-        session = PtySession(sid, argv, cwd=self._cwd)
+        backend = PipeCommandSession if _IS_WINDOWS else PtySession
+        workdir = cwd or self._cwd
+        session = backend(sid, sandbox_command(argv, cwd=workdir), cwd=workdir)
         self._sessions[sid] = session
         return sid, session
 
-    def get(self, session_id: str) -> PtySession | None:
+    def get(self, session_id: str) -> PtySession | PipeCommandSession | None:
         return self._sessions.get(session_id)
 
-    def list(self) -> list[PtySession]:
+    def list(self) -> list[PtySession | PipeCommandSession]:
         return list(self._sessions.values())
 
     def close(self, session_id: str) -> bool:
@@ -247,10 +292,69 @@ class PtySessionManager:
 # 跟 make_todo_write_tool(task_store) 一个套路。
 
 def make_terminal_tools(manager: PtySessionManager) -> list:
-    """返回绑定到指定 manager 的 terminal_open / send / close / list 四个工具。"""
-    from app.tools.registry import Tool, current_cancel_token
+    """为同一会话注册命令执行、等待和兼容终端工具。"""
+    from app.agent.cancel import Cancelled
+    from app.tools.builtin.files import WorkspacePathError, _outside_workspace_approval, _resolve_within_workspace
+    from app.tools.builtin.shell import _build_argv
+    from app.tools.registry import Tool, ToolExecutionError, current_cancel_token
 
-    def process_status(session: PtySession) -> str:
+    def collect(session: PtySession | PipeCommandSession, wait_ms: int) -> str:
+        cancel = current_cancel_token()
+        try:
+            output = session.read_until_idle(idle=None, timeout=wait_ms / 1000, cancel=cancel)
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            if session.alive:
+                result = {"status": "running", "session_id": session.id}
+            else:
+                # The process may exit just after yielding with unread output.
+                output += session.read_until_idle(idle=None, timeout=0.1, cancel=cancel)
+                result = {"status": "exited", "exit_code": session.exit_code}
+                manager.close(session.id)
+        except (Cancelled, OSError) as exc:
+            manager.close(session.id)
+            if isinstance(exc, Cancelled):
+                raise
+            raise ToolExecutionError(f"command session failed: {exc}") from exc
+        return json.dumps({**result, "output": _clip(output.strip())}, ensure_ascii=False)
+
+    def exec_command(args: dict) -> str:
+        command = args["command"].strip()
+        if not command:
+            raise ToolExecutionError("empty command")
+        try:
+            cwd = _resolve_within_workspace(args.get("cwd", "."), "exec_command_outside_workspace")
+        except WorkspacePathError as exc:
+            raise ToolExecutionError(str(exc)) from exc
+        if not cwd.is_dir():
+            raise ToolExecutionError(f"working directory not found: {cwd}")
+        if (cancel := current_cancel_token()) is not None:
+            cancel.raise_if_cancelled()
+        try:
+            _, session = manager.open_argv(_build_argv(command), cwd=str(cwd))
+        except (OSError, ProcessSandboxError) as exc:
+            raise ToolExecutionError(f"failed to start command: {exc}") from exc
+        return collect(session, args.get("yield_time_ms", 1000))
+
+    def write_stdin(args: dict) -> str:
+        sid = args["session_id"]
+        session = manager.get(sid)
+        if session is None:
+            raise ToolExecutionError(f"unknown session_id: {sid}")
+        chars = args.get("chars", "")
+        if chars:
+            try:
+                session.send(chars, append_newline=False, cancel=current_cancel_token())
+            except Cancelled:
+                manager.close(sid)
+                raise
+            except OSError as exc:
+                manager.close(sid)
+                raise ToolExecutionError(f"failed to write stdin: {exc}") from exc
+        default_wait = 250 if chars else 10000
+        return collect(session, min(args.get("yield_time_ms", default_wait), 30000 if chars else 300000))
+
+    def process_status(session: PtySession | PipeCommandSession) -> str:
         if session.alive:
             return "\n[进程仍在运行；可用 terminal_send 空输入继续等待]"
         if session.exit_code is None:
@@ -267,7 +371,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         if _IS_WINDOWS:
             return (
                 "交互式终端会话在 Windows 上不支持(需要 Unix PTY)。\n"
-                "Windows 用户请直接在命令行/PowerShell 执行交互式命令,或考虑 WSL。"
+                "Windows 上可用 exec_command 和 write_stdin 运行通过管道交互的命令。"
             )
         command = (args.get("command") or "").strip()
         if not command:
@@ -282,6 +386,8 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             timeout = DEFAULT_OPEN_TIMEOUT
         try:
             sid, session = manager.open(command)
+        except ProcessSandboxError as exc:
+            raise ToolExecutionError(str(exc)) from exc
         except ValueError as exc:
             return f"refused: {exc}"
         except OSError as exc:
@@ -481,4 +587,35 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         requires_approval=False,
     )
 
-    return [open_tool, send_tool, close_tool, list_tool]
+    wait_schema = {"type": "integer", "minimum": 1, "maximum": 300000}
+    return [
+        open_tool, send_tool, close_tool, list_tool,
+        Tool(
+            name="exec_command",
+            description=("执行命令并返回退出码或活跃 session_id。"
+                         "Windows 使用 PowerShell，启用系统沙箱时使用 WSL2 Bash。"
+                         "短命令直接获取输出；长任务用 write_stdin 空输入继续等待。"
+                         "输出截断后可用 read_tool_output 读取完整记录。"),
+            input_schema={"type": "object", "properties": {
+                "command": {"type": "string", "minLength": 1},
+                "cwd": {"type": "string", "description": "工作目录，默认当前工作区。"},
+                "yield_time_ms": {**wait_schema, "description": "返回前等待的毫秒数，默认 1000。"},
+            }, "required": ["command"], "additionalProperties": False},
+            executor=exec_command, risk="execute", target_type="process", origin="builtin",
+            scope="workspace_or_approved_external", requires_approval=True,
+            approval_resolver=lambda args: _outside_workspace_approval("exec_command", args, path_key="cwd"),
+        ),
+        Tool(
+            name="write_stdin",
+            description=("读取命令会话的新输出或发送字符。空 chars 只等待，默认 10 秒；"
+                         "发送时按原样写入，需回车请显式提供换行。可用 terminal_close 停止会话。"),
+            input_schema={"type": "object", "properties": {
+                "session_id": {"type": "string", "minLength": 1},
+                "chars": {"type": "string", "maxLength": 4096},
+                "yield_time_ms": wait_schema,
+            }, "required": ["session_id"], "additionalProperties": False},
+            executor=write_stdin, risk="execute", target_type="terminal_session", scope="session",
+            origin="builtin", requires_approval=False,
+            approval_resolver=lambda args: "write_stdin" if args.get("chars") else None,
+        ),
+    ]

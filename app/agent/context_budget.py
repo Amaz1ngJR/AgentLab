@@ -63,7 +63,17 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
         body = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
         body = str(message)
-    return estimate_tokens(body) + 4
+    blocks = message.get("output") if message.get("type") == "function_call_output" else message.get("content")
+    image_tokens = 0
+    if isinstance(blocks, list):
+        for block in blocks:
+            if isinstance(block, dict) and block.get("type") == "image":
+                metadata = block.get("metadata") or {}
+                width, height = metadata.get("width"), metadata.get("height")
+                image_tokens += (min(8192, 85 + 170 * ((width + 511) // 512) * ((height + 511) // 512))
+                                 if isinstance(width, int) and width > 0 and isinstance(height, int) and height > 0
+                                 else 2048)
+    return estimate_tokens(body) + image_tokens + 4
 
 
 def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:

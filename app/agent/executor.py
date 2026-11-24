@@ -180,9 +180,10 @@ class Executor:
     def _tools_for_task(self, task: str, *, mode: str = "task") -> list[dict[str, Any]]:
         """按任务文本为 Executor 提供动态工具 Schema。"""
         selector = getattr(self._tools, "schemas_for_task", None)
-        if callable(selector):
-            return selector(task, mode=mode)
-        return self._tools.schemas()
+        tools = selector(task, mode=mode) if callable(selector) else self._tools.schemas()
+        if not getattr(self._llm, "supports_vision", False):
+            tools = [tool for tool in tools if tool.get("name") != "view_image"]
+        return tools
 
     def _emit_provider_retry(
         self,
@@ -394,14 +395,14 @@ class Executor:
                 # 修改建议和 Esc 都意味着"停止当前 turn，回到主输入框"。先补齐
                 # tool_result 配对，避免历史损坏，再用协作式 Cancelled 收尾。
                 if approval_result.cancelled:
+                    if cancel is not None:
+                        cancel.cancel("approval_cancelled")
                     tool_results.append(ToolResult(
                         tool_call_id=call.id, output=output, is_error=False,
                     ))
                     resulted_ids.add(call.id)
                     flush()
-                    if approval_result.feedback:
-                        raise Cancelled(approval_result.feedback)
-                    raise KeyboardInterrupt("用户取消操作")
+                    raise Cancelled(approval_result.feedback or "用户取消操作", reason="approval_cancelled")
                 continue
 
             t0 = time.monotonic()
@@ -418,12 +419,13 @@ class Executor:
                 binder = delegated_manager(self._tools)
                 if binder is not None:
                     binder.bind_wait_tool_result(call.id, output, is_error)
-            if not is_error and call.name not in {"todo_write", "load_skill"}:
+            if not is_error and call.name not in {"todo_write", "load_skill", "request_user_input"}:
                 counters.successful_tool_calls += 1
             self._emit(RunEvent(
                 kind=events.TOOL_COMPLETED, task_id=task.id,
                 tool_name=call.name, tool_input=call.arguments,
                 tool_output=output, tool_error=is_error,
+                tool_call_id=call.id,
                 elapsed_seconds=batch.elapsed(call, time.monotonic() - t0),
             ))
             # 工具执行出错 -> 任务失败。先补齐 tool_result 配对,再返回,
@@ -639,7 +641,7 @@ class Executor:
                         "content": (
                             "你尚未成功执行任何相关工具，不能仅凭完成措辞标记任务完成。"
                             "请通过结构化工具接口核实或执行当前任务；"
-                            "todo_write/load_skill 不算实际操作证据。"
+                            "更新任务清单、加载 Skill 或询问用户均不能作为实际操作证据。"
                         ),
                     })
                     continue
@@ -662,12 +664,12 @@ class Executor:
                 self._tools, resp.tool_calls, cancel=cancel, seen=seen_tool_signatures,
                 on_start=lambda call: self._emit(RunEvent(
                     kind=events.TOOL_REQUESTED, task_id=task.id,
-                    tool_name=call.name, tool_input=call.arguments,
+                    tool_name=call.name, tool_input=call.arguments, tool_call_id=call.id,
                 )),
             )
             visited_ids: set[str] = set()
 
-            def _flush_pending_tool_results() -> None:
+            def _flush_pending_tool_results(reason: str | None = None) -> None:
                 """保留已并发完成的结果，仅给未执行调用补占位结果。"""
                 nonlocal tool_calls_made
                 pending = []
@@ -681,9 +683,16 @@ class Executor:
                             tool_calls_made += 1
                         self._emit(RunEvent(kind=events.TOOL_COMPLETED, task_id=task.id,
                                             tool_name=c.name, tool_input=c.arguments,
-                                            tool_output=actual.output, tool_error=actual.is_error))
+                                            tool_output=actual.output, tool_error=actual.is_error,
+                                            tool_call_id=c.id))
+                    elif c.id in batch.announced and (reason or (cancel and cancel.cancelled)):
+                        self._emit(RunEvent(
+                            kind="tool_cancelled", task_id=task.id, tool_name=c.name, tool_call_id=c.id,
+                            reason=reason or cancel.reason or "operation_cancelled",
+                        ))
                     pending.append(actual or ToolResult(tool_call_id=c.id,
                                                         output=INTERRUPTED_TOOL_RESULT, is_error=False))
+                    resulted_ids.add(c.id)
                 if pending or tool_results:
                     combined = tool_results + pending
                     messages.extend(self._llm.format_tool_results(combined))
@@ -716,14 +725,19 @@ class Executor:
                     flush=_flush_pending_tool_results,
                     on_auto_execute=on_auto_execute,
                 )
-            except BaseException:
+            except BaseException as exc:
                 # Cancelled / KeyboardInterrupt / 任何其他异常:
                 # 必须给本轮所有未执行的工具补合成 tool_result,保证 tool_use/tool_result
                 # 配对完整。否则 messages 里留下悬空 tool_use,下一轮 API 调用会因
                 # TOOL_USE_RESULT_MISMATCH 报错,且每轮都会持续失败(内存损坏即成立,
                 # 无需持久化)。原先只捕获 Cancelled,双击 Ctrl-C(KeyboardInterrupt)
                 # 或工具/回调的意外异常会直接逃逸,导致高频复现。
-                _flush_pending_tool_results()
+                reason = None
+                if isinstance(exc, Cancelled):
+                    reason = exc.reason or "operation_cancelled"
+                elif isinstance(exc, KeyboardInterrupt):
+                    reason = "keyboard_interrupt"
+                _flush_pending_tool_results(reason)
                 raise
 
             tool_calls_made = guard.counters.tool_calls_made

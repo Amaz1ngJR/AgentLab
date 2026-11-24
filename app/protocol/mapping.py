@@ -13,6 +13,7 @@ _TURN_KIND = {
     "tool_call": ("tool.call", "started"),
     "tool_result": ("tool.result", "completed"),
     "tool_denied": ("tool.result", "failed"),
+    "tool_cancelled": ("tool.result", "cancelled"),
 }
 
 _RUN_KIND = {
@@ -24,6 +25,7 @@ _RUN_KIND = {
     "approval_required": ("approval.request", "waiting"),
     "tool_completed": ("tool.result", "completed"),
     "tool_denied": ("tool.result", "failed"),
+    "tool_cancelled": ("tool.result", "cancelled"),
     "task_updated": ("task.execution", "completed"),
     # provider 网络抖动自动重试：映射成结构化 item，前端（Web/TUI）不必靠
     # runtime.event 兜底才能拿到 attempt/delay/error。

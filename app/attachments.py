@@ -172,7 +172,8 @@ def strip_image_blocks(messages: list[dict[str, Any]]) -> tuple[list[dict[str, A
     cleaned: list[dict[str, Any]] = []
     removed = 0
     for message in messages:
-        content = message.get("content")
+        key = "output" if message.get("type") == "function_call_output" else "content"
+        content = message.get(key)
         if not isinstance(content, list):
             cleaned.append(message)
             continue
@@ -183,8 +184,10 @@ def strip_image_blocks(messages: list[dict[str, Any]]) -> tuple[list[dict[str, A
             else:
                 blocks.append(block)
         # 图片消息可能没有文字；移除后为空时整条丢弃，避免 provider 收到空 content。
-        if blocks:
-            cleaned.append({**message, "content": blocks})
+        if key == "output":
+            cleaned.append({**message, key: blocks or "[图片已清除]"})
+        elif blocks:
+            cleaned.append({**message, key: blocks})
         elif not content:
             cleaned.append(message)
     return cleaned, removed

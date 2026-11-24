@@ -293,6 +293,8 @@ class Orchestrator:
                         retry_until_cancelled=auto_execute,
                     )
         except Cancelled as exc:
+            if cancel is not None:
+                cancel.cancel(exc.reason or "operation_cancelled")
             self.last_run_status = "cancelled"
             self.last_run_error = str(exc) or "已取消(规划阶段)"
             self._emit(RunEvent(kind=events.RUN_FAILED, text=self.last_run_error))
@@ -579,6 +581,8 @@ class Orchestrator:
                 )
 
         except Cancelled as exc:
+            if cancel is not None:
+                cancel.cancel(exc.reason or "operation_cancelled")
             self.last_run_status = "cancelled"
             reason = str(exc).strip()
             self.last_run_error = reason or "已取消"

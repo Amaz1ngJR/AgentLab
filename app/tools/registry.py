@@ -62,6 +62,12 @@ _APPROVAL_REQUIRED_RISKS = TOOL_RISKS - {"read"}
 # MCP)一律常驻:少暴露一个 shell 会让模型改用它唯一看得见的动作工具去开网页,
 # 代价远高于多暴露一个本地工具。
 _GATED_TOOL_NAMES = frozenset({"web_search", "web_fetch"})
+_COMMAND_SESSION_TOOLS = frozenset({"exec_command", "write_stdin"})
+_IMAGE_HINTS = ("图片", "截图", "图像", "渲染", "界面", "image", "screenshot", "render", ".png", ".jpg", ".webp", ".gif")
+_COMMAND_SESSION_HINTS = (
+    "命令", "终端", "编译", "构建", "运行测试", "跑测试", "下载", "安装", "启动", "进程", "日志",
+    "exec_command", "write_stdin", "command", "terminal", "build", "run tests", "download", "install", "process",
+)
 
 # 命中即暴露 web_search/web_fetch。刻意不含"文档""搜索""web"——它们在普通写码
 # 请求里太常见("搜索这个函数""看下文档""web server"),会把本地任务推上公网。
@@ -344,16 +350,17 @@ class ToolRegistry:
         mode: str = "direct",
         include: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """按任务文本选择工具集合：本地能力常驻，只收敛对外/浏览器工具。
+        """按任务文本选择工具集合，按需提供浏览器、联网和命令会话工具。
 
         mode 保留给调用方标注阶段，当前不再用它增删本地工具——任务文本无法可靠
         预测模型中途需要什么(问"看下当前改动"也要 shell 跑 git diff)。
         """
         text = (task or "").lower()
-        # 本地能力全部常驻：读写、执行、终端、todo、非浏览器 MCP。
+        # 常驻已有本地能力；新的命令会话工具按需成对提供。
         selected = {
             tool.name for tool in self._tools.values()
-            if tool.name not in _GATED_TOOL_NAMES and tool.target_type != "browser"
+            if tool.name not in _GATED_TOOL_NAMES and tool.name not in _COMMAND_SESSION_TOOLS
+            and tool.name != "view_image" and tool.target_type != "browser"
         }
         if any(word in text for word in _WEB_HINTS):
             selected.update(_GATED_TOOL_NAMES)
@@ -367,6 +374,10 @@ class ToolRegistry:
         selected.update(self._used_tools)
         if include is not None:
             selected.update(include)
+        if selected & _COMMAND_SESSION_TOOLS or any(word in text for word in _COMMAND_SESSION_HINTS):
+            selected.update(_COMMAND_SESSION_TOOLS)
+        if any(word in text for word in _IMAGE_HINTS):
+            selected.add("view_image")
         return self.schemas(include=selected)
 
     def schemas_for_stage(

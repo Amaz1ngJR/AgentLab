@@ -3,6 +3,7 @@ from app.agent.profiles import AgentProfile
 from app.agent.runtime import AgentSession
 from app.agent.service import RuntimeService
 from app.agent.session_router import SessionRouter
+from app.agent.tasks import Task
 from app.storage import Storage
 from tests.support.runtime import FakeRouter, _echo_tool, _registry_with, _resp_text, _resp_tool
 
@@ -42,6 +43,33 @@ def test_direct_budget_exhaustion_is_visible_persisted_and_resumable(tmp_path):
             "provider": "fake", "requested_model": "fake-model", "actual_model": "served-model",
             "cache_read_input_tokens": 0, "reasoning_tokens": 2,
         }
+    finally:
+        service.close()
+        storage.close()
+
+
+def test_blocked_turn_keeps_answer_and_reason_without_reporting_completion(tmp_path):
+    llm = FakeRouter([_resp_text("找到日志证据")])
+    storage = Storage(tmp_path / "db")
+    router = SessionRouter(
+        storage,
+        lambda profile, sid: AgentSession(llm, _registry_with()),
+        {"default": AgentProfile("default", "Default", "fake")},
+    )
+    router.new("default")
+    router.current.task_store.add(Task(id="remaining", content="等待交付"))
+    service = RuntimeService(router)
+    events = []
+    service.subscribe_protocol(events.append)
+    try:
+        answer = service.send_message("看下历史日志", run_id="blocked")
+        assert "找到日志证据" in answer
+        turn = storage.get_runtime_turn("blocked")
+        assert turn["status"] == "blocked"
+        assert turn["input_tokens"] == 5
+        assert events[-1].kind == "turn.blocked"
+        assert events[-1].payload == {"result": answer, "reason": "任务清单尚未完成：等待交付"}
+        assert not any(event.kind == "turn.completed" for event in events)
     finally:
         service.close()
         storage.close()

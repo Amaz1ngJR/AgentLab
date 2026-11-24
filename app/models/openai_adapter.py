@@ -616,7 +616,12 @@ class OpenAIAdapter:
             {
                 "type": "function_call_output",
                 "call_id": r.tool_call_id,
-                "output": (f"ERROR: {r.output}" if r.is_error else r.output),
+                "output": (
+                    [{"type": "input_text", "text": r.output},
+                     *(image.to_content_block() for image in r.images)]
+                    if r.images and not r.is_error else
+                    (f"ERROR: {r.output}" if r.is_error else r.output)
+                ),
             }
             for r in results
         ]
@@ -677,10 +682,17 @@ def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
 
             # function_call_output: 工具结果，保留必需字段
             if msg_type == "function_call_output":
+                output = msg.get("output", "")
+                if isinstance(output, list):
+                    output = [
+                        {"type": "input_image", "image_url": image_block_to_data_url(item)}
+                        if item.get("type") == "image" else item
+                        for item in output
+                    ]
                 cleaned = {
                     "type": "function_call_output",
                     "call_id": msg.get("call_id", ""),
-                    "output": msg.get("output", ""),
+                    "output": output,
                 }
                 result.append(cleaned)
                 continue

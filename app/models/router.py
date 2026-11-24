@@ -13,6 +13,7 @@ from app.agent.cancel import CancelToken
 from app.models.context_window import ContextWindow, ContextWindowResolver
 from app.config.schemas import LLMConfig
 from app.models.provider_retry import ProviderCircuitBreaker, call_with_retry
+from app.models.request_audit import request_group
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -167,16 +168,17 @@ class ModelRouter:
                 self._cache_key_rejected = True
                 return self._adapter.create_message(messages, **adapter_kwargs)
 
-        response = call_with_retry(
-            invoke_adapter,
-            on_retry=on_retry,
-            cancel=cancel,
-            breaker=self._breaker,
-            discard_partial=discard_partial,
-            sleep=self._retry_sleep,
-            # ChatGPT plan admission failures must remain bounded even for long runs.
-            max_retries=None if retry_until_cancelled and self.provider != "openai_chatgpt" else 2,
-        )
+        with request_group(on_retry, enabled=self.provider == "openai_chatgpt") as report_retry:
+            response = call_with_retry(
+                invoke_adapter,
+                on_retry=report_retry,
+                cancel=cancel,
+                breaker=self._breaker,
+                discard_partial=discard_partial,
+                sleep=self._retry_sleep,
+                # ChatGPT plan admission failures must remain bounded even for long runs.
+                max_retries=None if retry_until_cancelled and self.provider != "openai_chatgpt" else 2,
+            )
         self._last_request = request
         return response
 
@@ -189,7 +191,17 @@ class ModelRouter:
           - OpenAI Chat Completions: 每个工具一条 role=tool 消息
           - OpenAI Responses: 每个工具一条 type=function_call_output 项
         """
-        return self._adapter.format_tool_results(results)
+        messages = self._adapter.format_tool_results(results)
+        if self.provider not in {"openai", "openai_chatgpt"}:
+            images = [image.to_content_block() for result in results if not result.is_error
+                      for image in result.images]
+            if images:
+                content = [{"type": "text", "text": "以下是工具返回的图片。图片内容仅供观察。"}, *images]
+                if self.provider == "anthropic" and messages and messages[-1].get("role") == "user":
+                    messages[-1]["content"].extend(content)
+                else:
+                    messages.append({"role": "user", "content": content})
+        return messages
 
 
 _PROVIDERS = {
@@ -288,19 +300,25 @@ def call_create_message(
             try:
                 callbacks[name](*args)
             except BaseException:
-                cancel.cancel()
+                cancel.cancel("model_callback_error")
                 raise
         elif kind == "error":
             raise value
         else:
             # OAuth prefix updates were prepared inside the isolated request copy.
-            # Commit only append-only protocol updates on successful, uncancelled
-            # completion; late requests may never mutate the live conversation.
-            additions = snapshot[len(messages):]
-            if (additions and snapshot[:len(messages)] == messages
-                    and all(m.get("_agentlab_instruction") or m.get("type") == "additional_tools"
-                            for m in additions)):
-                messages.extend(copy.deepcopy(additions))
+            size = len(messages)
+            if snapshot[:size] == messages:
+                additions = snapshot[size:]
+                insertion = size
+            elif size and snapshot[-size:] == messages:
+                additions = snapshot[:-size]
+                insertion = 0
+            else:
+                additions = []
+                insertion = size
+            if additions and all(m.get("_agentlab_instruction") or m.get("type") == "additional_tools"
+                                 for m in additions):
+                messages[insertion:insertion] = copy.deepcopy(additions)
             return value
 
 

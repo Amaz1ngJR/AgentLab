@@ -107,6 +107,33 @@ def _requires_tool_execution(user_input: str) -> bool:
     ))
 
 
+def _is_commit_message_request(user_input: str) -> bool:
+    """Recognize a request for commit text without narrowing mixed work."""
+    text = user_input.lower()
+    if not re.search(r"提交(?:的)?(?:消息|说明|信息)|\bcommit message\b", text):
+        return False
+    if not re.search(r"\bgit\b|\bcommit message\b|仓库|代码|改动|变更|历史提交|暂存", text):
+        return False
+    if re.search(r"\b(?:git-commit|load_skill)\b", text):
+        return False
+    clauses = re.split(r"[，。！？；,!?;\n]", text)
+    positive = [clause.strip() for clause in clauses if not re.match(
+        r"\s*(?:请)?(?:不要|不用|无需|不必|不需要|请勿|禁止|不修改|不提交|不推送|do not|don't|without)",
+        clause,
+    )]
+    if not any(re.search(r"拟|建议|生成|写|起草|给出|draft|suggest|generate|write", clause)
+               for clause in positive):
+        return False
+    return not any(_requires_tool_execution(clause) or re.search(
+        r"\bgit\s+(?:add|commit(?!\s+message)|push|rebase|reset|merge)\b|"
+        r"推送|暂存(?:这些|改动|文件)|(?:并|再|直接|实际|帮我|请|完成)提交(?!的?(?:消息|说明|信息))|"
+        r"提交(?:当前|这些|改动|文件)|(?:将|把).{0,32}提交(?!的?(?:消息|说明|信息))|"
+        r"修改(?:代码|文件)|修复|审查代码|代码审查|\b(?:stage|push|deploy)\b|"
+        r"\bcommit\s+(?:the|these|all|it|them|my|current|staged)\b|\breview\s+(?:the\s+)?(?:code|changes)\b",
+        clause,
+    ) for clause in positive)
+
+
 def _looks_like_pseudo_tool_call(text: str, *, action_request: bool) -> bool:
     """识别模型正文中冒充工具调用的行；绝不从文字反序列化并执行。"""
     if re.search(r"(?m)^\s*\\?\[历史工具调用\s+\w+\]", text):
@@ -129,6 +156,8 @@ class TurnEvent:
     tool_output: str = ""
     tool_error: bool = False
     elapsed_seconds: float = 0.0
+    tool_call_id: str = ""
+    reason: str = ""
 
 
 class AgentSession:
@@ -180,6 +209,7 @@ class AgentSession:
         self._retiring_managers: list = []
         self.child_checkpoint = lambda records: None
         self._delegation_allowed = False
+        self._commit_message_only = False
         self.tools = tools
         self.approval: ApprovalPolicy = approval or AutoApprove()
         from app.tools.builtin import with_tool_guidance
@@ -268,7 +298,16 @@ class AgentSession:
         profile_skills = getattr(self, "profile_skills", None)
         base_prompt = getattr(self, "base_system_prompt", self.system_prompt)
         self._delegation_workflow = ""
+        if self._commit_message_only:
+            self.system_prompt = (
+                f"{self.commit_message_system_prompt}\n\n"
+                "根据工作区状态、暂存与未暂存的差异及近期提交风格拟定提交说明。"
+                "把互不依赖的 Git 查询放到同一批工具调用；先读统计，只有证据不足时才读有针对性的 diff。"
+                "只返回建议的提交说明；本轮仅执行只读 Git 查询。"
+            )
+            return
         if catalog is None:
+            self.system_prompt = base_prompt
             return
         activated = catalog.match(user_input, profile_skills)
         loaded = [
@@ -288,10 +327,14 @@ class AgentSession:
             self._orch._system = self.system_prompt
 
     def _tools_for_task(self, task: str, *, mode: str = "direct") -> list[dict[str, Any]]:
+        if self._commit_message_only:
+            return [tool.to_schema() for tool in self.tools.all()
+                    if tool.name in {"shell", "read_tool_output"}]
         selector = getattr(self.tools, "schemas_for_task", None)
-        if callable(selector):
-            return selector(task, mode=mode)
-        return self.tools.schemas()
+        tools = selector(task, mode=mode) if callable(selector) else self.tools.schemas()
+        if not getattr(self.llm, "supports_vision", False):
+            tools = [tool for tool in tools if tool.get("name") != "view_image"]
+        return tools
 
     def subscribe_events(
         self,
@@ -492,8 +535,17 @@ class AgentSession:
         """
         self.last_actual_model = None
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
-        self._prepare_skill_context(user_input)
+        self.last_turn_seconds = 0.0
+        self.last_run_error = ""
         mode = self._select_mode(user_input, images, resume)
+        self._commit_message_only = (
+            mode is ExecutionMode.DIRECT and not images and not resume
+            and getattr(self.llm, "provider", "") == "openai_chatgpt"
+            and hasattr(self, "commit_message_system_prompt")
+            and self.tools.get("shell") is not None
+            and _is_commit_message_request(user_input)
+        )
+        self._prepare_skill_context(user_input)
         self._last_mode = mode
         # 每条路径都发事件：Direct 也要让 CLI/协议订阅方知道这轮没有走 Planner。
         self._emit_run_event(RunEvent(
@@ -528,6 +580,14 @@ class AgentSession:
             latest_records = [record for record in self.child_records
                               if record.get("parent_run_id") == latest_run
                               and record.get("parent_workspace") == str(workspace_root().resolve())]
+        if not resume:
+            # A terminal read-only attempt has no write artifact to recover.
+            # Keep it in the checkpoint for explicit resume and audit.
+            latest_records = [
+                record for record in latest_records
+                if not (record.get("spec", {}).get("read_only") is True
+                        and record.get("execution_status", record.get("status")) == "budget_exhausted")
+            ]
         resume_workflow = ""
         pending_delivery = any(
             not record.get("superseded_by") and not record.get("continuation_id")
@@ -602,7 +662,9 @@ class AgentSession:
                 answer += "\n\n" + self.last_run_error
                 self._emit_run_event(RunEvent(kind=events.RUN_FAILED, text=self.last_run_error))
             return answer
-        except Cancelled:
+        except Cancelled as exc:
+            cancel.cancel(exc.reason or "operation_cancelled")
+            self.last_run_status = "cancelled"
             if manager.budget_error:
                 return report_budget()
             raise
@@ -695,7 +757,7 @@ class AgentSession:
 
         try:
             empty_rounds = 0
-            action_request = _requires_tool_execution(user_input)
+            action_request = self._commit_message_only or _requires_tool_execution(user_input)
             inspect_text_before_display = action_request or (
                 "[pasted text" in user_input.lower() or "历史工具调用" in user_input
             )
@@ -705,6 +767,17 @@ class AgentSession:
             corrected_no_tool = False
             max_steps = self.max_steps
             tool_context = user_input
+
+            def consume_steering():
+                nonlocal tool_context
+                steering = apply_steering(cancel, self.messages)
+                if steering:
+                    tool_context += "\n" + "\n".join(steering)
+                    if self._commit_message_only:
+                        self._commit_message_only = False
+                        self._prepare_skill_context(tool_context)
+                return steering
+
             step_index = -1
             while self._auto_execute_enabled or step_index + 1 < max_steps:
                 step_index += 1
@@ -716,13 +789,11 @@ class AgentSession:
                         kind="text", text="已中断。",
                     ))
                     return "已中断。"
-                steering = apply_steering(cancel, self.messages)
+                consume_steering()
                 manager = delegated_manager(self.tools)
                 if manager is not None:
                     manager.deliver(self.messages)
                     manager.charge_parent_round()
-                if steering:
-                    tool_context += "\n" + "\n".join(steering)
                 tools = self._tools_for_task(tool_context, mode="direct")
                 if self.context_manager is not None:
                     self.context_manager.compact_before_model_call(
@@ -797,9 +868,7 @@ class AgentSession:
                     manager = delegated_manager(self.tools)
                     if manager is not None and manager.settle_before_final(self.messages):
                         continue
-                    steering = apply_steering(cancel, self.messages)
-                    if steering:
-                        tool_context += "\n" + "\n".join(steering)
+                    if consume_steering():
                         tools = self._tools_for_task(tool_context, mode="direct")
                         continue
                     if not response_text.strip():
@@ -837,6 +906,8 @@ class AgentSession:
                             self.messages.append({
                                 "role": "user",
                                 "content": (
+                                    "请先调用只读 Git 工具查看改动和历史，再拟定提交说明。"
+                                    if self._commit_message_only else
                                     "你尚未实际执行请求。文字中的 edit_file/shell 等调用不是工具调用，"
                                     "不能宣称已经修改或运行。请现在通过提供的结构化工具接口"
                                     "读取必要上下文并执行；不要输出伪工具调用。"
@@ -861,6 +932,8 @@ class AgentSession:
                         self._emit_turn_event(TurnEvent(kind="text", text=response_text))
                     # 模型主动收口（无工具调用、有正文）= 本轮正常完成。
                     self.last_run_status = "blocked" if denied_tools else "completed"
+                    if denied_tools:
+                        self.last_run_error = "工具审批未通过：" + "、".join(sorted(denied_tools))
                     return response_text
 
                 if response_text and not text_streamed:
@@ -872,11 +945,11 @@ class AgentSession:
                 batch = ToolCallBatch(
                     self.tools, resp.tool_calls, cancel=cancel, denied=denied_tools,
                     on_start=lambda call: self._emit_turn_event(TurnEvent(
-                        kind="tool_call", tool_name=call.name, tool_input=call.arguments,
+                        kind="tool_call", tool_name=call.name, tool_input=call.arguments, tool_call_id=call.id,
                     )),
                 )
 
-                def _flush_legacy() -> None:
+                def _flush_legacy(reason: str | None = None) -> None:
                     """给未执行的工具补合成 tool_result,防止 tool_use 悬空。"""
                     from app.agent.executor import INTERRUPTED_TOOL_RESULT
                     pending = []
@@ -889,9 +962,15 @@ class AgentSession:
                             actual.output = _truncate_tool_output(actual.output)
                             self._emit_turn_event(TurnEvent(kind="tool_result", tool_name=c.name,
                                                            tool_input=c.arguments, tool_output=actual.output,
-                                                           tool_error=actual.is_error))
+                                                           tool_error=actual.is_error, tool_call_id=c.id))
+                        elif c.id in batch.announced and (reason or (cancel and cancel.cancelled)):
+                            self._emit_turn_event(TurnEvent(
+                                kind="tool_cancelled", tool_name=c.name, tool_call_id=c.id,
+                                reason=reason or cancel.reason or "operation_cancelled",
+                            ))
                         pending.append(actual or ToolResult(tool_call_id=c.id,
                                                             output=INTERRUPTED_TOOL_RESULT, is_error=False))
+                        resulted_ids.add(c.id)
                     if pending or tool_results:
                         self.messages.extend(
                             self.llm.format_tool_results(tool_results + pending)
@@ -914,6 +993,7 @@ class AgentSession:
                         # 吸收 Esc，这里必须显式检查，否则一串工具调用中途按 Esc 停不下来。
                         # _flush_legacy 会给本轮所有未执行的工具补合成结果，不留悬空 tool_use。
                         if cancel is not None and cancel.cancelled:
+                            self.last_run_status = "cancelled"
                             _flush_legacy()
                             self._emit_turn_event(TurnEvent(
                                 kind="text", text="已中断。",
@@ -965,6 +1045,8 @@ class AgentSession:
                                     approval_result.feedback = None  # 清除内部信号
 
                         if approval_result and approval_result.cancelled:
+                            if cancel is not None:
+                                cancel.cancel("approval_cancelled")
                             # 修改建议/取消都立即终止当前 turn；补齐结果后回到主输入框。
                             self.tools.record_denied(
                                 call.name,
@@ -982,7 +1064,7 @@ class AgentSession:
                             _flush_legacy()
                             if approval_result.feedback:
                                 return approval_result.feedback
-                            raise KeyboardInterrupt("用户取消操作")
+                            raise Cancelled("用户取消操作", reason="approval_cancelled")
 
                         if approval_result and not approval_result.approved:
                             denied_tools.add(call.name)
@@ -1013,7 +1095,7 @@ class AgentSession:
                                 binder = delegated_manager(self.tools)
                                 if binder is not None:
                                     binder.bind_wait_tool_result(call.id, output, is_error)
-                            if not is_error and call.name not in {"todo_write", "load_skill"}:
+                            if not is_error and call.name not in {"todo_write", "load_skill", "request_user_input"}:
                                 successful_tool_calls += 1
                             self._emit_turn_event(TurnEvent(
                                 kind="tool_result",
@@ -1021,6 +1103,7 @@ class AgentSession:
                                 tool_input=call.arguments,
                                 tool_output=output,
                                 tool_error=is_error,
+                                tool_call_id=call.id,
                                 elapsed_seconds=batch.elapsed(call, time.monotonic() - t0),
                             ))
 
@@ -1030,10 +1113,15 @@ class AgentSession:
                             is_error=is_error,
                         ))
                         resulted_ids.add(call.id)
-                except BaseException:
+                except BaseException as exc:
                     # 任何异常(含 KeyboardInterrupt)都先补齐 tool_result 配对,
                     # 防止 messages 留下悬空 tool_use 导致后续每轮 API 都报错。
-                    _flush_legacy()
+                    reason = None
+                    if isinstance(exc, Cancelled):
+                        reason = exc.reason or "operation_cancelled"
+                    elif isinstance(exc, KeyboardInterrupt):
+                        reason = "keyboard_interrupt"
+                    _flush_legacy(reason)
                     raise
 
                 # 工具结果的回传格式由 adapter 决定(Anthropic / OpenAI Chat /
@@ -1052,7 +1140,9 @@ class AgentSession:
             # CLI 通过事件显示正文，不消费 chat 的返回值；收尾提示也必须发事件。
             self._emit_turn_event(TurnEvent(kind="text", text=answer))
             return answer
-        except Cancelled:
+        except Cancelled as exc:
+            if cancel is not None:
+                cancel.cancel(exc.reason or "operation_cancelled")
             self.last_run_status = "cancelled"
             return "已中断。"
         except Exception:

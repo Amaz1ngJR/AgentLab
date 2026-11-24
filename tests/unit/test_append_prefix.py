@@ -28,6 +28,7 @@ def test_append_updates_do_not_rewrite_previous_wire_prefix():
     messages = [{"role": "user", "content": "inspect"}]
     prepare_history(messages, [READ], "base")
     first = a._params(messages, [READ], None, "medium")
+    assert [item.get("role") for item in first["input"]] == ["developer", "developer", "user"]
     messages.extend([{"type": "reasoning", "id": "rs1", "summary": [], "encrypted_content": "opaque"},
                      {"role": "user", "content": "edit"}])
     before = copy.deepcopy(messages)
@@ -83,7 +84,7 @@ def test_router_commits_updates_with_or_without_request_isolation(cancel):
     messages = [{"role": "user", "content": "inspect"}]
     call_create_message(router, messages, tools=[READ], system="base",
                         cancel=CancelToken() if cancel else None)
-    assert [m.get("type") for m in messages] == [None, "message", "additional_tools"]
+    assert [m.get("type") for m in messages] == ["message", "additional_tools", None]
     assert a.create_message.call_args.kwargs["system"] is None
     original = copy.deepcopy(messages)
     call_create_message(router, messages, tools=[READ], system="base",
@@ -97,6 +98,13 @@ def test_empty_instructions_do_not_append_forever():
     original = copy.deepcopy(messages)
     prepare_history(messages, [], None)
     assert messages == original
+
+
+def test_existing_transcript_without_managed_prefix_is_not_reordered():
+    messages = [{"role": "user", "content": "inspect"}, {"role": "assistant", "content": "done"}]
+    original = copy.deepcopy(messages)
+    prepare_history(messages, [READ], "base")
+    assert messages[:len(original)] == original
 
 
 def test_failed_isolated_request_does_not_commit_prefix_updates():

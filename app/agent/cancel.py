@@ -17,6 +17,10 @@ T = TypeVar("T")
 class Cancelled(Exception):
     """协作式取消被触发时抛出，由执行循环和 Service 以 cancelled 收尾。"""
 
+    def __init__(self, message: str = "", *, reason: str | None = None):
+        super().__init__(message)
+        self.reason = reason
+
 
 class CancelToken:
     """一次性取消标志。cancel() 幂等;cancelled 只读当前状态。"""
@@ -59,7 +63,7 @@ class CancelToken:
 
     def raise_if_cancelled(self) -> None:
         if self.cancelled:
-            raise Cancelled()
+            raise Cancelled(reason=self.reason)
 
     def wait(self, timeout: float | None = None) -> bool:
         return self._event.wait(timeout)

@@ -89,4 +89,10 @@ def prepare_history(messages, tools, system):
                         "content": (UPDATE_PREFIX if initialized else "") + desired_system})
     if new:
         updates.append({"type": "additional_tools", "role": "developer", "tools": copy.deepcopy(new)})
-    messages.extend(updates)
+    if not initialized and all(item.get("role") == "user" and item.get("type") in {None, "message"}
+                               for item in messages):
+        # Start fresh histories with the reusable developer block. Existing
+        # transcripts retain their original order once they have been used.
+        messages[:0] = updates
+    else:
+        messages.extend(updates)

@@ -6,6 +6,9 @@
 """
 import sys
 import shlex
+import json
+import os
+import threading
 import textwrap
 
 import pytest
@@ -40,6 +43,8 @@ _FAKE_REPL = textwrap.dedent('''
 @pytest.fixture
 def repl_cmd(tmp_path):
     """把 fake REPL 写到临时文件,返回启动它的命令字符串。"""
+    if os.name == "nt":
+        pytest.skip("legacy terminal_open requires a Unix PTY")
     script = tmp_path / "fake_repl.py"
     script.write_text(_FAKE_REPL, encoding="utf-8")
     return f"{sys.executable} {script}"
@@ -145,6 +150,7 @@ def test_terminal_open_returns_session_id_and_banner(repl_cmd):
         m.close_all()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="legacy terminal_open requires a Unix PTY")
 def test_terminal_open_empty_command_refused():
     m = PtySessionManager()
     out = _tools(m)["terminal_open"].executor({"command": ""})
@@ -184,6 +190,7 @@ def test_terminal_send_detects_session_end(repl_cmd):
         m.close_all()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="legacy terminal_open requires a Unix PTY")
 def test_terminal_open_waits_through_idle_and_reports_exit_code():
     source = "import time; print('start'); time.sleep(0.35); print('done'); raise SystemExit(7)"
     command = shlex.join([sys.executable, "-c", source])
@@ -199,6 +206,7 @@ def test_terminal_open_waits_through_idle_and_reports_exit_code():
         manager.close_all()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="legacy terminal_open requires a Unix PTY")
 def test_terminal_send_polls_without_writing_and_drains_completed_process():
     source = (
         "import select, sys; print('started'); "
@@ -253,6 +261,97 @@ def test_tool_approval_flags():
     # 关闭/列举无副作用,不需审批
     assert tools["terminal_close"].requires_approval is False
     assert tools["terminal_list"].requires_approval is False
+
+
+@pytest.fixture(params=["pty", "pipe"])
+def command_backend(request, monkeypatch):
+    pipe = request.param == "pipe"
+    if os.name == "nt" and not pipe:
+        pytest.skip("PTY backend is unavailable on Windows")
+    monkeypatch.setattr(I, "_IS_WINDOWS", pipe)
+    return pipe
+
+
+def test_exec_command_returns_exit_code_and_removes_completed_session(tmp_path, command_backend):
+    from app.config.loader import use_workspace_root
+
+    manager = PtySessionManager(str(tmp_path))
+    try:
+        with use_workspace_root(tmp_path):
+            result = json.loads(_tools(manager)["exec_command"].executor({
+                "command": "Write-Output 'hello'; exit 7" if os.name == "nt" else "printf 'hello\\n'; exit 7",
+                "yield_time_ms": 5000,
+            }))
+        assert result == {"status": "exited", "exit_code": 7, "output": "hello"}
+        assert manager.list() == []
+    finally:
+        manager.close_all()
+
+
+def test_command_session_poll_and_stdin_share_approval_and_process(tmp_path, command_backend):
+    from app.config.loader import use_workspace_root
+    from app.tools.registry import ToolRegistry
+
+    manager = PtySessionManager(str(tmp_path))
+    registry = ToolRegistry()
+    for tool in make_terminal_tools(manager):
+        registry.register(tool)
+    try:
+        with use_workspace_root(tmp_path):
+            command_tools = {"exec_command", "write_stdin"}
+            assert not command_tools.intersection(t["name"] for t in registry.schemas_for_task("查看文件"))
+            assert command_tools <= {t["name"] for t in registry.schemas_for_task("运行测试")}
+            if os.name == "nt":
+                command = "[Console]::Write('ready'); [Console]::Write([Console]::ReadLine())"
+            else:
+                command = "printf ready; read -r value; printf '%s' \"$value\""
+                if not command_backend:
+                    command = "stty -echo; " + command
+            start = {"command": command, "yield_time_ms": 250}
+            assert registry.execute("exec_command", start)[1]
+            raw, error = registry.execute("exec_command", start, approved_action="exec_command")
+            assert not error
+            started = json.loads(raw)
+            assert started["status"] == "running"
+            assert command_tools <= {t["name"] for t in registry.schemas_for_task("继续")}
+            sid = started["session_id"]
+            poll = {"session_id": sid, "yield_time_ms": 1500}
+            raw, error = registry.execute("write_stdin", poll)
+            assert not error
+            waiting = json.loads(raw)
+            assert waiting["status"] == "running"
+            assert started["output"] + waiting["output"] == "ready"
+            write = {**poll, "chars": "finished\n", "yield_time_ms": 1000}
+            assert registry.execute("write_stdin", write)[1]
+            raw, error = registry.execute("write_stdin", write, approved_action="write_stdin")
+            assert not error
+            assert json.loads(raw) == {"status": "exited", "exit_code": 0, "output": "finished"}
+            assert manager.get(sid) is None
+    finally:
+        manager.close_all()
+
+
+def test_cancel_command_session_releases_manager_entry(tmp_path, command_backend):
+    from app.agent.cancel import CancelToken, Cancelled
+    from app.config.loader import use_workspace_root
+    from app.tools.registry import ToolRegistry
+
+    manager = PtySessionManager(str(tmp_path))
+    registry = ToolRegistry()
+    for tool in make_terminal_tools(manager):
+        registry.register(tool)
+    token = CancelToken()
+    timer = threading.Timer(0.15, token.cancel)
+    timer.start()
+    try:
+        with use_workspace_root(tmp_path), pytest.raises(Cancelled):
+            command = "Start-Sleep -Seconds 30" if os.name == "nt" else "sleep 30"
+            registry.execute("exec_command", {"command": command, "yield_time_ms": 10000},
+                             approved_action="exec_command", cancel=token)
+        assert manager.list() == []
+    finally:
+        timer.cancel()
+        manager.close_all()
 
 
 def test_send_output_truncation(monkeypatch, repl_cmd):

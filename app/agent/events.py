@@ -97,6 +97,8 @@ class RunEvent:
     tool_output: str = ""
     tool_error: bool = False
     elapsed_seconds: float = 0.0
+    tool_call_id: str = ""
+    reason: str = ""
 
     # 结构化附加数据(如任务 snapshot、token 用量)
     payload: dict[str, Any] = field(default_factory=dict)

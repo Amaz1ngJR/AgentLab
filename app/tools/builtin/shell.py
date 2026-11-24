@@ -34,6 +34,7 @@ from app.tools.builtin.files import (
 from app.tools.registry import Tool, ToolExecutionError, current_cancel_token
 from app.tools.rtk_builtin import BuiltinRTK
 from app.util.process import run_process
+from app.util.process_sandbox import ProcessSandboxError, sandbox_command
 
 # 单次预览上限（字符）；完整输出由 output_archive 留存。
 MAX_OUTPUT_BYTES = 4_000
@@ -79,7 +80,10 @@ def _run_shell(args: dict) -> str:
         raise ToolExecutionError(f"working directory not found: {cwd}")
     if not cwd.is_dir():
         raise ToolExecutionError(f"not a working directory: {cwd}")
-    argv = _build_argv(command)
+    try:
+        argv = sandbox_command(_build_argv(command), cwd=cwd)
+    except ProcessSandboxError as exc:
+        raise ToolExecutionError(str(exc)) from exc
 
     cancel = current_cancel_token()
     try:
@@ -160,6 +164,7 @@ SHELL = Tool(
     name="shell",
     description=(
         "执行 shell 命令(macOS/Linux 用 bash,Windows 用 PowerShell)。"
+        "Windows 启用系统沙箱时使用 WSL2 Bash 语法。"
         "cwd 默认是 workspace;外部 cwd 需要独立审批。"
         "输出预览最多4000字符，完整输出通过 read_tool_output 按输出 ID 读取。"
         "常见开发命令会先经内置 RTK 风格过滤器压缩，"

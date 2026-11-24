@@ -8,19 +8,21 @@ from __future__ import annotations
 
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from app.agent.approval_broker import ApprovalBroker
 from app.agent.cancel import CancelToken, Cancelled
 from app.agent.session_router import SessionRouter
 from app.agent.submission import SubmissionQueue, SubmissionQueueOverloaded, TurnSubmission
+from app.agent.user_questions import QUESTION_ACTION
+from app.models.request_audit import observe_model_requests
 from app.protocol.envelopes import EventEnvelope, utc_now
 from app.protocol.errors import RuntimeFailure
 from app.protocol.items import TurnItem
 from app.protocol.json_types import to_json_value
 from app.protocol.mapping import item_event_kind, runtime_event_to_item
-from app.protocol.models import TurnRecord
+from app.protocol.models import TurnRecord, TurnStatus
 from app.protocol.handshake import (
     ClientInfo,
     InitializeResult,
@@ -51,6 +53,7 @@ _LEGACY_EVENT_KIND = {
     "agent_run_event": "turn.agent_event",
     "run_completed": "turn.completed",
     "run_suspended": "turn.suspended",
+    "run_blocked": "turn.blocked",
     "run_failed": "turn.failed",
     "run_cancel_requested": "turn.cancel_requested",
     "run_cancelled": "turn.cancelled",
@@ -586,7 +589,9 @@ class RuntimeService:
         return True
 
     def answer_request(self, request_id: str, response: Any) -> bool:
-        """回应异步审批请求；response 可为 approve/deny 或结构化对象。"""
+        """回应异步审批或结构化问题。"""
+        if isinstance(response, dict) and "answers" in response:
+            return self.approval_broker.resolve_answers(request_id, response["answers"])
         if isinstance(response, str):
             decision = response
             feedback = None
@@ -600,6 +605,30 @@ class RuntimeService:
         return self.approval_broker.resolve(
             request_id, decision, feedback=str(feedback) if feedback else None,
         )
+
+    def request_user_input(self, session_id, questions, cancel, *, resolver=None):
+        with self._lock:
+            turn_id = self._session_runs.get(session_id)
+        request_id = None
+
+        def publish(request):
+            nonlocal request_id
+            request_id = request.request_id
+            self._publish_protocol(
+                kind="user_input.requested", thread_id=session_id, turn_id=turn_id,
+                payload={"request_id": request_id, "questions": questions},
+            )
+
+        result = self.approval_broker.request(
+            QUESTION_ACTION, {"questions": questions}, resolver=resolver,
+            cancel=cancel, on_request=publish,
+        )
+        if request_id is not None:
+            self._publish_protocol(
+                kind="user_input.completed", thread_id=session_id, turn_id=turn_id,
+                payload={"request_id": request_id, "answered": result.answers is not None},
+            )
+        return result
 
     def _run_submission(self, submission: TurnSubmission) -> None:
         try:
@@ -690,17 +719,51 @@ class RuntimeService:
                 payload={"text": message, "image_count": len(images or [])},
             ),
         )
+        accumulated_usage: dict[str, int] = {}
+        accumulated_seconds = 0.0
+
+        def record_request(kind, payload):
+            self._publish_protocol(kind=kind, thread_id=target_id, turn_id=actual_run_id, payload=payload)
+
+        def execute_chat(text, **kwargs):
+            nonlocal accumulated_seconds
+            try:
+                with observe_model_requests(record_request):
+                    return session.chat(text, **kwargs)
+            finally:
+                for key, value in (getattr(session, "last_turn_usage", {}) or {}).items():
+                    accumulated_usage[key] = accumulated_usage.get(key, 0) + value
+                accumulated_seconds += getattr(session, "last_turn_seconds", 0.0)
+
+        def save_finished_turn(status: TurnStatus, failure_code=None):
+            if storage is None:
+                return
+            details = {key: accumulated_usage[key] for key in (
+                "cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens",
+            ) if key in accumulated_usage}
+            llm = getattr(session, "llm", None)
+            details.update({key: value for key, value in {
+                "provider": getattr(llm, "provider", None),
+                "requested_model": getattr(llm, "model", None),
+                "reasoning_effort": getattr(llm, "reasoning_effort", None),
+                "actual_model": getattr(session, "last_actual_model", None),
+            }.items() if value})
+            storage.save_runtime_turn(replace(
+                turn, status=status, finished_at=utc_now(), failure_code=failure_code,
+                input_tokens=accumulated_usage.get("input_tokens", 0),
+                output_tokens=accumulated_usage.get("output_tokens", 0),
+                usage_details=details,
+            ))
+
         try:
             chat_kwargs = {"cancel": token, "resume": resume}
             # 不传空的 images kwarg，兼容只实现旧 chat(message,cancel,resume) 接口的
             # 测试替身和第三方 AgentSession。
             if images:
                 chat_kwargs["images"] = images
-            result = session.chat(message, **chat_kwargs)
+            result = execute_chat(message, **chat_kwargs)
             # Do not acknowledge input and then lose it at the last model boundary.
             # A late steering message becomes a follow-up inside this same run.
-            accumulated_usage = dict(getattr(session, "last_turn_usage", {}) or {})
-            accumulated_seconds = getattr(session, "last_turn_seconds", 0.0)
             while True:
                 pending = token.finish_or_drain_steering()
                 if not pending:
@@ -708,48 +771,28 @@ class RuntimeService:
                 if token.cancelled:
                     session.messages.extend({"role": "user", "content": text} for text in pending)
                     break
-                result = session.chat("\n\n".join(pending), cancel=token)
-                for key, value in (getattr(session, "last_turn_usage", {}) or {}).items():
-                    accumulated_usage[key] = accumulated_usage.get(key, 0) + value
-                accumulated_seconds += getattr(session, "last_turn_seconds", 0.0)
+                result = execute_chat("\n\n".join(pending), cancel=token)
             session.last_turn_usage = accumulated_usage
             session.last_turn_seconds = accumulated_seconds
             self.router.persist(target_id)
-            usage = getattr(session, "last_turn_usage", {}) or {}
             # 正常返回不代表目标完成：Direct 耗尽预算时可恢复，但不是成功。
             run_status = getattr(session, "last_run_status", "")
             suspended = run_status == "budget_exhausted"
             cancelled = not suspended and (token.cancelled or run_status == "cancelled")
-            usage_details = {key: usage[key] for key in (
-                "cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens",
-            ) if key in usage}
-            llm = getattr(session, "llm", None)
-            usage_details.update({key: value for key, value in {
-                "provider": getattr(llm, "provider", None),
-                "requested_model": getattr(llm, "model", None),
-                "reasoning_effort": getattr(llm, "reasoning_effort", None),
-                "actual_model": getattr(session, "last_actual_model", None),
-            }.items() if value})
-            completed_turn = TurnRecord(
-                turn_id=actual_run_id,
-                thread_id=target_id,
-                status="cancelled" if cancelled else "suspended" if suspended else "completed",
-                input_text=message,
-                started_at=turn.started_at,
-                finished_at=utc_now(),
-                input_tokens=int(usage.get("input_tokens", 0)),
-                output_tokens=int(usage.get("output_tokens", 0)),
-                usage_details=usage_details,
+            status = (
+                "cancelled" if cancelled else "suspended" if suspended else
+                "blocked" if run_status == "blocked" else "completed"
             )
-            if storage is not None:
-                storage.save_runtime_turn(completed_turn)
+            save_finished_turn(status)
             payload = {"result": result}
             if suspended:
                 payload.update(reason=run_status, resumable=True)
             elif cancelled:
                 payload["reason"] = token.reason or "unspecified"
+            elif status == "blocked":
+                payload["reason"] = getattr(session, "last_run_error", "") or "blocked"
             self.publish(
-                "run_cancelled" if cancelled else "run_suspended" if suspended else "run_completed",
+                f"run_{status}",
                 session_id=target_id,
                 run_id=actual_run_id,
                 payload=payload,
@@ -757,17 +800,12 @@ class RuntimeService:
             return result
         except BaseException as exc:
             failure = RuntimeFailure.from_exception(exc)
+            if isinstance(exc, Cancelled):
+                token.cancel(exc.reason or "operation_cancelled")
+            elif isinstance(exc, KeyboardInterrupt):
+                token.cancel("keyboard_interrupt")
             was_cancelled = token.cancelled or isinstance(exc, (Cancelled, KeyboardInterrupt))
-            if storage is not None:
-                storage.save_runtime_turn(TurnRecord(
-                    turn_id=actual_run_id,
-                    thread_id=target_id,
-                    status="cancelled" if was_cancelled else "failed",
-                    input_text=message,
-                    started_at=turn.started_at,
-                    finished_at=utc_now(),
-                    failure_code=failure.code,
-                ))
+            save_finished_turn("cancelled" if was_cancelled else "failed", failure.code)
             # BaseException 保证 KeyboardInterrupt 时也能发出收尾事件并释放 run 槽位。
             payload = {"error": exc}
             if was_cancelled:

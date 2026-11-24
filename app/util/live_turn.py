@@ -14,7 +14,7 @@ from prompt_toolkit.application.current import set_app
 from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
 
 from app.util.composer import configure_composer, NativeStdoutProxy
-from app.agent.cancel import CancelToken
+from app.agent.cancel import Cancelled, CancelToken
 from app.util.input_arbiter import clear_background_reader, set_background_reader
 
 
@@ -237,7 +237,10 @@ class LiveTurnInput:
                     raise error
                 return result
             except BaseException as exc:
-                token.cancel("keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "input_worker_error")
+                if isinstance(exc, Cancelled):
+                    token.cancel(exc.reason or "operation_cancelled")
+                else:
+                    token.cancel("keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "input_worker_error")
                 raise
             finally:
                 clear_background_reader(self)

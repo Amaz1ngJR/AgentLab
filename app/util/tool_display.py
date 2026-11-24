@@ -35,6 +35,10 @@ def action_label(name, args):
         return f"{label}({args.get('command', '')})"
     if name == "terminal_send":
         return f"Terminal[{args.get('session_id', '?')}]({args.get('input', '')})"
+    if name == "exec_command":
+        return f"Exec({args.get('command', '')})"
+    if name == "write_stdin":
+        return f"Terminal[{args.get('session_id', '?')}]"
     if name == "terminal_close":
         return f"TerminalClose({args.get('session_id', '?')})"
     if name == "read_files":
@@ -53,6 +57,16 @@ def action_label(name, args):
 
 
 def _result_text(name, output):
+    if name in {"exec_command", "write_stdin"}:
+        try:
+            data = json.loads(output)
+            if data["status"] == "running":
+                status = f"仍在运行 · {data['session_id']}"
+            else:
+                status = f"已退出 · exit_code={data['exit_code']}"
+            return "\n".join(part for part in (data["output"], status) if part)
+        except (ValueError, KeyError, TypeError):
+            return output
     if name == "read_files":
         try:
             data = json.loads(output)

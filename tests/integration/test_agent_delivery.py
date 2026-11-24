@@ -5,7 +5,7 @@ import threading
 import pytest
 
 from app.agent.agent_manager import AgentManager
-from app.agent.approval import AutoApprove, DenyAll
+from app.agent.approval import ApprovalResult, AutoApprove, DenyAll
 from app.agent.cancel import CancelToken
 from app.models.protocol import ModelResponse, ToolCall
 from app.tools.builtin.files import default_tools
@@ -32,6 +32,84 @@ def make_manager(git_repo):
 
 def spawn_isolated(manager, *args, **kwargs):
     return manager.spawn(*args, workspace_mode="worktree", **kwargs)
+
+
+@pytest.mark.parametrize(("phase", "external"), [
+    ("verification", False), ("integration", False), ("verification", True),
+])
+def test_integration_cancellation_reaches_root_and_closes_tool_item(git_repo, tmp_path, monkeypatch,
+                                                                  phase, external):
+    from app.agent.profiles import AgentProfile
+    from app.agent.runtime import AgentSession
+    from app.agent.service import RuntimeService
+    from app.agent.session_router import SessionRouter
+    from app.storage import Storage
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(git_repo))
+    child_manager = make_manager(git_repo)
+    try:
+        sid = spawn_isolated(child_manager, "create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        assert child_manager.wait([sid], 3)["agents"][0]["status"] == "succeeded"
+        records = child_manager.records()
+    finally:
+        child_manager.finish()
+
+    root_token = CancelToken()
+
+    class CancelApproval:
+        def request_tool(self, tool, action, args):
+            if action == ("shell" if phase == "verification" else "integrate_agent"):
+                if external:
+                    root_token.cancel("keyboard_escape")
+                return ApprovalResult(False, cancelled=True)
+            return ApprovalResult(True)
+
+    llm = FakeRouter([ModelResponse("", [ToolCall("delivery-call", "integrate_agent", {
+        "sid": sid, "checks": ["test -f child.txt"],
+    })], {}, [])])
+    storage = Storage(tmp_path / "delivery.db")
+    router = SessionRouter(
+        storage, lambda profile, session_id: AgentSession(llm, child_manager.tools, approval=CancelApproval()),
+        {"default": AgentProfile("default", "Default", "fake")},
+    )
+    thread_id = router.new("default")
+    router.current.child_records = records
+    service = RuntimeService(router)
+    try:
+        assert service.send_message("继续验证并交付", run_id="delivery", cancel=root_token) == "已中断。"
+        phase_reason = f"{phase}_approval_cancelled"
+        assert root_token.reason == ("keyboard_escape" if external else phase_reason)
+        rows = storage.list_runtime_events(thread_id)
+        started = next(row for row in rows if row["kind"] == "item.started"
+                       and row["payload"]["item"]["kind"] == "tool.call")
+        interrupted = next(row for row in rows if row["kind"] == "item.cancelled")
+        assert started["payload"]["item"]["payload"]["tool_call_id"] == "delivery-call"
+        assert interrupted["payload"]["item"]["payload"] == {
+            "tool_name": "integrate_agent", "tool_call_id": "delivery-call", "reason": phase_reason,
+        }
+        assert rows[-1]["kind"] == "turn.cancelled" and rows[-1]["payload"]["reason"] == root_token.reason
+        assert storage.get_runtime_turn("delivery")["status"] == "cancelled"
+        assert not (git_repo / "child.txt").exists()
+        assert len(llm.calls) == 1
+    finally:
+        service.close()
+        storage.close()
+
+
+def test_verification_denial_does_not_cancel_and_approval_feedback_is_accepted():
+    from app.agent.agent_delivery import _approve_delivery
+
+    token = CancelToken()
+    with pytest.raises(ToolExecutionError, match="verification approval denied"):
+        _approve_delivery(DenyAll(), SHELL, "shell", {"command": "true"}, token, phase="verification")
+    assert not token.cancelled
+
+    class ApprovedWithFeedback:
+        def request_tool(self, tool, action, args):
+            return ApprovalResult(True, feedback="__enable_auto_execute__")
+
+    _approve_delivery(ApprovedWithFeedback(), SHELL, "shell", {"command": "true"}, token, phase="verification")
+    assert not token.cancelled
 
 
 def test_ordinary_followup_queries_and_integrates_previous_delivery(git_repo, monkeypatch):

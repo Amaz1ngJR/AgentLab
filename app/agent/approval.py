@@ -25,10 +25,12 @@ class ApprovalResult:
     feedback 不代表普通拒绝，而是用户要求暂停当前 turn、回到主聊天输入框后再
     提交下一条指令；Runtime 不应把反馈自动喂给模型继续 thinking。
     """
-    def __init__(self, approved: bool, feedback: str | None = None, cancelled: bool = False):
+    def __init__(self, approved: bool, feedback: str | None = None, cancelled: bool = False, *,
+                 answers: dict | None = None):
         self.approved = approved
         self.feedback = feedback  # 用户的修改建议
         self.cancelled = cancelled  # 用户是否按了 ESC/Ctrl-C 明确取消
+        self.answers = answers
 
 
 class ApprovalPolicy(Protocol):
@@ -149,7 +151,8 @@ class InteractivePolicy:
     # workspace 越界和交互终端执行必须逐次确认，不能被会话白名单吞掉。
     # workspace 内 shell 可在用户明确选择后按受限命令前缀记住到当前 session。
     _NON_PERSISTENT_ACTIONS = {
-        "shell", "bash", "terminal_open", "terminal_send", "clear_session_images", "integrate_agent", "request_confirmation",
+        "shell", "bash", "terminal_open", "terminal_send", "exec_command", "write_stdin",
+        "clear_session_images", "integrate_agent", "request_confirmation",
     }
     _NON_PERSISTENT_RISKS = {
         "browser_control",
@@ -205,6 +208,8 @@ class InteractivePolicy:
         terminal_payload_key = {
             "terminal_open": "command",
             "terminal_send": "input",
+            "exec_command": "command",
+            "write_stdin": "chars",
         }.get(tool_name)
         if terminal_payload_key and terminal_payload_key in tool_input:
             lines.append(f"● {tool_name}")

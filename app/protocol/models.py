@@ -9,7 +9,7 @@ from app.protocol.json_types import JsonValue
 
 TurnStatus = Literal[
     "queued", "running", "waiting_approval", "waiting_user_input",
-    "suspended", "completed", "failed", "cancelled",
+    "suspended", "blocked", "completed", "failed", "cancelled",
 ]
 
 

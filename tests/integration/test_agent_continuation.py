@@ -59,6 +59,65 @@ def test_restored_results_are_not_resumable(tmp_path):
         restored.finish()
 
 
+def test_readonly_budget_exhaustion_stops_gating_parent_after_delivery(tmp_path):
+    from app.models.protocol import ModelResponse, ToolCall
+
+    class Parent(ForkRouter):
+        def fork(self):
+            return FakeRouter([
+                ModelResponse("", [ToolCall("read", "read_file", {})],
+                              {"input_tokens": 1, "output_tokens": 1}, []),
+            ])
+
+    m = manager(tmp_path)
+    m.llm = Parent([])
+    try:
+        sid = m.spawn("检查历史代码", max_steps=1, max_tool_calls=1)["child_run_id"]
+        result = m.wait([sid], 2, consume=False)["agents"][0]
+        assert result["execution_status"] == "budget_exhausted"
+        assert m.unresolved() == [f"{sid}: budget_exhausted/none"]
+        history = []
+        assert m.deliver(history)
+        assert "budget_exhausted" in history[0]["content"]
+        assert m.unresolved() == []
+        assert m.records()[0]["execution_status"] == "budget_exhausted"
+    finally:
+        m.finish()
+
+
+@pytest.mark.parametrize(("read_only", "resume", "expected_status"), [
+    (True, False, "completed"),
+    (True, True, "completed"),
+    (False, False, "blocked"),
+])
+def test_prior_budget_exhaustion_only_carries_required_delivery(tmp_path, read_only, resume, expected_status):
+    from dataclasses import asdict
+
+    from app.agent.runtime import AgentSession
+    from app.agent.subagent_runtime import SubagentSpec
+    from app.config.loader import use_workspace_root
+    from tests.support.delegation import registry
+
+    llm = ForkRouter([response("查到独立证据")])
+    session = AgentSession(llm, registry(), delegation_policy="explicit")
+    record = {
+        "child_run_id": "old-child", "parent_run_id": "old-run",
+        "parent_workspace": str(tmp_path.resolve()), "delegation_allowed": True,
+        "execution_status": "budget_exhausted", "error": "budget_exhausted: tool call limit",
+        "delivery_status": "none" if read_only else "pending_review",
+        "spec": asdict(SubagentSpec("old-child", "上轮调查", read_only=read_only)),
+    }
+    session.child_records = [record]
+
+    with use_workspace_root(tmp_path):
+        answer = session.chat("看下历史日志", resume=resume)
+    assert session.last_run_status == expected_status
+    assert "查到独立证据" in answer
+    assert ("委派尚未交付" in answer) == (expected_status == "blocked")
+    assert ("old-child" in str(session.messages)) == (resume or not read_only)
+    assert session.child_records[0]["execution_status"] == "budget_exhausted"
+
+
 def test_native_prefix_final_serialized_request_and_fallback(tmp_path):
     from types import SimpleNamespace
     from unittest.mock import patch

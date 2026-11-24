@@ -10,9 +10,22 @@ import stat
 from pathlib import Path
 
 from app.agent.approval import request_tool_approval
-from app.agent.cancel import CancelToken
+from app.agent.cancel import Cancelled, CancelToken
 from app.tools.registry import Tool, ToolExecutionError
 from app.workspace.worktree import WorktreeManager
+
+
+def _approve_delivery(approval, tool, action, args, cancel: CancelToken, *, phase: str) -> None:
+    cancel.raise_if_cancelled()
+    decision = request_tool_approval(approval, tool, action, args)
+    if decision.cancelled or (not decision.approved and decision.feedback):
+        reason = f"{phase}_approval_cancelled"
+        cancel.cancel(reason)
+        raise Cancelled(decision.feedback or f"{phase} approval cancelled",
+                        reason="budget_exhausted" if cancel.reason == "budget_exhausted" else reason)
+    if not decision.approved:
+        raise ToolExecutionError(f"{phase} approval denied")
+    cancel.raise_if_cancelled()
 
 
 def scope_state(workspace: Path, scopes: tuple[str, ...]) -> dict[str, str]:
@@ -55,12 +68,7 @@ def _integrate_shared(result, *, workspace, tools, approval, checks, cancel, fil
         with use_workspace_root(workspace):
             action = shell.approval_action(args)
             if action:
-                decision = request_tool_approval(approval, shell, action, args)
-                if decision.cancelled or decision.feedback:
-                    from app.agent.cancel import Cancelled
-                    raise Cancelled(decision.feedback or "verification approval cancelled")
-                if not decision.approved:
-                    raise ToolExecutionError("verification approval denied")
+                _approve_delivery(approval, shell, action, args, cancel, phase="verification")
             output, error = tools.execute("shell", args, approved_action=action, cancel=cancel)
         evidence.append({"command": command, "output": output[:4000], "error": error})
         if scope_state(workspace, file_scope) != expected:
@@ -164,12 +172,7 @@ def integrate_result(result, *, workspace: Path, tools, approval, checks: list[s
         with use_workspace_root(result.worktree.path):
             action = shell.approval_action(args)
             if action:
-                decision = request_tool_approval(approval, shell, action, args)
-                if decision.cancelled or decision.feedback:
-                    from app.agent.cancel import Cancelled
-                    raise Cancelled(decision.feedback or "verification approval cancelled")
-                if not decision.approved:
-                    raise ToolExecutionError("verification approval denied")
+                _approve_delivery(approval, shell, action, args, cancel, phase="verification")
             output, error = tools.execute("shell", args, approved_action=action, cancel=cancel)
         evidence.append({"command": command, "output": output[:4000], "error": error})
         if error:
@@ -192,13 +195,7 @@ def integrate_result(result, *, workspace: Path, tools, approval, checks: list[s
             "changed_files": changed, "patch_sha256": sha,
             "diff": patch.decode("utf-8", errors="replace"),
             "verification": evidence}
-    decision = request_tool_approval(approval, approval_tool, "integrate_agent", args)
-    if decision.cancelled or decision.feedback:
-        from app.agent.cancel import Cancelled
-        raise Cancelled(decision.feedback or "integration approval cancelled")
-    if not decision.approved:
-        raise ToolExecutionError("integration approval denied")
-    cancel.raise_if_cancelled()
+    _approve_delivery(approval, approval_tool, "integrate_agent", args, cancel, phase="integration")
     if (manager.state_fingerprint() != review_baseline
             or patch_bytes(manager, result.worktree) != patch):
         raise ToolExecutionError("workspace or approved patch changed; revalidation required")

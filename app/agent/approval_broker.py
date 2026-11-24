@@ -17,10 +17,12 @@ import asyncio
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 from app.agent.approval import ApprovalPolicy, ApprovalResult, request_tool_approval
+from app.agent.user_questions import QUESTION_ACTION, normalize_answers
 from app.util.subscribers import SubscriberList
 
 
@@ -88,6 +90,8 @@ class ApprovalBroker:
         tool: Any = None,
         timeout: float | None = None,
         resolver: Callable[[], ApprovalResult | bool] | None = None,
+        cancel=None,
+        on_request: Callable[[ApprovalRequest], None] | None = None,
     ) -> ApprovalResult:
         """登记请求并同步等待决定。
 
@@ -111,6 +115,8 @@ class ApprovalBroker:
                 return ApprovalResult(False, feedback="approval broker is closed", cancelled=True)
             self._pending[request.request_id] = pending
             subscribers = self._subscribers.snapshot()
+        if on_request is not None:
+            subscribers = (*subscribers, on_request)
 
         # 订阅者异常不能破坏执行线程；前端可通过日志/事件系统单独观测自身失败。
         for callback in subscribers:
@@ -122,7 +128,7 @@ class ApprovalBroker:
         # Resolver 的整个生命周期（菜单 + 修改建议输入框）必须一次性占有 stdin。
         # 过去 select_menu 退出后会短暂 resume EscWatcher，随后 prompt_text 再次
         # pause；竞态窗口里后台线程可能抢走第一个按键，表现为输入框不出现/继续执行。
-        if resolver is not None:
+        def resolve_foreground():
             try:
                 from app.util.input_arbiter import foreground_stdin
                 with foreground_stdin():
@@ -139,7 +145,13 @@ class ApprovalBroker:
                 result = ApprovalResult(False, feedback=str(exc))
             self.resolve(request.request_id, result=result)
 
-        signalled = pending.event.wait(effective_timeout)
+        def cancel_pending():
+            self.resolve(request.request_id, result=ApprovalResult(False, cancelled=True))
+
+        with (cancel.callback(cancel_pending) if cancel is not None else nullcontext()):
+            if resolver is not None and not pending.event.is_set():
+                resolve_foreground()
+            signalled = pending.event.wait(effective_timeout)
         with self._lock:
             self._pending.pop(request.request_id, None)
         if not signalled or pending.result is None:
@@ -172,12 +184,22 @@ class ApprovalBroker:
             if pending is None or pending.event.is_set():
                 return False
             if result is None:
+                if pending.request.action == QUESTION_ACTION:
+                    return False
                 if decision not in ("approve", "deny"):
                     raise ValueError("decision must be 'approve' or 'deny'")
                 result = ApprovalResult(decision == "approve", feedback=feedback)
             pending.result = result
             pending.event.set()
             return True
+
+    def resolve_answers(self, request_id: str, answers: dict) -> bool:
+        with self._lock:
+            pending = self._pending.get(request_id)
+            if pending is None or pending.event.is_set() or pending.request.action != QUESTION_ACTION:
+                return False
+            normalized = normalize_answers(pending.request.tool_input["questions"], answers)
+            return self.resolve(request_id, result=ApprovalResult(True, answers=normalized))
 
     def close(self) -> None:
         """关闭 Broker，并拒绝/唤醒全部等待者，确保应用退出时不残留线程。"""

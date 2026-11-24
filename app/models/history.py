@@ -56,10 +56,12 @@ def _message_to_portable(message: dict[str, Any]) -> tuple[str, str] | None:
             f"{message.get('arguments') or '{}'}",
         )
     if item_type == "function_call_output":
+        output = message.get("output", "")
+        if isinstance(output, list):
+            output = "\n".join(_content_parts(output))
         return (
             "user",
-            f"[历史工具结果 {message.get('call_id', '')}] "
-            f"{message.get('output', '')}",
+            f"[历史工具结果 {message.get('call_id', '')}] {output}",
         )
 
     role = message.get("role")

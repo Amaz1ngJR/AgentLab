@@ -1026,6 +1026,14 @@ def _print_tool_result(ev) -> None:
     print(block, flush=True)
 
 
+def _print_cancelled_tool(ev: TurnEvent | RunEvent) -> None:
+    phase = {
+        "verification_approval_cancelled": "（验证命令审批取消）",
+        "integration_approval_cancelled": "（应用补丁审批取消）",
+    }.get(ev.reason, "")
+    _emit_progress_notice(f"工具已中断：{ev.tool_name}{phase}")
+
+
 def _print_event(ev: TurnEvent) -> None:
     if ev.kind == "tool_call":
         if _LIVE_INPUT is not None:
@@ -1051,6 +1059,8 @@ def _print_event(ev: TurnEvent) -> None:
         # write_file/edit_file 拒绝后也关闭 VS Code diff
         if ev.tool_name in ("write_file", "edit_file"):
             _close_active_vscode_diff()
+    elif ev.kind == "tool_cancelled":
+        _print_cancelled_tool(ev)
     elif ev.kind == "text":
         print(f"\n{_model_text(ev.text)}\n", flush=True)
 
@@ -1117,6 +1127,8 @@ def _print_run_event(ev: RunEvent, panel_state: dict | None = None) -> None:
         # write_file/edit_file 拒绝后也关闭 VS Code diff
         if ev.tool_name in ("write_file", "edit_file"):
             _close_active_vscode_diff()
+    elif kind == "tool_cancelled":
+        _print_cancelled_tool(ev)
     elif kind == run_events.MODE_SELECTED:
         mode = (ev.payload or {}).get("mode", "")
         print(f"  · 执行模式: {mode}", flush=True)
@@ -1263,7 +1275,7 @@ _TOOL_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
     ("写入", "改文件、打补丁",
      ("write_file", "edit_file", "apply_patch")),
     ("执行", "跑命令、操作交互式终端",
-     ("shell", "terminal_open", "terminal_send", "terminal_close", "terminal_list")),
+     ("shell", "exec_command", "write_stdin", "terminal_open", "terminal_send", "terminal_close", "terminal_list")),
     ("网络", "搜索与抓取网页",
      ("web_search", "web_fetch")),
     ("交互", "请求确认、管理任务、加载 Skill",
@@ -2000,6 +2012,8 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
     from app.config.loader import workspace_root
     ws = workspace_root()
     _print_init(f"workspace: {ws}")
+    from app.util.process_sandbox import sandbox_mode
+    _print_init(f"进程沙箱 : {sandbox_mode()}")
 
     # 动态生成工具列表
     from app.tools.builtin import default_tools
@@ -2125,7 +2139,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         reg.register(make_todo_write_tool(task_store))
         reg.register(make_load_skill_tool(skill_catalog, agent_profile.skills))
         # 交互式终端会话:每个 session 一个 PtySessionManager(子进程随会话生死),
-        # 注册 terminal_open/send/close/list。cwd 锁 workspace,跟 shell 一致。
+        # 命令会话和交互终端共用进程管理器及工作区。
         pty_manager = PtySessionManager(cwd=str(ws))
         for t in make_terminal_tools(pty_manager):
             reg.register(t)
@@ -2206,9 +2220,19 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         sess.skill_catalog = skill_catalog
         sess.profile_skills = list(agent_profile.skills)
         sess.base_system_prompt = sys_prompt
+        sess.commit_message_system_prompt = base_prompt
         # 附加 agent_profile 供 CLI prompt 显示用(非 AgentSession 核心属性)
         sess.agent_profile = agent_profile
         sess.session_id = session_id
+        from app.tools.builtin.view_image import make_view_image_tool
+        reg.register(make_view_image_tool(session_id, lambda: bool(getattr(sess.llm, "supports_vision", False))))
+        from app.agent.user_questions import prompt_questions
+        from app.tools.builtin.user_input import make_request_user_input_tool
+        reg.register(make_request_user_input_tool(
+            lambda questions, cancel: service.request_user_input(
+                session_id, questions, cancel, resolver=lambda: prompt_questions(questions),
+            )
+        ))
         # 附加 mem_policy 供退出时写摘要(§6.2,read_write 策略会话结束写入)
         sess.mem_policy = mem_policy
         return sess
@@ -2768,7 +2792,8 @@ def _chat_with_cancel(
                 return result
             return live_input.run(execute, token)
         except (KeyboardInterrupt, Cancelled) as exc:
-            token.cancel("keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "unspecified")
+            token.cancel("keyboard_interrupt" if isinstance(exc, KeyboardInterrupt)
+                         else exc.reason or "operation_cancelled")
             session.last_run_status = "cancelled"
             return "已中断。"
         finally:
@@ -2779,6 +2804,10 @@ def _chat_with_cancel(
                     "keyboard_interrupt": "收到 Ctrl+C / SIGINT",
                     "input_eof": "终端输入流已关闭（EOF）",
                     "approval_cancelled": "审批被取消",
+                    "verification_approval_cancelled": "子任务集成的验证命令审批被取消",
+                    "integration_approval_cancelled": "子任务补丁的应用审批被取消",
+                    "model_callback_error": "模型输出回调异常",
+                    "operation_cancelled": "工具或内部操作被取消",
                     "api_cancel": "收到 API 取消请求",
                     "service_shutdown": "运行服务关闭",
                     "input_worker_error": "执行或输入协程异常，详情见错误信息",

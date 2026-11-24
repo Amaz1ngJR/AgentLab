@@ -37,6 +37,41 @@ def test_build_system_prompt_without_workspace_is_default():
 from tests.support.runtime import FakeRouter, _echo_tool, _registry_with, _resp_text, _resp_tool
 
 
+def test_oauth_commit_message_uses_small_context_and_restores_normal_workflow():
+    from app.skills import SkillCatalog
+    from app.skills.loader import Skill
+    from tests.support.delegation import SnapshotRouter, response
+
+    class OAuthRouter(SnapshotRouter):
+        provider = "openai_chatgpt"
+
+    shell = Tool("shell", "read Git state", {}, lambda _: "pending changes")
+    write_file = Tool("write_file", "write content", {}, lambda _: "written")
+    model = OAuthRouter([
+        ModelResponse("", [ToolCall("git", "shell", {})], {}, []),
+        response("feat: 改善用量"),
+        ModelResponse("", [ToolCall("write", "write_file", {})], {}, []),
+        response("done"),
+    ])
+    session = AgentSession(model, _registry_with(shell, write_file), system_prompt="recent memories")
+    session.commit_message_system_prompt = "profile instructions"
+    session.base_system_prompt = "recent memories"
+    session.skill_catalog = SkillCatalog({
+        "git-commit": Skill("git-commit", "Git workflow", workflow="full Git workflow",
+                            triggers=["提交"], enabled=True),
+    })
+    assert session.chat("请看下当前改动，拟一条提交说明，不修改文件，不提交或推送。") == "feat: 改善用量"
+    for request in model.calls[:2]:
+        assert {tool["name"] for tool in request["tools"]} == {"shell"}
+        assert "profile instructions" in request["system"]
+        assert "recent memories" not in request["system"]
+        assert "full Git workflow" not in request["system"]
+    assert session.chat("请修改代码，并拟一条提交说明") == "done"
+    assert {tool["name"] for tool in model.calls[2]["tools"]} == {"shell", "write_file"}
+    assert "recent memories" in model.calls[2]["system"]
+    assert "full Git workflow" in model.calls[2]["system"]
+
+
 def _danger_tool() -> Tool:
     return Tool(
         name="danger",

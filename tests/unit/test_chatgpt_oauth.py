@@ -162,6 +162,79 @@ def test_completed_tool_then_result_replay(adapter, monkeypatch):
     assert params["input"][1]["call_id"] == "c1"
 
 
+def test_request_events_and_partial_usage_survive_a_failed_runtime_turn(adapter, monkeypatch, tmp_path):
+    from app.agent.profiles import AgentProfile
+    from app.agent.runtime import AgentSession
+    from app.agent.service import RuntimeService
+    from app.agent.session_router import SessionRouter
+    from app.models.router import ModelRouter
+    from app.storage import Storage
+    from app.tools.registry import Tool, ToolRegistry
+
+    adapter._cfg.context_size = 64000
+    completed = complete([item(type="function_call", name="echo", call_id="c1", arguments="{}")])
+    completed.response.id = "resp_accepted"
+    completed.response.usage.input_tokens_details = NS(cached_tokens=4)
+    attempts = iter([
+        NS(type="response.failed", code="server_error"),
+        completed,
+        NS(type="response.failed", code="admission_denied"),
+    ])
+    sent = []
+
+    def client_factory():
+        event = next(attempts)
+        stream = MagicMock()
+        stream.response = NS(headers={"x-request-id": f"req_{len(sent) + 1}"}, status_code=200)
+        stream.__iter__.return_value = iter([event])
+        client = MagicMock()
+        client.__enter__.return_value = client
+
+        def create(**params):
+            sent.append(params)
+            return stream
+
+        client.responses.create.side_effect = create
+        stream.__enter__.return_value = stream
+        return client
+
+    monkeypatch.setattr(adapter, "_client", client_factory)
+    registry = ToolRegistry()
+    registry.register(Tool("echo", "return evidence", TOOLS[0]["input_schema"], lambda _: "evidence"))
+    llm = ModelRouter(adapter, retry_sleep=lambda _: None)
+    with_storage = Storage(tmp_path / "audit.db")
+    router = SessionRouter(
+        with_storage, lambda profile, sid: AgentSession(llm, registry, system_prompt="stable policy"),
+        {"default": AgentProfile("default", "Default", "chatgpt_codex")},
+    )
+    sid = router.new("default")
+    service = RuntimeService(router)
+    try:
+        with pytest.raises(ChatGPTError, match="admission_denied"):
+            service.send_message("查看结果", run_id="audited")
+        rows = [row for row in with_storage.list_runtime_events(sid) if row["kind"].startswith("model.request.")]
+        assert [row["kind"] for row in rows] == [
+            "model.request.finished", "model.request.retry", "model.request.finished", "model.request.finished",
+        ]
+        first, retry, success, last = [row["payload"] for row in rows]
+        assert first["call_id"] == retry["call_id"] == success["call_id"] != last["call_id"]
+        assert [first["attempt"], success["attempt"], last["attempt"]] == [1, 2, 1]
+        assert [first["status"], success["status"], last["status"]] == ["failed", "completed", "failed"]
+        assert first["input_tokens"] is None and last["cached_tokens"] is None
+        assert success["input_tokens"] == 10 and success["cached_tokens"] == 4 and success["output_tokens"] == 3
+        assert success["request_id"] == "req_2" and success["response_id"] == "resp_accepted"
+        assert "evidence" not in json.dumps(rows)
+        assert [item.get("role") for item in sent[0]["input"]] == ["developer", "developer", "user"]
+        assert sent[0] == sent[1]
+        assert sent[2]["input"][:len(sent[0]["input"])] == sent[0]["input"]
+        turn = with_storage.get_runtime_turn("audited")
+        assert (turn["status"], turn["input_tokens"], turn["output_tokens"]) == ("failed", 10, 3)
+        assert turn["usage_details"]["cache_read_input_tokens"] == 4
+    finally:
+        service.close()
+        with_storage.close()
+
+
 def test_no_completed_event_never_returns_tool_calls(adapter, monkeypatch):
     call = item(type="function_call", name="echo", call_id="c1", arguments="{}")
     set_events(adapter, monkeypatch, [NS(type="response.output_item.done", output_index=0, item=call)])

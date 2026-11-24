@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from app.attachments import ImageAttachment
 
 # 流式回调签名
 ProgressCallback = Callable[[dict[str, int]], None]
@@ -47,6 +50,24 @@ class ToolResult:
     tool_call_id: str
     output: str
     is_error: bool = False
+    images: tuple[ImageAttachment, ...] = ()
+
+    def __post_init__(self):
+        if isinstance(self.output, ImageToolOutput):
+            self.images = () if self.is_error else (self.output.image,)
+            self.output = str(self.output)
+
+
+class ImageToolOutput(str):
+    """Keep legacy text rendering and auditing while carrying a validated image."""
+
+    def __new__(cls, text: str, image: ImageAttachment):
+        result = super().__new__(cls, text)
+        result.image = image
+        return result
+
+    def __getnewargs__(self):
+        return str(self), self.image
 
 
 @dataclass

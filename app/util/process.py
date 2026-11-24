@@ -11,6 +11,27 @@ import time
 from app.agent.cancel import CancelToken
 
 
+def terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Stop a subprocess started in its own process group."""
+    if platform.system() == "Windows":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def run_process(argv: list[str], *, cwd: str, timeout: float, cancel: CancelToken | None = None):
     if cancel is None:
         return subprocess.run(
@@ -29,25 +50,6 @@ def run_process(argv: list[str], *, cwd: str, timeout: float, cancel: CancelToke
     stop_lock = threading.RLock()
     stopping = False
 
-    def kill_tree() -> None:
-        if windows:
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            finally:
-                if proc.poll() is None:
-                    proc.kill()
-        else:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
     def stop() -> None:
         nonlocal stopping
         with stop_lock:
@@ -56,9 +58,10 @@ def run_process(argv: list[str], *, cwd: str, timeout: float, cancel: CancelToke
             stopping = True
         # Windows tree termination can itself block; keep it off the input thread.
         if windows:
-            threading.Thread(target=kill_tree, name="agentlab-process-stop", daemon=True).start()
+            threading.Thread(target=terminate_process_tree, args=(proc,),
+                             name="agentlab-process-stop", daemon=True).start()
         else:
-            kill_tree()
+            terminate_process_tree(proc)
 
     def reap() -> None:
         try:
