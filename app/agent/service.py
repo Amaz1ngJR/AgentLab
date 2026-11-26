@@ -720,9 +720,21 @@ class RuntimeService:
             ),
         )
         accumulated_usage: dict[str, int] = {}
+        audited_usage: dict[str, int] = {}
+        usage_lock = threading.Lock()
         accumulated_seconds = 0.0
 
         def record_request(kind, payload):
+            if kind == "model.request.finished":
+                with usage_lock:
+                    for event_key, usage_key in (
+                        ("input_tokens", "input_tokens"), ("output_tokens", "output_tokens"),
+                        ("cached_tokens", "cache_read_input_tokens"),
+                        ("cache_creation_input_tokens", "cache_creation_input_tokens"),
+                    ):
+                        value = payload.get(event_key)
+                        if isinstance(value, int):
+                            audited_usage[usage_key] = audited_usage.get(usage_key, 0) + value
             self._publish_protocol(kind=kind, thread_id=target_id, turn_id=actual_run_id, payload=payload)
 
         def execute_chat(text, **kwargs):
@@ -736,6 +748,11 @@ class RuntimeService:
                 accumulated_seconds += getattr(session, "last_turn_seconds", 0.0)
 
         def save_finished_turn(status: TurnStatus, failure_code=None):
+            # Runtime counters already include successful requests. Audit totals
+            # recover observed usage from retries or failures without adding it twice.
+            with usage_lock:
+                for key, value in audited_usage.items():
+                    accumulated_usage[key] = max(accumulated_usage.get(key, 0), value)
             if storage is None:
                 return
             details = {key: accumulated_usage[key] for key in (

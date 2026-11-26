@@ -599,9 +599,9 @@ JsonParser --> Loop : parsed action / validation error
 ```yaml
 # config/models.yaml
 models:
-  local_qwen:
+  local_qwen3_14b:
     provider: ollama
-    model: qwen2.5-coder:7b-instruct
+    model: qwen3:14b
     base_url: http://127.0.0.1:11434/v1
     capabilities: [chat, tools, streaming]
     params:
@@ -624,7 +624,7 @@ models:
 运行时选择：
 
 ```bash
-python -m app --profile local_qwen
+python -m app --profile local_qwen3_14b
 python -m app --profile cloud_claude
 python -m app serve --profile cloud_gpt
 ```
@@ -838,7 +838,7 @@ agents:
   coding:
     name: Coding Agent
     description: 代码理解、修改、测试和代码审查
-    model_profile: local_qwen
+    model_profile: local_qwen3_14b
     system_prompt: prompts/coding.md
     skills: [code-review]
     tools: [read_file, write_file, list_dir, code_search, shell, todo_write]
@@ -1243,7 +1243,7 @@ goal:
   constraints:
     allowed_paths: ["app/web/", "tests/"]
     forbidden_actions: ["delete_database", "publish_release"]
-    model_profile: "local_qwen"
+    model_profile: "local_qwen3_14b"
   verification_plan:
     checks:
       - type: command

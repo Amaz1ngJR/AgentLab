@@ -11,16 +11,24 @@ from app.models.router import ModelRouter, call_create_message
 from app.models.protocol import ModelResponse
 from app.models.openai_adapter import ProviderStreamError
 from app.agent.cancel import CancelToken
+from app.config.schemas import LLMConfig
 
 
 READ = {"name": "read", "input_schema": {"type": "object", "properties": {}}}
 WRITE = {"name": "write", "input_schema": {"type": "object", "properties": {}}}
 
 
+@pytest.fixture(autouse=True)
+def isolated_oauth_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHATGPT_AUTH_DIR", str(tmp_path))
+
+
 def adapter():
-    result = ChatGPTAdapter.__new__(ChatGPTAdapter)
-    result._cfg = SimpleNamespace(model="gpt-6.1-sol", context_size=64000, chatgpt_account="default", reasoning_effort="medium")
-    return result
+    return ChatGPTAdapter(LLMConfig(
+        provider="openai_chatgpt", model="gpt-6.1-sol", base_url=None, api_key=None,
+        auth_token=None, temperature=0.7, top_p=None, context_size=64000,
+        timeout_seconds=60, stream=True, reasoning_effort="medium",
+    ))
 
 
 def test_append_updates_do_not_rewrite_previous_wire_prefix():
@@ -159,6 +167,7 @@ def test_dynamic_spawn_budget_maps_wire_version_to_current_local_tool():
 def test_compaction_rebuilds_only_current_state_and_tail_dependencies():
     from app.agent.context_compaction import ContextCompressor
     from app.models.append_prefix import INSTRUCTION, definitions_in, tool_bindings
+    from app.models.chatgpt_adapter import ChatGPTAdapter
     from tests.support.context import _VALID_SUMMARY
     messages = [{"role": "user", "content": "old conversation " * 3000}]
     prepare_history(messages, [READ, WRITE], "obsolete instructions " * 2000)
@@ -169,7 +178,8 @@ def test_compaction_rebuilds_only_current_state_and_tail_dependencies():
         {"type": "function_call_output", "call_id": "c1", "output": "read result"}])
     original = copy.deepcopy(messages)
     model = SimpleNamespace(create_message=Mock(return_value=ModelResponse(
-        json.dumps(_VALID_SUMMARY), [], {"input_tokens": 100, "output_tokens": 10}, [])))
+        json.dumps(_VALID_SUMMARY), [], {"input_tokens": 100, "output_tokens": 10}, [])),
+        rebuild_request_history=ChatGPTAdapter.rebuild_request_history)
     result = ContextCompressor(model).compact(messages, keep_recent=3,
         current_system="current instructions", current_tools=[changed], target_message_tokens=5000)
     assert result.compacted

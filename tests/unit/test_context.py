@@ -90,6 +90,36 @@ def _summary_resp():
     return _resp_text(json.dumps(_VALID_SUMMARY, ensure_ascii=False))
 
 
+@pytest.mark.parametrize("valid_summary", [True, False])
+def test_verification_compaction_keeps_recent_tool_pairs_and_does_not_retry_summary(valid_summary):
+    model = FakeRouter([_summary_resp() if valid_summary else _resp_text("invalid summary")])
+    context = ContextManager(ContextBudget.from_context_size(100_000), ContextCompressor(model))
+    goal = {"role": "user", "content": "重构登录模块，不要改数据库 schema"}
+    evidence = [
+        message for i in range(10) for message in (
+            {"type": "function_call", "name": "read_file", "arguments": "{}", "call_id": f"read-{i}"},
+            {"type": "function_call_output", "output": "源码" * 2_500, "call_id": f"read-{i}"},
+        )
+    ]
+    recent = [
+        message for i in range(4) for message in (
+            {"type": "function_call", "name": "shell", "arguments": "{}", "call_id": f"check-{i}"},
+            {"type": "function_call_output", "output": "tests passed", "call_id": f"check-{i}"},
+        )
+    ]
+    original = [goal, *evidence, *recent]
+    messages = original.copy()
+    usage = []
+    assert context.maybe_compact(messages, verification=True, on_summary_usage=usage.append) is valid_summary
+    assert len(model.calls) == 1
+    assert usage == [{"input_tokens": 5, "output_tokens": 3}]
+    if valid_summary:
+        assert goal in messages and messages[-len(recent):] == recent
+        assert context.estimate(original) - context.estimate(messages) >= 12_000
+    else:
+        assert messages == original
+
+
 # ── token 估算 ────────────────────────────────────────────────────────────────
 
 

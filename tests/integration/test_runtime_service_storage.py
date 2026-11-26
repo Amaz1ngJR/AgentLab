@@ -62,7 +62,7 @@ def test_blocked_turn_keeps_answer_and_reason_without_reporting_completion(tmp_p
     events = []
     service.subscribe_protocol(events.append)
     try:
-        answer = service.send_message("看下历史日志", run_id="blocked")
+        answer = service.send_message("继续交付", run_id="blocked")
         assert "找到日志证据" in answer
         turn = storage.get_runtime_turn("blocked")
         assert turn["status"] == "blocked"

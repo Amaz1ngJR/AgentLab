@@ -247,6 +247,23 @@ def test_streaming_callbacks_are_invoked():
     assert final["output_tokens"] == 8
 
 
+def test_request_audit_distinguishes_reported_usage_from_missing_usage():
+    from app.models.request_audit import observe_model_requests
+
+    cfg = _cfg()
+    cfg.provider = "openai_compatible"
+    attempts = []
+    with patch("openai.OpenAI") as sdk, observe_model_requests(lambda kind, payload: attempts.append(payload)):
+        sdk.return_value.chat.completions.create.side_effect = [
+            _stream_text("ok"), iter([_chunk(content="ok", finish_reason="stop")]),
+        ]
+        adapter = OpenAICompatibleAdapter(cfg)
+        adapter.create_message([])
+        adapter.create_message([])
+        assert sdk.call_args.kwargs["max_retries"] == 0
+    assert [(p["input_tokens"], p["output_tokens"]) for p in attempts] == [(20, 8), (None, None)]
+
+
 def _stream_thinking(reasoning: str, answer: str, prompt_tokens=12, completion_tokens=6):
     """模拟深度思考模型:先吐 reasoning_content,再吐正式 content。"""
     chunks = [_chunk(reasoning=ch) for ch in reasoning]

@@ -34,6 +34,19 @@ def test_resume_keeps_structured_history_for_openai():
     assert _portable_for(_Session("openai"), messages) == messages
 
 
+def test_openai_wire_conversion_skips_oauth_instruction_and_private_metadata():
+    from app.models.append_prefix import INSTRUCTION
+    from app.models.openai_adapter import _convert_messages_to_responses_format
+
+    messages = [
+        {"type": "message", "role": "developer", "content": "OAuth rules", INSTRUCTION: True},
+        {"type": "message", "role": "user", "content": "summary", "_agentlab_summary": True},
+    ]
+    assert _convert_messages_to_responses_format(messages) == [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "summary"}]},
+    ]
+
+
 def test_resume_leaves_clean_history_untouched():
     clean = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
     assert _portable_for(_Session("anthropic"), clean) == clean

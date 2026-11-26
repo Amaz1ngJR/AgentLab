@@ -219,13 +219,13 @@ def test_reasoning_parameter_omitted_when_not_configured():
     assert "reasoning" not in params
 
 
-def test_reasoning_only_response_retries_with_lower_effort():
+def test_zero_output_usage_with_reasoning_item_retries_with_lower_effort():
     cfg = _cfg()
     cfg.reasoning_effort = "high"
     with patch("openai.OpenAI") as MockOpenAI:
         client = MockOpenAI.return_value
         client.responses.stream.side_effect = [
-            _FakeStream([], _build_final([_reasoning_item()], out_tokens=89)),
+            _FakeStream([], _build_final([_reasoning_item()], out_tokens=0)),
             _FakeStream([], _build_final([_message_item("OK")], out_tokens=6)),
         ]
         response = OpenAIAdapter(cfg).create_message(
@@ -234,7 +234,7 @@ def test_reasoning_only_response_retries_with_lower_effort():
         )
 
     assert response.text == "OK"
-    assert response.usage == {"input_tokens": 24, "output_tokens": 95}
+    assert response.usage == {"input_tokens": 24, "output_tokens": 6}
     assert response.provider_payload[0]["type"] == "message"
     assert client.responses.stream.call_args_list[0].kwargs["reasoning"] == {"effort": "high"}
     assert client.responses.stream.call_args_list[1].kwargs["reasoning"] == {"effort": "low"}
@@ -276,13 +276,13 @@ def test_empty_final_output_recovers_structured_tool_call():
     assert client.responses.stream.call_count == 1
 
 
-def test_empty_final_output_with_reasoning_usage_retries_lower_effort():
+def test_empty_final_output_without_output_usage_retries_lower_effort():
     cfg = _cfg()
     cfg.reasoning_effort = "high"
     with patch("openai.OpenAI") as MockOpenAI:
         client = MockOpenAI.return_value
         client.responses.stream.side_effect = [
-            _FakeStream([_reasoning_delta_event("思考中")], _build_final([], out_tokens=99)),
+            _FakeStream([], _build_final([], out_tokens=0)),
             _FakeStream([], _build_final([_message_item("OK")], out_tokens=8)),
         ]
         response = OpenAIAdapter(cfg).create_message(
@@ -290,7 +290,7 @@ def test_empty_final_output_with_reasoning_usage_retries_lower_effort():
         )
 
     assert response.text == "OK"
-    assert response.usage["output_tokens"] == 107
+    assert response.usage["output_tokens"] == 8
     assert client.responses.stream.call_args_list[1].kwargs["reasoning"] == {"effort": "none"}
 
 
@@ -300,7 +300,7 @@ def test_empty_final_output_still_empty_after_fallback_reports_state():
     with patch("openai.OpenAI") as MockOpenAI:
         client = MockOpenAI.return_value
         client.responses.stream.side_effect = [
-            _FakeStream([], _build_final([], out_tokens=99)),
+            _FakeStream([], _build_final([], out_tokens=0)),
             _FakeStream([], _build_final([], out_tokens=30)),
         ]
         with pytest.raises(ProviderStreamError, match="空输出") as exc:
@@ -308,6 +308,35 @@ def test_empty_final_output_still_empty_after_fallback_reports_state():
 
     assert "output_types=[]" in str(exc.value)
     assert client.responses.stream.call_count == 2
+
+
+@pytest.mark.parametrize("status,output_tokens", [("completed", 99), ("incomplete", 0)])
+def test_empty_gateway_response_is_audited_without_replaying_prompt(status, output_tokens):
+    from types import SimpleNamespace
+    from app.models.request_audit import observe_model_requests
+
+    cfg = _cfg()
+    cfg.base_url = "https://gateway.example/v1"
+    cfg.reasoning_effort = "high"
+    final = _build_final([], in_tokens=10000, out_tokens=output_tokens)
+    final.id = "resp_gateway"
+    final.status = status
+    events = []
+    with patch("openai.OpenAI") as sdk, observe_model_requests(lambda kind, data: events.append(data)):
+        client = sdk.return_value
+        client.responses.create.return_value = iter([
+            SimpleNamespace(type=f"response.{status}", response=final),
+        ])
+        with pytest.raises(ProviderStreamError, match="空输出"):
+            OpenAIAdapter(cfg).create_message([{"role": "user", "content": "test"}])
+        client.responses.create.assert_called_once()
+        client.responses.stream.assert_not_called()
+        assert sdk.call_args.kwargs["max_retries"] == 0
+
+    assert len(events) == 1
+    assert (events[0]["response_id"], events[0]["input_tokens"], events[0]["output_tokens"]) == (
+        "resp_gateway", 10000, output_tokens,
+    )
 
 
 def test_streamed_text_survives_missing_final_message_item():
@@ -327,21 +356,18 @@ def test_streamed_text_survives_missing_final_message_item():
     assert client.responses.stream.call_count == 1
 
 
-def test_persistently_reasoning_only_response_reports_provider_state():
+def test_paid_reasoning_only_response_reports_provider_state_without_retry():
     cfg = _cfg()
     cfg.reasoning_effort = "high"
     with patch("openai.OpenAI") as MockOpenAI:
         client = MockOpenAI.return_value
-        client.responses.stream.side_effect = [
-            _FakeStream([], _build_final([_reasoning_item()])),
-            _FakeStream([], _build_final([_reasoning_item()])),
-        ]
+        client.responses.stream.return_value = _FakeStream([], _build_final([_reasoning_item()]))
         with pytest.raises(ProviderStreamError, match="仅返回推理内容") as exc:
             OpenAIAdapter(cfg).create_message(messages=[{"role": "user", "content": "test"}])
 
     assert "status=completed" in str(exc.value)
     assert "output_types=['reasoning']" in str(exc.value)
-    assert client.responses.stream.call_count == 2
+    assert client.responses.stream.call_count == 1
 
 
 def test_refusal_is_returned_as_visible_text_without_reasoning_retry():

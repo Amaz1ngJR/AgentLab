@@ -51,8 +51,8 @@ DEFAULT_SYSTEM_PROMPT = """你是 AgentLab,一个本地编码助手。
 【常规约定】
 - 用户用中文对话时,回复也用中文。
 - 写代码时简洁优先,不要过度解释。
-- 任务复杂(需要 3 步以上,或涉及多个文件)时,先用 todo_write 列出子任务清单,
-  然后边做边把任务从 pending → in_progress → completed,让用户看见进度。简单任务不必用。
+- 复杂任务可用 todo_write 跟踪进度。把更新与下一批实际工具操作放在同一次响应中；
+  只有任务状态实质变化时才更新，简单任务无需调用。
 - 如果工具返回"User denied execution",说明用户拒绝了这次操作,不要立即重试,
   而是向用户简短说明,询问替代方案或直接停下。
 
@@ -132,6 +132,22 @@ def _is_commit_message_request(user_input: str) -> bool:
         r"\bcommit\s+(?:the|these|all|it|them|my|current|staged)\b|\breview\s+(?:the\s+)?(?:code|changes)\b",
         clause,
     ) for clause in positive)
+
+
+def _is_read_only_followup(user_input: str) -> bool:
+    text = re.sub(r"^继续\s*[，,：:]\s*", "", user_input.strip().lower())
+    if not re.match(
+        r"^(?:(?:请(?:你)?\s*)?(?:帮我\s*)?|please\s+)(?:告诉我|解释|分析|看下|看一下|查看|检查|梳理|"
+        r"如何|怎么|为什么|是否|能否|what\b|why\b|how\b|explain\b|inspect\b|show\b)",
+        text,
+    ):
+        return False
+    return not any(_requires_tool_execution(clause) or re.search(
+        r"(?:继续|接着|并且?|然后|再|现在|直接)\s*(?:开发|修改|修复|迁移|实现|部署|集成|交付|接管|写入|提交|验证|验收|运行测试)"
+        r"|\b(?:and|then|also|now)\s+(?:run|test|write|deploy|commit|push|integrate)\b"
+        r"|/resume\b|\bresume\b|\badopt_current\b|继续上一轮|继续未完成|交付状态|验收状态|子任务|委派|子\s*agent|\bsubagents?\b",
+        clause,
+    ) for clause in re.split(r"[，。！？；,!?;\n]", text))
 
 
 def _looks_like_pseudo_tool_call(text: str, *, action_request: bool) -> bool:
@@ -214,6 +230,10 @@ class AgentSession:
         self.approval: ApprovalPolicy = approval or AutoApprove()
         from app.tools.builtin import with_tool_guidance
         self.system_prompt = with_tool_guidance(system_prompt, tools)
+        if tools.get("shell") is not None:
+            self.system_prompt += "\n\n用户仅要求拟定提交说明时，只做只读 Git 查询并返回建议的说明。"
+        self.base_system_prompt = self.system_prompt
+        self._turn_guidance = ""
         if max_steps <= 0:
             raise ValueError("max_steps 必须 > 0")
         if max_task_steps is not None and max_task_steps <= 0:
@@ -298,12 +318,13 @@ class AgentSession:
         profile_skills = getattr(self, "profile_skills", None)
         base_prompt = getattr(self, "base_system_prompt", self.system_prompt)
         self._delegation_workflow = ""
+        self._turn_guidance = ""
         if self._commit_message_only:
-            self.system_prompt = (
-                f"{self.commit_message_system_prompt}\n\n"
+            self.system_prompt = base_prompt
+            self._turn_guidance = (
+                "【以下 Git 工作流仅适用于本轮】\n"
                 "根据工作区状态、暂存与未暂存的差异及近期提交风格拟定提交说明。"
                 "把互不依赖的 Git 查询放到同一批工具调用；先读统计，只有证据不足时才读有针对性的 diff。"
-                "只返回建议的提交说明；本轮仅执行只读 Git 查询。"
             )
             return
         if catalog is None:
@@ -314,15 +335,14 @@ class AgentSession:
             skill for skill in (catalog.load_skill(s.skill_id) for s in activated) if skill
         ]
         workflow = catalog.build_skill_context(loaded)
+        if workflow:
+            self._turn_guidance = "【以下本地工作流仅适用于本轮任务】\n" + workflow
         self._delegation_workflow = "\n".join(skill.workflow for skill in loaded)
         skill_index = catalog.build_skill_index(profile_skills)
         catalog.record_disclosure(
             catalog.index(profile_skills), loaded, len(skill_index), len(workflow),
         )
-        from app.tools.builtin import with_tool_guidance
-        self.system_prompt = with_tool_guidance(
-            f"{base_prompt}\n\n{workflow}" if workflow else base_prompt, self.tools,
-        )
+        self.system_prompt = base_prompt
         if self._orch is not None:
             self._orch._system = self.system_prompt
 
@@ -401,7 +421,7 @@ class AgentSession:
         for manager in self._retiring_managers:
             manager.cancel_all()
             manager.pump()
-        for c in self._closeables:
+        for c in [*self._closeables, self.llm]:
             stop = getattr(c, "stop", None) or getattr(c, "close", None)
             if stop is not None:
                 try:
@@ -434,6 +454,9 @@ class AgentSession:
 
         # 更新 LLM 和 Planner
         self.llm = new_llm
+        bind_scope = getattr(new_llm, "bind_cache_scope", None)
+        if callable(bind_scope) and getattr(self, "session_id", None):
+            bind_scope(self.session_id)
         if new_planner is not None:
             self._planner = new_planner
 
@@ -538,14 +561,31 @@ class AgentSession:
         self.last_turn_seconds = 0.0
         self.last_run_error = ""
         mode = self._select_mode(user_input, images, resume)
+        read_only_followup = (not resume and mode is not ExecutionMode.LOOP
+                              and _is_read_only_followup(user_input)
+                              and (mode is ExecutionMode.DIRECT or self.messages or self.child_records
+                                   or not self.task_store.is_empty()))
+        if read_only_followup:
+            # The non-resume planner clears the task store. An independent
+            # follow-up uses the direct read loop and leaves the plan available.
+            mode = ExecutionMode.DIRECT
+        inherited_tasks = {(task.id, task.content, task.status) for task in self.task_store.all()
+                           if task.status != "completed"} if read_only_followup else set()
         self._commit_message_only = (
             mode is ExecutionMode.DIRECT and not images and not resume
-            and getattr(self.llm, "provider", "") == "openai_chatgpt"
-            and hasattr(self, "commit_message_system_prompt")
             and self.tools.get("shell") is not None
             and _is_commit_message_request(user_input)
         )
         self._prepare_skill_context(user_input)
+        if not self._commit_message_only and hasattr(self, "memory_context"):
+            previous_memory = next((item["content"] for item in reversed(self.messages)
+                                    if item.get("_agentlab_memory_context")), None)
+            if self.memory_context or previous_memory is not None:
+                memory = ("【本会话的最新记忆，替代此前的记忆提示】\n"
+                          + (self.memory_context or "当前无相关记忆。"))
+                if previous_memory != memory:
+                    self.messages.append({"role": "user", "content": memory,
+                                          "_agentlab_memory_context": True})
         self._last_mode = mode
         # 每条路径都发事件：Direct 也要让 CLI/协议订阅方知道这轮没有走 Planner。
         self._emit_run_event(RunEvent(
@@ -591,21 +631,26 @@ class AgentSession:
         resume_workflow = ""
         pending_delivery = any(
             not record.get("superseded_by") and not record.get("continuation_id")
+            and record.get("delivery_status") != "parent_verified"
             and (record.get("execution_status", record.get("status")) != "succeeded"
                  or (not record.get("spec", {}).get("read_only", True)
                      and record.get("delivery_status") != "integrated"))
             for record in latest_records
         )
+        # A question about the code must not create a new delegated run over a
+        # pending delivery or give its model access to the old delivery tools.
+        delegation_policy = "off" if read_only_followup and pending_delivery else self.delegation_policy
         newly_allowed = delegation_allowed(
-            self.delegation_policy, user_input,
+            delegation_policy, user_input,
             workflow=getattr(self, "_delegation_workflow", ""),
         )
-        if (resume or pending_delivery) and latest_records and latest_records[-1].get("delegation_allowed"):
+        restore_delivery = resume or (pending_delivery and not read_only_followup)
+        if restore_delivery and latest_records and latest_records[-1].get("delegation_allowed"):
             # Resume continues an already authorized run, not a fresh implicit delegation.
             # delegation_allowed still gives off and a new user veto precedence.
             resume_workflow = "使用子 agent 继续已授权任务"
         self._delegation_allowed = delegation_allowed(
-            self.delegation_policy, user_input,
+            delegation_policy, user_input,
             workflow=getattr(self, "_delegation_workflow", "") + resume_workflow,
         )
         source = self.tools
@@ -627,7 +672,7 @@ class AgentSession:
             on_event=self._emit_run_event, checkpoint=checkpoint,
             history=self.messages,
         )
-        if (resume or pending_delivery) and self._delegation_allowed:
+        if restore_delivery and self._delegation_allowed:
             manager.restore_results(latest_records, messages=self.messages, restore_budget=resume)
         if self._auto_execute_enabled:
             manager.enable_long_run(self.auto_max_steps, self.auto_max_tool_calls, self.auto_timeout_seconds)
@@ -639,14 +684,15 @@ class AgentSession:
             return text
         try:
             if mode is ExecutionMode.DIRECT:
-                answer = self._chat_legacy(user_input, images=images, cancel=cancel)
+                answer = self._chat_legacy(user_input, images=images, cancel=cancel,
+                                           read_only_followup=read_only_followup)
             else:
                 answer = self._chat_orchestrated(user_input, images=images, cancel=cancel, resume=resume)
             manager.pump()
             if manager.budget_error:
                 return report_budget()
             unresolved = manager.unresolved()
-            if pending_delivery and not self._delegation_allowed:
+            if pending_delivery and restore_delivery and not self._delegation_allowed:
                 unresolved.append("上一轮子任务仍未交付；当前委派策略或用户限制禁止恢复执行")
             delivery_errors = list(self.tools.delivery_errors.values())
             if (unresolved or delivery_errors) and self.last_run_status == "completed":
@@ -655,7 +701,16 @@ class AgentSession:
                 answer += "\n\n委派尚未交付：" + self.last_run_error
                 self._emit_run_event(RunEvent(kind=events.RUN_FAILED, text=answer,
                                              payload={"children": manager.records()}))
-            open_tasks = [task.content for task in self.task_store.all() if task.status != "completed"]
+            for task in self.task_store.all():
+                sid = task.execution.get("child_run_id")
+                child = manager.children.get(sid)
+                if (task.status != "completed" and child is not None and child.result is not None
+                        and child.result.delivery_status == "parent_verified"):
+                    self.task_store.get(task.id).execution["result"] = manager.snapshot(sid)
+                    self.task_store.update_status(task.id, "completed", error="",
+                                                  evidence="父任务已批准并验证当前共享工作区")
+            open_tasks = [task.content for task in self.task_store.all() if task.status != "completed"
+                          and (task.id, task.content, task.status) not in inherited_tasks]
             if open_tasks and self.last_run_status == "completed":
                 self.last_run_status = "blocked"
                 self.last_run_error = "任务清单尚未完成：" + "; ".join(open_tasks)
@@ -718,6 +773,7 @@ class AgentSession:
                     resume=resume,
                     append_goal_message=False,
                     auto_execute=self._auto_execute_enabled,
+                    turn_guidance=self._turn_guidance,
                 )
             else:
                 answer = orch.run(
@@ -725,6 +781,7 @@ class AgentSession:
                     cancel=cancel,
                     resume=resume,
                     auto_execute=self._auto_execute_enabled,
+                    turn_guidance=self._turn_guidance,
                 )
             # 把 run 级统计拷回 session,供 CLI 展示 / 持久化
             self.last_turn_usage = dict(orch.last_run_usage)
@@ -744,7 +801,22 @@ class AgentSession:
         *,
         images: list[ImageAttachment] | None = None,
         cancel: Optional[CancelToken] = None,
+        read_only_followup: bool = False,
     ) -> str:
+        previous_messages = len(self.messages)
+        projected_history = None
+        if (read_only_followup and self.context_manager is not None
+                and getattr(self.context_manager, "auto_compact", False)):
+            from app.agent.context import project_read_only_history
+            history = project_read_only_history(
+                self.messages, replays_encrypted_reasoning=getattr(self.llm, "replays_encrypted_reasoning", False),
+                safe_input_limit=self.context_manager.budget.safe_input_limit,
+            )
+            if history is not self.messages:
+                projected_history = history
+        if self._turn_guidance:
+            self.messages.append({"role": "user", "content": self._turn_guidance,
+                                  "_agentlab_turn_guidance": True})
         self.messages.append({
             "role": "user",
             "content": build_user_content(user_input, images),
@@ -767,6 +839,15 @@ class AgentSession:
             corrected_no_tool = False
             max_steps = self.max_steps
             tool_context = user_input
+            workspace_changed = False
+            verification_rounds = 0
+            verification_compaction_checked = False
+            consecutive_low_cache = 0
+
+            def record_usage(usage):
+                for key, value in usage.items():
+                    self.last_turn_usage[key] = self.last_turn_usage.get(key, 0) + value
+                    self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + value
 
             def consume_steering():
                 nonlocal tool_context
@@ -776,6 +857,9 @@ class AgentSession:
                     if self._commit_message_only:
                         self._commit_message_only = False
                         self._prepare_skill_context(tool_context)
+                        if self._turn_guidance:
+                            self.messages.append({"role": "user", "content": self._turn_guidance,
+                                                  "_agentlab_turn_guidance": True})
                 return steering
 
             step_index = -1
@@ -789,16 +873,43 @@ class AgentSession:
                         kind="text", text="已中断。",
                     ))
                     return "已中断。"
-                consume_steering()
+                steering = consume_steering()
+                if steering or workspace_changed:
+                    projected_history = None
                 manager = delegated_manager(self.tools)
                 if manager is not None:
                     manager.deliver(self.messages)
                     manager.charge_parent_round()
                 tools = self._tools_for_task(tool_context, mode="direct")
                 if self.context_manager is not None:
-                    self.context_manager.compact_before_model_call(
-                        self.messages, system=self.system_prompt, tools=tools, cancel=cancel,
-                    )
+                    compacted = False
+                    if (verification_rounds >= 2 and consecutive_low_cache >= 2
+                            and not verification_compaction_checked and not steering):
+                        from app.agent.context import VERIFICATION_COMPACTION_SECONDS
+                        if (manager is not None
+                                and manager.deadline - time.monotonic() > 2 * VERIFICATION_COMPACTION_SECONDS):
+                            verification_compaction_checked = True
+                            compacted = self.context_manager.maybe_compact(
+                                self.messages, system=self.system_prompt, tools=tools, cancel=cancel,
+                                verification=True, on_summary_usage=record_usage,
+                            )
+                    if not compacted and projected_history is None:
+                        compacted = self.context_manager.compact_before_model_call(
+                            self.messages, system=self.system_prompt, tools=tools, cancel=cancel,
+                        )
+                    if compacted:
+                        projected_history = None
+                request_messages = self.messages
+                if projected_history is not None:
+                    request_messages = projected_history + self.messages[previous_messages:]
+                    if self.context_manager.budget.status_for(
+                        self.context_manager.estimate(request_messages, system=self.system_prompt, tools=tools)
+                    ) == "compact":
+                        self.context_manager.compact_before_model_call(
+                            self.messages, system=self.system_prompt, tools=tools, cancel=cancel,
+                        )
+                        request_messages = self.messages
+                        projected_history = None
                 text_streamed = False
                 streamed_parts: list[str] = []
 
@@ -831,7 +942,7 @@ class AgentSession:
 
                     resp = call_create_message(
                         self.llm,
-                        self.messages,
+                        request_messages,
                         tools=tools or None,
                         system=self.system_prompt,
                         on_progress=on_progress,
@@ -848,9 +959,15 @@ class AgentSession:
                         retry_until_cancelled=self._auto_execute_enabled,
                     )
 
-                for key, value in resp.usage.items():
-                    self.last_turn_usage[key] = self.last_turn_usage.get(key, 0) + value
-                    self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + value
+                record_usage(resp.usage)
+                cache_hit_ratio = getattr(self.llm, "cache_hit_ratio", None)
+                ratio = cache_hit_ratio(resp.usage) if callable(cache_hit_ratio) else None
+                consecutive_low_cache = consecutive_low_cache + 1 if ratio is not None and ratio < 0.5 else 0
+                prepare_history = getattr(self.llm, "prepare_request_history", None)
+                if projected_history is not None and callable(prepare_history):
+                    # Commit instruction/tool versions only after the isolated
+                    # request succeeded, using the original unsliced history.
+                    prepare_history(self.messages, tools or None, self.system_prompt)
 
                 # 记下服务器实际使用的模型 ID(可能被代理静默映射到别的型号)
                 if resp.actual_model:
@@ -873,7 +990,9 @@ class AgentSession:
                         continue
                     if not response_text.strip():
                         empty_rounds += 1
-                        if empty_rounds == 1 and (self._auto_execute_enabled or step_index + 1 < max_steps):
+                        truncated = resp.finish_reason in {"max_tokens", "length", "MAX_TOKENS"}
+                        if (not truncated and empty_rounds == 1
+                                and (self._auto_execute_enabled or step_index + 1 < max_steps)):
                             self.messages.append({
                                 "role": "user",
                                 "content": (
@@ -887,9 +1006,7 @@ class AgentSession:
                             for item in (resp.provider_payload or [])
                             if isinstance(item, dict)
                         ]
-                        if (resp.finish_reason or "") in {
-                            "max_tokens", "length", "MAX_TOKENS",
-                        }:
+                        if truncated:
                             raise RuntimeError(
                                 "模型输出被 max_tokens 截断，正文/工具调用尚未开始写入"
                                 f" (output_types={output_types})。"
@@ -942,6 +1059,7 @@ class AgentSession:
                 empty_rounds = 0
                 tool_results: list[ToolResult] = []
                 resulted_ids: set[str] = set()
+                verified_this_batch = False
                 batch = ToolCallBatch(
                     self.tools, resp.tool_calls, cancel=cancel, denied=denied_tools,
                     on_start=lambda call: self._emit_turn_event(TurnEvent(
@@ -959,6 +1077,7 @@ class AgentSession:
                         actual = batch.pending_result(c)
                         if actual is not None:
                             from app.agent.executor import _truncate_tool_output
+                            actual.output = batch.limit_exploration_output(c, actual.output, actual.is_error)
                             actual.output = _truncate_tool_output(actual.output)
                             self._emit_turn_event(TurnEvent(kind="tool_result", tool_name=c.name,
                                                            tool_input=c.arguments, tool_output=actual.output,
@@ -1089,6 +1208,7 @@ class AgentSession:
                             )
                             # 进入历史前截断超大输出(与编排路径一致,见 executor)。
                             from app.agent.executor import _truncate_tool_output
+                            output = batch.limit_exploration_output(call, output, is_error)
                             output = _truncate_tool_output(output)
                             # Only bind result envelopes actually retained in history.
                             if call.name == "wait_agent":
@@ -1097,6 +1217,10 @@ class AgentSession:
                                     binder.bind_wait_tool_result(call.id, output, is_error)
                             if not is_error and call.name not in {"todo_write", "load_skill", "request_user_input"}:
                                 successful_tool_calls += 1
+                            if not is_error and call.name in {"apply_patch", "edit_file", "write_file", "integrate_agent"}:
+                                workspace_changed = True
+                            if not is_error and workspace_changed and call.name == "shell":
+                                verified_this_batch = True
                             self._emit_turn_event(TurnEvent(
                                 kind="tool_result",
                                 tool_name=call.name,
@@ -1128,6 +1252,7 @@ class AgentSession:
                 # OpenAI Responses 三家不一样),Runtime 不关心
                 if tool_results:
                     self.messages.extend(self.llm.format_tool_results(tool_results))
+                    verification_rounds += int(verified_this_batch)
                     manager = delegated_manager(self.tools)
                     if manager is not None:
                         manager.acknowledge_tool_results(tool_results)

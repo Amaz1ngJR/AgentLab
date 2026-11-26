@@ -219,6 +219,19 @@ def test_executor_retries_empty_response_then_returns_real_answer():
     assert "没有返回正文" in router.calls[1][-1]["content"]
 
 
+def test_executor_does_not_resend_truncated_empty_response():
+    truncated = _resp_text("")
+    truncated.finish_reason = "max_tokens"
+    router = FakeRouter([truncated])
+    ex = Executor(router, _registry(_echo_tool()))
+
+    out = ex.run_task(Task("t1", "介绍项目"), [], system="", max_steps=3)
+
+    assert out.status == FAILED
+    assert "max_tokens" in out.error
+    assert out.model_rounds == 1
+
+
 def test_executor_retries_empty_response_after_tool_call():
     router = FakeRouter([
         _resp_tool("c1", "echo", {"msg": "README"}),

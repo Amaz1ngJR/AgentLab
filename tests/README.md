@@ -46,8 +46,7 @@ tests/
 在仓库根目录执行（Python 3.11+，安装项目依赖和 pytest）：
 
 ```bash
-python -m pip install -e .
-python -m pip install pytest
+python -m pip install -e ".[test]"
 
 # 默认运行两层，不隐式跳过集成测试
 python -m pytest -q

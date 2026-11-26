@@ -1,4 +1,5 @@
 """Controlled concurrency through both real tool loops, without model/network calls."""
+import json
 import threading
 import time
 
@@ -55,6 +56,30 @@ def test_independent_reads_overlap_and_results_audits_stay_ordered_on_owner(path
     _, messages = invoke(path, registry, [("read", {"n": n}) for n in range(3)])
     assert [r["content"] for r in results(messages)] == ["0", "1", "2"]
     assert audit_threads == [owner] * 3
+
+
+@pytest.mark.parametrize("path", ["session", "executor"])
+def test_exploration_response_shares_budget_and_preserves_recoverable_results(path, tmp_path, monkeypatch):
+    from app.tools.builtin.tool_output import READ_TOOL_OUTPUT
+    from app.tools.output_archive import read_output
+
+    monkeypatch.setenv("AGENTLAB_OUTPUT_CACHE_DIR", str(tmp_path))
+    read_text = "source code\n" * 650
+    matches = [{"preview": "source match " * 20}] * 20
+    search_text = json.dumps({"count": len(matches), "matches": matches, "truncated": False})
+    registry = ToolRegistry()
+    registry.register(READ_TOOL_OUTPUT)
+    register(registry, "read_file", lambda args: read_text)
+    register(registry, "code_search", lambda args: search_text)
+    _, messages = invoke(path, registry, [
+        ("read_file", {"n": 1}), ("code_search", {}), ("read_file", {"n": 2}),
+    ])
+    outputs = [result["content"] for result in results(messages)]
+    assert sum(map(len, outputs)) <= 12_000
+    search = json.loads(outputs[1])
+    assert search["truncated"] and 0 < search["count"] == len(search["matches"]) < len(matches)
+    out_id = outputs[0].split("完整输出: ")[1].split("；")[0]
+    assert "source code" in read_output({"output_id": out_id})
 
 
 @pytest.mark.parametrize("path", ["session", "executor"])

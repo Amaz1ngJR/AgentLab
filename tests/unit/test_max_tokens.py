@@ -41,7 +41,7 @@ def test_env_overrides_profile(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-token")
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.setenv("LLM_MAX_TOKENS", "20000")
-    assert load_config("cloud_claude_opus").max_tokens == 20000
+    assert load_config("cloud_claude").max_tokens == 20000
 
 
 def test_profile_param_used_when_env_absent(monkeypatch):
@@ -49,8 +49,7 @@ def test_profile_param_used_when_env_absent(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-token")
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
-    # cloud_claude_opus 在 models.yaml 里显式配了 32768
-    assert load_config("cloud_claude_opus").max_tokens == 32768
+    assert load_config("cloud_claude").max_tokens == 32768
 
 
 def _patch_anthropic(captured: dict):

@@ -21,21 +21,36 @@ from app.config.loader import workspace_root
 from app.storage import Storage
 
 
-def _portable_for(session, messages: list[dict]) -> list[dict]:
-    """恢复历史时按目标 provider 的协议做一次转换。
+def _model_route(session) -> tuple[str, str] | None:
+    llm = getattr(session, "llm", None)
+    profile = getattr(llm, "profile_name", None)
+    provider = getattr(llm, "provider", None)
+    if isinstance(profile, str) and profile and isinstance(provider, str) and provider:
+        return profile, provider
+    return None
 
-    换 provider 的路径不止 ``/model switch`` 一条：直接改 ``.env`` 的
-    ``ACTIVE_PROFILE`` 再重启，会在 ``resume_or_new`` → ``switch`` 里原样读回
-    旧 provider 写下的结构化条目（Responses 的 ``function_call``/``reasoning``、
-    ChatGPT 的 ``developer`` 指令）。这些条目对新 provider 是非法的，轻则语义
-    错位，重则整次请求被拒。
 
-    只在会话空闲（恢复期）执行：此时工具调用已闭合，降级成文本不会留下悬空
-    配对。provider 自身仍有边界归一化兜底，这里是把历史尽早收敛成可移植形态。
-    """
+def _portable_for(session, messages: list[dict], previous_route: tuple[str, str] | None = None) -> list[dict]:
+    """与 /model switch 使用同一历史转换；旧库从历史识别 OAuth 格式。"""
     if not messages:
         return messages
-    provider = str(getattr(getattr(session, "llm", None), "provider", "") or "")
+    from app.models.append_prefix import INSTRUCTION
+    from app.models.history import make_history_portable
+
+    provider = getattr(getattr(session, "llm", None), "provider", None)
+    route = _model_route(session)
+    if previous_route is not None and route is not None and previous_route != route:
+        return make_history_portable(messages)
+
+    native_oauth = any(isinstance(m, dict) and (
+        m.get(INSTRUCTION) or m.get("type") == "additional_tools"
+        or (m.get("type") == "function_call" and m.get("namespace") == "agentlab")
+    ) for m in messages)
+    if native_oauth:
+        return messages if provider == "openai_chatgpt" else make_history_portable(messages)
+    if route is not None and route == previous_route:
+        return messages
+
     foreign = any(
         isinstance(m, dict) and (
             m.get("role") in {"developer", "tool"}
@@ -46,11 +61,6 @@ def _portable_for(session, messages: list[dict]) -> list[dict]:
     # 目标 provider 自己能安全吸收的结构化历史不必降级，避免无意义地丢失保真度。
     if not foreign or provider == "openai":
         return messages
-    if provider == "openai_chatgpt":
-        from app.models.append_prefix import INSTRUCTION
-        if any(isinstance(m, dict) and m.get(INSTRUCTION) for m in messages):
-            return messages
-    from app.models.history import make_history_portable
     return make_history_portable(messages)
 
 
@@ -111,11 +121,13 @@ class SessionRouter:
                                    mode="auto")
         session_id = str(uuid.uuid4())[:8]
         session = self._factory(profile, session_id)
+        model_profile, model_provider = _model_route(session) or (profile.model_profile, "")
         self._sessions[session_id] = session
         self._storage.create_session(
             session_id=session_id,
             agent_id=aid,
-            model_profile=profile.model_profile,
+            model_profile=model_profile,
+            model_provider=model_provider,
             title=title or f"{profile.name} #{session_id}",
             workspace=str(workspace_root()),
         )
@@ -124,12 +136,12 @@ class SessionRouter:
         return session_id
 
     def _bind_checkpoint(self, session, session_id: str) -> None:
-        from app.models.history import make_history_portable
-        # delivery_receipt lives in structured child records, not in display text:
-        # portable history may merge messages. Commit both in the same transaction.
+        bind_scope = getattr(getattr(session, "llm", None), "bind_cache_scope", None)
+        if callable(bind_scope):
+            bind_scope(session_id)
         session.child_checkpoint = lambda records: self._storage.save_delegation_checkpoint(
-            session_id, messages=make_history_portable(session.messages),
-            tasks=session.task_store.snapshot(), records=records,
+            session_id, messages=session.messages, tasks=session.task_store.snapshot(),
+            records=records, model_route=_model_route(session),
         )
 
     def switch(self, session_id: str) -> bool:
@@ -152,13 +164,21 @@ class SessionRouter:
                     mode="auto",
                 )
             session = self._factory(profile, session_id)
-            session.messages = _portable_for(session, self._storage.load_messages(session_id))
-            session.child_records = self._storage.load_child_runs(session_id)
+            try:
+                messages = self._storage.load_messages(session_id)
+                route = _model_route(session)
+                stored_route = (row["model_profile"], row.get("model_provider", ""))
+                session.messages = _portable_for(session, messages, stored_route if stored_route[1] else None)
+                session.child_records = self._storage.load_child_runs(session_id)
+                tasks_snapshot = self._storage.load_tasks(session_id)
+                if tasks_snapshot and getattr(session, "task_store", None) is not None:
+                    session.task_store.restore(tasks_snapshot)
+                if session.messages is not messages or (route is not None and route != stored_route):
+                    self._storage.save_messages(session_id, session.messages, model_route=route)
+            except Exception:
+                session.close()
+                raise
             self._bind_checkpoint(session, session_id)
-            # 恢复任务快照(若有):让 /session switch 后任务面板与编排状态接上
-            tasks_snapshot = self._storage.load_tasks(session_id)
-            if tasks_snapshot and getattr(session, "task_store", None) is not None:
-                session.task_store.restore(tasks_snapshot)
             self._sessions[session_id] = session
         self.current_id = session_id
         return True
@@ -250,7 +270,7 @@ class SessionRouter:
         sess = self._sessions.get(session_id)
         if sess is None:
             return
-        self._storage.save_messages(session_id, sess.messages)
+        self._storage.save_messages(session_id, sess.messages, model_route=_model_route(sess))
         # 标记最后活跃时间:让 resume_or_new 的"最近"= 最后对话时间,而非创建/
         # 重命名时间,避免每次启动恢复到从未对话过的空壳 session。只在确有消息时
         # touch,空会话不抢占"最近"位置。

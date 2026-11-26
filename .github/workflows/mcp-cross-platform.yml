@@ -43,7 +43,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -e ".[test]"
 
       - name: Verify npx command resolution
         run: python -c "from app.mcp.manager import _resolve_stdio_command; print(_resolve_stdio_command('npx'))"

@@ -9,10 +9,10 @@
 #
 # model_profile:
 #   对应 config/models.yaml 中定义的模型 profile，例如：
-#   - cloud_claude_opus（Claude Opus 5，适合复杂任务）
+#   - cloud_claude（Anthropic Claude）
 #   - local_qwen3_14b（本地 Qwen3 14B，快速响应）
 #   - siliconflow（硅基流动，多种云端模型）
-#   - gpt_official（OpenAI GPT）
+#   - codex（ChatGPT OAuth）
 #
 # memory_policy:
 #   none        - 不使用长期记忆（默认，最安全）
@@ -67,7 +67,7 @@ agents:
   # 默认通用助手：显式要求时才委派
   default:
     name: 默认助手
-    model_profile: cloud_claude_opus
+    model_profile: cloud_claude
     memory_policy: none
     orchestrate: true
     mode: auto
@@ -82,7 +82,7 @@ agents:
   # 代码助手——专注于代码审查、重构和测试
   coder:
     name: 代码助手
-    model_profile: cloud_claude_opus
+    model_profile: cloud_claude
     system_prompt: |
       你是一个专注于代码质量的助手。工作原则：
       1. 优先用搜索工具定位相关代码，精读后再修改
@@ -123,7 +123,7 @@ agents:
   # 研究助手——擅长信息检索和分析
   researcher:
     name: 研究助手
-    model_profile: cloud_claude_opus
+    model_profile: cloud_claude
     system_prompt: |
       你是一个研究助手。工作流程：
       1. 先阅读项目相关文档和代码，理解背景

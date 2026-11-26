@@ -214,6 +214,7 @@ class Orchestrator:
         resume: bool = False,
         append_goal_message: bool = True,
         auto_execute: bool = False,
+        turn_guidance: str = "",
     ) -> str:
         """规划并执行一个目标,返回最终答复文本。
 
@@ -242,6 +243,8 @@ class Orchestrator:
                     kind=events.RUN_STARTED,
                     text=f"继续上一轮任务(已重置 {reset_count} 个未完成任务)",
                 ))
+        if turn_guidance:
+            self.messages.append({"role": "user", "content": turn_guidance, "_agentlab_turn_guidance": True})
         if append_goal_message:
             self.messages.append({"role": "user", "content": goal})
         self._emit(RunEvent(kind=events.RUN_STARTED, text=goal))
@@ -263,6 +266,8 @@ class Orchestrator:
                 # 提取 skill 相关内容传给 Planner，让它能按 skill 指示拆任务。
                 # 只传 skill 片段，避免重复传递 MCP 服务器列表、记忆等完整 system。
                 skill_context = _extract_skill_context(self._system)
+                if turn_guidance:
+                    skill_context = "\n".join(part for part in (skill_context, turn_guidance) if part)
                 if resume and not self.store.is_empty():
                     # 已恢复任务的执行规格是可信来源；不让新 Planner 覆盖旧任务。
                     from app.agent.planner import TaskPlan
@@ -284,7 +289,7 @@ class Orchestrator:
                                           "；剩余工具调用预算: " + str(manager.tools_left) +
                                           "；共享时间预算（秒）: " + str(manager.timeout) +
                                           "；省略子预算时继承父配置，派发时分配剩余额度" +
-                                          "；有效工具: " + ", ".join(t.name for t in self._tools.all()))
+                                          "；有效工具: " + ", ".join(sorted(t.name for t in self._tools.all())))
                     plan = self._planner.create_plan(
                         goal,
                         context=skill_context,
@@ -379,19 +384,28 @@ class Orchestrator:
                     for restored_task in self.store.all():
                         sid = restored_task.execution.get("child_run_id")
                         child = manager.children.get(sid)
+                        adopt_shared = (child is not None and child.result is not None
+                                        and child.spec.workspace_mode == "shared"
+                                        and child.result.delivery_status in {"applied_unverified", "no_changes"}
+                                        and child.result.status != "succeeded")
                         if (restored_task.execution.get("executor") == "subagent" and restored_task.status == BLOCKED
                                 and child is not None and child.done.is_set() and not child.spec.read_only
-                                and child.result.status == "succeeded" and child.result.delivery_status != "integrated"):
+                                and (adopt_shared or (child.result.status == "succeeded"
+                                     and child.result.delivery_status not in {"integrated", "parent_verified"}))):
                             from app.agent.tasks import Task
                             self.store.add(Task(
                                 id=f"{restored_task.id}-delivery", content=(
+                                    f"审阅失败的共享写入 {sid} 和当前工作区；确认当前范围满足目标后，"
+                                    "调用 integrate_agent(adopt_current=true) 并提供实际验证命令。"
+                                    if adopt_shared else
                                     f"审阅恢复的写入产物 {sid}；调用 integrate_agent 并提供适用的 checks。"
                                     "需验证和审批，禁止重跑写任务。"),
                                 execution={"executor": "main_agent", "delivery_for": restored_task.id},
                             ))
                         if (child is not None and child.done.is_set() and restored_task.status != COMPLETED
-                                and child.result.status == "succeeded" and
-                                (child.spec.read_only or child.result.delivery_status == "integrated")):
+                                and (child.result.delivery_status == "parent_verified" or (
+                                    child.result.status == "succeeded" and
+                                    (child.spec.read_only or child.result.delivery_status == "integrated")))):
                             self.store.update_status(restored_task.id, COMPLETED, error="",
                                 evidence=json.dumps(manager.snapshot(sid), ensure_ascii=False))
                     manager.pump()
@@ -562,7 +576,7 @@ class Orchestrator:
                         sid = completed_task.execution.get("child_run_id")
                         if sid in manager.children and manager.children[sid].result is not None:
                             result = manager.children[sid].result
-                            if result.delivery_status == "integrated":
+                            if result.delivery_status in {"integrated", "parent_verified"}:
                                 stored = self.store.get(completed_task.id)
                                 stored.execution["result"] = manager.snapshot(sid)
                                 self.store.update_status(stored.id, COMPLETED, error="",

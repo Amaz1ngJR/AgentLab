@@ -1,4 +1,6 @@
 """离线测试：SessionRouter 命令解析与 session 生命周期。"""
+import pytest
+
 from app.agent.profiles import AgentProfile
 from app.agent.runtime import AgentSession
 from app.agent.session_router import SessionRouter
@@ -58,7 +60,9 @@ def test_switch_keeps_native_oauth_history_for_same_provider(tmp_path):
          "call_id": "call_1", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "call_1", "output": "result"},
     ]
-    storage.save_messages(sid, history)
+    router.current.messages = history.copy()
+    router.current.child_checkpoint([])
+    assert storage.load_messages(sid) == history
     resumed = _make_router(storage, _profiles())
     factory = resumed._factory
 
@@ -74,6 +78,60 @@ def test_switch_keeps_native_oauth_history_for_same_provider(tmp_path):
     other = _make_router(storage, _profiles())
     assert other.switch(sid)
     assert all("type" not in message for message in other.current.messages)
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_startup_switches_saved_oauth_session_to_selected_responses_profile(tmp_path, monkeypatch, legacy):
+    from app.agent.service import RuntimeService
+    from app.models.append_prefix import INSTRUCTION
+    from app.models.history import make_history_portable
+    from app.models.openai_adapter import _convert_messages_to_responses_format
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    storage = Storage(tmp_path / "resume.db")
+    history = [
+        {"type": "message", "role": "developer", "content": "OAuth instructions", INSTRUCTION: True},
+        {"type": "additional_tools", "role": "developer", "tools": [{"name": "read_file"}]},
+        {"role": "user", "content": "压缩后的进度与约束", "_agentlab_summary": True},
+        {"type": "function_call", "name": "read_file", "namespace": "agentlab",
+         "call_id": "call_1", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "previous finding"},
+    ]
+    storage.create_session("saved", "coder", "cloud_claude_opus" if legacy else "codex",
+                           workspace=str(tmp_path), model_provider="" if legacy else "openai_chatgpt")
+    storage.save_messages("saved", history)
+    storage.save_tasks("saved", [{"id": "task", "content": "继续验证", "status": "pending"}])
+    sent = []
+
+    class DefaultRouter(_FakeRouter):
+        provider = "openai"
+        profile_name = "crs_gpt"
+
+        def create_message(self, messages, **kwargs):
+            sent.extend(_convert_messages_to_responses_format(messages))
+            return super().create_message(messages, **kwargs)
+
+    router = SessionRouter(
+        storage, lambda profile, sid: AgentSession(DefaultRouter(), ToolRegistry(), orchestrate=False),
+        _profiles(),
+    )
+    service = RuntimeService(router)
+    try:
+        assert service.resume_or_new() == ("saved", True)
+        assert router.current.messages == make_history_portable(history)
+        record = storage.get_session("saved")
+        assert (record["model_profile"], record["model_provider"]) == ("crs_gpt", "openai")
+        assert storage.load_messages("saved") == router.current.messages
+        assert router.current.task_store.get("task").content == "继续验证"
+
+        service.send_message("继续", run_id="resume-after-switch")
+        assert all(set(item) <= {"type", "role", "content"} for item in sent)
+        request_text = " ".join(part["text"] for message in sent for part in message["content"])
+        assert "压缩后的进度与约束" in request_text and "previous finding" in request_text
+        assert "OAuth instructions" not in request_text
+    finally:
+        service.close()
+        storage.close()
 
 
 def test_lifecycle_saves_read_write_summary_once(tmp_path, monkeypatch):
@@ -401,7 +459,7 @@ def test_delegation_checkpoint_rolls_back_all_parts_on_failure(tmp_path, monkeyp
     db.close()
 
 
-def test_portable_checkpoint_receipt_survives_merged_user_messages(tmp_path):
+def test_checkpoint_receipt_survives_without_merging_user_messages(tmp_path):
     import json
     from tests.support.delegation import manager
     db_path = tmp_path / "receipt.db"
@@ -419,7 +477,7 @@ def test_portable_checkpoint_receipt_survives_merged_user_messages(tmp_path):
         "parent_run_id": m.run_id, "result_id": sid, "revision": 1,
     }
     history = db.load_messages(session_id)
-    assert len(history) == 1 and history[0]["content"].startswith("original goal")
+    assert len(history) == 2 and history[0]["content"] == "original goal"
     assert json.dumps(history).count("CHILD_FINDING") == 1
     m.finish()
     db.close()
@@ -468,7 +526,7 @@ def test_wait_receipt_is_committed_only_after_result_enters_history(tmp_path):
     records = db.load_child_runs(session_id)
     assert records[0]["delivery_receipt"]["revision"] == 1
     history = db.load_messages(session_id)
-    assert len(history) == 1  # portable history merged goal and tool output
+    assert len(history) == 2
     recovered = manager(tmp_path)
     recovered.restore_results(records, messages=history)
     assert not recovered.deliver(history)

@@ -701,7 +701,7 @@ agentlab --workspace .
 agentlab --workspace . --profile cloud_claude -p "list_dir 看下当前目录"
 
 # 本地模型。需要先启动 Ollama 并下载模型。
-agentlab --workspace . --profile local_qwen -p "list_dir 看下当前目录"
+agentlab --workspace . --profile local_qwen3_14b -p "list_dir 看下当前目录"
 
 # 源码目录内仍可使用开发入口。
 python -m app

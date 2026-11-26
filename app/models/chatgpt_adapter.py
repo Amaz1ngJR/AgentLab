@@ -1,8 +1,10 @@
 """ChatGPT plan Responses transport; execution remains in AgentLab."""
 from __future__ import annotations
 
-import json
 import copy
+from contextlib import ExitStack, contextmanager
+import json
+from threading import Lock
 
 from app.agent.cancel import close_on_cancel
 from app.auth.chatgpt import RESOURCE, TokenManager
@@ -12,9 +14,10 @@ from app.models.openai_adapter import (
 )
 from app.models.protocol import ModelResponse, ToolCall
 from app.models.cache_usage import cache_usage
-from app.models.request_audit import emit_request_event, start_request
+from app.models.request_audit import ResponsesRequestPrefix, emit_request_event, start_request
 from app.models.token_progress import StreamingTokenProgress
 from app.models.context_window import positive_int
+from app.models.responses_websocket import ResponsesWebSocket
 
 NAMESPACE = "agentlab"
 TEMPORARY_CODES = {"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable",
@@ -40,12 +43,84 @@ class ChatGPTAdapter:
     def __init__(self, cfg):
         self._cfg = cfg
         self.tokens = TokenManager(cfg.chatgpt_account)
+        self._request_prefix = ResponsesRequestPrefix()
+        self._client_lock = Lock()
+        self._transport_lock = Lock()
+        self._sdk = None
+        self._websocket = ResponsesWebSocket()
+        self._websocket_unavailable = False
+        self._session_bound = False
+
+    replays_encrypted_reasoning = True
+
+    def bind_conversation(self):
+        self._session_bound = True
+
+    @staticmethod
+    def prepare_request_history(messages, tools, system):
+        from app.models.append_prefix import prepare_history
+        prepare_history(messages, tools, system)
+
+    @staticmethod
+    def rebuild_request_history(candidate, original, *, system, tools):
+        from app.models.append_prefix import rebuild_compacted_history
+        return rebuild_compacted_history(candidate, original, system=system, tools=tools)
 
     def _client(self):
         from openai import OpenAI
-        # Request-local clients avoid stale credentials and work with older SDKs.
-        return OpenAI(api_key=self.tokens.access_token(), base_url=RESOURCE,
-                      organization="", project="", timeout=self._cfg.timeout_seconds, max_retries=0)
+        with self._client_lock:
+            token = self.tokens.access_token()
+            if self._sdk is None or self._sdk.api_key != token:
+                if self._sdk is not None:
+                    self._websocket.close()
+                    self._sdk.close()
+                self._sdk = OpenAI(api_key=token, base_url=RESOURCE, organization="", project="",
+                                   timeout=self._cfg.timeout_seconds, max_retries=0)
+                self._websocket_unavailable = False
+            return self._sdk
+
+    def close(self):
+        with self._client_lock:
+            try:
+                self._websocket.close()
+            finally:
+                if self._sdk is not None:
+                    self._sdk.close()
+                    self._sdk = None
+
+    @contextmanager
+    def _stream(self, params, cancel, audit):
+        with self._transport_lock, ExitStack() as resources:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            client = self._client()
+            if not self._session_bound:
+                resources.callback(self.close)
+            if self._session_bound and self._cfg.chatgpt_websocket and not self._websocket_unavailable:
+                try:
+                    self._websocket.open(client, min(10, self._cfg.timeout_seconds))
+                except Exception as exc:
+                    if cancel is not None:
+                        cancel.raise_if_cancelled()
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status in {401, 403}:
+                        raise ChatGPTError("admission_denied", status=status) from exc
+                    # No inference was sent. Keep using the public HTTP route
+                    # on this adapter if the SDK or handshake lacks support.
+                    self._websocket_unavailable = True
+                    if audit is not None:
+                        audit["websocket_fallback"] = type(exc).__name__
+                else:
+                    with self._websocket.stream(
+                        params, cancel=cancel, timeout=self._cfg.timeout_seconds,
+                        encode_output=self._input_items, audit=audit,
+                    ) as stream:
+                        yield stream, "websocket"
+                    return
+            if audit is not None:
+                audit.update(transport="http", sent_input_items=len(params["input"]))
+            with client.responses.create(**params) as stream:
+                yield stream, "http"
 
     @property
     def provider(self):
@@ -74,9 +149,7 @@ class ChatGPTAdapter:
                 return positive_int(model.get("context_window"))
         return None
 
-    def _params(self, messages, tools, system, effort):
-        from app.models.append_prefix import INSTRUCTION, tool_bindings
-        stable = any(m.get(INSTRUCTION) for m in messages)
+    def _input_items(self, messages):
         inputs = []
         for message in messages:
             if message.get("type") == "additional_tools":
@@ -114,7 +187,13 @@ class ChatGPTAdapter:
                 item["role"] = "developer"
             if item.get("type") == "function_call" and namespaces.get(item["call_id"]):
                 item["namespace"] = namespaces[item["call_id"]]
-        params = dict(model=self.model, input=_repair_responses_tool_pairs(inputs), store=False, stream=True)
+        return inputs
+
+    def _params(self, messages, tools, system, effort):
+        from app.models.append_prefix import INSTRUCTION, tool_bindings
+        stable = any(m.get(INSTRUCTION) for m in messages)
+        params = dict(model=self.model, input=_repair_responses_tool_pairs(self._input_items(messages)),
+                      store=False, stream=True)
         if system and not stable:
             params["instructions"] = system
         if effort:
@@ -152,12 +231,16 @@ class ChatGPTAdapter:
         if cancel:
             cancel.raise_if_cancelled()
         audit = start_request()
+        if audit is not None:
+            client_request_id = f"agentlab-{audit['call_id']}-{audit['attempt']}"
+            audit.update(client_request_id=client_request_id, **self._request_prefix.describe(params))
+            params["extra_headers"] = {"X-Client-Request-Id": client_request_id}
         try:
-            with self._client() as client, client.responses.create(**params) as stream:
+            with self._stream(params, cancel, audit) as (stream, transport):
                 response = getattr(stream, "response", None)
                 http_status = getattr(response, "status_code", None)
-                headers = getattr(response, "headers", {})
-                request_id = headers.get("x-request-id")
+                headers = getattr(response, "headers", None) or {}
+                request_id = headers.get("x-request-id") or headers.get("x-openai-request-id")
                 with close_on_cancel(cancel, stream):
                     for event in stream:
                         if cancel:
@@ -169,6 +252,10 @@ class ChatGPTAdapter:
                             response_usage = getattr(failed, "usage", None)
                             error = getattr(failed, "error", None) or getattr(event, "error", None)
                             code = getattr(error, "code", None) or getattr(event, "code", None) or kind
+                            if transport == "websocket" and code == "previous_response_not_found":
+                                failure = ChatGPTError(code)
+                                failure.retryable = True
+                                raise failure
                             raise ChatGPTError(code, status=getattr(response, "status_code", None),
                                 request_id=request_id, param=getattr(error, "param", None))
                         if kind == "response.output_text.delta":

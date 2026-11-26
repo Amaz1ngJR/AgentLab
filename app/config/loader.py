@@ -198,5 +198,8 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
         prompt_cache_enabled=_env_bool("LLM_PROMPT_CACHE_ENABLED", default=params.get("prompt_cache_enabled") is True),
         profile_name=active_profile,
         chatgpt_account=_env("CHATGPT_ACCOUNT") or "default",
+        chatgpt_websocket=(profile.provider == "openai_chatgpt" and _env_bool(
+            "LLM_CHATGPT_WEBSOCKET", default=params.get("chatgpt_websocket", True) is True,
+        )),
         capabilities=list(profile.capabilities),
     )

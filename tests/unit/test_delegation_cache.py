@@ -50,6 +50,39 @@ def test_router_cache_key_and_immutable_request_snapshot(enabled):
         assert ModelRouter(OpenAIAdapter(cfg))._cache_group != router._cache_group
 
 
+def test_responses_audit_reports_append_only_prefix_and_stable_session_cache_key():
+    from app.models.request_audit import observe_model_requests
+
+    cfg = _cfg()
+    cfg.prompt_cache_enabled = True
+    events = []
+    with patch("openai.OpenAI") as sdk, observe_model_requests(lambda kind, payload: events.append(payload)):
+        sdk.return_value.responses.stream.side_effect = lambda **kwargs: _FakeStream([], SimpleNamespace(
+            output=[_message_item("done")], status="completed", model="gpt-5",
+            usage=SimpleNamespace(input_tokens=100, output_tokens=5),
+        ))
+        router = ModelRouter(OpenAIAdapter(cfg))
+        router.bind_cache_scope("same-session")
+        messages = [{"role": "user", "content": "original prompt"}]
+        tools = [{"name": name, "input_schema": {"type": "object"}} for name in ("z", "a")]
+        router.create_message(messages, system="stable", tools=tools)
+        messages.append({"role": "user", "content": "follow-up"})
+        router.create_message(messages, system="stable", tools=list(reversed(tools)))
+        router.create_message(messages, system="updated", tools=tools)
+
+        restored = ModelRouter(OpenAIAdapter(cfg))
+        restored.bind_cache_scope("same-session")
+        assert restored._cache_group == router._cache_group
+        restored.bind_cache_scope("different-session")
+        assert restored._cache_group != router._cache_group
+
+    first, second, third = events
+    assert first["fixed_prefix_sha256"] == second["fixed_prefix_sha256"] != third["fixed_prefix_sha256"]
+    assert second["common_input_prefix_items"] == first["input_items"] == 1
+    assert second["previous_input_items"] == 1
+    assert "original prompt" not in str(events)
+
+
 def test_prefix_keeps_messages_system_and_restricts_claim():
     llm = SimpleNamespace(provider="openai", model="gpt-5", context_size=32000)
     snapshot = {"provider": "openai", "model": "gpt-5", "system": "unchanged",

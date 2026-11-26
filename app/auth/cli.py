@@ -8,6 +8,8 @@ import httpx
 
 from app.auth.chatgpt import AuthError, PERMISSION, RESOURCE, TokenManager
 
+DEFAULT_CHATGPT_PROFILE = "codex"
+
 
 def main(argv):
     from dotenv import load_dotenv
@@ -17,13 +19,13 @@ def main(argv):
     parser.add_argument("action", choices=["login", "status", "logout", "models", "test"])
     parser.add_argument("provider", choices=["chatgpt"])
     parser.add_argument("--account", default=os.getenv("CHATGPT_ACCOUNT", "default"))
-    parser.add_argument("--profile", default="chatgpt_codex", help="test 使用的 ChatGPT OAuth profile")
+    parser.add_argument("--profile", default=DEFAULT_CHATGPT_PROFILE, help="test 使用的 ChatGPT OAuth profile")
     args = parser.parse_args(argv)
     try:
         manager = TokenManager(args.account)
         if args.action == "login":
             manager.login()
-            print("ChatGPT 授权成功。可使用 agentlab --profile chatgpt_codex。")
+            print(f"ChatGPT 授权成功。可使用 agentlab --profile {DEFAULT_CHATGPT_PROFILE}。")
         elif args.action == "status":
             with manager.lock:
                 record = manager.read()

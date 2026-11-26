@@ -121,7 +121,7 @@ class Planner:
         self.last_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_diagnostics = []
         self.last_actual_model = None
-        prompt = goal if not context else f"{context}\n\n目标:{goal}"
+        prompt = goal if not context else f"目标:{goal}\n\n{context}"
         try:
             resp = call_create_message(
                 self._llm,

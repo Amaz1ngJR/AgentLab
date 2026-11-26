@@ -413,7 +413,7 @@ class Executor:
             )
             # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
             # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
-            output = _truncate_tool_output(output)
+            output = _truncate_tool_output(batch.limit_exploration_output(call, output, is_error))
             # wait batches are bounded per result before serialization.
             if call.name == "wait_agent":
                 binder = delegated_manager(self._tools)
@@ -594,7 +594,8 @@ class Executor:
                     continue
                 if not response_text.strip():
                     no_progress_rounds += 1
-                    if no_progress_rounds == 1 and (auto_execute or model_rounds < max_steps):
+                    truncated = resp.finish_reason in {"max_tokens", "length", "MAX_TOKENS"}
+                    if not truncated and no_progress_rounds == 1 and (auto_execute or model_rounds < max_steps):
                         messages.append({
                             "role": "user",
                             "content": (
@@ -608,9 +609,6 @@ class Executor:
                         for item in (resp.provider_payload or [])
                         if isinstance(item, dict)
                     ]
-                    truncated = (resp.finish_reason or "") in {
-                        "max_tokens", "length", "MAX_TOKENS",
-                    }
                     return TaskOutcome(
                         status=FAILED,
                         error=(
@@ -678,7 +676,8 @@ class Executor:
                         continue
                     actual = batch.pending_result(c)
                     if actual is not None:
-                        actual.output = _truncate_tool_output(actual.output)
+                        actual.output = _truncate_tool_output(
+                            batch.limit_exploration_output(c, actual.output, actual.is_error))
                         if c.id not in visited_ids:
                             tool_calls_made += 1
                         self._emit(RunEvent(kind=events.TOOL_COMPLETED, task_id=task.id,

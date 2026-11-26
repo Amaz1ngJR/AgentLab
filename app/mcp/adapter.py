@@ -80,4 +80,4 @@ def build_mcp_tools(
             requires_observation=is_browser and not is_observation,
             requires_approval=not auto,  # 白名单内免审批,其余需审批
         ))
-    return tools
+    return sorted(tools, key=lambda tool: tool.name)

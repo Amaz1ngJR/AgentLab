@@ -207,6 +207,8 @@ def test_skill_context_audit_records_candidates_and_cost(tmp_path):
 
 
 def test_runtime_activates_skill_workflow_only_on_matching_turn(tmp_path):
+    from copy import deepcopy
+
     from app.skills import SkillCatalog
 
     _write_skill(tmp_path, "code-review")
@@ -217,11 +219,11 @@ def test_runtime_activates_skill_workflow_only_on_matching_turn(tmp_path):
         provider = "fake"
 
         def __init__(self):
-            self.systems = []
+            self.requests = []
 
         def create_message(self, messages, **kwargs):
             from app.models.protocol import ModelResponse
-            self.systems.append(kwargs.get("system", ""))
+            self.requests.append((kwargs.get("system", ""), deepcopy(messages)))
             return ModelResponse(text="ok", tool_calls=[], usage={}, provider_payload=[])
 
         def format_tool_results(self, results):
@@ -238,8 +240,19 @@ def test_runtime_activates_skill_workflow_only_on_matching_turn(tmp_path):
     session.base_system_prompt = base
     session.chat("写个函数")
     session.chat("请 review 代码")
-    assert "Read changed files" not in llm.systems[0]
-    assert "Read changed files" in llm.systems[1]
+    session.chat("写个例子")
+    first, matched, last = llm.requests
+    assert first[0] == matched[0] == last[0]
+    assert "Read changed files" not in first[0]
+
+    def guidance(messages):
+        return [m for m in messages if m.get("_agentlab_turn_guidance")]
+
+    assert not guidance(first[1])
+    (instruction,) = guidance(matched[1][len(first[1]):])
+    assert "Read changed files" in instruction["content"]
+    assert matched[1][-2:] == [instruction, {"role": "user", "content": "请 review 代码"}]
+    assert not guidance(last[1][len(matched[1]):])
 
 
 # ── Skill.matches ───────────────────────────────────────────────────────────

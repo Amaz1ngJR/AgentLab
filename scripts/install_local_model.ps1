@@ -1,9 +1,9 @@
 # 一键安装脚本 (Windows PowerShell):
 #   - 检测 Ollama 是否安装,缺失时打印安装链接并退出
 #   - 检查 Ollama 服务是否运行
-#   - 拉取指定模型(默认 qwen2.5-coder:7b-instruct)
+#   - 拉取指定模型(默认 qwen3:14b)
 #   - 用一次简单推理验证模型可用
-#   - 提示用户改 .env 切换到 local_qwen profile
+#   - 提示用户选择与模型对应的 profile
 #
 # 用法:
 #   powershell -ExecutionPolicy Bypass -File scripts\install_local_model.ps1
@@ -12,7 +12,7 @@
 # 注意:5060Ti 主机推荐用 14b-instruct;Mac M3 16GB 用 7b-instruct
 
 param(
-    [string]$Model = "qwen2.5-coder:7b-instruct",
+    [string]$Model = "qwen3:14b",
     [string]$Endpoint = "http://localhost:11434"
 )
 
@@ -115,12 +115,16 @@ Write-Host "✅ 安装完成" -ForegroundColor Green
 Write-Host ""
 Write-Host "下一步:切换 AgentLab 到本地 profile"
 Write-Host ""
-Write-Host "  Set-Content .env 'ACTIVE_PROFILE=local_qwen'" -ForegroundColor Cyan
+if ($Model -ne "qwen3:14b") {
+    Write-Host "请先在 config/models.yaml 配置 model 为 $Model 的 Ollama profile，再用 --profile 指定其名称。"
+    exit 0
+}
+Write-Host "  在 .env 中设置 ACTIVE_PROFILE=local_qwen3_14b" -ForegroundColor Cyan
 Write-Host "  python -m app" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "或单次测试:"
 Write-Host ""
-Write-Host "  python -m app --profile local_qwen -p '用一句话介绍你自己'" -ForegroundColor Cyan
+Write-Host "  python -m app --profile local_qwen3_14b -p '用一句话介绍你自己'" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "更多模型与故障排查见 docs/local_model_guide.md"
 Write-Host ""

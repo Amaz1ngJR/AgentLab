@@ -52,11 +52,16 @@ def scope_state(workspace: Path, scopes: tuple[str, ...]) -> dict[str, str]:
     return state
 
 
-def _integrate_shared(result, *, workspace, tools, approval, checks, cancel, file_scope):
+def _integrate_shared(result, *, workspace, tools, approval, checks, cancel, file_scope,
+                      adopt_current, check_timeout_seconds):
     """Shared writes already exist: verify their frozen state, never replay a patch."""
     from app.config.loader import use_workspace_root
-    expected = result.metrics.get("shared_artifact")
-    if not file_scope or expected is None or scope_state(workspace, file_scope) != expected:
+    original = result.metrics.get("shared_artifact")
+    if not file_scope or original is None:
+        raise ToolExecutionError("shared workspace artifact is missing; review required")
+    current = scope_state(workspace, file_scope)
+    expected = current if adopt_current else original
+    if current != expected:
         raise ToolExecutionError("shared workspace artifact changed; review required")
     shell = tools.get("shell")
     if shell is None:
@@ -64,7 +69,7 @@ def _integrate_shared(result, *, workspace, tools, approval, checks, cancel, fil
     evidence = []
     for command in checks:
         cancel.raise_if_cancelled()
-        args = {"command": command, "cwd": str(workspace), "timeout": 60}
+        args = {"command": command, "cwd": str(workspace), "timeout": check_timeout_seconds}
         with use_workspace_root(workspace):
             action = shell.approval_action(args)
             if action:
@@ -78,11 +83,26 @@ def _integrate_shared(result, *, workspace, tools, approval, checks, cancel, fil
     cancel.raise_if_cancelled()
     if scope_state(workspace, file_scope) != expected:
         raise ToolExecutionError("shared workspace artifact changed; review required")
-    result.delivery_status = "integrated"
     artifact_sha = hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()
-    return {"status": "integrated", "workspace_mode": "shared", "artifact_sha256": artifact_sha,
+    status = "parent_verified" if adopt_current else "integrated"
+    if adopt_current:
+        changed_since_child = sorted(path for path in original.keys() | expected.keys()
+                                     if original.get(path) != expected.get(path))
+        review = Tool("integrate_agent", "Accept the currently verified shared workspace scope", {},
+                      lambda args: "", risk="write", requires_approval=True)
+        args = {"adopt_current": True, "subagent_id": result.subagent_id,
+                "workspace": str(workspace), "file_scope": list(file_scope),
+                "changed_since_child": changed_since_child, "artifact_sha256": artifact_sha,
+                "child_execution_status": result.status, "checks": checks,
+                "check_timeout_seconds": check_timeout_seconds}
+        _approve_delivery(approval, review, "integrate_agent", args, cancel, phase="integration")
+        if scope_state(workspace, file_scope) != expected:
+            raise ToolExecutionError("approved shared workspace artifact changed; revalidation required")
+    result.delivery_status = status
+    return {"status": status, "workspace_mode": "shared", "artifact_sha256": artifact_sha,
             "changed_files": result.changed_files,
-            "verification": evidence}
+            "verification": evidence, **({"file_scope": list(file_scope),
+                                           "changed_since_child": changed_since_child} if adopt_current else {})}
 
 
 def patch_bytes(manager: WorktreeManager, worktree) -> bytes:
@@ -142,20 +162,26 @@ def _check_parent_paths(manager: WorktreeManager, result, changed: list[str]) ->
 
 
 def integrate_result(result, *, workspace: Path, tools, approval, checks: list[str], cancel: CancelToken,
-                     file_scope: tuple[str, ...] = ()):
+                     file_scope: tuple[str, ...] = (), adopt_current: bool = False,
+                     check_timeout_seconds: int = 60):
     """Verify exact patch, approve exact artifact, revalidate baseline, then apply once."""
     from app.config.loader import use_workspace_root
-    if result.delivery_status == "integrated":
-        return {"status": "integrated", "already_integrated": True}
-    if result.status != "succeeded":
+    if result.delivery_status in {"integrated", "parent_verified"}:
+        return {"status": result.delivery_status, "already_integrated": True}
+    if adopt_current and (result.worktree is not None or result.delivery_status not in {"applied_unverified", "no_changes"}):
+        raise ToolExecutionError("adopt_current requires a stopped shared write result with a recorded scope")
+    if not adopt_current and result.status != "succeeded":
         raise ToolExecutionError("only successful write results may be integrated")
     if not checks or any(not command.strip() for command in checks):
         raise ToolExecutionError("explicit verification commands are required")
+    if type(check_timeout_seconds) is not int or not 1 <= check_timeout_seconds <= 600:
+        raise ToolExecutionError("check_timeout_seconds must be an integer from 1 to 600")
     if result.worktree is None:
-        if result.delivery_status != "applied_unverified":
+        if not adopt_current and result.delivery_status != "applied_unverified":
             raise ToolExecutionError("only successful write results may be integrated")
         return _integrate_shared(result, workspace=workspace, tools=tools, approval=approval,
-                                 checks=checks, cancel=cancel, file_scope=file_scope)
+                                 checks=checks, cancel=cancel, file_scope=file_scope, adopt_current=adopt_current,
+                                 check_timeout_seconds=check_timeout_seconds)
     manager = WorktreeManager(workspace)
     review_baseline = manager.state_fingerprint()
     _check_parent_paths(manager, result, manager.changed_files(result.worktree))
@@ -168,7 +194,7 @@ def integrate_result(result, *, workspace: Path, tools, approval, checks: list[s
     evidence = []
     for command in checks:
         cancel.raise_if_cancelled()
-        args = {"command": command, "cwd": str(result.worktree.path), "timeout": 60}
+        args = {"command": command, "cwd": str(result.worktree.path), "timeout": check_timeout_seconds}
         with use_workspace_root(result.worktree.path):
             action = shell.approval_action(args)
             if action:

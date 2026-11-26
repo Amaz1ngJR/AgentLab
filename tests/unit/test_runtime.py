@@ -1,6 +1,8 @@
 """离线测试：AgentSession 多轮工具循环、审批、超限、错误。"""
 from __future__ import annotations
 
+import pytest
+
 from app.agent.approval import ApprovalResult, AutoApprove, DenyAll
 from app.agent.runtime import (
     DEFAULT_SYSTEM_PROMPT,
@@ -37,6 +39,74 @@ def test_build_system_prompt_without_workspace_is_default():
 from tests.support.runtime import FakeRouter, _echo_tool, _registry_with, _resp_text, _resp_tool
 
 
+@pytest.mark.parametrize("provider", ["openai", "openai_chatgpt", "anthropic", "openai_compatible", "ollama"])
+def test_read_only_followup_shortens_wire_history_without_changing_original(provider):
+    from functools import wraps
+
+    from app.agent.context import ContextManager
+    from app.agent.context_budget import ContextBudget
+    from app.agent.context_compaction import ContextCompressor
+
+    from app.models.append_prefix import INSTRUCTION, definitions_in, prepare_history
+    from app.models.anthropic_adapter import AnthropicAdapter
+    from app.models.compatible_adapter import OpenAICompatibleAdapter
+    from app.models.openai_adapter import OpenAIAdapter
+
+    class Router(FakeRouter):
+        @property
+        def provider(self):
+            return provider
+
+        @property
+        def replays_encrypted_reasoning(self):
+            return provider == "openai_chatgpt"
+
+        def prepare_request_history(self, messages, tools, system):
+            if self.replays_encrypted_reasoning:
+                prepare_history(messages, tools, system)
+
+        @wraps(FakeRouter.create_message)
+        def create_message(self, messages, **kwargs):
+            self.prepare_request_history(messages, kwargs.get("tools"), kwargs.get("system"))
+            return super().create_message(messages, **kwargs)
+
+    model = Router([_resp_tool("new", "echo", {"msg": "evidence"}), _resp_text("索引在封存后写入")])
+    ctx = ContextManager(ContextBudget.from_context_size(1_000_000), ContextCompressor(model))
+    session = AgentSession(model, _registry_with(_echo_tool()), orchestrate=False, context_manager=ctx)
+    goal = {"role": "user", "content": "保留录像索引兼容性"}
+    history = [goal]
+    if provider == "openai_chatgpt":
+        history.append({"type": "message", "role": "developer", "content": "old policy", INSTRUCTION: True})
+        history.append({"type": "reasoning", "id": "rs_old", "encrypted_content": "opaque"})
+    fmt = {"anthropic": AnthropicAdapter, "openai_compatible": OpenAICompatibleAdapter,
+           "ollama": OpenAICompatibleAdapter}.get(provider, OpenAIAdapter)
+    base = len(history)
+    for i in range(20):
+        if provider == "anthropic":
+            call = {"role": "assistant", "content": [{"type": "tool_use", "id": str(i), "name": "read_file", "input": {}}]}
+        elif provider in {"openai_compatible", "ollama"}:
+            call = {"role": "assistant", "tool_calls": [{"id": str(i), "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}}]}
+        else:
+            call = {"type": "function_call", "call_id": str(i), "name": "read_file", "arguments": "{}"}
+        history.append(call)
+        history.extend(fmt.format_tool_results([ToolResult(str(i), "原始记录" * 1000)]))
+    session.messages = history.copy()
+
+    assert session.chat("继续，请你告诉我索引何时写入") == "索引在封存后写入"
+    assert len(model.calls) == 2
+    first, second = model.calls
+    assert first[:base + 1] == history[:base + 1]
+    assert len(str(first[base + 1])) < len(str(history[base + 1]))
+    assert "已节选" in str(first[base + 1])
+    assert first[base + 1] == second[base + 1]
+    assert first[len(history) - 1] == history[-1]
+    assert session.messages[:len(history)] == history
+    if provider == "openai_chatgpt":
+        assert definitions_in(first) == definitions_in(second) == definitions_in(session.messages)
+        assert "echo" in definitions_in(session.messages)
+
+
 def test_oauth_commit_message_uses_small_context_and_restores_normal_workflow():
     from app.skills import SkillCatalog
     from app.skills.loader import Skill
@@ -53,9 +123,8 @@ def test_oauth_commit_message_uses_small_context_and_restores_normal_workflow():
         ModelResponse("", [ToolCall("write", "write_file", {})], {}, []),
         response("done"),
     ])
-    session = AgentSession(model, _registry_with(shell, write_file), system_prompt="recent memories")
-    session.commit_message_system_prompt = "profile instructions"
-    session.base_system_prompt = "recent memories"
+    session = AgentSession(model, _registry_with(shell, write_file), system_prompt="profile instructions")
+    session.memory_context = "recent memories"
     session.skill_catalog = SkillCatalog({
         "git-commit": Skill("git-commit", "Git workflow", workflow="full Git workflow",
                             triggers=["提交"], enabled=True),
@@ -64,12 +133,13 @@ def test_oauth_commit_message_uses_small_context_and_restores_normal_workflow():
     for request in model.calls[:2]:
         assert {tool["name"] for tool in request["tools"]} == {"shell"}
         assert "profile instructions" in request["system"]
-        assert "recent memories" not in request["system"]
+        assert "recent memories" not in str(request["messages"])
         assert "full Git workflow" not in request["system"]
     assert session.chat("请修改代码，并拟一条提交说明") == "done"
     assert {tool["name"] for tool in model.calls[2]["tools"]} == {"shell", "write_file"}
-    assert "recent memories" in model.calls[2]["system"]
-    assert "full Git workflow" in model.calls[2]["system"]
+    assert model.calls[2]["system"] == model.calls[0]["system"]
+    assert "recent memories" in str(model.calls[2]["messages"])
+    assert "full Git workflow" in str(model.calls[2]["messages"])
 
 
 def _danger_tool() -> Tool:
@@ -379,6 +449,19 @@ def test_direct_mode_retries_empty_response_then_answers():
     assert session.execution_mode.value == "direct"
     assert len(router.calls) == 2
     assert any(event.kind == "text" and event.text == "这是项目介绍" for event in seen)
+
+
+def test_direct_mode_does_not_resend_truncated_empty_response():
+    import pytest
+
+    truncated = _resp_text("")
+    truncated.finish_reason = "length"
+    router = FakeRouter([truncated])
+    session = AgentSession(llm=router, tools=_registry_with(_echo_tool()), orchestrate=False)
+
+    with pytest.raises(RuntimeError, match="max_tokens"):
+        session.chat("介绍下这个项目")
+    assert len(router.calls) == 1
 
 
 def test_direct_mode_retries_empty_response_after_tool_call():

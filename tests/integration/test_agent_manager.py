@@ -15,6 +15,27 @@ from app.tools.registry import ToolExecutionError
 from tests.support.delegation import FakeRouter, ForkRouter, manager, registry, response
 
 
+@pytest.mark.parametrize("charge,counter,unit", [
+    ("charge_parent_tool", "tools_left", "tool"),
+    ("charge_parent_round", "rounds_left", "model"),
+])
+@pytest.mark.parametrize("expired", [True, False])
+def test_parent_budget_reports_time_and_count_separately(tmp_path, charge, counter, unit, expired):
+    m = manager(tmp_path, timeout=600)
+    try:
+        if expired:
+            m.deadline = time.monotonic() - 1
+        else:
+            setattr(m, counter, 0)
+        detail = "600 秒" if expired else f"aggregate {unit} budget"
+        with pytest.raises(Cancelled, match=detail) as raised:
+            getattr(m, charge)()
+        assert raised.value.reason == m.cancel.reason == "budget_exhausted"
+        assert detail in m.budget_error
+    finally:
+        m.finish()
+
+
 def test_parallel_nonblocking_spawn_and_id_isolation(tmp_path):
     gate = threading.Event()
     barrier = threading.Barrier(3)

@@ -2,9 +2,9 @@
 # 一键安装脚本(macOS / Linux):
 #   - 检测 Ollama 是否安装,缺失时打印安装命令并退出
 #   - 启动 Ollama 服务(如果还没在运行)
-#   - 拉取指定模型(默认 qwen2.5-coder:7b-instruct)
+#   - 拉取指定模型(默认 qwen3:14b)
 #   - 用一次简单推理验证模型可用
-#   - 提示用户改 .env 切换到 local_qwen profile
+#   - 提示用户选择与模型对应的 profile
 #
 # 用法:
 #   bash scripts/install_local_model.sh
@@ -19,7 +19,7 @@
 
 set -e
 
-MODEL="${1:-qwen2.5-coder:7b-instruct}"
+MODEL="${1:-qwen3:14b}"
 ENDPOINT="${OLLAMA_ENDPOINT:-http://localhost:11434}"
 
 # ── 颜色辅助(如果终端不支持就退化为空) ──────────────────────────────────────
@@ -127,12 +127,16 @@ printf "${GREEN}${BOLD}✅ 安装完成${RESET}\n"
 echo
 echo "下一步:切换 AgentLab 到本地 profile"
 echo
-echo "  ${CYAN}echo 'ACTIVE_PROFILE=local_qwen' > .env${RESET}"
+if [ "$MODEL" != "qwen3:14b" ]; then
+    echo "请先在 config/models.yaml 配置 model 为 $MODEL 的 Ollama profile，再用 --profile 指定其名称。"
+    exit 0
+fi
+echo "  在 .env 中设置 ACTIVE_PROFILE=local_qwen3_14b"
 echo "  ${CYAN}python -m app${RESET}"
 echo
 echo "或单次测试:"
 echo
-echo "  ${CYAN}python -m app --profile local_qwen -p '用一句话介绍你自己'${RESET}"
+echo "  ${CYAN}python -m app --profile local_qwen3_14b -p '用一句话介绍你自己'${RESET}"
 echo
 echo "更多模型与故障排查见 docs/local_model_guide.md"
 echo

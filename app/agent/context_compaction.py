@@ -261,6 +261,7 @@ def _safe_split_point(
 def _is_real_user(message: dict[str, Any]) -> bool:
     return (message.get("role") == "user"
             and not _is_tool_result_message(message)
+            and not message.get("_agentlab_turn_guidance") and not message.get("_agentlab_memory_context")
             and not str(message.get("content", "")).startswith("【上下文摘要"))
 
 
@@ -420,6 +421,7 @@ class ContextCompressor:
         on_compaction_progress=None,
         current_system: str | None = None,
         current_tools: list[dict] | None = None,
+        min_savings: int = 0,
     ) -> CompactionResult:
         """就地压缩 messages 的可压缩前缀。成功时 messages 被原地改短。
 
@@ -429,16 +431,21 @@ class ContextCompressor:
         返回 CompactionResult;失败/无可压段时 messages 不变、compacted=False。
         """
         started = time.monotonic()
+        self.last_usage = {"input_tokens": 0, "output_tokens": 0}
         deadline = min(deadline or float("inf"), started + self.timeout_for(messages, input_token_budget))
         if cancel is not None:
             cancel.raise_if_cancelled()
-        self.last_usage = {"input_tokens": 0, "output_tokens": 0}
         split = _safe_split_point(messages, keep_recent, recent_budget)
         if split <= 0:
             return CompactionResult(False, reason="无可安全压缩的前缀")
 
         old = messages[:split]
-        from app.models.append_prefix import INSTRUCTION, rebuild_compacted_history
+        rebuild = getattr(self._llm, "rebuild_request_history", None)
+
+        def rebuild_history(candidate):
+            if not callable(rebuild):
+                return candidate
+            return rebuild(candidate, messages, system=current_system, tools=current_tools)
         token_before = estimate_messages_tokens(old)
 
         # 独立保留最近真实用户请求；即使工具循环很长也不会被摘要转述替代。
@@ -446,13 +453,17 @@ class ContextCompressor:
                           if _is_real_user(messages[i])), None)
         pinned = [m for i, m in enumerate(old)
                   if m.get("role") in {"system", "developer"} or i == last_user]
-        protected = rebuild_compacted_history([*pinned, *messages[split:]], messages,
-                                             system=current_system, tools=current_tools)
+        protected = rebuild_history([*pinned, *messages[split:]])
         if (target_message_tokens is not None
                 and estimate_messages_tokens(protected) > target_message_tokens):
             return CompactionResult(False, reason="受保护消息超出安全输入预算", code="budget_exceeded")
         transcript = self._render_transcript([
-            m for m in old if not m.get(INSTRUCTION) and m.get("type") != "additional_tools"])
+            m for m in old if not m.get("_agentlab_instruction") and m.get("type") != "additional_tools"])
+        if min_savings and (
+                estimate_messages_tokens(messages) - estimate_messages_tokens(protected) < min_savings
+                or estimate_tokens(transcript) > self._input_limit(input_token_budget)):
+            return CompactionResult(False, reason="预计压缩收益不足或需要多次摘要请求",
+                                    code="insufficient_savings")
         fallback_reason = ""
         request_cancel = CancelToken()
         unsubscribe = (cancel.add_callback(lambda: request_cancel.cancel("user"))
@@ -465,6 +476,7 @@ class ContextCompressor:
             obj = self._summarize(
                 transcript, summary_budget, on_progress, request_cancel, input_token_budget,
                 on_compaction_progress, started, deadline,
+                **({"single_request": True} if min_savings else {}),
             )
             request_cancel.raise_if_cancelled()
         except Cancelled:
@@ -475,7 +487,7 @@ class ContextCompressor:
                                         code="timeout")
             raise
         except Exception as exc:  # 模型异常:进入本地兜底,不让手动 compact 失效
-            if not self._allow_local_fallback:
+            if min_savings or not self._allow_local_fallback:
                 return CompactionResult(False, reason=f"压缩模型调用失败: {exc}")
             # 保留诊断原因供 ContextManager/UI 展示，但继续构造本地摘要。
             obj = _fallback_summary(old)
@@ -506,8 +518,9 @@ class ContextCompressor:
         # 传入 skills 列表，在压缩摘要中重新提醒模型
         summary_msg = {"role": "user", "content": summary.to_message_text(self._available_skills),
                        "_agentlab_summary": True}
-        candidate = rebuild_compacted_history([summary_msg, *pinned, *messages[split:]], messages,
-                                              system=current_system, tools=current_tools)
+        candidate = rebuild_history([summary_msg, *pinned, *messages[split:]])
+        if min_savings and estimate_messages_tokens(messages) - estimate_messages_tokens(candidate) < min_savings:
+            return CompactionResult(False, reason="压缩后收益不足，保留原始历史", code="insufficient_savings")
         # Include all protected runtime state in the benefit/budget checks.
         tail_ids = {id(m) for m in messages[split:]}
         summary.token_count_after = estimate_messages_tokens([m for m in candidate if id(m) not in tail_ids])
@@ -564,7 +577,7 @@ class ContextCompressor:
     def _summarize(self, transcript: str, output_tokens: int, on_progress,
                    cancel: CancelToken | None, input_token_budget: int | None = None,
                    on_compaction_progress=None, started: float = 0,
-                   deadline: float = float("inf")) -> dict:
+                   deadline: float = float("inf"), *, single_request: bool = False) -> dict:
         output_tokens = self._output_limit(output_tokens)
         text = transcript
         # 已知安全窗口时利用可用预算，避免长历史被固定 4k 切成几十次串行请求。
@@ -597,7 +610,7 @@ class ContextCompressor:
         def request(index, chunk, emit, token):
             usage = {"input_tokens": 0, "output_tokens": 0}
             budget = output_tokens
-            for attempt in range(2):
+            for attempt in range(1 if single_request else 2):
                 token.raise_if_cancelled()
                 emit("status", {"chunk": index, "attempt": attempt + 1, "phase": "request"})
                 response = call_create_message(
@@ -608,8 +621,13 @@ class ContextCompressor:
                     on_retry=lambda attempt, delay, exc: emit("status", {
                         "chunk": index, "phase": "retry", "retry": attempt, "retry_delay": delay}),
                 )
+                response_usage = getattr(response, "usage", None) or {}
                 for key in usage:
-                    usage[key] += (getattr(response, "usage", None) or {}).get(key, 0)
+                    usage[key] += response_usage.get(key, 0)
+                if single_request:
+                    # Count even an invalid summary that will be discarded.
+                    for key, value in response_usage.items():
+                        self.last_usage[key] = self.last_usage.get(key, 0) + value
                 finish = getattr(response, "finish_reason", None)
                 obj = _extract_json(getattr(response, "text", "") or "")
                 if _is_valid_summary(obj) and finish not in {"length", "max_tokens"}:
@@ -626,6 +644,8 @@ class ContextCompressor:
 
         for round_index in range(8):
             chunks = _split_transcript(text, input_limit)
+            if single_request and len(chunks) != 1:
+                raise ValueError("summary_requires_multiple_chunks")
             results = [None] * len(chunks)
             snapshots = {}
             finished_indices = set()
@@ -655,8 +675,9 @@ class ContextCompressor:
                 nonlocal completed
                 obj, usage = result
                 results[index - 1] = obj
-                for key in self.last_usage:
-                    self.last_usage[key] += usage[key]
+                if not single_request:
+                    for key in usage:
+                        self.last_usage[key] += usage[key]
                 completed += 1
                 # 最终实际用量覆盖该分片的流式估算，其他分片继续保留。
                 emit("metrics", (index, usage))
@@ -708,7 +729,7 @@ class ContextCompressor:
                 raise
             except Exception as exc:
                 code = str(getattr(exc, "code", "")) + " " + str(exc)
-                if any(marker in code.lower() for marker in (
+                if not single_request and any(marker in code.lower() for marker in (
                     "context_length_exceeded", "context_window_exceeded",
                     "maximum context length", "context window exceeded",
                 )) and input_limit > 256:

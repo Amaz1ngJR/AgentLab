@@ -50,8 +50,8 @@ def make_todo_write_tool(store: TaskStore) -> Tool:
     return Tool(
         name="todo_write",
         description=(
-            "维护本次会话的任务清单。模型应在面对复杂多步任务时调用此工具:"
-            "先列出子任务,再随着执行进度更新每项的 status。"
+            "维护复杂任务的清单。只有任务状态实质变化时才更新；能与实际工具操作一起调用时，"
+            "把清单更新放在同一批工具调用里。"
             "每次调用会用 tasks 参数完整替换整个清单(不是增量更新),"
             "所以要把所有任务一并传入,包括已完成的。"
             f"status 取值: {PENDING} / {IN_PROGRESS} / {COMPLETED}。"

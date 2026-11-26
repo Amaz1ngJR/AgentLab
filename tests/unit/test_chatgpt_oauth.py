@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace as NS
@@ -10,7 +11,7 @@ from app.auth.chatgpt import AuthError, PERMISSION, TokenManager, _atomic_json
 from app.models.chatgpt_adapter import ChatGPTAdapter, ChatGPTError
 from app.models.openai_adapter import ProviderStreamError
 from app.models.protocol import ToolResult
-from app.config.loader import load_config
+from app.config.schemas import LLMConfig
 
 
 def record(**overrides):
@@ -100,7 +101,12 @@ def test_logout_clears_tokens_keeps_client_on_network_failure(tmp_path, monkeypa
 @pytest.fixture
 def adapter(tmp_path, monkeypatch):
     monkeypatch.setenv("CHATGPT_AUTH_DIR", str(tmp_path))
-    return ChatGPTAdapter(load_config("chatgpt_codex"))
+    return ChatGPTAdapter(LLMConfig(
+        provider="openai_chatgpt", model="gpt-6.1-sol", profile_name="codex",
+        base_url=None, api_key=None, auth_token=None, temperature=0.7, top_p=None,
+        context_size=None, timeout_seconds=60, stream=True, reasoning_effort="medium",
+        capabilities=["chat", "tools", "vision"],
+    ))
 
 
 def item(**data):
@@ -126,6 +132,171 @@ def set_events(adapter, monkeypatch, events):
 def complete(output):
     return NS(type="response.completed", response=NS(status="completed", output=output,
               usage=NS(input_tokens=10, output_tokens=3), model="gpt-6.1-sol"))
+
+
+def test_oauth_http_client_reuses_transport_and_rotates_on_token_change(adapter, monkeypatch):
+    tokens = iter(["first", "first", "renewed"])
+    monkeypatch.setattr(adapter.tokens, "access_token", lambda: next(tokens))
+    clients = []
+
+    def make_client(**kwargs):
+        client = MagicMock(api_key=kwargs["api_key"])
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("openai.OpenAI", make_client)
+    assert adapter._client() is adapter._client()
+    assert adapter._client() is clients[1]
+    clients[0].close.assert_called_once_with()
+    adapter.close()
+    clients[1].close.assert_called_once_with()
+
+
+def test_codex_profile_prefers_websocket_unless_disabled(monkeypatch):
+    from app.config.loader import load_config
+
+    monkeypatch.setattr("app.config.loader.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.delenv("LLM_CHATGPT_WEBSOCKET", raising=False)
+    assert load_config("codex").chatgpt_websocket is True
+    assert load_config("crs_gpt").chatgpt_websocket is False
+
+    monkeypatch.setenv("LLM_CHATGPT_WEBSOCKET", "0")
+    assert load_config("codex").chatgpt_websocket is False
+
+
+def test_bound_oauth_session_uses_http_when_websocket_is_disabled(adapter, monkeypatch):
+    adapter._cfg.chatgpt_websocket = False
+    adapter.bind_conversation()
+    message = item(type="message", role="assistant", content=[{"type": "output_text", "text": "done"}])
+    client = set_events(adapter, monkeypatch, [complete([message])])
+
+    assert adapter.create_message([]).text == "done"
+
+    client.responses.connect.assert_not_called()
+    client.responses.create.assert_called_once()
+
+
+def test_default_websocket_continues_exact_prefix_and_resets_on_changed_history(adapter, monkeypatch):
+    from app.models.request_audit import observe_model_requests
+    from app.models.router import ModelRouter
+
+    client = MagicMock()
+    connection = client.responses.connect.return_value.__enter__.return_value
+    call = item(type="function_call", id="fc1", name="echo", namespace="agentlab", call_id="c1", arguments="{}")
+    message = item(type="message", role="assistant", content=[{"type": "output_text", "text": "done"}])
+    replies = [complete([call]), complete([message]), complete([message])]
+    for index, event in enumerate(replies):
+        event.response.id = f"resp_{index}"
+    connection.recv.side_effect = replies
+    monkeypatch.setattr(adapter, "_client", lambda: client)
+    router = ModelRouter(adapter)
+    router.bind_cache_scope("session")
+    history = [{"role": "user", "content": "echo"}]
+    events = []
+    with observe_model_requests(lambda kind, payload: events.append(payload)):
+        first = router.create_message(history, system="stable", tools=TOOLS)
+        history.extend(first.provider_payload)
+        history.extend(router.format_tool_results([ToolResult("c1", "evidence")]))
+        assert router.create_message(history, system="stable", tools=TOOLS).text == "done"
+        history = [{"role": "user", "content": "different history"}]
+        router.create_message(history, system="stable", tools=TOOLS)
+    first_sent, second, third = [json.loads(call.args[0]) for call in connection.send_raw.call_args_list]
+    assert len(first_sent["input"]) == 3 and "previous_response_id" not in first_sent
+    assert second["previous_response_id"] == "resp_0"
+    assert second["input"] == [{"type": "function_call_output", "call_id": "c1", "output": "evidence"}]
+    assert "previous_response_id" not in third
+    assert all(body["store"] is False and "stream" not in body for body in (first_sent, second, third))
+    assert events[1]["sent_input_items"] == 1 and events[1]["input_items"] == 5
+    client.responses.connect.assert_called_once()
+    client.responses.create.assert_not_called()
+    router.close()
+    connection.close.assert_called_once()
+
+
+def test_websocket_connect_rejection_falls_back_before_sending_inference(adapter, monkeypatch):
+    adapter.bind_conversation()
+    message = item(type="message", role="assistant", content=[{"type": "output_text", "text": "done"}])
+    client = set_events(adapter, monkeypatch, [complete([message])])
+    client.responses.connect.side_effect = ImportError("websockets is missing")
+    assert adapter.create_message([]).text == "done"
+    client.responses.create.return_value.__enter__.return_value = iter([complete([message])])
+    assert adapter.create_message([]).text == "done"
+    client.responses.connect.assert_called_once()
+    assert client.responses.create.call_count == 2
+
+
+def test_websocket_expired_previous_response_retries_with_full_history(adapter, monkeypatch):
+    from app.models.router import ModelRouter
+
+    client = MagicMock()
+    connection = client.responses.connect.return_value.__enter__.return_value
+    message = item(type="message", role="assistant", content=[{"type": "output_text", "text": "done"}])
+    first = complete([message])
+    first.response.id = "resp_expired"
+    connection.recv.side_effect = [first, NS(type="error", code="previous_response_not_found"), complete([message])]
+    monkeypatch.setattr(adapter, "_client", lambda: client)
+    router = ModelRouter(adapter, retry_sleep=lambda delay: None)
+    router.bind_cache_scope("session")
+    history = [{"role": "user", "content": "first"}]
+    history.extend(router.create_message(history).provider_payload)
+    history.append({"role": "user", "content": "second"})
+
+    assert router.create_message(history).text == "done"
+
+    original, continuation, retry = [json.loads(call.args[0]) for call in connection.send_raw.call_args_list]
+    assert continuation["previous_response_id"] == "resp_expired"
+    assert "previous_response_id" not in retry
+    assert retry["input"][:len(original["input"])] == original["input"]
+    assert retry["input"][-1:] == continuation["input"]
+    client.responses.create.assert_not_called()
+
+
+def test_websocket_disconnect_after_submission_does_not_replay(adapter, monkeypatch):
+    from app.models.openai_adapter import ProviderStreamError
+    from app.models.router import ModelRouter
+
+    client = MagicMock()
+    connection = client.responses.connect.return_value.__enter__.return_value
+    connection.recv.side_effect = OSError("connection lost")
+    monkeypatch.setattr(adapter, "_client", lambda: client)
+    router = ModelRouter(adapter, retry_sleep=lambda delay: None)
+    router.bind_cache_scope("session")
+
+    with pytest.raises(ProviderStreamError, match="interrupted after submission"):
+        router.create_message([{"role": "user", "content": "first"}])
+
+    connection.send_raw.assert_called_once()
+    connection.close.assert_called_once()
+    client.responses.create.assert_not_called()
+
+
+def test_websocket_timeout_measures_idle_time(adapter, monkeypatch):
+    adapter._cfg.timeout_seconds = 0.25
+    adapter.bind_conversation()
+    client = MagicMock()
+    connection = client.responses.connect.return_value.__enter__.return_value
+    message = item(type="message", role="assistant", content=[{"type": "output_text", "text": "done"}])
+    events = iter([NS(type="response.created")] * 4 + [complete([message])])
+    closed = threading.Event()
+    connection.close.side_effect = closed.set
+
+    def receive():
+        assert not closed.wait(0.075)
+        return next(events)
+
+    connection.recv.side_effect = receive
+    monkeypatch.setattr(adapter, "_client", lambda: client)
+    assert adapter.create_message([]).text == "done"
+    connection.close.assert_not_called()
+
+    def stalled_receive():
+        assert closed.wait(2)
+        raise OSError("closed by watchdog")
+
+    connection.recv.side_effect = stalled_receive
+    with pytest.raises(ProviderStreamError, match="timed out waiting for a stream event"):
+        adapter.create_message([])
+    client.responses.create.assert_not_called()
 
 
 TOOLS = [{"name": "echo", "input_schema": {"type": "object", "properties": {}}}]
@@ -171,6 +342,7 @@ def test_request_events_and_partial_usage_survive_a_failed_runtime_turn(adapter,
     from app.storage import Storage
     from app.tools.registry import Tool, ToolRegistry
 
+    adapter._cfg.chatgpt_websocket = False
     adapter._cfg.context_size = 64000
     completed = complete([item(type="function_call", name="echo", call_id="c1", arguments="{}")])
     completed.response.id = "resp_accepted"
@@ -205,7 +377,7 @@ def test_request_events_and_partial_usage_survive_a_failed_runtime_turn(adapter,
     with_storage = Storage(tmp_path / "audit.db")
     router = SessionRouter(
         with_storage, lambda profile, sid: AgentSession(llm, registry, system_prompt="stable policy"),
-        {"default": AgentProfile("default", "Default", "chatgpt_codex")},
+        {"default": AgentProfile("default", "Default", "codex")},
     )
     sid = router.new("default")
     service = RuntimeService(router)
@@ -225,7 +397,17 @@ def test_request_events_and_partial_usage_survive_a_failed_runtime_turn(adapter,
         assert success["request_id"] == "req_2" and success["response_id"] == "resp_accepted"
         assert "evidence" not in json.dumps(rows)
         assert [item.get("role") for item in sent[0]["input"]] == ["developer", "developer", "user"]
-        assert sent[0] == sent[1]
+        assert [body["extra_headers"]["X-Client-Request-Id"] for body in sent] == [
+            first["client_request_id"], success["client_request_id"], last["client_request_id"],
+        ]
+        assert len({first["client_request_id"], success["client_request_id"], last["client_request_id"]}) == 3
+        assert first["fixed_prefix_sha256"] == success["fixed_prefix_sha256"] == last["fixed_prefix_sha256"]
+        assert first["input_items"] == success["input_items"] < last["input_items"]
+        assert first["input_bytes"] == success["input_bytes"] < last["input_bytes"]
+        assert first["common_input_prefix_items"] is None
+        assert success["common_input_prefix_items"] == last["common_input_prefix_items"] == first["input_items"]
+        assert ({key: value for key, value in sent[0].items() if key != "extra_headers"}
+                == {key: value for key, value in sent[1].items() if key != "extra_headers"})
         assert sent[2]["input"][:len(sent[0]["input"])] == sent[0]["input"]
         turn = with_storage.get_runtime_turn("audited")
         assert (turn["status"], turn["input_tokens"], turn["output_tokens"]) == ("failed", 10, 3)
@@ -420,13 +602,18 @@ def test_real_sdk_serializes_namespace_and_reads_sse(adapter, monkeypatch):
     client = openai.OpenAI(api_key="test-token", base_url="https://api.openai.com/v1",
         http_client=transport_api.Client(transport=transport_api.MockTransport(handle)), max_retries=0)
     monkeypatch.setattr(adapter, "_client", lambda: client)
-    result = adapter.create_message([{"role": "user", "content": "call echo"}], tools=TOOLS)
+    from app.models.request_audit import observe_model_requests
+    audit = []
+    with observe_model_requests(lambda kind, payload: audit.append(payload)):
+        result = adapter.create_message([{"role": "user", "content": "call echo"}], tools=TOOLS)
     assert result.tool_calls[0].name == "echo"
     assert result.provider_payload[0]["namespace"] == "agentlab"
     body = json.loads(requests[0].content)
     assert body["tools"][0]["tools"][0]["name"] == "echo"
     assert body["store"] is False and body["stream"] is True
     assert requests[0].headers["authorization"] == "Bearer test-token"
+    assert requests[0].headers["x-client-request-id"] == audit[0]["client_request_id"]
+    assert audit[0]["request_id"] is None and audit[0]["response_id"] == "resp_test"
 
 
 def test_long_run_oauth_retries_remain_bounded(adapter, monkeypatch):

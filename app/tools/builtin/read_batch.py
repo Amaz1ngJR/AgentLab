@@ -69,6 +69,7 @@ READ_FILES = Tool(
 READ_GUIDANCE = """【高效读取】
 先规划已知需要的文件和行段；独立读取放在同一轮工具调用中，或在提供 read_files 工具时一次提交多个路径/行段。
 默认每页80行；优先 code_search 精确定位并显式填写 offset/limit。超长行按 next_column/column_offset 续读，不丢弃中间字符。
+合并同一文件重叠的行段；文件未改动时复用已有结果，仅补读尚未覆盖的范围。搜索先限定目录、文件类型和少量命中。
 只有下一步依赖当前结果时才逐次读取。先 code_search 定位再读相关区域，避免从头逐页扫描整个项目。
 read_files 有共享输出预算，检查各项 next_offset、truncated 和 pending_indices；没有返回的内容不能假设已读。
 """

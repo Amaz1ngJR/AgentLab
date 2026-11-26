@@ -16,6 +16,7 @@ from typing import Any, Optional
 from app.agent.cancel import CancelToken, close_on_cancel
 from app.config.schemas import LLMConfig
 from app.attachments import image_block_to_data_url
+from app.models.request_audit import audited_request, record_stream, record_usage
 from app.models.token_progress import StreamingTokenProgress
 from app.models.stream_normalizer import StreamDeltaNormalizer
 from app.models.protocol import (
@@ -136,6 +137,7 @@ class OpenAICompatibleAdapter:
             base_url=cfg.base_url,
             api_key=cfg.api_key or "ollama",
             timeout=cfg.timeout_seconds,
+            max_retries=0,
         )
 
     def fetch_context_size(self) -> int | None:
@@ -181,6 +183,7 @@ class OpenAICompatibleAdapter:
         resp = self._client.chat.completions.create(**self._base_params(messages, temperature))
         return resp.choices[0].message.content or ""
 
+    @audited_request
     def create_message(
         self,
         messages: list[dict],
@@ -234,28 +237,25 @@ class OpenAICompatibleAdapter:
         cache_tokens = {}
         from app.models.cache_usage import cache_usage
         stream = self._client.chat.completions.create(**params)
+        record_stream(stream)
         with close_on_cancel(cancel, stream):
             for chunk in stream:
-                cache_tokens.update(cache_usage(getattr(chunk, "usage", None), provider="compatible"))
                 if cancel is not None:
                     cancel.raise_if_cancelled()
+                usage = getattr(chunk, "usage", None)
+                record_usage(usage, provider="compatible", response=chunk)
+                if usage is not None:
+                    cache_tokens.update(cache_usage(usage, provider="compatible"))
+                    p = getattr(usage, "prompt_tokens", None)
+                    c = getattr(usage, "completion_tokens", None)
+                    if p is not None:
+                        in_tokens = p
+                    if c is not None:
+                        out_tokens = c
+                    progress.set_usage(input_tokens=p, output_tokens=c, force=True, final=True)
                 if actual_model is None and getattr(chunk, "model", None):
                     actual_model = chunk.model
                 if not chunk.choices:
-                    usage = getattr(chunk, "usage", None)
-                    if usage:
-                        p = getattr(usage, "prompt_tokens", None)
-                        c = getattr(usage, "completion_tokens", None)
-                        if p is not None:
-                            in_tokens = p
-                        if c is not None:
-                            out_tokens = c
-                        progress.set_usage(
-                            input_tokens=in_tokens,
-                            output_tokens=out_tokens,
-                            force=True,
-                            final=True,
-                        )
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta

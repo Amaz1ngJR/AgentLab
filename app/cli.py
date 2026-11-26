@@ -22,6 +22,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -107,6 +108,49 @@ def _fmt_tokens(n: int) -> str:
         return f"{value:.1f}k" if value < 100 else f"{value:.0f}k"
     value = n / 1_000_000
     return f"{value:.2f}m" if value < 100 else f"{value:.1f}m"
+
+
+def _format_request_usage(number: int, payload: dict) -> str:
+    def tokens(key):
+        value = payload.get(key)
+        return value if type(value) is int and value >= 0 else None
+
+    def display(value):
+        return "未知" if value is None else _fmt_tokens(value)
+
+    input_tokens = tokens("input_tokens")
+    output_tokens = tokens("output_tokens")
+    cached = tokens("cached_tokens")
+    cache_write = tokens("cache_creation_input_tokens")
+    uncached = None
+    if payload.get("provider") == "anthropic":
+        # Anthropic reports uncached input, cache reads and cache writes separately.
+        if input_tokens is not None and cached is not None and cache_write is not None:
+            uncached = input_tokens + cache_write
+            input_tokens = uncached + cached
+        else:
+            input_tokens = None
+    elif input_tokens is not None and cached is not None and cached <= input_tokens:
+        uncached = input_tokens - cached
+    rate = f"{cached / input_tokens:.1%}" if input_tokens and uncached is not None else "未知"
+    parts = [f"#{number}  in={display(input_tokens)} out={display(output_tokens)}",
+             f"缓存命中={display(cached)} ({rate})", f"未命中={display(uncached)}"]
+    if cache_write:
+        parts.append(f"写入缓存={display(cache_write)}")
+    sent_items = tokens("sent_input_items")
+    if payload.get("transport") == "websocket" and sent_items is not None:
+        mode = "新增" if payload.get("continued_response_id") else "全量"
+        parts.append(f"WS {mode} {sent_items} 项")
+    elif payload.get("websocket_fallback"):
+        parts.append("WS 连接失败，回退 HTTP")
+    attempt = tokens("attempt")
+    if attempt and attempt > 1:
+        parts.append(f"第 {attempt} 次尝试")
+    status = {"failed": "失败", "cancelled": "已取消", "stream_fallback": "流兼容回退",
+              "empty_fallback": "空响应回退"}.get(payload.get("status"))
+    if status:
+        parts.append(status)
+    return " · ".join(parts)
 
 
 # 任务列表渲染用的 ANSI 颜色 / 字符
@@ -2156,20 +2200,19 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             "", agent_profile.agent_id, limit=10, workspace=str(ws),
         )
         base_prompt = agent_profile.system_prompt or build_system_prompt(str(ws))
-        # 先注入 Skill 的 L0 目录（不含正文），再注入记忆。明确命中的 L1
-        # 工作流在每轮 chat 开始时按 query 临时加入 system prompt。
-        with_skills = skill_catalog.inject(base_prompt, agent_profile.skills)
-        sys_prompt = inject_memories(with_skills, recent)
+        # The opening system instructions keep only the stable skill catalog.
+        sys_prompt = skill_catalog.inject(base_prompt, agent_profile.skills)
         # ── 上下文预算 + 压缩(§7.3)──────────────────────────────────────────
         # 按显式配置、提供方元数据、默认值解析模型窗口
         # 预算,在编排稳定点接近 85% 时自动压缩旧历史,避免长 run 撞 token 上限。
         ctx_budget = ContextBudget.from_llm(llm)
+        session_llm = llm.fork()
         # 获取可用的 skills 列表（skill_id）
         available_skills = [s.skill_id for s in skill_catalog.all()]
         ctx_manager = ContextManager(
             budget=ctx_budget,
             compressor=ContextCompressor(
-                llm,
+                session_llm,
                 model_profile=cfg.profile_name or "",
                 available_skills=available_skills
             ),
@@ -2183,7 +2226,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         from functools import partial
         print_run_event_with_state = partial(_print_run_event, panel_state=panel_state)
         sess = AgentSession(
-            llm=llm,
+            llm=session_llm,
             tools=reg,
             approval=_new_session_approval(),
             system_prompt=sys_prompt,
@@ -2211,7 +2254,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
             # 编排模式/本地模式路由：legacy 沿用 profile 的 orchestrate 语义，
             # auto/direct/task 则显式交给 AgentSession。
             orchestrate=agent_profile.orchestrate,
-            planner=Planner(llm),
+            planner=Planner(session_llm),
             mode=(agent_profile.mode if agent_profile.mode != "legacy" else None),
             on_run_event=print_run_event_with_state,
             context_manager=ctx_manager,
@@ -2219,8 +2262,7 @@ def _build_session(auto_approve: bool, profile: str | None) -> RuntimeService:
         # 附加 Skill catalog，Runtime 每轮按 query 激活规则明确命中的 L1 正文。
         sess.skill_catalog = skill_catalog
         sess.profile_skills = list(agent_profile.skills)
-        sess.base_system_prompt = sys_prompt
-        sess.commit_message_system_prompt = base_prompt
+        sess.memory_context = inject_memories("", recent).lstrip()
         # 附加 agent_profile 供 CLI prompt 显示用(非 AgentSession 核心属性)
         sess.agent_profile = agent_profile
         sess.session_id = session_id
@@ -2770,21 +2812,40 @@ def _chat_with_cancel(
     import signal
 
     token = CancelToken()
+    run_id = f"run-{uuid.uuid4().hex}"
+
+    def execute_chat():
+        request_count = 0
+
+        def show_usage(kind, payload):
+            nonlocal request_count
+            if kind == "model.request.finished":
+                request_count += 1
+                _emit_progress_notice(_format_request_usage(request_count, payload), marker="[request]")
+
+        if service is None:
+            from app.models.request_audit import observe_model_requests
+            with observe_model_requests(show_usage):
+                return session.chat(line, images=images, cancel=token, resume=resume)
+
+        def handle_event(event):
+            if event.turn_id == run_id:
+                show_usage(event.kind, event.payload)
+
+        unsubscribe = service.subscribe_protocol(handle_event)
+        try:
+            return service.send_message(line, images=images, cancel=token, resume=resume, run_id=run_id)
+        finally:
+            unsubscribe()
+
     if live_input is not None:
         global _LIVE_INPUT
         _LIVE_INPUT = live_input
-        import uuid
-        run_id = f"run-{uuid.uuid4().hex}"
         if service is not None:
             live_input.on_steer = lambda text: service.steer_turn(run_id, text)
         try:
             def execute():
-                if service is not None:
-                    result = service.send_message(
-                        line, images=images, cancel=token, resume=resume, run_id=run_id,
-                    )
-                else:
-                    result = session.chat(line, images=images, cancel=token, resume=resume)
+                result = execute_chat()
                 live_input.run_status = getattr(session, "last_run_status", "")
                 usage = getattr(session, "last_turn_usage", None)
                 if isinstance(usage, dict) and hasattr(live_input, "composer"):
@@ -2839,14 +2900,7 @@ def _chat_with_cancel(
 
     try:
         with _EscWatcher(on_esc=lambda: _request_cancel("Esc")):
-            if service is not None:
-                return service.send_message(
-                    line, images=images, cancel=token, resume=resume,
-                )
-            # 兼容直接传 AgentSession 的旧测试和第三方调用方。
-            return session.chat(
-                line, images=images, cancel=token, resume=resume,
-            )
+            return execute_chat()
     finally:
         if can_trap and prev_handler is not None:
             signal.signal(signal.SIGINT, prev_handler)

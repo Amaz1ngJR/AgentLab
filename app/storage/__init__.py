@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_id    TEXT NOT NULL DEFAULT 'default',
     title       TEXT NOT NULL DEFAULT '',
     model_profile TEXT NOT NULL,
+    model_provider TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     archived    INTEGER NOT NULL DEFAULT 0,
@@ -235,7 +236,7 @@ class Storage:
         self._tx_depth = 0
         self._con.executescript(_SCHEMA)
         self._migrate_tool_executions()
-        self._migrate_sessions_workspace()
+        self._migrate_sessions()
         columns = {row["name"] for row in self._con.execute("PRAGMA table_info(tasks)")}
         if "execution_metadata" not in columns:
             self._con.execute("ALTER TABLE tasks ADD COLUMN execution_metadata TEXT NOT NULL DEFAULT '{}'")
@@ -273,16 +274,15 @@ class Storage:
                     f"ALTER TABLE tool_executions ADD COLUMN {name} {declaration}"
                 )
 
-    def _migrate_sessions_workspace(self) -> None:
-        """为已有数据库的 sessions 表添加 workspace 列。"""
+    def _migrate_sessions(self) -> None:
+        """补充 workspace 和实际模型来源，旧会话的模型来源保留为空。"""
         existing = {
             row["name"]
             for row in self._con.execute("PRAGMA table_info(sessions)").fetchall()
         }
-        if "workspace" not in existing:
-            self._con.execute(
-                "ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT ''"
-            )
+        for name in ("workspace", "model_provider"):
+            if name not in existing:
+                self._con.execute(f"ALTER TABLE sessions ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def _tx(self):
@@ -304,16 +304,16 @@ class Storage:
 
     def create_session(self, session_id: str, agent_id: str,
                        model_profile: str, title: str = "",
-                       workspace: str = "") -> None:
+                       workspace: str = "", *, model_provider: str = "") -> None:
         now = _now()
         # workspace 统一规范化,保证写入与 list_sessions 过滤用同一把钥匙。
         ws = str(Path(workspace).expanduser().resolve()) if workspace else ""
         with self._tx() as con:
             con.execute(
                 "INSERT OR REPLACE INTO sessions"
-                " (id,agent_id,title,model_profile,created_at,updated_at,archived,workspace)"
-                " VALUES (?,?,?,?,?,?,0,?)",
-                (session_id, agent_id, title, model_profile, now, now, ws),
+                " (id,agent_id,title,model_profile,model_provider,created_at,updated_at,archived,workspace)"
+                " VALUES (?,?,?,?,?,?,?,0,?)",
+                (session_id, agent_id, title, model_profile, model_provider, now, now, ws),
             )
 
     def update_session_title(self, session_id: str, title: str) -> None:
@@ -389,9 +389,15 @@ class Storage:
     # ── messages ─────────────────────────────────────────────────────────────
 
     def save_messages(self, session_id: str,
-                      messages: list[dict[str, Any]]) -> None:
+                      messages: list[dict[str, Any]], *,
+                      model_route: tuple[str, str] | None = None) -> None:
         """保存完整消息历史（覆盖）；图片只允许保存受控 file 引用。"""
         with self._tx() as con:
+            if model_route is not None:
+                con.execute(
+                    "UPDATE sessions SET model_profile=?, model_provider=? WHERE id=?",
+                    (*model_route, session_id),
+                )
             con.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
             now = _now()
             for m in messages:
@@ -664,10 +670,11 @@ class Storage:
         return out
 
     def save_delegation_checkpoint(self, session_id: str, *, messages: list[dict],
-                                   tasks: list[dict], records: list[dict]) -> None:
+                                   tasks: list[dict], records: list[dict],
+                                   model_route: tuple[str, str] | None = None) -> None:
         """Commit parent evidence, DAG/child associations and reservations together."""
         with self._tx():
-            self.save_messages(session_id, messages)
+            self.save_messages(session_id, messages, model_route=model_route)
             self.save_tasks(session_id, tasks)
             self.save_child_runs(session_id, records)
 

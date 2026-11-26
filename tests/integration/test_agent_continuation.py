@@ -88,7 +88,8 @@ def test_readonly_budget_exhaustion_stops_gating_parent_after_delivery(tmp_path)
 @pytest.mark.parametrize(("read_only", "resume", "expected_status"), [
     (True, False, "completed"),
     (True, True, "completed"),
-    (False, False, "blocked"),
+    (False, False, "completed"),
+    (False, True, "blocked"),
 ])
 def test_prior_budget_exhaustion_only_carries_required_delivery(tmp_path, read_only, resume, expected_status):
     from dataclasses import asdict
@@ -114,8 +115,42 @@ def test_prior_budget_exhaustion_only_carries_required_delivery(tmp_path, read_o
     assert session.last_run_status == expected_status
     assert "查到独立证据" in answer
     assert ("委派尚未交付" in answer) == (expected_status == "blocked")
-    assert ("old-child" in str(session.messages)) == (resume or not read_only)
+    assert ("old-child" in str(session.messages)) == resume
     assert session.child_records[0]["execution_status"] == "budget_exhausted"
+
+
+@pytest.mark.parametrize("mode", ["direct", "task"])
+def test_read_only_question_does_not_consume_previous_delivery_or_task_state(tmp_path, mode):
+    from dataclasses import asdict
+    from app.agent.runtime import AgentSession
+    from app.agent.subagent_runtime import SubagentSpec
+    from app.config.loader import use_workspace_root
+    from tests.support.delegation import registry
+
+    llm = ForkRouter([response("封存后写入索引"), response("仍需验证")])
+    session = AgentSession(llm, registry(), delegation_policy="auto",
+                           orchestrate=mode == "task", mode=mode)
+    session.task_store.restore([{"id": "old-task", "content": "交付录像索引", "status": "pending"}])
+    session.child_records = [{
+        "child_run_id": "old-child", "parent_run_id": "old-run",
+        "parent_workspace": str(tmp_path.resolve()), "delegation_allowed": True,
+        "execution_status": "failed", "delivery_status": "applied_unverified",
+        "spec": asdict(SubagentSpec("old-child", "迁移录像索引", read_only=False)),
+    }]
+    original = copy.deepcopy(session.child_records)
+
+    with use_workspace_root(tmp_path):
+        assert session.chat("继续，请你告诉我索引什么时候写入？") == "封存后写入索引"
+        assert session.last_run_status == "completed"
+        assert session.execution_mode.value == "direct"
+        assert session.task_store.get("old-task").status == "pending"
+        assert session.child_records == original
+        assert "integrate_agent" not in {tool["name"] for tool in llm.calls[0]["tools"]}
+
+        if mode == "direct":
+            assert "委派尚未交付" in session.chat("继续验证并交付")
+            assert session.last_run_status == "blocked"
+            assert "integrate_agent" in {tool["name"] for tool in llm.calls[1]["tools"]}
 
 
 def test_native_prefix_final_serialized_request_and_fallback(tmp_path):

@@ -25,6 +25,7 @@ from typing import Any, Optional
 from app.agent.cancel import CancelToken, close_on_cancel
 from app.config.schemas import LLMConfig
 from app.attachments import image_block_to_data_url
+from app.models.request_audit import ResponsesRequestPrefix, audited_request, record_attempt, record_stream, record_usage
 from app.models.token_progress import StreamingTokenProgress
 from app.models.stream_normalizer import StreamDeltaNormalizer
 from app.models.protocol import (
@@ -236,11 +237,12 @@ class OpenAIAdapter:
         from openai import OpenAI
 
         self._cfg = cfg
-        self._raw_stream_required = False
+        self._raw_stream_required = bool(cfg.base_url)
+        self._request_prefix = ResponsesRequestPrefix()
         if not cfg.api_key:
             raise RuntimeError("openai provider 需要 OPENAI_API_KEY")
 
-        kwargs: dict[str, Any] = {"timeout": cfg.timeout_seconds, "api_key": cfg.api_key}
+        kwargs: dict[str, Any] = {"timeout": cfg.timeout_seconds, "api_key": cfg.api_key, "max_retries": 0}
         if cfg.base_url:
             kwargs["base_url"] = cfg.base_url
         self._client = OpenAI(**kwargs)
@@ -286,6 +288,7 @@ class OpenAIAdapter:
         # SDK 提供 output_text 便捷属性,自动拼接所有 text 段
         return getattr(resp, "output_text", "") or ""
 
+    @audited_request
     def create_message(
         self,
         messages: list[dict],
@@ -313,6 +316,7 @@ class OpenAIAdapter:
         if tools:
             # Responses API 的工具定义是扁平结构,直接 name / parameters,不嵌套 function
             params["tools"] = [_to_responses_tool(t) for t in tools]
+        self._request_prefix.record(params)
 
         # ── 流式累积状态 ────────────────────────────────────────────────────
         # 输入 token 只能在服务端 usage 到达时确定。Responses API 通常只在
@@ -335,6 +339,8 @@ class OpenAIAdapter:
             delta_text = getattr(event, "delta", "") or ""
             response = getattr(event, "response", None)
             event_usage = getattr(response, "usage", None) if response is not None else None
+            if response is not None:
+                record_usage(event_usage, provider="openai", response=response)
             if event_usage is not None:
                 event_input = getattr(event_usage, "input_tokens", None)
                 event_output = getattr(event_usage, "output_tokens", None)
@@ -368,7 +374,7 @@ class OpenAIAdapter:
                 index = getattr(event, "output_index", None)
                 if item is not None and isinstance(index, int):
                     completed_items[index] = item
-            return response if etype == "response.completed" else None
+            return response if etype in {"response.completed", "response.incomplete"} else None
 
         try:
             if _use_raw_stream:
@@ -376,6 +382,7 @@ class OpenAIAdapter:
                 last_response = None
                 failure: tuple[str, bool] | None = None
                 raw_stream = self._client.responses.create(**params, stream=True)
+                record_stream(raw_stream)
                 try:
                     with close_on_cancel(cancel, raw_stream):
                         for event in raw_stream:
@@ -422,6 +429,7 @@ class OpenAIAdapter:
                     )
             else:
                 with self._client.responses.stream(**params) as stream:
+                    record_stream(stream)
                     with close_on_cancel(cancel, stream):
                         for event in stream:
                             if cancel is not None:
@@ -461,6 +469,7 @@ class OpenAIAdapter:
                 or _MISSING_COMPLETED_MARKER in message
             ):
                 self._raw_stream_required = True
+                record_attempt(status="stream_fallback")
                 return self.create_message(
                     messages=messages,
                     tools=tools,
@@ -492,6 +501,10 @@ class OpenAIAdapter:
         final_items = final.output or [completed_items[i] for i in sorted(completed_items)]
         for item in final_items:
             item_type = getattr(item, "type", None)
+            if (getattr(final, "status", None) == "incomplete"
+                    and not isinstance(final, _SynthesizedResponse)
+                    and item_type == "function_call" and getattr(item, "status", None) != "completed"):
+                continue
             item_dict = item.model_dump() if hasattr(item, "model_dump") else dict(item)
             output_items.append(item_dict)
 
@@ -541,15 +554,20 @@ class OpenAIAdapter:
             out_tokens = progress.output_tokens
 
         output_types = [item.get("type", "unknown") for item in output_items]
+        record_usage(usage_obj, provider="openai", response=final)
         empty_result = not text_parts and not tool_calls
         if empty_result:
             effort = reasoning_effort_override or self._cfg.reasoning_effort
-            if reasoning_effort_override is None and effort not in (None, "none"):
-                # 网关可能返回 completed + 空 output；仅在无结果时降档重试一次。
+            if (reasoning_effort_override is None and effort not in (None, "none")
+                    and getattr(usage_obj, "output_tokens", None) == 0
+                    and getattr(final, "status", None) == "completed"):
+                # An explicit empty completion can be a gateway quirk. Avoid replaying
+                # the prompt after the provider already produced output or usage is unknown.
                 fallback_effort = (
                     "low" if output_types and effort in ("medium", "high", "xhigh", "max")
                     else "none"
                 )
+                record_attempt(status="empty_fallback")
                 retry = self.create_message(
                     messages=messages,
                     tools=tools,
@@ -580,12 +598,11 @@ class OpenAIAdapter:
             status = getattr(final, "status", None)
             details = getattr(final, "incomplete_details", None)
             reason = getattr(details, "reason", None) if details is not None else None
-            if reasoning_effort_override is not None or saw_reasoning_delta or "reasoning" in output_types:
-                raise ProviderStreamError(
-                    "OpenAI Responses 仅返回推理内容或空输出、没有正文或工具调用"
-                    f" (status={status}, reason={reason}, output_types={output_types}, "
-                    f"reasoning_delta={saw_reasoning_delta})"
-                )
+            raise ProviderStreamError(
+                "OpenAI Responses 仅返回推理内容或空输出、没有正文或工具调用"
+                f" (status={status}, reason={reason}, output_types={output_types}, "
+                f"reasoning_delta={saw_reasoning_delta})"
+            )
 
         from app.models.cache_usage import cache_usage
         return ModelResponse(
@@ -658,9 +675,14 @@ def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
       - 工具调用: {"type": "function_call", "call_id": "...", "name": "...", "arguments": {...}}
       - 工具结果: {"type": "function_call_output", "call_id": "...", "output": "..."}
     """
+    from app.models.append_prefix import INSTRUCTION
+
     result = []
 
     for msg in messages:
+        if msg.get(INSTRUCTION):
+            # OAuth reconstructs this as a wire-format developer message itself.
+            continue
         # 如果已经是 Responses API 格式 (有 type 字段), 清理并验证
         if "type" in msg:
             msg_type = msg.get("type")
@@ -701,7 +723,8 @@ def _convert_messages_to_responses_format(messages: list[dict]) -> list[dict]:
             if msg_type == "message":
                 # 移除内部字段
                 cleaned = {k: v for k, v in msg.items()
-                          if k not in ('parsed_arguments', 'status', 'namespace',
+                          if not k.startswith("_agentlab_")
+                          and k not in ('parsed_arguments', 'status', 'namespace',
                                       'internal_chat_message_metadata_passthrough',
                                       'metadata', 'id', 'summary', 'encrypted_content',
                                       'phase')}

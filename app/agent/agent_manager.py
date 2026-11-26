@@ -54,7 +54,8 @@ class ChildRun:
             return False
         if not self.done.is_set():
             return True
-        return not self.closed and (self.result is None or self.result.delivery_status != "integrated")
+        return not self.closed and (self.result is None
+                                    or self.result.delivery_status not in {"integrated", "parent_verified"})
 
 
 class AgentManager:
@@ -120,7 +121,7 @@ class AgentManager:
         if self._deadline_timer is not None:
             self._deadline_timer.cancel()
         self._deadline_timer = threading.Timer(max(0, self.deadline - time.monotonic()),
-            lambda: self._expire_budget("budget_exhausted: 自动运行达到时间上限；未完成任务已保留，请检查预算后继续或重新规划"))
+            lambda: self._expire_budget(self._deadline_error()))
         self._deadline_timer.daemon = True
         self._deadline_timer.start()
 
@@ -130,6 +131,17 @@ class AgentManager:
                 return
             self.budget_error = reason
         self.cancel.cancel("budget_exhausted")
+
+    def _deadline_error(self) -> str:
+        return f"budget_exhausted: 本轮达到时间上限（{self.timeout:g} 秒）"
+
+    def _check_parent_budget(self, remaining: int, exhausted: str) -> None:
+        if time.monotonic() >= self.deadline:
+            exhausted = self._deadline_error()
+        elif remaining > 0:
+            return
+        self._expire_budget(exhausted)
+        raise Cancelled(exhausted, reason="budget_exhausted")
 
     def result_delivered(self, sid: str) -> bool:
         return sid in self._delivered
@@ -308,6 +320,8 @@ class AgentManager:
                         result.changed_files = sorted(path for path in shared_before.keys() | after.keys()
                                                       if shared_before.get(path) != after.get(path))
                         result.metrics["shared_artifact"] = after
+                        if not result.changed_files and result.status != "succeeded":
+                            result.delivery_status = "no_changes"
                     except Exception as exc:
                         result.status = "failed"
                         result.error = f"artifact collection failed: {exc}"
@@ -492,9 +506,7 @@ class AgentManager:
             return
         self.pump()
         self._wait_for_reservations("rounds_left")
-        if time.monotonic() >= self.deadline or self.rounds_left <= 0:
-            self._expire_budget("budget_exhausted: parent/child aggregate model budget")
-            raise Cancelled("budget_exhausted: parent/child aggregate model budget")
+        self._check_parent_budget(self.rounds_left, "budget_exhausted: parent/child aggregate model budget")
         self.rounds_left -= 1
         self._save()
 
@@ -502,9 +514,7 @@ class AgentManager:
         if not self.allowed and not self.long_run:
             return
         self._wait_for_reservations("tools_left")
-        if time.monotonic() >= self.deadline or self.tools_left <= 0:
-            self._expire_budget("budget_exhausted: parent/child aggregate tool budget")
-            raise Cancelled("budget_exhausted: parent/child aggregate tool budget")
+        self._check_parent_budget(self.tools_left, "budget_exhausted: parent/child aggregate tool budget")
         self.tools_left -= 1
         self._save()
 
@@ -682,13 +692,17 @@ class AgentManager:
         self._save()
         return self.snapshot(sid)
 
-    def integrate(self, sid: str, checks: list[str]) -> dict:
+    def integrate(self, sid: str, checks: list[str], adopt_current: bool = False,
+                  check_timeout_seconds: int = 60) -> dict:
         from app.agent.agent_delivery import integrate_result
         child = self._get(sid)
         if not child.done.is_set() or child.result is None:
             raise ToolExecutionError("child has not stopped")
-        if child.result.delivery_status == "integrated":
-            return {"status": "integrated", "already_integrated": True}
+        if child.result.delivery_status in {"integrated", "parent_verified"}:
+            return {"status": child.result.delivery_status, "already_integrated": True}
+        if adopt_current and (child.spec.read_only or any(
+                not sibling.spec.read_only and not sibling.done.is_set() for sibling in self.children.values())):
+            raise ToolExecutionError("parent verification requires a shared write result and no active writers")
         # Query/close are free, but verification commands consume the parent budget.
         for _ in checks:
             self.charge_parent_tool()
@@ -705,7 +719,8 @@ class AgentManager:
         try:
             result = integrate_result(child.result, workspace=self.workspace, tools=self.tools,
                                       approval=self.approval, checks=checks, cancel=delivery_cancel,
-                                      file_scope=child.spec.file_scope)
+                                      file_scope=child.spec.file_scope, adopt_current=adopt_current,
+                                      check_timeout_seconds=check_timeout_seconds)
         except Cancelled as exc:
             reason = exc.reason or delivery_cancel.reason or "operation_cancelled"
             if reason == "budget_exhausted":
@@ -870,7 +885,8 @@ class AgentManager:
                         result.status == "budget_exhausted" and self.result_delivered(sid)
                     ):
                         continue
-                elif result.status == "succeeded" and result.delivery_status == "integrated":
+                elif result.delivery_status == "parent_verified" or (
+                        result.status == "succeeded" and result.delivery_status == "integrated"):
                     continue
             snapshot = self.snapshot(sid)
             unresolved.append(f"{sid}: {snapshot['status']}/{snapshot['delivery_status']}")
@@ -899,7 +915,7 @@ class AgentManager:
             return lambda args: json.dumps(fn(**args), ensure_ascii=False)
         def integrate_tool(args):
             result = self.integrate(**args)
-            if result.get("status") != "integrated":
+            if result.get("status") not in {"integrated", "parent_verified"}:
                 raise ToolExecutionError("未交付：" + json.dumps(result, ensure_ascii=False))
             return json.dumps(result, ensure_ascii=False)
         return [
@@ -929,9 +945,14 @@ class AgentManager:
                          "max_tool_calls": {"type": "integer", "minimum": 1, "maximum": self.tool_limit}}, ["sid", "instruction"]), wrap(self.resume)),
             Tool("send_input", "向指定活动子任务排队 steer；不会消费父邮箱。",
                  schema({"sid": string, "text": string, "mode": {"enum": ["steer", "interrupt"]}}, ["sid", "text"]), wrap(self.send_input)),
-            Tool("integrate_agent", "验证写入子任务：共享模式确认已在父工作区的成果；worktree 模式审批并应用补丁。不提交或推送。",
+            Tool("integrate_agent", "验证写入子任务：共享模式确认已在父工作区的成果；worktree 模式审批并应用补丁。"
+                 "共享写入失败或快照已变化时，父级先审查当前工作区，再用 adopt_current=true 和实际检查结清交付；"
+                 "保存当前范围的验证证据和审批结果，保留原子任务执行状态。",
                  schema({"sid": string, "checks": {"type": "array", "items": string, "minItems": 1,
-                         "description": "必须是实际可执行的 shell 验证命令，在子任务实际工作区运行；不是审查说明、操作计划或承诺稍后验证"}},
+                         "description": "实际可执行的 shell 验证命令；adopt_current 时在当前父工作区运行"},
+                         "adopt_current": {"type": "boolean", "description": "显式验证并接管共享写入的当前状态"},
+                         "check_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600,
+                                                   "description": "单条验证超时，默认 60 秒，仍受父运行时限约束"}},
                         ["sid", "checks"]), integrate_tool),
             Tool("close_agent", "幂等关闭子任务并请求取消；cancelling 表示尚未退出，仍占用写范围。关闭且实际停止后释放写范围，父级可接手；保留结果和文件，不代表补丁已集成或任务成功。",
                  schema({"sid": string}, ["sid"]), wrap(self.close)),

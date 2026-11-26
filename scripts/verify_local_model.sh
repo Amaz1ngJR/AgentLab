@@ -8,11 +8,11 @@
 #
 # 用法:
 #   bash scripts/verify_local_model.sh
-#   bash scripts/verify_local_model.sh local_qwen14b   # 验证其他 profile
+#   bash scripts/verify_local_model.sh local_qwen3_14b   # 显式指定本地 profile
 
 set -e
 
-PROFILE="${1:-local_qwen}"
+PROFILE="${1:-local_qwen3_14b}"
 
 if [ -t 1 ]; then
     BOLD="\033[1m"; GREEN="\033[32m"; RED="\033[31m"; CYAN="\033[36m"; RESET="\033[0m"

@@ -1,6 +1,6 @@
 # ChatGPT OAuth 模型接入
 
-AgentLab 使用自己的 ChatGPT OAuth 注册访问 Responses API。`chatgpt_codex` profile
+AgentLab 使用自己的 ChatGPT OAuth 注册访问 Responses API。`codex` profile
 配置为 `gpt-6.2-sol`，推理强度为 `medium`。任务编排、工具执行、记忆、审批和本地会话由 AgentLab 管理。
 该入口不会调用 Codex CLI，也不会读取 `~/.codex/auth.json`。
 
@@ -13,7 +13,7 @@ agentlab auth login chatgpt
 agentlab auth status chatgpt
 agentlab auth models chatgpt
 agentlab auth test chatgpt
-agentlab --profile chatgpt_codex
+agentlab --profile codex
 ```
 
 登录会打开系统浏览器，显示 Continue with ChatGPT，要求授权 AgentLab 使用
@@ -29,7 +29,7 @@ echo 工具调用及结果回放。不自动改用 API Key 计费。
 若想设为默认，在 `.env` 设置：
 
 ```dotenv
-ACTIVE_PROFILE=chatgpt_codex
+ACTIVE_PROFILE=codex
 CHATGPT_ACCOUNT=default
 ```
 
@@ -210,3 +210,13 @@ developer 指令不因这项清理被自动删除。请求允许列表、本地�
 压缩使用独立 Router 配置，将 SDK 请求超时扩展到本次剩余时间，普通对话的
 `LLM_TIMEOUT_SECONDS` 保持不变；子任务的预算包装不被绕过。取消和整体截止时间
 仍生效，超时保留原始历史，迟到响应不会覆盖会话。修改配置后重启生效。
+
+## WebSocket 续接
+
+OAuth 对话默认优先使用 WebSocket。旧环境可运行 `python -m pip install -r requirements.txt`
+补齐依赖。如果客户端不支持 WebSocket 或握手遇到兼容性问题，会在发送推理请求前回退到 HTTP，
+并在会话内复用 HTTP 连接。如需固定使用 HTTP，在 `.env` 中设置 `LLM_CHATGPT_WEBSOCKET=0`。
+
+只有请求设置保持一致且历史完整追加时，才会在同一条 WebSocket 连接上发送新增输入项。
+历史压缩或改写后会重新发送当前上下文。CLI 的 `WS 新增 N 项` 表示实际发送的增量项数，
+缓存命中率仍按服务端返回的 token 用量计算。

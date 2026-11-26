@@ -14,11 +14,59 @@ from typing import Any, Callable, Optional
 from app.agent import events
 from app.agent.cancel import Cancelled, CancelToken
 from app.agent.context_budget import ContextBudget, estimate_messages_tokens, estimate_message_tokens
-from app.agent.context_compaction import ContextCompressor, ContextSummary
+from app.agent.context_compaction import ContextCompressor, ContextSummary, _safe_split_point
 from app.agent.events import RunEvent
 
 # 压缩时至少保留的最近消息条数:保护最后一条用户请求 + 当前任务的近距上下文。
 DEFAULT_KEEP_RECENT = 6
+VERIFICATION_COMPACTION_MIN_SAVINGS = 12_000
+VERIFICATION_COMPACTION_SECONDS = 30
+
+
+def _excerpt_tool_content(content):
+    if isinstance(content, str) and len(content) > 1200:
+        return (content[:600] + "\n[较早的工具输出已节选；如需完整证据，请按工具参数重新定位。]\n"
+                + content[-500:])
+    if isinstance(content, list):
+        blocks = []
+        for block in content:
+            if (isinstance(block, dict) and block.get("type") in {"text", "input_text", "output_text"}
+                    and isinstance(block.get("text"), str)):
+                block = {**block, "text": _excerpt_tool_content(block["text"])}
+            blocks.append(block)
+        return blocks
+    return content
+
+
+def project_read_only_history(
+    messages: list[dict], *, replays_encrypted_reasoning: bool, safe_input_limit: int,
+) -> list[dict]:
+    """Shorten old tool evidence in a request view. Keep persisted history and tool IDs intact."""
+    # OAuth can replay opaque reasoning state. Other adapters drop top-level reasoning.
+    wire_history = [item for item in messages if item.get("type") != "reasoning"
+                    or (replays_encrypted_reasoning and item.get("id") and item.get("encrypted_content"))]
+    estimated = estimate_messages_tokens(wire_history)
+    if estimated < min(64_000, max(1536, safe_input_limit // 2)):
+        return messages
+    recent_budget = min(12_000, max(512, safe_input_limit // 4))
+    split = _safe_split_point(wire_history, DEFAULT_KEEP_RECENT, recent_budget)
+    projected = []
+    for item in wire_history[:split]:
+        if item.get("type") == "function_call_output" and "output" in item:
+            item = {**item, "output": _excerpt_tool_content(item["output"])}
+        elif item.get("role") == "tool" and "content" in item:
+            item = {**item, "content": _excerpt_tool_content(item["content"])}
+        elif item.get("role") == "user" and isinstance(item.get("content"), list):
+            item = {**item, "content": [
+                {**block, "content": _excerpt_tool_content(block["content"])}
+                if isinstance(block, dict) and block.get("type") == "tool_result" and "content" in block
+                else block for block in item["content"]
+            ]}
+        projected.append(item)
+    projected.extend(wire_history[split:])
+    if estimated - estimate_messages_tokens(projected) < min(12_000, max(512, safe_input_limit // 8)):
+        return messages
+    return projected
 
 
 class ContextBudgetExceeded(RuntimeError):
@@ -184,10 +232,13 @@ class ContextManager:
         tools: Optional[list[dict[str, Any]]] = None,
         on_progress=None,
         cancel: CancelToken | None = None,
+        verification: bool = False,
+        on_summary_usage=None,
     ) -> bool:
         """在稳定点检查预算并按需压缩。返回是否发生了压缩。
 
         force=True 时无视阈值与 auto_compact 直接尝试压缩(供 /context compact)。
+        verification=True 时仅尝试有明显收益且能单次摘要的提前压缩。
         """
         if cancel is not None:
             cancel.raise_if_cancelled()
@@ -196,7 +247,11 @@ class ContextManager:
         if status == "ok":
             self._failed_compaction = None
 
-        if not force:
+        if verification:
+            if (not self.auto_compact or est < 32_000 or status == "compact"
+                    or self.retry_status(est).get("blocked")):
+                return False
+        elif not force:
             if not self.auto_compact:
                 return False
             if status == "warn" and not self._warned:
@@ -211,15 +266,29 @@ class ContextManager:
                 return False
 
         compaction_started = time.monotonic()
-        # 触发压缩
-        self._emit(RunEvent(
-            kind=events.CONTEXT_COMPACTION_STARTED,
-            payload={"token_before": est},
-        ))
+        started_event_sent = False
+
+        def emit_started():
+            nonlocal started_event_sent
+            self._emit(RunEvent(kind=events.CONTEXT_COMPACTION_STARTED, payload={"token_before": est}))
+            started_event_sent = True
+
+        def emit_progress(progress):
+            if not started_event_sent:
+                emit_started()
+            self._emit(RunEvent(kind=events.CONTEXT_COMPACTION_PROGRESS, payload={
+                **progress, "elapsed_seconds": time.monotonic() - compaction_started,
+            }))
+
+        if not verification:
+            emit_started()
         # 手动 compact 的语义是“尽可能压缩旧历史”。不能继续传 recent_budget，
         # 否则当整段历史本身低于 recent_messages_budget 时，选段算法会把全部消息
         # 都判为 recent tail，split=0，最终错误报告“无可安全压缩的前缀”。
-        effective_recent_budget = None if force else self.budget.recent_messages_budget
+        if verification:
+            recent_budgets = [min(self.budget.recent_messages_budget, 8_000)]
+        else:
+            recent_budgets = [None] if force else [self.budget.recent_messages_budget, None]
         fixed_tokens = est - estimate_messages_tokens(messages)
         target = max(0, self.budget.safe_input_limit - fixed_tokens)
         summary_cap = getattr(self._compressor, "MAX_SUMMARY_OUTPUT_TOKENS", 4096)
@@ -230,25 +299,35 @@ class ContextManager:
             self._emit(RunEvent(kind=events.CONTEXT_COMPACTION_FAILED,
                                 text="模型窗口不足以容纳摘要指令和输出预留"))
             return False
-        deadline = compaction_started + self._compressor.timeout_for(messages, summary_input)
+        deadline = compaction_started + (
+            VERIFICATION_COMPACTION_SECONDS if verification
+            else self._compressor.timeout_for(messages, summary_input)
+        )
+        policies = {"min_savings": VERIFICATION_COMPACTION_MIN_SAVINGS} if verification else {}
         # 先尝试常规尾部预算；若仍超限，缩减到条数下限，始终对候选执行原子校验。
-        for recent_budget in ([None] if force else [effective_recent_budget, None]):
-            result = self._compressor.compact(
-                messages, keep_recent=self.keep_recent,
-                recent_budget=recent_budget,
-                summary_budget=summary_budget, input_token_budget=summary_input,
-                current_system=system, current_tools=tools,
-                target_message_tokens=target,
-                source_run_ids=source_run_ids, on_progress=on_progress, cancel=cancel,
-                deadline=deadline,
-                on_compaction_progress=lambda progress: self._emit(RunEvent(
-                    kind=events.CONTEXT_COMPACTION_PROGRESS, payload={
-                        **progress, "elapsed_seconds": time.monotonic() - compaction_started,
-                    })),
-            )
+        for recent_budget in recent_budgets:
+            try:
+                result = self._compressor.compact(
+                    messages, keep_recent=self.keep_recent,
+                    recent_budget=recent_budget,
+                    summary_budget=summary_budget, input_token_budget=summary_input,
+                    current_system=system, current_tools=tools,
+                    target_message_tokens=target,
+                    source_run_ids=source_run_ids, on_progress=on_progress, cancel=cancel,
+                    deadline=deadline,
+                    **policies,
+                    on_compaction_progress=emit_progress,
+                )
+            finally:
+                if on_summary_usage is not None:
+                    on_summary_usage(self._compressor.last_usage)
             if result.compacted or result.code != "budget_exceeded":
                 break
         if not result.compacted or result.summary is None:
+            if verification:
+                if started_event_sent:
+                    self._emit(RunEvent(kind=events.CONTEXT_COMPACTION_FAILED, text=result.reason))
+                return False
             self._remember_failure(est, result.reason or "压缩未发生")
             self._emit(RunEvent(
                 kind=events.CONTEXT_COMPACTION_FAILED,

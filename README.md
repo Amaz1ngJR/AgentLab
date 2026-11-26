@@ -24,7 +24,7 @@
 
 ## 安装
 
-ChatGPT 订阅账号可通过独立 OAuth 授权接入 `gpt-6.1-sol`，继续使用 AgentLab
+ChatGPT 订阅账号可通过 `codex` profile 使用 OAuth 授权，继续使用 AgentLab
 的工具、记忆和审批。配置与验证步骤见 [ChatGPT OAuth 接入](docs/chatgpt_oauth.md)。
 
 需要 **Python 3.11+**。
@@ -200,7 +200,7 @@ python -m app
 python -m app --profile local_qwen3_14b -p "用一句话介绍你自己"
 ```
 
-也可以使用现有的一键脚本安装默认的 Qwen2.5-Coder 7B：
+也可以使用一键脚本安装 `local_qwen3_14b` 对应的 `qwen3:14b`：
 
 ```bash
 bash scripts/install_local_model.sh                 # macOS / Linux
@@ -265,14 +265,14 @@ Session 和 workspace；管道或命令链会逐段检查。越界目录、重�
 ```bash
 agentlab --workspace .                 # 从任意目录启动，以当前目录为工作区
 agentlab -w /path/to/project           # 指定其他工作区
-agentlab -w . --profile local_qwen     # 指定工作区和模型 profile
+agentlab -w . --profile local_qwen3_14b     # 指定工作区和模型 profile
 
 python -m app --version                # 显示当前版本后退出
 python -m app --image ./error.png -p "分析截图"  # 单次图片 prompt
 python -m app                          # 交互式 REPL
 python -m app -p "帮我看 README.md"    # 单次 prompt 后退出
 python -m app -y                       # 自动放行所有工具（跳过审批）
-python -m app --profile local_qwen     # 临时切换 profile,不改 .env
+python -m app --profile local_qwen3_14b     # 临时切换 profile,不改 .env
 ```
 
 `agentlab` 可以在任意目录执行。模型、Agent、Skill 和 MCP 配置仍从 AgentLab
@@ -317,9 +317,8 @@ python -m app --profile local_qwen     # 临时切换 profile,不改 .env
 ### 图片输入
 
 支持 PNG、JPEG、WEBP 和 GIF，单张最大 5MB、最大 2500 万像素。当前
-`cloud_claude`、`cloud_claude_opus` 和已实测的 `crs_gpt` profile 声明了
-`vision` 能力；`gpt_official` 默认模型是非视觉的 `gpt-3.5-turbo`，切换到
-视觉模型后需在 profile capabilities 中显式加入 `vision`。其他 profile 发送图片
+`codex`、`cloud_claude` 和 `crs_gpt` profile 声明了 `vision` 能力。
+自定义视觉模型需在 profile capabilities 中显式加入 `vision`。非视觉 profile 发送图片
 时会明确拒绝，避免图片被静默丢弃。
 
 ```text
@@ -541,7 +540,7 @@ python -m app
 
 ## ChatGPT OAuth 登录与多账号切换
 
-使用 `chatgpt_codex` profile 调用 `gpt-6.1-sol`，保留 AgentLab 的工具、记忆和审批。
+使用 `codex` profile，保留 AgentLab 的工具、记忆和审批。
 首次登录默认账号：
 
 ```bash
@@ -559,19 +558,19 @@ macOS / Linux 可在启动时临时选择账号，无需先退出其他账号：
 
 ```bash
 # 原账号
-CHATGPT_ACCOUNT=default agentlab --profile chatgpt_codex
+CHATGPT_ACCOUNT=default agentlab --profile codex
 
 # 工作账号
-CHATGPT_ACCOUNT=work agentlab --profile chatgpt_codex
+CHATGPT_ACCOUNT=work agentlab --profile codex
 ```
 
 Windows PowerShell 使用 `$env:CHATGPT_ACCOUNT="work"` 后运行
-`agentlab --profile chatgpt_codex`；切回原账号时将该环境变量改为 `default`。
+`agentlab --profile codex`；切回原账号时将该环境变量改为 `default`。
 
 若要固定默认账号，在 `.env` 中设置并重新启动 AgentLab：
 
 ```dotenv
-ACTIVE_PROFILE=chatgpt_codex
+ACTIVE_PROFILE=codex
 CHATGPT_ACCOUNT=work
 ```
 
@@ -611,8 +610,8 @@ WORKSPACE_ROOT=/Users/you/some-project
 
 | Profile | 说明 | 需要的环境变量 |
 |---|---|---|
-| `chatgpt_codex` | ChatGPT OAuth + GPT-6.2 Sol | 先运行 `agentlab auth login chatgpt`；`CHATGPT_ACCOUNT` 可选择账号标签 |
-| `cloud_claude_opus` | Anthropic Claude Opus | `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY`（可用 `ANTHROPIC_MODEL` 覆盖型号） |
+| `codex` | ChatGPT OAuth + GPT-6.2 Sol | 先运行 `agentlab auth login chatgpt`；`CHATGPT_ACCOUNT` 可选择账号标签 |
+| `cloud_claude` | Anthropic Claude | `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY`（可用 `ANTHROPIC_MODEL` 覆盖型号） |
 | `crs_gpt` | 内部 CRS 网关 GPT-6.2 Astra | `CRS_OAI_URL` + `CRS_OAI_KEY` |
 | `siliconflow` | 硅基流动 SiliconFlow（OpenAI 兼容云端） | `SILICONFLOW_API_KEY`（可选 `SILICONFLOW_MODEL` 覆盖型号） |
 | `local_qwen3_14b` | 本机 Ollama + Qwen3 14B | 无（需先 `ollama pull qwen3:14b`） |

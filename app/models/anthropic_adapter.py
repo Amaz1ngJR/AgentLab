@@ -15,6 +15,7 @@ from app.attachments import materialize_image_block
 from app.models.token_progress import StreamingTokenProgress
 from app.models.stream_normalizer import StreamDeltaNormalizer
 from app.models.openai_adapter import ProviderStreamError
+from app.models.request_audit import audited_request, record_attempt, record_stream, record_usage
 from app.models.protocol import (
     ModelResponse,
     ProgressCallback,
@@ -351,7 +352,7 @@ class AnthropicAdapter:
         if not (cfg.auth_token or cfg.api_key):
             raise RuntimeError("anthropic provider 需要 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY")
 
-        kwargs: dict[str, Any] = {"timeout": cfg.timeout_seconds}
+        kwargs: dict[str, Any] = {"timeout": cfg.timeout_seconds, "max_retries": 0}
         if cfg.auth_token:
             kwargs["auth_token"] = cfg.auth_token
         else:
@@ -400,6 +401,7 @@ class AnthropicAdapter:
         return "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
 
     @_temperature_compatible
+    @audited_request
     def create_message(
         self,
         messages: list[dict],
@@ -441,6 +443,7 @@ class AnthropicAdapter:
         progress.emit(force=True)
 
         with self._client.messages.stream(**params) as stream:
+            record_stream(stream)
             with close_on_cancel(cancel, stream):
                 # 不再用 ``for event in stream``：SDK 的 MessageStream.__stream__
                 # 在 yield 之前就调用 accumulate_event()，而那里直接用
@@ -459,6 +462,7 @@ class AnthropicAdapter:
                     if etype == "message_start":
                         # content=null 已由 _iter_events_with_repaired_snapshot 修好。
                         usage = getattr(event.message, "usage", None)
+                        record_usage(usage, provider="anthropic", response=event.message)
                         if usage:
                             in_tokens = getattr(usage, "input_tokens", 0) or 0
                             out_tokens = getattr(usage, "output_tokens", 0) or 0
@@ -483,6 +487,7 @@ class AnthropicAdapter:
                             v = getattr(usage, "output_tokens", None)
                             if v is not None:
                                 out_tokens = v
+                                record_attempt(output_tokens=v)
                                 progress.set_usage(output_tokens=v)
 
                 if cancel is not None:
@@ -531,6 +536,7 @@ class AnthropicAdapter:
             usage = {"input_tokens": in_tokens, "output_tokens": out_tokens}
 
         from app.models.cache_usage import cache_usage
+        record_usage(getattr(message, "usage", None), provider="anthropic", response=message)
         usage.update(cache_usage(getattr(message, "usage", None), provider="anthropic"))
         # 用最终 usage 再发一次进度，确保 spinner 显示的数字与 [stats] 一致
         if on_progress:

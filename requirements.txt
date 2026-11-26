@@ -1,4 +1,4 @@
-openai>=1.40.0
+openai[realtime]>=2.38.0
 PyJWT[crypto]>=2.10.0
 filelock>=3.16.0
 httpx>=0.27,<1
@@ -24,7 +24,6 @@ beautifulsoup4>=4.12.0
 # Web fetch (optional, for web_fetch tool — 正文抽取，按优先级取任一即可)
 # trafilatura 效果最好；没装则回退 beautifulsoup4（已在上方）纯文本抽取
 trafilatura>=1.6.0
-markdownify>=0.11.0
 
 # Image attachments and cross-platform clipboard image paste
 Pillow>=10.0.0

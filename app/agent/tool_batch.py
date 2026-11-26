@@ -11,6 +11,9 @@ from app.agent.cancel import Cancelled
 from app.models.protocol import ToolResult
 from app.tools.registry import _deferred_audits
 
+EXPLORATION_TOOLS = frozenset({"code_search", "list_dir", "read_file", "read_files"})
+EXPLORATION_BATCH_CHARS = 12_000
+
 
 def signature(call):
     return call.name, json.dumps(call.arguments, sort_keys=True, default=repr)
@@ -26,6 +29,9 @@ class ToolCallBatch:
         self.futures = {}
         self.published = set()
         self.elapsed_seconds = {}
+        exploration_count = sum(call.name in EXPLORATION_TOOLS for call in calls)
+        self.exploration_allowance = (EXPLORATION_BATCH_CHARS // exploration_count
+                                      if exploration_count > 1 else None)
         self.limit = getattr(tools, "max_parallel_tools", 4)
         if len({call.id for call in calls}) != len(calls):
             self.limit = 1
@@ -73,6 +79,48 @@ class ToolCallBatch:
 
     def elapsed(self, call, fallback):
         return self.elapsed_seconds.get(call.id, fallback)
+
+    def limit_exploration_output(self, call, output, is_error):
+        allowance = self.exploration_allowance
+        if (allowance is None or call.name not in EXPLORATION_TOOLS or is_error
+                or len(output) <= allowance):
+            return output
+        notice = "[本轮探索输出达到共享上限；需要时缩小范围重读]"
+        if self.tools.get("read_tool_output") is not None:
+            from app.tools.output_archive import archive_output, output_reference
+            output_id = archive_output(output)
+            if output_id:
+                notice = "[本轮探索输出达到共享上限] " + output_reference(output_id)
+        if call.name in {"code_search", "read_files"}:
+            return self._limit_exploration_json(call.name, output, allowance, notice)
+        preview = output[:max(0, allowance - len(notice) - 1)]
+        # Keep the preview on whole lines when possible.
+        preview = preview.rsplit("\n", 1)[0] if "\n" in preview else preview
+        return f"{preview}\n{notice}" if preview else notice[:allowance]
+
+    @staticmethod
+    def _limit_exploration_json(name, output, allowance, notice):
+        try:
+            data = json.loads(output)
+        except ValueError:
+            return notice[:allowance]
+        entries_key = "matches" if name == "code_search" else "files"
+        if not isinstance(data, dict) or not isinstance(data.get(entries_key), list):
+            return notice[:allowance]
+        data["truncated"] = True
+        data["batch_notice"] = notice
+        entries = data[entries_key]
+        while True:
+            if name == "code_search":
+                data["count"] = len(entries)
+            encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded) <= allowance:
+                return encoded
+            if not entries:
+                return notice[:allowance]
+            omitted = entries.pop()
+            if name == "read_files":
+                data["pending_indices"].insert(0, omitted["index"])
 
     def execute(self, call, *, approved_action=None, cancel=None):
         cancel = cancel if cancel is not None else self.cancel

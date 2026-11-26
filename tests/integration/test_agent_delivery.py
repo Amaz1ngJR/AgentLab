@@ -929,6 +929,108 @@ def test_shared_results_survive_recovery_without_reapplying_files(tmp_path):
         restored.finish()
 
 
+@pytest.mark.parametrize("delivery_status", ["applied_unverified", "no_changes"])
+def test_parent_can_verify_current_shared_scope_without_rewriting_child_failure(tmp_path, delivery_status):
+    from app.agent.agent_manager import DelegationRegistry
+
+    original = make_manager(tmp_path)
+    sid = original.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+    original.wait([sid], 3)
+    records = original.records()
+    original.finish()
+    records[0].update(status="failed", execution_status="failed", delivery_status=delivery_status,
+                      error="old patch was ambiguous")
+    (tmp_path / "child.txt").write_text("parent correction")
+
+    class Review:
+        approved = False
+
+        def request_tool(self, tool, action, args):
+            if action == "integrate_agent":
+                assert args["adopt_current"] and args["file_scope"] == ["child.txt"]
+                assert args["changed_since_child"] == ["child.txt"]
+                return ApprovalResult(self.approved)
+            return ApprovalResult(True)
+
+    restored = make_manager(tmp_path)
+    restored.approval = review = Review()
+    try:
+        restored.restore_results(records)
+        tools = DelegationRegistry(restored.tools, restored, continuation_only=True)
+        with pytest.raises(ToolExecutionError, match="only successful"):
+            restored.integrate(sid, ["test -f child.txt"])
+        arguments = {"sid": sid, "checks": ["grep -qx 'parent correction' child.txt"], "adopt_current": True}
+        assert tools.execute("integrate_agent", arguments)[1]
+        assert restored.unresolved() == [f"{sid}: failed/{delivery_status}"]
+        review.approved = True
+        output, error = tools.execute("integrate_agent", arguments)
+        assert not error and json.loads(output)["status"] == "parent_verified"
+        assert not restored.unresolved() and not tools.delivery_errors
+        record = restored.records()[0]
+        assert record["execution_status"] == "failed" and record["error"] == "old patch was ambiguous"
+        assert record["verification"]["verification"][0]["error"] is False
+        assert (tmp_path / "child.txt").read_text() == "parent correction"
+    finally:
+        restored.finish()
+
+    reopened = make_manager(tmp_path)
+    try:
+        reopened.restore_results([record])
+        assert not reopened.unresolved()
+        assert reopened.integrate(sid, ["exit 1"], adopt_current=True)["already_integrated"]
+    finally:
+        reopened.finish()
+
+
+def test_parent_verified_delivery_completes_linked_task_and_survives_session_restart(tmp_path, monkeypatch):
+    from app.agent.profiles import AgentProfile
+    from app.agent.runtime import AgentSession
+    from app.agent.session_router import SessionRouter
+    from app.storage import Storage
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    original = make_manager(tmp_path)
+    sid = original.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+    original.wait([sid], 3)
+    records = original.records()
+    original.finish()
+    records[0].update(status="failed", execution_status="failed", error="old patch was ambiguous")
+    llm = FakeRouter([
+        ModelResponse("", [ToolCall("adopt", "integrate_agent", {
+            "sid": sid, "adopt_current": True, "checks": ["test -f child.txt"],
+            "check_timeout_seconds": 300,
+        })], {}, []),
+        response("已验证当前改动"),
+        response("下一轮答复"),
+    ])
+    storage = Storage(tmp_path / "state.db")
+
+    def factory(profile, session_id):
+        return AgentSession(llm, original.tools, approval=AutoApprove())
+
+    profiles = {"default": AgentProfile("default", "Default", "fake")}
+    router = SessionRouter(storage, factory, profiles)
+    thread_id = router.new("default")
+    session = router.current
+    session.child_records = records
+    session.task_store.restore([{"id": "task", "content": "交付写入", "status": "blocked",
+                                "execution": {"child_run_id": sid}}])
+    try:
+        assert session.chat("请接管并验证旧子任务的当前改动") == "已验证当前改动"
+        assert session.last_run_status == "completed"
+        assert session.task_store.get("task").status == "completed"
+        assert session.task_store.get("task").execution["result"]["execution_status"] == "failed"
+        router.close_all()
+        reopened = SessionRouter(storage, factory, profiles)
+        assert reopened.switch(thread_id)
+        assert reopened.current.child_records[0]["delivery_status"] == "parent_verified"
+        assert reopened.current.chat("继续开发下一步") == "下一轮答复"
+        assert reopened.current.last_run_status == "completed"
+        reopened.close_all()
+    finally:
+        storage.close()
+
+
 def test_isolated_dirty_snapshot_keeps_parent_index_and_branches_unchanged(git_repo):
     import subprocess
     def git(*args):

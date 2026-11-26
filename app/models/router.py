@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 import copy
+import hashlib
 import contextvars
 import queue
 import threading
@@ -44,6 +45,41 @@ class ModelRouter:
         self._cache_group = uuid.uuid4().hex
         self._cache_key_rejected = False
 
+    def bind_cache_scope(self, scope: str) -> None:
+        """Bind opt-in routing to a stable, opaque conversation key."""
+        scope_data = f"agentlab:{self.provider}:{self.profile_name}:{self.model}:{scope}"
+        self._cache_group = hashlib.sha256(scope_data.encode()).hexdigest()
+        bind_conversation = getattr(self._adapter, "bind_conversation", None)
+        if callable(bind_conversation):
+            bind_conversation()
+
+    @property
+    def replays_encrypted_reasoning(self) -> bool:
+        return bool(getattr(self._adapter, "replays_encrypted_reasoning", False))
+
+    def prepare_request_history(self, messages, tools, system) -> bool:
+        prepare = getattr(self._adapter, "prepare_request_history", None)
+        if prepare is None:
+            return False
+        prepare(messages, sorted(tools, key=lambda tool: tool["name"]) if tools else None, system)
+        return True
+
+    def rebuild_request_history(self, candidate, original, *, system, tools):
+        rebuild = getattr(self._adapter, "rebuild_request_history", None)
+        if rebuild is None:
+            return candidate
+        ordered_tools = sorted(tools, key=lambda tool: tool["name"]) if tools else tools
+        return rebuild(candidate, original, system=system, tools=ordered_tools)
+
+    def cache_hit_ratio(self, usage: dict) -> float | None:
+        cached = usage.get("cache_read_input_tokens")
+        total = usage.get("input_tokens")
+        if cached is None or total is None or self.configured_provider == "ollama":
+            return None
+        if self.provider == "anthropic":
+            total += cached + usage.get("cache_creation_input_tokens", 0)
+        return cached / total if total > 0 and 0 <= cached <= total else None
+
     def fork(self) -> "ModelRouter":
         """Independent SDK client and retry breaker for concurrent child runs."""
         cfg = getattr(self._adapter, "_cfg", None)
@@ -53,6 +89,11 @@ class ModelRouter:
         child._cache_group = self._cache_group
         child._cache_key_rejected = self._cache_key_rejected
         return child
+
+    def close(self) -> None:
+        close = getattr(self._adapter, "close", None)
+        if callable(close):
+            close()
 
     def fork_snapshot(self) -> dict | None:
         """Only the last successfully completed request; never expose SDK state."""
@@ -65,6 +106,10 @@ class ModelRouter:
     @property
     def provider(self) -> str:
         return self._adapter.provider
+
+    @property
+    def configured_provider(self) -> str:
+        return getattr(getattr(self._adapter, "_cfg", None), "provider", self.provider)
 
     @property
     def temperature(self) -> float | None:
@@ -127,6 +172,8 @@ class ModelRouter:
         on_retry: Optional[Callable[[int, float, BaseException], None]] = None,
         retry_until_cancelled: bool = False,
     ) -> ModelResponse:
+        if tools:
+            tools = sorted(tools, key=lambda tool: tool["name"])
         adapter_kwargs: dict[str, Any] = {
             "tools": tools,
             "system": system,
@@ -137,9 +184,7 @@ class ModelRouter:
             "on_thinking_delta": on_thinking_delta,
         }
         self._last_request = None
-        if self.provider == "openai_chatgpt":
-            from app.models.append_prefix import prepare_history
-            prepare_history(messages, tools, system)
+        if self.prepare_request_history(messages, tools, system):
             adapter_kwargs["system"] = None
         if cancel is not None and _accepts_keyword(self._adapter.create_message, "cancel"):
             adapter_kwargs["cancel"] = cancel
@@ -168,7 +213,7 @@ class ModelRouter:
                 self._cache_key_rejected = True
                 return self._adapter.create_message(messages, **adapter_kwargs)
 
-        with request_group(on_retry, enabled=self.provider == "openai_chatgpt") as report_retry:
+        with request_group(on_retry, enabled=True) as report_retry:
             response = call_with_retry(
                 invoke_adapter,
                 on_retry=report_retry,
@@ -176,8 +221,8 @@ class ModelRouter:
                 breaker=self._breaker,
                 discard_partial=discard_partial,
                 sleep=self._retry_sleep,
-                # ChatGPT plan admission failures must remain bounded even for long runs.
-                max_retries=None if retry_until_cancelled and self.provider != "openai_chatgpt" else 2,
+                # Only local inference can keep retrying through an unattended run.
+                max_retries=None if retry_until_cancelled and self.configured_provider == "ollama" else 2,
             )
         self._last_request = request
         return response

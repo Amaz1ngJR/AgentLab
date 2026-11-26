@@ -9,6 +9,9 @@ description = "A cross-platform local agent runtime with configurable models, sk
 readme = "README.md"
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [project.scripts]
 agentlab = "app.cli:main"
 
