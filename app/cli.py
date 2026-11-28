@@ -143,6 +143,9 @@ def _format_request_usage(number: int, payload: dict) -> str:
         parts.append(f"WS {mode} {sent_items} 项")
     elif payload.get("websocket_fallback"):
         parts.append("WS 连接失败，回退 HTTP")
+    quarantined = tokens("quarantined_reasoning_items")
+    if quarantined:
+        parts.append(f"重试时跳过 {quarantined} 项历史推理状态")
     attempt = tokens("attempt")
     if attempt and attempt > 1:
         parts.append(f"第 {attempt} 次尝试")

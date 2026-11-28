@@ -164,6 +164,59 @@ def test_codex_profile_prefers_websocket_unless_disabled(monkeypatch):
     assert load_config("codex").chatgpt_websocket is False
 
 
+def test_auto_compaction_threshold_applies_only_to_oauth_profiles(monkeypatch, tmp_path):
+    from app.agent.context_budget import ContextBudget
+    from app.config.loader import load_config
+    from app.models.router import build_model_router
+
+    monkeypatch.setattr("app.config.loader.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("CHATGPT_AUTH_DIR", str(tmp_path))
+    monkeypatch.delenv("LLM_AUTO_COMPACT_TOKEN_LIMIT", raising=False)
+    cfg = load_config("codex")
+    assert cfg.auto_compact_token_limit is None
+    cfg.context_size = 500_000
+    assert ContextBudget.from_llm(build_model_router(cfg)).compact_threshold == 450_000
+    monkeypatch.setenv("LLM_AUTO_COMPACT_TOKEN_LIMIT", "50000")
+    assert load_config("codex").auto_compact_token_limit == 50_000
+    assert load_config("crs_gpt").auto_compact_token_limit is None
+    monkeypatch.setenv("LLM_AUTO_COMPACT_TOKEN_LIMIT", "0")
+    assert load_config("codex").auto_compact_token_limit == 0
+
+
+def test_compaction_uses_reported_prefix_and_only_estimates_new_items(adapter, monkeypatch):
+    from app.agent.context import ContextManager
+    from app.agent.context_budget import ContextBudget, estimate_active_messages_tokens, estimate_messages_tokens
+    from app.models.router import ModelRouter
+
+    assistant = item(type="message", role="assistant", content=[{"type": "output_text", "text": "done"}])
+    event = complete([assistant])
+    event.response.usage = NS(input_tokens=12_000, output_tokens=90)
+    set_events(adapter, monkeypatch, [event])
+    router = ModelRouter(adapter)
+    budget = ContextBudget.from_context_size(100_000, auto_compact_token_limit=20_000)
+    compressor = MagicMock()
+    context = ContextManager(budget, compressor)
+    context.bind_context_model(router)
+    historical = {"type": "reasoning", "id": "rs_big", "summary": [], "encrypted_content": "x" * 90_000}
+    history = [historical, {"role": "user", "content": "continue"}]
+
+    assert context.estimate(history) < 20_000  # No server sample yet.
+    result = router.create_message(history, system="policy")
+    tail = {"role": "user", "content": "follow-up"}
+    history.extend([*result.provider_payload, tail])
+    expected = 12_090 + estimate_active_messages_tokens([tail])
+    assert estimate_messages_tokens(history) > 20_000
+    assert context.estimate(history, system="policy") == expected
+    assert context.report(history, system="policy")["estimated_input_tokens"] == expected
+    assert not context.compact_before_model_call(history, system="policy")
+    compressor.compact.assert_not_called()
+    assert router.active_context_tokens(history, system="changed", tools=None) is None
+    assert router.active_context_tokens(history[1:], system="policy", tools=None) is None
+
+    huge = {**historical, "encrypted_content": "a" * 400_000}
+    assert context.estimate([huge], system="changed") > budget.safe_input_limit
+
+
 def test_bound_oauth_session_uses_http_when_websocket_is_disabled(adapter, monkeypatch):
     adapter._cfg.chatgpt_websocket = False
     adapter.bind_conversation()
@@ -174,6 +227,49 @@ def test_bound_oauth_session_uses_http_when_websocket_is_disabled(adapter, monke
 
     client.responses.connect.assert_not_called()
     client.responses.create.assert_called_once()
+
+
+def test_delegated_oauth_websockets_are_isolated_and_reused_on_resume(adapter, monkeypatch, tmp_path):
+    from app.models.router import ModelRouter
+    from tests.support.delegation import manager
+
+    adapter._cfg.context_size = 64000
+    monkeypatch.setattr(TokenManager, "access_token", lambda self: "fake")
+    clients = [MagicMock(api_key="fake"), MagicMock(api_key="fake")]
+    client_iter = iter(clients)
+    monkeypatch.setattr("openai.OpenAI", lambda **kwargs: next(client_iter))
+    first_ws, second_ws = [client.responses.connect.return_value.__enter__.return_value for client in clients]
+    message = item(type="message", role="assistant", content=[{"type": "output_text", "text": "finding"}])
+    first = complete([message])
+    first.response.id = "resp_child"
+    first_ws.recv.side_effect = [first, complete([message])]
+    second_ws.recv.return_value = NS(type="error", code="admission_denied")
+
+    m = manager(tmp_path)
+    m.llm = ModelRouter(adapter)
+    try:
+        initial = m.spawn("first evidence", role="reviewer", max_steps=3, max_tool_calls=3)["child_run_id"]
+        assert m.wait([initial], 2)["agents"][0]["status"] == "succeeded"
+        sibling = m.spawn("other evidence", role="reviewer", max_steps=3, max_tool_calls=3)["child_run_id"]
+        assert m.wait([sibling], 2)["agents"][0]["status"] == "failed"
+        second_ws.close.assert_called_once()
+        continued = m.resume(initial, "follow up", max_steps=3, max_tool_calls=3)["child_run_id"]
+        assert m.wait([continued], 2)["agents"][0]["status"] == "succeeded"
+
+        initial_payload, resume_payload = [json.loads(call.args[0]) for call in first_ws.send_raw.call_args_list]
+        sibling_payload = json.loads(second_ws.send_raw.call_args.args[0])
+        assert "previous_response_id" not in initial_payload and "previous_response_id" not in sibling_payload
+        assert resume_payload["previous_response_id"] == "resp_child"
+        assert [entry["role"] for entry in resume_payload["input"]] == ["user", "user"]
+        assert "follow up" in resume_payload["input"][-1]["content"][0]["text"]
+        for client in clients:
+            client.responses.connect.assert_called_once()
+            client.responses.create.assert_not_called()
+        first_ws.close.assert_not_called()
+        m.close(initial)
+        first_ws.close.assert_called_once()
+    finally:
+        m.finish()
 
 
 def test_default_websocket_continues_exact_prefix_and_resets_on_changed_history(adapter, monkeypatch):
@@ -207,6 +303,7 @@ def test_default_websocket_continues_exact_prefix_and_resets_on_changed_history(
     assert "previous_response_id" not in third
     assert all(body["store"] is False and "stream" not in body for body in (first_sent, second, third))
     assert events[1]["sent_input_items"] == 1 and events[1]["input_items"] == 5
+    assert [event["full_context_reason"] for event in events] == ["no_connection_anchor", None, "input_not_appended"]
     client.responses.connect.assert_called_once()
     client.responses.create.assert_not_called()
     router.close()
@@ -251,23 +348,195 @@ def test_websocket_expired_previous_response_retries_with_full_history(adapter, 
     client.responses.create.assert_not_called()
 
 
-def test_websocket_disconnect_after_submission_does_not_replay(adapter, monkeypatch):
-    from app.models.openai_adapter import ProviderStreamError
+def test_websocket_nested_error_keeps_code_and_redacted_diagnostics(adapter, monkeypatch):
+    from openai.resources.responses.responses import ResponsesConnection
+    from app.models.request_audit import observe_model_requests
     from app.models.router import ModelRouter
 
     client = MagicMock()
     connection = client.responses.connect.return_value.__enter__.return_value
-    connection.recv.side_effect = OSError("connection lost")
+    frame = {"type": "error", "status": 400, "request_id": "req_ws",
+             "error": {"code": "invalid_request", "param": "input[0]",
+                       "message": "Rejected WebSocket input. Bearer sensitive.test.token"}}
+    connection.recv.return_value = ResponsesConnection.parse_event(None, json.dumps(frame))
+    monkeypatch.setattr(adapter, "_client", lambda: client)
+    router = ModelRouter(adapter)
+    router.bind_cache_scope("session")
+    events = []
+    with observe_model_requests(lambda kind, payload: events.append(payload)):
+        with pytest.raises(ChatGPTError, match="Rejected WebSocket input") as failure:
+            router.create_message([{"role": "user", "content": "hello"}])
+    assert failure.value.param == "input[0]"
+    assert "sensitive.test.token" not in str(failure.value)
+    assert events[0]["error_code"] == "invalid_request"
+    assert events[0]["http_status"] == 400 and events[0]["request_id"] == "req_ws"
+    connection.send_raw.assert_called_once()
+    client.responses.create.assert_not_called()
+
+
+def test_websocket_connection_limit_reconnects_with_full_input(adapter, monkeypatch):
+    from app.models.router import ModelRouter
+
+    client, old, new = MagicMock(), MagicMock(), MagicMock()
+    client.responses.connect.return_value.__enter__.side_effect = [old, new]
+    message = item(type="message", role="assistant", content=[{"type": "output_text", "text": "done"}])
+    old.recv.return_value = NS(type="error", error={"code": "websocket_connection_limit_reached"})
+    new.recv.return_value = complete([message])
+    monkeypatch.setattr(adapter, "_client", lambda: client)
+    router = ModelRouter(adapter, retry_sleep=lambda _: None)
+    router.bind_cache_scope("session")
+
+    assert router.create_message([{"role": "user", "content": "hello"}]).text == "done"
+    old.close.assert_called_once()
+    assert json.loads(old.send_raw.call_args.args[0]) == json.loads(new.send_raw.call_args.args[0])
+    client.responses.create.assert_not_called()
+
+
+def test_idle_websocket_is_replaced_before_submission(monkeypatch):
+    from app.models.responses_websocket import ResponsesWebSocket
+
+    client, stale, fresh = MagicMock(), MagicMock(), MagicMock()
+    stale._connection.close_code = None
+    stale._connection.ping.return_value.wait.return_value = False
+    client.responses.connect.return_value.__enter__.side_effect = [stale, fresh]
+    times = iter([0, 21, 22])
+    monkeypatch.setattr("app.models.responses_websocket.time.monotonic", lambda: next(times))
+    websocket = ResponsesWebSocket()
+    websocket.open(client, 10)
+    websocket.anchor = ("resp_old", {}, [])
+    websocket.open(client, 10)
+
+    assert websocket.connection is fresh and websocket.anchor is None
+    stale.close.assert_called_once()
+    stale.send_raw.assert_not_called()
+    assert client.responses.connect.call_args.kwargs["websocket_connection_options"]["ping_interval"] is None
+
+
+def test_rejected_reasoning_survives_reload_and_stays_session_scoped(adapter, tmp_path):
+    from app.agent.profiles import AgentProfile
+    from app.agent.runtime import AgentSession
+    from app.agent.session_router import SessionRouter
+    from app.models.router import ModelRouter
+    from app.storage import Storage
+    from app.tools.registry import ToolRegistry
+
+    path = tmp_path / "reasoning.db"
+    old_item = {"type": "reasoning", "id": "rs_stale", "summary": [], "encrypted_content": "opaque"}
+    message = {"role": "user", "content": "visible history"}
+
+    def make_router(storage):
+        def factory(profile, sid):
+            return AgentSession(ModelRouter(ChatGPTAdapter(adapter._cfg)), ToolRegistry())
+        return SessionRouter(storage, factory, {"default": AgentProfile("default", "Default", "codex")})
+
+    storage = Storage(path)
+    try:
+        router = make_router(storage)
+        sid = router.new("default")
+        current = router.current.llm._adapter
+        assert current._recover_encrypted_history("invalid_encrypted_content", 400, {"input": [old_item]}, None)
+        storage.save_messages(sid, [old_item, message])
+    finally:
+        storage.close()
+
+    storage = Storage(path)
+    try:
+        router = make_router(storage)
+        assert router.switch(sid)
+        loaded = router.current.llm._adapter
+        assert storage.load_messages(sid) == [old_item, message]
+        assert all(entry.get("id") != "rs_stale" for entry in loaded._input_items([old_item, message]))
+        router.new("default")
+        assert router.current.llm._adapter._input_items([old_item]) == [old_item]
+    finally:
+        storage.close()
+
+
+def test_websocket_disconnect_after_submission_does_not_replay(adapter, monkeypatch):
+    from app.models.openai_adapter import ProviderStreamError
+    from app.models.request_audit import observe_model_requests
+    from app.models.router import ModelRouter
+
+    client = MagicMock()
+    connection = client.responses.connect.return_value.__enter__.return_value
+    disconnect = OSError("connection lost")
+    disconnect.rcvd = NS(code=1011)
+    connection.recv.side_effect = disconnect
     monkeypatch.setattr(adapter, "_client", lambda: client)
     router = ModelRouter(adapter, retry_sleep=lambda delay: None)
     router.bind_cache_scope("session")
 
-    with pytest.raises(ProviderStreamError, match="interrupted after submission"):
-        router.create_message([{"role": "user", "content": "first"}])
+    events = []
+    with observe_model_requests(lambda kind, payload: events.append(payload)):
+        with pytest.raises(ProviderStreamError, match=r"interrupted after submission \(OSError, rcvd=1011\)"):
+            router.create_message([{"role": "user", "content": "first"}])
+    assert events[0]["websocket_failure_phase"] == "receive"
+    assert events[0]["websocket_exception_type"] == "OSError"
+    assert events[0]["websocket_close_codes"] == {"rcvd": 1011}
 
     connection.send_raw.assert_called_once()
     connection.close.assert_called_once()
     client.responses.create.assert_not_called()
+
+
+def test_oauth_retries_rejected_reasoning_without_removing_visible_history(adapter, monkeypatch):
+    from app.models.request_audit import observe_model_requests
+    from app.models.router import ModelRouter
+
+    client, old, fresh = MagicMock(), MagicMock(), MagicMock()
+    client.responses.connect.return_value.__enter__.side_effect = [old, fresh]
+    old.recv.return_value = NS(type="error", status=400, error={"code": "invalid_encrypted_content"})
+    message = item(type="message", role="assistant", content=[{"type": "output_text", "text": "done"}])
+    fresh.recv.side_effect = [complete([message]), complete([message])]
+    monkeypatch.setattr(adapter, "_client", lambda: client)
+    router = ModelRouter(adapter, retry_sleep=lambda _: None)
+    router.bind_cache_scope("session")
+    history = [{"role": "user", "content": "first"},
+               {"type": "reasoning", "id": "rs_stale", "summary": [], "encrypted_content": "opaque"},
+               {"type": "function_call", "call_id": "c1", "name": "echo", "arguments": "{}"},
+               {"type": "function_call_output", "call_id": "c1", "output": "evidence"},
+               {"role": "user", "content": "continue"}]
+    events = []
+    with observe_model_requests(lambda kind, payload: events.append((kind, payload))):
+        assert router.create_message(history).text == "done"
+    old_payload = json.loads(old.send_raw.call_args.args[0])
+    retry_payload = json.loads(fresh.send_raw.call_args.args[0])
+    assert retry_payload["input"] == [entry for entry in old_payload["input"] if entry.get("id") != "rs_stale"]
+    assert "previous_response_id" not in retry_payload
+    assert events[0][1]["quarantined_reasoning_items"] == 1
+    assert history[1]["encrypted_content"] == "opaque"
+    old.close.assert_called_once()
+
+    history.append({"type": "reasoning", "id": "rs_fresh", "summary": [], "encrypted_content": "new"})
+    router.create_message(history)
+    later = json.loads(fresh.send_raw.call_args.args[0])
+    assert [entry["id"] for entry in later["input"] if entry["type"] == "reasoning"] == ["rs_fresh"]
+    router.close()
+
+
+def test_http_200_stream_error_retries_without_rejected_reasoning(adapter, monkeypatch):
+    from app.models.router import ModelRouter
+
+    client = MagicMock()
+    response = NS(status_code=200, headers={})
+    failed, recovered = MagicMock(response=response), MagicMock(response=response)
+    failed.__iter__.return_value = [NS(type="response.failed", response=NS(
+        error=NS(code="invalid_encrypted_content"),
+    ))]
+    message = item(type="message", role="assistant", content=[{"type": "output_text", "text": "done"}])
+    recovered.__iter__.return_value = [complete([message])]
+    client.responses.create.return_value.__enter__.side_effect = [failed, recovered]
+    monkeypatch.setattr(adapter, "_client", lambda: client)
+    adapter._cfg.chatgpt_websocket = False
+    router = ModelRouter(adapter, retry_sleep=lambda _: None)
+    router.bind_cache_scope("session")
+    reasoning = {"type": "reasoning", "id": "rs_stale", "summary": [], "encrypted_content": "opaque"}
+    history = [reasoning, {"role": "user", "content": "continue"}]
+
+    assert router.create_message(history).text == "done"
+    first, second = [call.kwargs["input"] for call in client.responses.create.call_args_list]
+    assert reasoning in first and second == [entry for entry in first if entry.get("id") != "rs_stale"]
+    assert history[0] == reasoning
 
 
 def test_websocket_timeout_measures_idle_time(adapter, monkeypatch):
@@ -641,7 +910,7 @@ def test_context_window_uses_account_metadata_and_caches(adapter, monkeypatch):
     budget = ContextBudget.from_llm(router)
     assert router.context_window.tokens == 500000
     assert router.context_window.source == "provider"
-    assert budget.compact_threshold == 452463
+    assert budget.compact_threshold == 450_000
     assert budget.status_for(60000) == "ok"
     assert get.call_count == 1
     assert get.call_args.kwargs["timeout"] == 3

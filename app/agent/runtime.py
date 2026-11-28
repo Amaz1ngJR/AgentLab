@@ -272,6 +272,9 @@ class AgentSession:
         # 上下文预算/压缩协调者(可选,§7.3)。交给 Orchestrator 在稳定点调用。
         # None 时编排路径不做预算检查与压缩(默认,既有测试不受影响)。
         self.context_manager = context_manager
+        bind_context_model = getattr(context_manager, "bind_context_model", None)
+        if callable(bind_context_model):
+            bind_context_model(llm)
         # 编排 run 的目标与结果状态,供 SessionRouter.persist_current 写 runs 审计
         self.last_goal: str = ""
         self.last_run_status: str = ""
@@ -323,8 +326,9 @@ class AgentSession:
             self.system_prompt = base_prompt
             self._turn_guidance = (
                 "【以下 Git 工作流仅适用于本轮】\n"
-                "根据工作区状态、暂存与未暂存的差异及近期提交风格拟定提交说明。"
-                "把互不依赖的 Git 查询放到同一批工具调用；先读统计，只有证据不足时才读有针对性的 diff。"
+                "根据 Git 差异和近期提交风格拟定提交说明。用户指定暂存区时，只查看暂存的改动。"
+                "把互不依赖的 Git 查询放到同一批工具调用；先读统计和少量近期提交样例，"
+                "只有证据不足时才读有针对性的 diff。"
             )
             return
         if catalog is None:
@@ -457,6 +461,9 @@ class AgentSession:
         bind_scope = getattr(new_llm, "bind_cache_scope", None)
         if callable(bind_scope) and getattr(self, "session_id", None):
             bind_scope(self.session_id)
+        bind_recovery = getattr(self, "bind_reasoning_recovery", None)
+        if callable(bind_recovery):
+            bind_recovery(new_llm)
         if new_planner is not None:
             self._planner = new_planner
 
@@ -466,6 +473,9 @@ class AgentSession:
 
         # 重置上下文管理器（如果有）以避免缓存旧模型的 token 计数
         if self.context_manager is not None:
+            bind_context_model = getattr(self.context_manager, "bind_context_model", None)
+            if callable(bind_context_model):
+                bind_context_model(new_llm)
             reset_fn = getattr(self.context_manager, "reset", None)
             if reset_fn is not None:
                 try:
@@ -569,13 +579,14 @@ class AgentSession:
             # The non-resume planner clears the task store. An independent
             # follow-up uses the direct read loop and leaves the plan available.
             mode = ExecutionMode.DIRECT
-        inherited_tasks = {(task.id, task.content, task.status) for task in self.task_store.all()
-                           if task.status != "completed"} if read_only_followup else set()
         self._commit_message_only = (
             mode is ExecutionMode.DIRECT and not images and not resume
             and self.tools.get("shell") is not None
             and _is_commit_message_request(user_input)
         )
+        read_only_followup = read_only_followup or self._commit_message_only
+        inherited_tasks = {(task.id, task.content, task.status) for task in self.task_store.all()
+                           if task.status != "completed"} if read_only_followup else set()
         self._prepare_skill_context(user_input)
         if not self._commit_message_only and hasattr(self, "memory_context"):
             previous_memory = next((item["content"] for item in reversed(self.messages)
@@ -803,9 +814,14 @@ class AgentSession:
         cancel: Optional[CancelToken] = None,
         read_only_followup: bool = False,
     ) -> str:
-        previous_messages = len(self.messages)
+        isolated = self._commit_message_only
+        fork = getattr(self.llm, "fork", None)
+        isolated_llm = fork() if isolated and callable(fork) else None
+        request_llm = isolated_llm if isolated_llm is not None else self.llm
+        messages = [] if isolated else self.messages
+        previous_messages = len(messages)
         projected_history = None
-        if (read_only_followup and self.context_manager is not None
+        if (not isolated and read_only_followup and self.context_manager is not None
                 and getattr(self.context_manager, "auto_compact", False)):
             from app.agent.context import project_read_only_history
             history = project_read_only_history(
@@ -815,19 +831,24 @@ class AgentSession:
             if history is not self.messages:
                 projected_history = history
         if self._turn_guidance:
-            self.messages.append({"role": "user", "content": self._turn_guidance,
+            messages.append({"role": "user", "content": self._turn_guidance,
                                   "_agentlab_turn_guidance": True})
-        self.messages.append({
+        user_message = {
             "role": "user",
             "content": build_user_content(user_input, images),
-        })
+        }
+        messages.append(user_message)
         # 在每次模型调用前检查，确保当前用户输入和 Responses 顶层 item 都计入预算。
         tools = self._tools_for_task(user_input, mode="direct")
         self.last_turn_usage = {"input_tokens": 0, "output_tokens": 0}
         self.last_turn_seconds = 0.0
         turn_start = time.monotonic()
 
+        response_text = ""
         try:
+            if isolated_llm is not None and getattr(isolated_llm, "provider", None) == "openai_chatgpt":
+                from uuid import uuid4
+                isolated_llm.bind_cache_scope(uuid4().hex)
             empty_rounds = 0
             action_request = self._commit_message_only or _requires_tool_execution(user_input)
             inspect_text_before_display = action_request or (
@@ -850,15 +871,19 @@ class AgentSession:
                     self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + value
 
             def consume_steering():
-                nonlocal tool_context
-                steering = apply_steering(cancel, self.messages)
+                nonlocal tool_context, isolated, messages, request_llm
+                steering = apply_steering(cancel, messages)
                 if steering:
                     tool_context += "\n" + "\n".join(steering)
                     if self._commit_message_only:
+                        self.messages.extend(item for item in messages if not item.get("_agentlab_instruction"))
+                        messages = self.messages
+                        request_llm = self.llm
+                        isolated = False
                         self._commit_message_only = False
                         self._prepare_skill_context(tool_context)
                         if self._turn_guidance:
-                            self.messages.append({"role": "user", "content": self._turn_guidance,
+                            messages.append({"role": "user", "content": self._turn_guidance,
                                                   "_agentlab_turn_guidance": True})
                 return steering
 
@@ -878,10 +903,10 @@ class AgentSession:
                     projected_history = None
                 manager = delegated_manager(self.tools)
                 if manager is not None:
-                    manager.deliver(self.messages)
+                    manager.deliver(messages)
                     manager.charge_parent_round()
                 tools = self._tools_for_task(tool_context, mode="direct")
-                if self.context_manager is not None:
+                if not isolated and self.context_manager is not None:
                     compacted = False
                     if (verification_rounds >= 2 and consecutive_low_cache >= 2
                             and not verification_compaction_checked and not steering):
@@ -890,25 +915,30 @@ class AgentSession:
                                 and manager.deadline - time.monotonic() > 2 * VERIFICATION_COMPACTION_SECONDS):
                             verification_compaction_checked = True
                             compacted = self.context_manager.maybe_compact(
-                                self.messages, system=self.system_prompt, tools=tools, cancel=cancel,
+                                messages, system=self.system_prompt, tools=tools, cancel=cancel,
                                 verification=True, on_summary_usage=record_usage,
                             )
                     if not compacted and projected_history is None:
+                        warm_prefix = getattr(request_llm, "has_warm_prefix", None)
                         compacted = self.context_manager.compact_before_model_call(
-                            self.messages, system=self.system_prompt, tools=tools, cancel=cancel,
+                            messages, system=self.system_prompt, tools=tools, cancel=cancel,
+                            preserve_cached_prefix=bool(warm_prefix and not steering and not workspace_changed
+                                and warm_prefix(messages, system=self.system_prompt, tools=tools)),
+                            on_summary_usage=record_usage,
                         )
                     if compacted:
                         projected_history = None
-                request_messages = self.messages
+                request_messages = messages
                 if projected_history is not None:
-                    request_messages = projected_history + self.messages[previous_messages:]
+                    request_messages = projected_history + messages[previous_messages:]
                     if self.context_manager.budget.status_for(
                         self.context_manager.estimate(request_messages, system=self.system_prompt, tools=tools)
                     ) == "compact":
                         self.context_manager.compact_before_model_call(
-                            self.messages, system=self.system_prompt, tools=tools, cancel=cancel,
+                            messages, system=self.system_prompt, tools=tools, cancel=cancel,
+                            on_summary_usage=record_usage,
                         )
-                        request_messages = self.messages
+                        request_messages = messages
                         projected_history = None
                 text_streamed = False
                 streamed_parts: list[str] = []
@@ -941,13 +971,13 @@ class AgentSession:
                             raw_on_text(delta)
 
                     resp = call_create_message(
-                        self.llm,
+                        request_llm,
                         request_messages,
                         tools=tools or None,
                         system=self.system_prompt,
                         on_progress=on_progress,
                         on_text_delta=(
-                            on_text_delta if raw_on_text and (
+                            on_text_delta if raw_on_text and not (manager and manager.defer_writer_text()) and (
                                 not inspect_text_before_display or has_tool_call
                             )
                             else None
@@ -960,14 +990,14 @@ class AgentSession:
                     )
 
                 record_usage(resp.usage)
-                cache_hit_ratio = getattr(self.llm, "cache_hit_ratio", None)
+                cache_hit_ratio = getattr(request_llm, "cache_hit_ratio", None)
                 ratio = cache_hit_ratio(resp.usage) if callable(cache_hit_ratio) else None
                 consecutive_low_cache = consecutive_low_cache + 1 if ratio is not None and ratio < 0.5 else 0
                 prepare_history = getattr(self.llm, "prepare_request_history", None)
                 if projected_history is not None and callable(prepare_history):
                     # Commit instruction/tool versions only after the isolated
                     # request succeeded, using the original unsliced history.
-                    prepare_history(self.messages, tools or None, self.system_prompt)
+                    prepare_history(messages, tools or None, self.system_prompt)
 
                 # 记下服务器实际使用的模型 ID(可能被代理静默映射到别的型号)
                 if resp.actual_model:
@@ -976,24 +1006,35 @@ class AgentSession:
                 # provider_payload 是 list[dict],由 adapter 决定追加哪几条 message
                 # (Anthropic 把多个 content block 合在一条 assistant 里;
                 #  OpenAI Responses 可能把 text 块和 function_call 块拆成多条)
-                self.messages.extend(resp.provider_payload)
-
                 # 明确要求执行的请求先核实是否真有工具调用，不能把文字里的伪调用显示为结果。
                 response_text = resp.text or "".join(streamed_parts)
 
                 if not resp.tool_calls:
                     manager = delegated_manager(self.tools)
-                    if manager is not None and manager.settle_before_final(self.messages):
+                    if manager is not None and manager.settle_before_final(
+                        messages, can_follow_up=self._auto_execute_enabled or step_index + 1 < max_steps,
+                        delivery_errors=self.tools.delivery_errors,
+                    ):
                         continue
                     if consume_steering():
                         tools = self._tools_for_task(tool_context, mode="direct")
                         continue
+                    if manager is not None and manager.pending_adoptions():
+                        # The model's proposed final message is not a delivery receipt.
+                        self.last_run_status = "blocked"
+                        self.last_run_error = manager.delivery_blocker(self.tools.delivery_errors)
+                        messages.append({"role": "assistant", "content": self.last_run_error})
+                        self._emit_turn_event(TurnEvent(kind="text", text=self.last_run_error))
+                        self._emit_run_event(RunEvent(kind=events.RUN_FAILED, text=self.last_run_error,
+                                                      payload={"children": manager.records()}))
+                        return self.last_run_error
+                    messages.extend(resp.provider_payload)
                     if not response_text.strip():
                         empty_rounds += 1
                         truncated = resp.finish_reason in {"max_tokens", "length", "MAX_TOKENS"}
                         if (not truncated and empty_rounds == 1
                                 and (self._auto_execute_enabled or step_index + 1 < max_steps)):
-                            self.messages.append({
+                            messages.append({
                                 "role": "user",
                                 "content": (
                                     "上一轮没有返回正文，也没有调用工具。请直接回答，"
@@ -1020,7 +1061,7 @@ class AgentSession:
                     if action_request and not successful_tool_calls and not denied_tools:
                         if not corrected_no_tool and (self._auto_execute_enabled or step_index + 1 < max_steps):
                             corrected_no_tool = True
-                            self.messages.append({
+                            messages.append({
                                 "role": "user",
                                 "content": (
                                     "请先调用只读 Git 工具查看改动和历史，再拟定提交说明。"
@@ -1035,7 +1076,7 @@ class AgentSession:
                     if _looks_like_pseudo_tool_call(response_text, action_request=action_request):
                         if not corrected_no_tool and (self._auto_execute_enabled or step_index + 1 < max_steps):
                             corrected_no_tool = True
-                            self.messages.append({
+                            messages.append({
                                 "role": "user",
                                 "content": (
                                     "你的正文包含模拟的工具调用，但本轮没有结构化工具调用。"
@@ -1053,6 +1094,7 @@ class AgentSession:
                         self.last_run_error = "工具审批未通过：" + "、".join(sorted(denied_tools))
                     return response_text
 
+                messages.extend(resp.provider_payload)
                 if response_text and not text_streamed:
                     self._emit_turn_event(TurnEvent(kind="text", text=response_text))
                 has_tool_call = True
@@ -1076,9 +1118,7 @@ class AgentSession:
                             continue
                         actual = batch.pending_result(c)
                         if actual is not None:
-                            from app.agent.executor import _truncate_tool_output
-                            actual.output = batch.limit_exploration_output(c, actual.output, actual.is_error)
-                            actual.output = _truncate_tool_output(actual.output)
+                            actual.output = batch.limit_output(c, actual.output, actual.is_error)
                             self._emit_turn_event(TurnEvent(kind="tool_result", tool_name=c.name,
                                                            tool_input=c.arguments, tool_output=actual.output,
                                                            tool_error=actual.is_error, tool_call_id=c.id))
@@ -1091,8 +1131,8 @@ class AgentSession:
                                                             output=INTERRUPTED_TOOL_RESULT, is_error=False))
                         resulted_ids.add(c.id)
                     if pending or tool_results:
-                        self.messages.extend(
-                            self.llm.format_tool_results(tool_results + pending)
+                        messages.extend(
+                            request_llm.format_tool_results(tool_results + pending)
                         )
                         manager = delegated_manager(self.tools)
                         if manager is not None:
@@ -1206,10 +1246,7 @@ class AgentSession:
                                 approved_action=approval_action,
                                 cancel=cancel,
                             )
-                            # 进入历史前截断超大输出(与编排路径一致,见 executor)。
-                            from app.agent.executor import _truncate_tool_output
-                            output = batch.limit_exploration_output(call, output, is_error)
-                            output = _truncate_tool_output(output)
+                            output = batch.limit_output(call, output, is_error)
                             # Only bind result envelopes actually retained in history.
                             if call.name == "wait_agent":
                                 binder = delegated_manager(self.tools)
@@ -1251,7 +1288,7 @@ class AgentSession:
                 # 工具结果的回传格式由 adapter 决定(Anthropic / OpenAI Chat /
                 # OpenAI Responses 三家不一样),Runtime 不关心
                 if tool_results:
-                    self.messages.extend(self.llm.format_tool_results(tool_results))
+                    messages.extend(request_llm.format_tool_results(tool_results))
                     verification_rounds += int(verified_this_batch)
                     manager = delegated_manager(self.tools)
                     if manager is not None:
@@ -1274,5 +1311,15 @@ class AgentSession:
             self.last_run_status = "failed"
             raise
         finally:
+            if isolated:
+                self.messages.append(user_message)
+                if self.last_run_status == "completed":
+                    self.messages.append({"role": "assistant", "content": response_text})
+            close = getattr(isolated_llm, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
             self.last_turn_seconds = time.monotonic() - turn_start
             self.cumulative_seconds += self.last_turn_seconds

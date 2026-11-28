@@ -48,3 +48,4 @@ class LLMConfig:
     capabilities: list[str] = field(default_factory=list)  # 例 ["chat", "tools", "streaming"]
     chatgpt_account: str = "default"  # Credential reference only, never OAuth tokens.
     chatgpt_websocket: bool = True
+    auto_compact_token_limit: int | None = None

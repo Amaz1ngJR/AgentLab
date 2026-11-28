@@ -33,7 +33,14 @@ from app.agent.events import RunEvent
 from app.agent.tasks import BLOCKED, COMPLETED, FAILED, Task
 from app.models.protocol import ToolResult
 from app.models.router import ModelRouter, call_create_message
+from app.tools.output_budget import TOOL_OUTPUT_MAX_CHARS, truncate_tool_output as _truncate_tool_output
 from app.tools.registry import ToolRegistry, delegated_manager
+
+
+def _add_usage(total, usage):
+    if total is not None:
+        for key, value in usage.items():
+            total[key] = total.get(key, 0) + value
 
 DENIED_MESSAGE = (
     "User denied execution of this tool. Do not retry without first confirming with the user."
@@ -43,35 +50,6 @@ DENIED_MESSAGE = (
 # tool_use 都必须有配对的 tool_result,否则下一轮请求会因悬空 tool_call 报错。
 # 中断后用户往往要重新引导(steering),历史必须处于可继续状态,所以这里兜底补齐。
 INTERRUPTED_TOOL_RESULT = "[用户已中断,此工具未执行]"
-
-# 工具输出进入对话历史前的截断上限(字符数)。超大输出(读大文件、长 shell stdout)
-# 若原样塞进 messages,会一条消息就撑爆上下文窗口,且压缩也压不动(它落在最近窗口
-# 受保护区)。参考 Claude Code / Aider 的做法:在工具结果进入历史时就截断,保留头尾
-# 两端(头部含主要内容,尾部常含结论/报错),中间用标记说明省略量,让模型知道被截断。
-TOOL_OUTPUT_HEAD_CHARS = 8_000   # 保留开头多少字符
-TOOL_OUTPUT_TAIL_CHARS = 2_000   # 保留结尾多少字符
-TOOL_OUTPUT_MAX_CHARS = TOOL_OUTPUT_HEAD_CHARS + TOOL_OUTPUT_TAIL_CHARS  # 超过才截断
-
-
-def _truncate_tool_output(output: str, max_chars: int = TOOL_OUTPUT_MAX_CHARS) -> str:
-    """把过长的工具输出截断成"头部 + 省略标记 + 尾部",防止单条结果撑爆上下文。
-
-    不超过 max_chars 原样返回;超过则保留前 TOOL_OUTPUT_HEAD_CHARS 字符与后
-    TOOL_OUTPUT_TAIL_CHARS 字符,中间插一行标记说明省略了多少字符。这样模型既能
-    看到主要内容和结尾(报错/结论常在末尾),也明确知道中间有内容被省略。
-    """
-    if not output or len(output) <= max_chars:
-        return output
-    head = output[:TOOL_OUTPUT_HEAD_CHARS]
-    tail = output[-TOOL_OUTPUT_TAIL_CHARS:]
-    omitted = len(output) - TOOL_OUTPUT_HEAD_CHARS - TOOL_OUTPUT_TAIL_CHARS
-    return (
-        f"{head}\n"
-        f"\n[... 工具输出过长,已省略中间 {omitted} 个字符(共 {len(output)} 字符);"
-        f"如需完整内容请用更精确的参数重新调用 ...]\n\n"
-        f"{tail}"
-    )
-
 
 def _looks_like_action_task(task_content: str) -> bool:
     """判断任务描述是否明显需要工具操作（而不是纯思考/总结）。
@@ -217,6 +195,7 @@ class Executor:
         auto_execute: bool,
         usage_acc: Optional[dict[str, int]],
         on_actual_model: Optional[Callable[[str], None]],
+        defer_text: bool = False,
     ) -> tuple[Any, str, bool]:
         """跑一轮模型调用，返回 (resp, 本轮正文, 是否已流式打印过正文)。
 
@@ -236,15 +215,19 @@ class Executor:
             raw_on_text = getattr(handle, "on_text", None)
             raw_on_thinking = getattr(handle, "on_thinking", None)
             on_discard = getattr(handle, "discard_text", None)
+            manager = delegated_manager(self._tools)
 
             if self._ctx is not None:
                 try:
+                    warm_prefix = getattr(self._llm, "has_warm_prefix", None)
                     self._ctx.compact_before_model_call(
                         messages,
                         system=system,
                         tools=tools,
                         on_progress=on_progress,
                         cancel=cancel,
+                        preserve_cached_prefix=bool(warm_prefix and warm_prefix(messages, system=system, tools=tools)),
+                        on_summary_usage=lambda usage: _add_usage(usage_acc, usage),
                     )
                 except (Cancelled, ContextBudgetExceeded):
                     raise
@@ -278,7 +261,8 @@ class Executor:
                 tools=tools,
                 system=system,
                 on_progress=on_progress,
-                on_text_delta=on_text_delta if raw_on_text else None,
+                on_text_delta=(on_text_delta if raw_on_text and not defer_text
+                               and not (manager and manager.defer_writer_text()) else None),
                 on_thinking_delta=raw_on_thinking,
                 cancel=cancel,
                 discard_partial=_discard_partial,
@@ -288,9 +272,7 @@ class Executor:
                 retry_until_cancelled=auto_execute,
             )
 
-        if usage_acc is not None and getattr(resp, "usage", None):
-            for key, value in resp.usage.items():
-                usage_acc[key] = usage_acc.get(key, 0) + value
+        _add_usage(usage_acc, getattr(resp, "usage", None) or {})
         if on_actual_model is not None and getattr(resp, "actual_model", None):
             on_actual_model(resp.actual_model)
 
@@ -413,7 +395,7 @@ class Executor:
             )
             # 进入对话历史前截断超大输出(根治"单条大结果撑爆窗口")。
             # 截断后再发事件 / 入 messages,保证历史里的副本是有界的。
-            output = _truncate_tool_output(batch.limit_exploration_output(call, output, is_error))
+            output = batch.limit_output(call, output, is_error)
             # wait batches are bounded per result before serialization.
             if call.name == "wait_agent":
                 binder = delegated_manager(self._tools)
@@ -521,6 +503,8 @@ class Executor:
         on_actual_model: Optional[Callable[[str], None]] = None,
         auto_execute: bool = False,
         on_auto_execute: Optional[Callable[[], None]] = None,
+        adoption_scope: Callable[[str], bool] | None = None,
+        delivery_sid: str | None = None,
     ) -> TaskOutcome:
         """执行一个任务。就地把对话追加进共享 messages,返回 TaskOutcome。
 
@@ -542,6 +526,13 @@ class Executor:
         last_outputs: dict[tuple[str, str], bytes] = {}
         task_context = task.content
         manager = delegated_manager(self._tools)
+
+        def delivery_pending():
+            if "delivery_for" not in task.execution:
+                return False
+            child = manager.children.get(delivery_sid) if manager is not None else None
+            return (child is None or not child.done.is_set() or child.result is None
+                    or child.result.delivery_status not in {"integrated", "parent_verified"})
 
         while auto_execute or (manager is not None and manager.long_run) or model_rounds < max(1, max_steps):
             if manager is not None and manager.long_run:
@@ -571,10 +562,23 @@ class Executor:
                 auto_execute=auto_execute,
                 usage_acc=usage_acc,
                 on_actual_model=on_actual_model,
+                defer_text=delivery_pending(),
             )
 
-            messages.extend(resp.provider_payload)
+            if not resp.tool_calls:
+                if manager is not None and manager.settle_before_final(
+                        messages, can_follow_up=auto_execute or model_rounds < max_steps,
+                        delivery_errors=self._tools.delivery_errors, adoption_scope=adoption_scope):
+                    continue
+                if delivery_pending() or (manager is not None and manager.pending_adoptions(adoption_scope)):
+                    reason = "委派尚未交付：找不到关联的子任务结果"
+                    if manager is not None and ("delivery_for" not in task.execution
+                                                or delivery_sid in manager.children):
+                        reason = manager.delivery_blocker(self._tools.delivery_errors, adoption_scope)
+                    return TaskOutcome(status=BLOCKED, text=reason, error=reason, model_rounds=model_rounds,
+                                       tool_calls_made=tool_calls_made)
 
+            messages.extend(resp.provider_payload)
             if response_text:
                 last_text = response_text
                 # 文本若已被 spinner 流式打印过,就不再发 message_delta(避免重复)
@@ -584,9 +588,6 @@ class Executor:
 
             # 没有工具调用 = 模型认为这个子任务已经做完
             if not resp.tool_calls:
-                manager = delegated_manager(self._tools)
-                if manager is not None and manager.settle_before_final(messages):
-                    continue
                 steering = apply_steering(cancel, messages)
                 if steering:
                     seen_tool_signatures.clear()
@@ -676,8 +677,7 @@ class Executor:
                         continue
                     actual = batch.pending_result(c)
                     if actual is not None:
-                        actual.output = _truncate_tool_output(
-                            batch.limit_exploration_output(c, actual.output, actual.is_error))
+                        actual.output = batch.limit_output(c, actual.output, actual.is_error)
                         if c.id not in visited_ids:
                             tool_calls_made += 1
                         self._emit(RunEvent(kind=events.TOOL_COMPLETED, task_id=task.id,
@@ -761,10 +761,13 @@ class Executor:
             # tool_result 刚入历史后再次预检，尽早压缩下一轮要发送的上下文。
             if self._ctx is not None:
                 try:
+                    warm_prefix = getattr(self._llm, "has_warm_prefix", None)
                     self._ctx.compact_before_model_call(
                         messages, system=system, tools=tools,
                         on_progress=on_progress,
                         cancel=cancel,
+                        preserve_cached_prefix=bool(warm_prefix and warm_prefix(messages, system=system, tools=tools)),
+                        on_summary_usage=lambda usage: _add_usage(usage_acc, usage),
                     )
                 except (Cancelled, ContextBudgetExceeded):
                     raise

@@ -31,7 +31,7 @@ from app.agent.events import RunEvent
 from app.agent.executor import Executor, TaskOutcome
 from app.agent.planner import Planner
 from app.agent.replanner import Replanner
-from app.agent.tasks import BLOCKED, COMPLETED, FAILED, TaskStore
+from app.agent.tasks import BLOCKED, COMPLETED, FAILED, Task, TaskStore
 from app.agent.execution_plan import ExecutionPlan
 from app.agent.subagent_runtime import SubagentRuntimeFactory
 from app.agent.subagents import SubagentCoordinator, SubagentResult, SubagentSpec
@@ -327,7 +327,6 @@ class Orchestrator:
                 reachable.update(following)
         if any(t.execution.get("executor") == "subagent" and not has_parent_consumer(t.id)
                for t in planned_tasks):
-            from app.agent.tasks import Task
             self.store.add(Task(
                 id=f"run{self._run_seq}-summary", content=(
                     "结合所有依赖子任务的证据，给出面向原始用户目标的综合答复；"
@@ -349,6 +348,28 @@ class Orchestrator:
         last_text = ""
         manager = delegated_manager(self._tools)
         planned_running: dict[str, str] = {}
+        requeued_deliveries: set[str] = set()
+
+        def queue_delivery(task_id, sid, *, adopt_current):
+            content = (f"审阅失败的共享写入 {sid} 和当前工作区；确认当前范围满足目标后，"
+                       "调用 integrate_agent(adopt_current=true) 并提供实际验证命令。"
+                       if adopt_current else f"审阅子任务 {sid} 的写入产物；调用 integrate_agent 并提供适用的 checks。")
+            content += "需验证和审批，禁止重跑写任务。"
+            delivery_id = f"{task_id}-delivery"
+            existing = self.store.get(delivery_id)
+            if existing is not None:
+                # Older checkpoints may claim delivery completed without integration.
+                if (resume and manager.allowed and existing.status in {BLOCKED, COMPLETED}
+                        and existing.execution.get("delivery_for") == task_id
+                        and delivery_id not in requeued_deliveries):
+                    requeued_deliveries.add(delivery_id)
+                    existing.content = content
+                    self.store.update_status(delivery_id, "pending", error="", note="retry delivery on resume")
+                return
+            requeued_deliveries.add(delivery_id)
+            self.store.add(Task(id=delivery_id, content=content,
+                                execution={"executor": "main_agent", "delivery_for": task_id}))
+
         from app.agent.execution_plan import ExecutionPolicy
         policy = plan.execution_plan.policy if plan.execution_plan else ExecutionPolicy()
         if resume:
@@ -384,24 +405,12 @@ class Orchestrator:
                     for restored_task in self.store.all():
                         sid = restored_task.execution.get("child_run_id")
                         child = manager.children.get(sid)
-                        adopt_shared = (child is not None and child.result is not None
-                                        and child.spec.workspace_mode == "shared"
-                                        and child.result.delivery_status in {"applied_unverified", "no_changes"}
-                                        and child.result.status != "succeeded")
+                        adopt_shared = child is not None and child.can_adopt_current()
                         if (restored_task.execution.get("executor") == "subagent" and restored_task.status == BLOCKED
                                 and child is not None and child.done.is_set() and not child.spec.read_only
                                 and (adopt_shared or (child.result.status == "succeeded"
                                      and child.result.delivery_status not in {"integrated", "parent_verified"}))):
-                            from app.agent.tasks import Task
-                            self.store.add(Task(
-                                id=f"{restored_task.id}-delivery", content=(
-                                    f"审阅失败的共享写入 {sid} 和当前工作区；确认当前范围满足目标后，"
-                                    "调用 integrate_agent(adopt_current=true) 并提供实际验证命令。"
-                                    if adopt_shared else
-                                    f"审阅恢复的写入产物 {sid}；调用 integrate_agent 并提供适用的 checks。"
-                                    "需验证和审批，禁止重跑写任务。"),
-                                execution={"executor": "main_agent", "delivery_for": restored_task.id},
-                            ))
+                            queue_delivery(restored_task.id, sid, adopt_current=adopt_shared)
                         if (child is not None and child.done.is_set() and restored_task.status != COMPLETED
                                 and (child.result.delivery_status == "parent_verified" or (
                                     child.result.status == "succeeded" and
@@ -426,7 +435,7 @@ class Orchestrator:
                         status = (COMPLETED if result.status == "succeeded" and
                                   (child.spec.read_only or result.delivery_status == "integrated") else BLOCKED)
                         if result.status in {"failed", "timed_out", "budget_exhausted"}:
-                            status = FAILED
+                            status = BLOCKED if child.can_adopt_current() else FAILED
                         outcome = TaskOutcome(status, text=result.output,
                                               evidence=json.dumps(summary, ensure_ascii=False), error=result.error)
                         patch = self._replanner.apply(task, outcome)
@@ -439,16 +448,11 @@ class Orchestrator:
                         if retrying:
                             task.execution["retries"] = task.execution.get("retries", 0) + 1
                             self.store.update_status(task.id, "pending", note="bounded read-only retry")
-                        if result.status == "succeeded" and not child.spec.read_only:
+                        if not child.spec.read_only and (result.status == "succeeded" or child.can_adopt_current()):
                             # Integration is a parent task, not a child success claim. Dependents
                             # stay blocked until the reviewed artifact is actually applied.
-                            from app.agent.tasks import Task
-                            self.store.add(Task(
-                                id=f"{task.id}-delivery", content=(
-                                    f"审阅子任务 {sid} 的结果，使用 integrate_agent(sid, checks) 执行适用的验证、"
-                                    "审批并集成。不得重跑写入任务或绕过审批；失败则明确报告未交付。"),
-                                execution={"executor": "main_agent", "delivery_for": task.id},
-                            ))
+                            if result.status == "succeeded" or policy.failure_policy != "fail_fast":
+                                queue_delivery(task.id, sid, adopt_current=child.can_adopt_current())
                         self._emit_task_update(task.id, patch.new_status, patch.note)
                         if result.output:
                             last_text = result.output
@@ -559,12 +563,24 @@ class Orchestrator:
                 elif executor != "main_agent":
                     outcome = TaskOutcome(BLOCKED, error="未知执行器；拒绝降级执行")
                 else:
+                    # Planned children have their own delivery tasks. Other tasks can still settle
+                    # children spawned through tools, without being blocked by those planned writes.
+                    delivery_target = self.store.get(task.execution.get("delivery_for"))
+                    delivery_sid = delivery_target.execution.get("child_run_id") if delivery_target else None
+                    planned_sids = {t.execution.get("child_run_id") for t in self.store.all()
+                                    if t.execution.get("executor") == "subagent"}
+
+                    def adoption_scope(sid):
+                        return sid == delivery_sid if delivery_target else sid not in planned_sids
+
                     outcome = self._executor.run_task(
                         task, self.messages,
                         system=self._system, max_steps=budget, cancel=cancel,
                         usage_acc=self.last_run_usage, on_actual_model=_record_model,
                         auto_execute=auto_execute,
                         on_auto_execute=self._enable_auto_execute,
+                        adoption_scope=adoption_scope,
+                        delivery_sid=delivery_sid,
                     )
                 if self._auto_execute_requested and not auto_execute:
                     auto_execute = True
@@ -609,9 +625,13 @@ class Orchestrator:
         snapshot = self.store.snapshot()
         if self.store.is_stalled():
             self.last_run_status = "blocked"
-            self.last_run_error = "部分任务被阻塞或失败,无法继续"
-            self._emit(RunEvent(kind=events.RUN_FAILED, text="部分任务被阻塞或失败,无法继续",
+            delivery_blocked = manager is not None and bool(manager.pending_adoptions())
+            self.last_run_error = (manager.delivery_blocker(self._tools.delivery_errors) if delivery_blocked
+                                   else "部分任务被阻塞或失败,无法继续")
+            self._emit(RunEvent(kind=events.RUN_FAILED, text=self.last_run_error,
                                 payload={"tasks": snapshot}))
+            if delivery_blocked:
+                return self.last_run_error
             return last_text or "部分任务未能完成(被阻塞或失败)。"
 
         if rounds_left is not None and rounds_left <= 0 and self.store.has_open():

@@ -12,16 +12,49 @@ from app.models.openai_adapter import ProviderStreamError
 _TERMINAL = {"response.completed", "response.failed", "response.incomplete", "response.error", "error"}
 
 
+def _transport_error(message, exc, audit, *, phase):
+    error_type = type(exc).__name__
+    close_codes = {}
+    for direction in ("rcvd", "sent"):
+        code = getattr(getattr(exc, direction, None), "code", None)
+        if isinstance(code, int):
+            close_codes[direction] = int(code)
+    if audit is not None:
+        audit.update(websocket_failure_phase=phase, websocket_exception_type=error_type)
+        if close_codes:
+            audit["websocket_close_codes"] = close_codes
+    details = [error_type, *(f"{direction}={code}" for direction, code in close_codes.items())]
+    return ProviderStreamError(f"{message} ({', '.join(details)})")
+
+
 class ResponsesWebSocket:
     def __init__(self):
         self.connection = None
         self.anchor = None
+        self._last_activity = 0.0
 
     def open(self, client, timeout):
+        transport = getattr(self.connection, "_connection", None)
+        if transport is not None:
+            try:
+                if isinstance(getattr(transport, "close_code", None), int) or (
+                    time.monotonic() - self._last_activity >= 20
+                    and not transport.ping().wait(min(2, timeout))
+                ):
+                    self.close()
+            except Exception:
+                # This probe runs before response.create, so replacing the
+                # connection cannot replay an admitted model request.
+                try:
+                    self.close()
+                except Exception:
+                    pass
         if self.connection is None:
             self.connection = client.responses.connect(
-                max_retries=0, websocket_connection_options={"open_timeout": timeout, "close_timeout": 1},
+                max_retries=0, websocket_connection_options={"open_timeout": timeout, "close_timeout": 1,
+                                                            "ping_interval": None},
             ).__enter__()
+            self._last_activity = time.monotonic()
 
     def close(self):
         connection, self.connection = self.connection, None
@@ -37,14 +70,21 @@ class ResponsesWebSocket:
                     if key not in {"input", "stream", "extra_headers"}}
         payload = {"type": "response.create", **settings, "input": inputs}
         anchor, self.anchor = self.anchor, None
+        full_context_reason = "no_connection_anchor"
         if anchor is not None:
             response_id, old_settings, previous = anchor
-            if settings == old_settings and len(inputs) > len(previous) and inputs[:len(previous)] == previous:
+            if settings != old_settings:
+                full_context_reason = "settings_changed"
+            elif len(inputs) <= len(previous) or inputs[:len(previous)] != previous:
+                full_context_reason = "input_not_appended"
+            else:
                 payload.update(previous_response_id=response_id, input=inputs[len(previous):])
+                full_context_reason = None
 
         if audit is not None:
             audit.update(transport="websocket", sent_input_items=len(payload["input"]),
-                         continued_response_id=payload.get("previous_response_id"))
+                         continued_response_id=payload.get("previous_response_id"),
+                         full_context_reason=full_context_reason)
 
         terminal = None
         last_activity = time.monotonic()
@@ -55,9 +95,12 @@ class ResponsesWebSocket:
                 try:
                     event = connection.recv()
                 except Exception as exc:
+                    phase = "receive"
+                    message = "Responses WebSocket interrupted after submission"
                     if timed_out.is_set():
-                        raise ProviderStreamError("Responses WebSocket timed out waiting for a stream event") from exc
-                    raise ProviderStreamError("Responses WebSocket interrupted after submission") from exc
+                        phase = "receive_timeout"
+                        message = "Responses WebSocket timed out waiting for a stream event"
+                    raise _transport_error(message, exc, audit, phase=phase) from exc
                 last_activity = time.monotonic()
                 if event.type in _TERMINAL:
                     terminal = event
@@ -92,7 +135,7 @@ class ResponsesWebSocket:
                 except Exception as exc:
                     # A broken connection can leave admission unknown. Do not
                     # automatically resend the same billable input over HTTP.
-                    raise ProviderStreamError("Responses WebSocket send interrupted") from exc
+                    raise _transport_error("Responses WebSocket send interrupted", exc, audit, phase="send") from exc
                 yield events()
             response = getattr(terminal, "response", None)
             if (getattr(terminal, "type", None) == "response.completed"
@@ -103,6 +146,7 @@ class ResponsesWebSocket:
                     self.anchor = (response.id, settings, inputs + output)
         finally:
             finished.set()
+            self._last_activity = last_activity
             if terminal is None or timed_out.is_set() or (cancel is not None and cancel.cancelled):
                 try:
                     self.close()

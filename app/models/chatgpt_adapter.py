@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import copy
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 import json
 from threading import Lock
 
@@ -18,14 +18,20 @@ from app.models.request_audit import ResponsesRequestPrefix, emit_request_event,
 from app.models.token_progress import StreamingTokenProgress
 from app.models.context_window import positive_int
 from app.models.responses_websocket import ResponsesWebSocket
+from app.util.redact import redact
 
 NAMESPACE = "agentlab"
 TEMPORARY_CODES = {"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable",
                    "server_error", "internal_error", "service_unavailable", "rate_limit_exceeded", "overloaded"}
 
 
+def _error_field(value, name):
+    return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+
+
 class ChatGPTError(ProviderStreamError):
-    def __init__(self, code, *, status=None, request_id=None, param=None, retry_after=None):
+    def __init__(self, code, *, status=None, request_id=None, param=None, retry_after=None,
+                 detail=None, retryable=False):
         self.code, self.status_code, self.request_id = code, status, request_id
         self.param, self.retry_after = param, retry_after
         hint = {
@@ -34,9 +40,18 @@ class ChatGPTError(ProviderStreamError):
             "subscription_sharing_invalid_user": "登录身份不可用，请检查账号或重新登录",
             "subscription_sharing_unsupported_capability": "请求包含当前授权路线不支持的能力",
             "admission_denied": "请求未获准，请检查账号权限、地区或登录状态",
-        }.get(code, "请检查 ChatGPT 账号授权和接口配置")
-        super().__init__(f"ChatGPT 请求失败 ({code}; HTTP {status}; request_id={request_id}; param={param})：{hint}",
-                         retryable=code in TEMPORARY_CODES)
+        }.get(code, "服务端拒绝或中断了模型请求")
+        fields = [code]
+        if status is not None:
+            fields.append(f"状态 {status}")
+        if request_id:
+            fields.append(f"request_id={request_id}")
+        if param:
+            fields.append(f"param={param}")
+        message = f"ChatGPT 请求失败 ({', '.join(fields)})：{hint}"
+        if isinstance(detail, str) and detail.strip():
+            message += "。服务端：" + " ".join(redact(detail).split())[:360]
+        super().__init__(message, retryable=retryable or code in TEMPORARY_CODES)
 
 
 class ChatGPTAdapter:
@@ -50,11 +65,18 @@ class ChatGPTAdapter:
         self._websocket = ResponsesWebSocket()
         self._websocket_unavailable = False
         self._session_bound = False
+        self._rejected_reasoning_ids: set[str] = set()
+        self._save_rejected_reasoning = None
 
     replays_encrypted_reasoning = True
 
     def bind_conversation(self):
         self._session_bound = True
+
+    def bind_reasoning_recovery(self, load, save):
+        route = json.dumps([self.provider, self.model, self._cfg.profile_name, self._cfg.chatgpt_account])
+        self._rejected_reasoning_ids.update(load(route))
+        self._save_rejected_reasoning = lambda ids: save(route, ids)
 
     @staticmethod
     def prepare_request_history(messages, tools, system):
@@ -159,7 +181,8 @@ class ChatGPTAdapter:
                 # Stateless Responses needs the opaque reasoning item, in place.
                 # Plain summaries without encrypted state cannot restore reasoning.
                 if (isinstance(message.get("encrypted_content"), str) and message["encrypted_content"]
-                        and isinstance(message.get("id"), str) and message["id"]):
+                        and isinstance(message.get("id"), str) and message["id"]
+                        and message["id"] not in self._rejected_reasoning_ids):
                     state = {key: copy.deepcopy(message[key]) for key in
                              ("type", "id", "summary", "encrypted_content") if key in message}
                     state["summary"] = state.get("summary") or []
@@ -207,6 +230,26 @@ class ChatGPTAdapter:
                 "tools": [_to_responses_tool(t) for t in tools]}]
         return params
 
+    def _recover_encrypted_history(self, code, status, params, audit):
+        if code != "invalid_encrypted_content" or status not in {None, 400}:
+            return False
+        # The server may reject multiple items one at a time. Quarantine this
+        # replay set together so recovery only sends one additional full request.
+        rejected = {item["id"] for item in params["input"] if item.get("type") == "reasoning"}
+        rejected.difference_update(self._rejected_reasoning_ids)
+        if not rejected:
+            return False
+        self._rejected_reasoning_ids.update(rejected)
+        if audit is not None:
+            audit["quarantined_reasoning_items"] = len(rejected)
+        if self._save_rejected_reasoning is not None:
+            try:
+                self._save_rejected_reasoning(rejected)
+            except Exception:
+                if audit is not None:
+                    audit["reasoning_recovery_persist_failed"] = True
+        return True
+
     def chat(self, messages, temperature=None):
         return self.create_message(messages).text
 
@@ -251,13 +294,26 @@ class ChatGPTAdapter:
                             response_id = getattr(failed, "id", None)
                             response_usage = getattr(failed, "usage", None)
                             error = getattr(failed, "error", None) or getattr(event, "error", None)
-                            code = getattr(error, "code", None) or getattr(event, "code", None) or kind
-                            if transport == "websocket" and code == "previous_response_not_found":
-                                failure = ChatGPTError(code)
-                                failure.retryable = True
-                                raise failure
-                            raise ChatGPTError(code, status=getattr(response, "status_code", None),
-                                request_id=request_id, param=getattr(error, "param", None))
+                            code = (_error_field(error, "code") or _error_field(event, "code")
+                                    or _error_field(error, "type") or kind)
+                            status = _error_field(event, "status")
+                            event_status = status if type(status) is int else None
+                            if http_status is None and event_status is not None:
+                                http_status = status
+                            request_id = (_error_field(event, "request_id") or _error_field(error, "request_id")
+                                          or request_id)
+                            retryable = transport == "websocket" and code in {
+                                "previous_response_not_found", "websocket_connection_limit_reached",
+                            }
+                            # A successful HTTP handshake does not set the status of a stream error.
+                            recovered = self._recover_encrypted_history(code, event_status, params, audit)
+                            if transport == "websocket" and (recovered or code == "websocket_connection_limit_reached"):
+                                with suppress(Exception):
+                                    self._websocket.close()
+                            raise ChatGPTError(code, status=http_status, request_id=request_id,
+                                param=_error_field(error, "param") or _error_field(event, "param"),
+                                detail=_error_field(error, "message") or _error_field(event, "message"),
+                                retryable=retryable or recovered)
                         if kind == "response.output_text.delta":
                             streamed_text.setdefault(event.output_index, []).append(event.delta)
                             if on_text_delta:
@@ -293,11 +349,12 @@ class ChatGPTAdapter:
             if not code and exc.status_code == 429:
                 code = "rate_limit_exceeded"
             error_code = code or "admission_denied"
+            recovered = self._recover_encrypted_history(error_code, http_status, params, audit)
             from app.models.provider_retry import _retry_after
             raise ChatGPTError(error_code, status=exc.status_code,
                                request_id=exc.request_id,
                                param=error.get("param") if isinstance(error, dict) else None,
-                               retry_after=_retry_after(exc)) from None
+                               retry_after=_retry_after(exc), retryable=recovered) from None
         except Exception as exc:
             error_code = getattr(exc, "code", None) or type(exc).__name__
             # Closing an in-flight stream can manifest as an SDK/transport error.

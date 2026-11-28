@@ -209,6 +209,32 @@ def test_read_file_pages_large_file(monkeypatch, tmp_path):
     assert "line 1000\n" in page
 
 
+def test_long_path_pages_survive_history_limiter(monkeypatch, tmp_path):
+    import re
+    from app.agent.tool_batch import ToolCallBatch
+    from app.models.protocol import ToolCall
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    path = tmp_path.joinpath(*(["目录名" * 23] * 4), "source.txt")
+    path.parent.mkdir(parents=True)
+    text = "甲乙丙丁" * 1700
+    path.write_text(text, encoding="utf-8")
+    column = 0
+    while column < len(text):
+        args = {"path": str(path), "offset": 1, "column_offset": column}
+        call = ToolCall("read", "read_file", args)
+        page = _read_file(args)
+        assert ToolCallBatch(ToolRegistry(), [call]).limit_output(call, page, False) == page
+        cursor = re.search(r" offset=1 column_offset=(\d+)\]$", page)
+        if not cursor:
+            assert page == text[column:]
+            break
+        end = int(cursor[1])
+        assert end > column
+        assert page.split("\n", 1)[1].rsplit("\n[...", 1)[0] == text[column:end]
+        column = end
+
+
 def test_read_file_small_file_is_unchanged(monkeypatch, tmp_path):
     """小文件不分页,返回值保持原样(向后兼容)。"""
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))

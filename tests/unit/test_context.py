@@ -488,6 +488,21 @@ def test_compact_before_model_call_uses_full_item_estimate():
     before = ctx.estimate(messages, system="system", tools=[{"name": "shell"}])
     assert before >= budget.compact_threshold
 
+
+def test_warm_prefix_defers_only_inside_soft_threshold_band(monkeypatch):
+    budget = ContextBudget.from_context_size(context_size=10_000)
+    ctx = ContextManager(budget, ContextCompressor(FakeRouter([])))
+    estimate = budget.compact_threshold
+    monkeypatch.setattr(ctx, "estimate", lambda *args, **kwargs: estimate)
+    calls = []
+    monkeypatch.setattr(ctx, "maybe_compact", lambda *args, **kwargs: calls.append(True) or True)
+    assert not ctx.compact_before_model_call([], preserve_cached_prefix=True)
+    assert calls == []
+    assert ctx.compact_before_model_call([])
+    estimate = budget.safe_input_limit
+    assert ctx.compact_before_model_call([], preserve_cached_prefix=True)
+    assert calls == [True, True]
+
 def test_orchestrator_passes_tool_schema_to_preflight():
     """模型请求前的预检应把完整工具 Schema 传给 ContextManager。"""
     class ContextSpy:

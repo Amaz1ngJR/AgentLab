@@ -40,7 +40,9 @@ import signal
 import threading
 import time
 
+from app.agent.context_budget import estimate_tokens
 from app.tools.builtin.command_pipes import PipeCommandSession
+from app.tools.output_budget import OUTPUT_TOKEN_LIMIT_SCHEMA, fit_prefix, fits_output, truncate_tool_output
 from app.util.process_sandbox import ProcessSandboxError, sandbox_command
 
 # Windows 的 select 不支持终端文件描述符。
@@ -73,13 +75,41 @@ def _normalize(raw: bytes) -> str:
     return _strip_ansi(text)
 
 
-def _clip(text: str) -> str:
+def _clip(text: str, max_tokens: int | None = None, *, original: str | None = None) -> str:
+    if max_tokens is not None:
+        from app.tools.output_archive import archive_output, output_reference
+        preview = truncate_tool_output(text, MAX_OUTPUT_BYTES, max_tokens=max_tokens)
+        if preview == text and (original is None or original == text):
+            return text
+        output_id = archive_output(text if original is None else original)
+        return preview + ("\n" + output_reference(output_id) if output_id else "")
     if len(text) <= MAX_OUTPUT_BYTES:
         return text
     from app.tools.output_archive import archive_output, output_reference
     path = archive_output(text)
     preview = text[:MAX_OUTPUT_BYTES // 2] + "\n…\n" + text[-MAX_OUTPUT_BYTES // 2:]
     return f"{preview}\n[...truncated, total {len(text)} characters]" + ("\n" + output_reference(path) if path else "")
+
+
+def _command_result(status: dict, text: str, max_tokens: int | None) -> str:
+    def serialize(body):
+        return json.dumps({**status, "output": body}, ensure_ascii=False)
+
+    def fits(body, suffix=""):
+        return (len(body) <= MAX_OUTPUT_BYTES
+                and (max_tokens is None or estimate_tokens(body) <= max_tokens)
+                and fits_output(serialize(body + suffix)))
+
+    if fits(text):
+        return serialize(text)
+
+    from app.tools.output_archive import archive_output, output_reference
+
+    output_id = archive_output(text)
+    suffix = "\n" + output_reference(output_id) if output_id else ""
+    notice = "\n[命令输出已截断]"
+    prefix = fit_prefix(text[:MAX_OUTPUT_BYTES], lambda body: fits(body + notice, suffix))
+    return serialize(prefix + notice + suffix)
 
 
 class PtySession:
@@ -298,7 +328,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
     from app.tools.builtin.shell import _build_argv
     from app.tools.registry import Tool, ToolExecutionError, current_cancel_token
 
-    def collect(session: PtySession | PipeCommandSession, wait_ms: int) -> str:
+    def collect(session: PtySession | PipeCommandSession, wait_ms: int, max_tokens: int | None) -> str:
         cancel = current_cancel_token()
         try:
             output = session.read_until_idle(idle=None, timeout=wait_ms / 1000, cancel=cancel)
@@ -316,7 +346,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             if isinstance(exc, Cancelled):
                 raise
             raise ToolExecutionError(f"command session failed: {exc}") from exc
-        return json.dumps({**result, "output": _clip(output.strip())}, ensure_ascii=False)
+        return _command_result(result, output.strip(), max_tokens)
 
     def exec_command(args: dict) -> str:
         command = args["command"].strip()
@@ -334,7 +364,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             _, session = manager.open_argv(_build_argv(command), cwd=str(cwd))
         except (OSError, ProcessSandboxError) as exc:
             raise ToolExecutionError(f"failed to start command: {exc}") from exc
-        return collect(session, args.get("yield_time_ms", 1000))
+        return collect(session, args.get("yield_time_ms", 1000), args.get("max_output_tokens"))
 
     def write_stdin(args: dict) -> str:
         sid = args["session_id"]
@@ -352,7 +382,8 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
                 manager.close(sid)
                 raise ToolExecutionError(f"failed to write stdin: {exc}") from exc
         default_wait = 250 if chars else 10000
-        return collect(session, min(args.get("yield_time_ms", default_wait), 30000 if chars else 300000))
+        return collect(session, min(args.get("yield_time_ms", default_wait), 30000 if chars else 300000),
+                       args.get("max_output_tokens"))
 
     def process_status(session: PtySession | PipeCommandSession) -> str:
         if session.alive:
@@ -404,7 +435,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         )
         from app.tools.rtk_builtin import BuiltinRTK
         body = BuiltinRTK().compress_terminal(command, initial.strip()) or "(无输出)"
-        return f"[session {sid}]\n{_clip(body)}{status}"
+        return f"[session {sid}]\n{_clip(body, args.get('max_output_tokens'), original=initial.strip())}{status}"
 
     def _send(args: dict) -> str:
         sid = (args.get("session_id") or "").strip()
@@ -444,7 +475,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         )
         from app.tools.rtk_builtin import BuiltinRTK
         body = BuiltinRTK().compress_terminal(str(data), out.strip()) or "(无输出)"
-        return f"{_clip(body)}{status}"
+        return f"{_clip(body, args.get('max_output_tokens'), original=out.strip())}{status}"
 
     def _close(args: dict) -> str:
         sid = (args.get("session_id") or "").strip()
@@ -478,6 +509,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         input_schema={
             "type": "object",
             "properties": {
+                "max_output_tokens": OUTPUT_TOKEN_LIMIT_SCHEMA,
                 "command": {
                     "type": "string",
                     "description": "启动会话的命令,例如 \"zsh -ic 'vsm orangepi-xxx'\" 或 'python3'",
@@ -520,6 +552,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
         input_schema={
             "type": "object",
             "properties": {
+                "max_output_tokens": OUTPUT_TOKEN_LIMIT_SCHEMA,
                 "session_id": {
                     "type": "string",
                     "description": "terminal_open 返回的会话 id,例如 'term-1'",
@@ -597,6 +630,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
                          "短命令直接获取输出；长任务用 write_stdin 空输入继续等待。"
                          "输出截断后可用 read_tool_output 读取完整记录。"),
             input_schema={"type": "object", "properties": {
+                "max_output_tokens": OUTPUT_TOKEN_LIMIT_SCHEMA,
                 "command": {"type": "string", "minLength": 1},
                 "cwd": {"type": "string", "description": "工作目录，默认当前工作区。"},
                 "yield_time_ms": {**wait_schema, "description": "返回前等待的毫秒数，默认 1000。"},
@@ -610,6 +644,7 @@ def make_terminal_tools(manager: PtySessionManager) -> list:
             description=("读取命令会话的新输出或发送字符。空 chars 只等待，默认 10 秒；"
                          "发送时按原样写入，需回车请显式提供换行。可用 terminal_close 停止会话。"),
             input_schema={"type": "object", "properties": {
+                "max_output_tokens": OUTPUT_TOKEN_LIMIT_SCHEMA,
                 "session_id": {"type": "string", "minLength": 1},
                 "chars": {"type": "string", "maxLength": 4096},
                 "yield_time_ms": wait_schema,

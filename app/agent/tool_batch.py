@@ -9,6 +9,7 @@ from contextvars import copy_context
 
 from app.agent.cancel import Cancelled
 from app.models.protocol import ToolResult
+from app.tools.output_budget import TOOL_OUTPUT_MAX_CHARS, fits_output, truncate_tool_output
 from app.tools.registry import _deferred_audits
 
 EXPLORATION_TOOLS = frozenset({"code_search", "list_dir", "read_file", "read_files"})
@@ -96,7 +97,20 @@ class ToolCallBatch:
         preview = output[:max(0, allowance - len(notice) - 1)]
         # Keep the preview on whole lines when possible.
         preview = preview.rsplit("\n", 1)[0] if "\n" in preview else preview
-        return f"{preview}\n{notice}" if preview else notice[:allowance]
+        bounded = f"{preview}\n{notice}" if preview else notice[:allowance]
+        return bounded if fits_output(bounded, allowance) else truncate_tool_output(output, allowance, reference=notice)
+
+    def limit_output(self, call, output, is_error):
+        output = self.limit_exploration_output(call, output, is_error)
+        if fits_output(output):
+            return output
+        from app.tools.output_archive import archive_output, output_reference
+        output_id = archive_output(output) if self.tools.get("read_tool_output") is not None else None
+        reference = output_reference(output_id) if output_id else ""
+        if not is_error and call.name in {"code_search", "read_files"}:
+            return self._limit_exploration_json(call.name, output, TOOL_OUTPUT_MAX_CHARS,
+                                                reference or "[工具输出超过历史预算，请缩小读取范围]")
+        return truncate_tool_output(output, reference=reference)
 
     @staticmethod
     def _limit_exploration_json(name, output, allowance, notice):
@@ -114,13 +128,13 @@ class ToolCallBatch:
             if name == "code_search":
                 data["count"] = len(entries)
             encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-            if len(encoded) <= allowance:
+            if fits_output(encoded, allowance):
                 return encoded
             if not entries:
                 return notice[:allowance]
             omitted = entries.pop()
             if name == "read_files":
-                data["pending_indices"].insert(0, omitted["index"])
+                data["pending_indices"][:0] = [omitted["index"], *omitted.get("covered_indices", [])]
 
     def execute(self, call, *, approved_action=None, cancel=None):
         cancel = cancel if cancel is not None else self.cancel

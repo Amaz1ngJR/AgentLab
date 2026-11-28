@@ -105,7 +105,10 @@ def read_output(args: dict) -> str:
             _cleanup_expired(path.parent, time.time())
             if path.is_symlink() or not path.is_file():
                 raise ToolExecutionError("output unavailable: expired, evicted, or belongs to another workspace")
-            _, page = _read_page(args, _trusted_path=path)
+            from app.tools.output_budget import TOOL_PAGE_MAX_TOKENS
+            _, page = _read_page(args, _trusted_path=path,
+                                 max_tokens=min(args.get("max_output_tokens", TOOL_PAGE_MAX_TOKENS),
+                                                TOOL_PAGE_MAX_TOKENS))
             path.touch()
         result = f"[{output_id}, lines {page['start_line']}-{page['end_line']}]\n" + page["content"]
         if page["truncated"]:

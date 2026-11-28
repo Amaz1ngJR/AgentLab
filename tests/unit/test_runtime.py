@@ -108,38 +108,57 @@ def test_read_only_followup_shortens_wire_history_without_changing_original(prov
 
 
 def test_oauth_commit_message_uses_small_context_and_restores_normal_workflow():
+    from unittest.mock import Mock
     from app.skills import SkillCatalog
     from app.skills.loader import Skill
     from tests.support.delegation import SnapshotRouter, response
 
     class OAuthRouter(SnapshotRouter):
         provider = "openai_chatgpt"
+        bind_cache_scope = Mock()
+        close = Mock()
+
+    commit_model = OAuthRouter([
+        ModelResponse("", [ToolCall("git", "shell", {})], {}, []),
+        response("feat: 改善用量"),
+    ])
 
     shell = Tool("shell", "read Git state", {}, lambda _: "pending changes")
     write_file = Tool("write_file", "write content", {}, lambda _: "written")
     model = OAuthRouter([
-        ModelResponse("", [ToolCall("git", "shell", {})], {}, []),
-        response("feat: 改善用量"),
         ModelResponse("", [ToolCall("write", "write_file", {})], {}, []),
         response("done"),
     ])
+    model.fork = Mock(return_value=commit_model)
     session = AgentSession(model, _registry_with(shell, write_file), system_prompt="profile instructions")
+    previous = [{"role": "user", "content": "previous discussion " * 4_000}]
+    session.messages.extend(previous)
     session.memory_context = "recent memories"
     session.skill_catalog = SkillCatalog({
         "git-commit": Skill("git-commit", "Git workflow", workflow="full Git workflow",
                             triggers=["提交"], enabled=True),
     })
-    assert session.chat("请看下当前改动，拟一条提交说明，不修改文件，不提交或推送。") == "feat: 改善用量"
-    for request in model.calls[:2]:
+    prompt = "请你看下暂存区的代码，结合历史提交消息，生成暂存区提交的消息"
+    assert session.chat(prompt) == "feat: 改善用量"
+    assert not model.calls
+    assert len(commit_model.calls) == 2
+    commit_model.bind_cache_scope.assert_called_once()
+    commit_model.close.assert_called_once()
+    for request in commit_model.calls:
         assert {tool["name"] for tool in request["tools"]} == {"shell"}
         assert "profile instructions" in request["system"]
         assert "recent memories" not in str(request["messages"])
         assert "full Git workflow" not in request["system"]
+        assert "previous discussion" not in str(request["messages"])
+    assert "pending changes" in str(commit_model.calls[1]["messages"])
+    assert session.messages == previous + [
+        {"role": "user", "content": prompt}, {"role": "assistant", "content": "feat: 改善用量"},
+    ]
     assert session.chat("请修改代码，并拟一条提交说明") == "done"
-    assert {tool["name"] for tool in model.calls[2]["tools"]} == {"shell", "write_file"}
-    assert model.calls[2]["system"] == model.calls[0]["system"]
-    assert "recent memories" in str(model.calls[2]["messages"])
-    assert "full Git workflow" in str(model.calls[2]["messages"])
+    assert {tool["name"] for tool in model.calls[0]["tools"]} == {"shell", "write_file"}
+    assert model.calls[0]["system"] == commit_model.calls[0]["system"]
+    assert "recent memories" in str(model.calls[0]["messages"])
+    assert "full Git workflow" in str(model.calls[0]["messages"])
 
 
 def _danger_tool() -> Tool:

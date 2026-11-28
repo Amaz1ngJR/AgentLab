@@ -982,6 +982,179 @@ def test_parent_can_verify_current_shared_scope_without_rewriting_child_failure(
         reopened.finish()
 
 
+def _pending_shared_adoptions(tmp_path):
+    from dataclasses import asdict
+    from app.agent.subagents import SubagentSpec
+
+    records, checks = [], []
+    for sid, status in [("manifest", "budget_exhausted"), ("origin", "failed")]:
+        path = f"{sid}.txt"
+        records.append({"child_run_id": sid, "parent_run_id": "old", "parent_workspace": str(tmp_path),
+                        "delegation_allowed": True, "execution_status": status, "delivery_status": "no_changes",
+                        "spec": asdict(SubagentSpec(sid, sid, workspace_mode="shared", file_scope=(path,))),
+                        "metrics": {"shared_artifact": {}}, "changed_files": []})
+        (tmp_path / path).write_text("parent implementation")
+        checks.append(ToolCall(sid, "integrate_agent", {"sid": sid, "adopt_current": True,
+                                                        "checks": [f"grep -qx 'parent implementation' {path}"]}))
+    return records, checks
+
+
+def _reply_with_payload(text):
+    return ModelResponse(text, [], {}, [{"role": "assistant", "content": text}])
+
+
+@pytest.mark.parametrize("adopt_both", [True, False])
+def test_final_answer_waits_for_both_parent_adoptions(tmp_path, monkeypatch, adopt_both):
+    from app.agent.runtime import AgentSession
+    from tests.support.delegation import SnapshotRouter
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    records, checks = _pending_shared_adoptions(tmp_path)
+    llm = SnapshotRouter([_reply_with_payload("未经核实的完成声明"),
+                          ModelResponse("", checks if adopt_both else checks[:1], {}, []),
+                          _reply_with_payload("全部验收完成")])
+    notifications = []
+    session = AgentSession(llm, make_manager(tmp_path).tools, approval=AutoApprove(), on_event=notifications.append)
+    session.child_records = records
+    answer = session.chat("请接管并验证旧子任务的当前改动")
+    assert len(llm.calls) == 3
+    prompt = llm.calls[1]["messages"][-1]["content"]
+    assert all(value in prompt for value in ("manifest.txt", "origin.txt", "integrate_agent", "adopt_current"))
+    assert not any(e.text == "未经核实的完成声明" for e in notifications)
+    assert all(m.get("content") != "未经核实的完成声明"
+               for history in [*(call["messages"] for call in llm.calls), session.messages] for m in history)
+    by_id = {r["child_run_id"]: (r["execution_status"], r["delivery_status"]) for r in session.child_records}
+    assert by_id["manifest"] == ("budget_exhausted", "parent_verified")
+    if adopt_both:
+        assert by_id["origin"] == ("failed", "parent_verified")
+        assert session.last_run_status == "completed" and answer == "全部验收完成"
+    else:
+        assert by_id["origin"] == ("failed", "no_changes")
+        assert session.last_run_status == "blocked" and "origin: failed/no_changes" in answer
+        assert "manifest" not in answer and "全部验收完成" not in answer
+        assert not any(e.text == "全部验收完成" for e in notifications)
+        assert not any(m.get("content") == "全部验收完成" for m in session.messages)
+
+
+def test_planned_delivery_tasks_settle_only_their_own_child(tmp_path, monkeypatch):
+    from app.agent.runtime import AgentSession
+    from app.agent.tasks import BLOCKED, COMPLETED, Task
+    from tests.support.delegation import SnapshotRouter
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    records, checks = _pending_shared_adoptions(tmp_path)
+    premature = "尚未验收时声明完成"
+    llm = SnapshotRouter([
+        _reply_with_payload(premature),
+        ModelResponse("", checks[:1], {}, []),
+        _reply_with_payload("manifest 已验收"),
+        ModelResponse("", checks[1:], {}, []),
+        _reply_with_payload("origin 已验收"),
+        _reply_with_payload("两项均已验收"),
+    ])
+    notifications = []
+    session = AgentSession(llm, make_manager(tmp_path).tools, approval=AutoApprove(),
+                           on_event=notifications.append, orchestrate=True)
+    session.child_records = records
+    for record in records:
+        sid = record["child_run_id"]
+        session.task_store.add(Task(id=sid, content=sid, status=BLOCKED, execution={
+            "executor": "subagent", "child_run_id": sid, "subagent": record["spec"],
+        }))
+
+    assert session.chat("继续验收子任务", resume=True) == "两项均已验收"
+    assert session.last_run_status == "completed"
+    assert {task.id: task.status for task in session.task_store.all()} == dict.fromkeys(
+        ["manifest", "origin", "manifest-delivery", "origin-delivery", "run1-summary"], COMPLETED)
+    prompt = llm.calls[1]["messages"][-1]["content"]
+    assert "manifest.txt" in prompt and "origin.txt" not in prompt
+    assert not any(e.text == premature for e in notifications)
+    assert all(m.get("content") != premature
+               for history in [*(call["messages"] for call in llm.calls), session.messages] for m in history)
+
+
+def test_resume_requeues_blocked_delivery_without_rerunning_writer(tmp_path, monkeypatch):
+    from app.agent.runtime import AgentSession
+    from app.agent.tasks import BLOCKED, COMPLETED, Task
+    from tests.support.delegation import SnapshotRouter
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    records, checks = _pending_shared_adoptions(tmp_path)
+    llm = SnapshotRouter([
+        _reply_with_payload("暂不验收"),
+        _reply_with_payload("仍未验收"),
+        ModelResponse("", checks[:1], {}, []),
+        _reply_with_payload("manifest 已验收"),
+        _reply_with_payload("全部交付完成"),
+    ])
+    session = AgentSession(llm, make_manager(tmp_path).tools, approval=AutoApprove(), orchestrate=True)
+    session.child_records = records[:1]
+    session.task_store.add(Task(id="manifest", content="原写入任务", status=BLOCKED, execution={
+        "executor": "subagent", "child_run_id": "manifest", "subagent": records[0]["spec"],
+    }))
+
+    assert "manifest: budget_exhausted/no_changes" in session.chat("继续验收子任务", resume=True)
+    delivery = session.task_store.get("manifest-delivery")
+    assert delivery.status == BLOCKED and len(llm.calls) == 2
+
+    assert session.chat("继续验收子任务", resume=True) == "全部交付完成"
+    assert session.last_run_status == "completed"
+    assert session.task_store.get("manifest-delivery") is delivery and delivery.status == COMPLETED
+    assert session.task_store.get("manifest").status == COMPLETED
+    assert len(session.child_records) == 1
+    assert session.child_records[0]["execution_status"] == "budget_exhausted"
+    assert session.child_records[0]["delivery_status"] == "parent_verified"
+
+
+@pytest.mark.parametrize("stale_completed", [False, True])
+def test_resume_requires_integration_of_successful_writer(tmp_path, monkeypatch, stale_completed):
+    from app.agent.runtime import AgentSession
+    from app.agent.tasks import BLOCKED, COMPLETED, Task
+    from tests.support.delegation import SnapshotRouter
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    original = make_manager(tmp_path)
+    try:
+        sid = original.spawn("create", role="executor", file_scope=["child.txt"])["child_run_id"]
+        result = original.wait([sid], 3)["agents"][0]
+        assert (result["status"], result["delivery_status"]) == ("succeeded", "applied_unverified")
+        records = original.records()
+    finally:
+        original.finish()
+
+    premature = "只读检查完成，声明已交付"
+    responses = [] if stale_completed else [
+        ModelResponse("", [ToolCall("read", "read_file", {"path": "child.txt"})], {}, []),
+        _reply_with_payload(premature),
+    ]
+    llm = SnapshotRouter(responses + [
+        ModelResponse("", [ToolCall("integrate", "integrate_agent", {
+            "sid": sid, "checks": ["test -f child.txt"],
+        })], {}, []),
+        _reply_with_payload("已验收"),
+        _reply_with_payload("全部交付完成"),
+    ])
+    session = AgentSession(llm, original.tools, approval=AutoApprove(), orchestrate=True)
+    session.child_records = records
+    session.task_store.add(Task(id="writer", content="原写入任务", status=BLOCKED, execution={
+        "executor": "subagent", "child_run_id": sid, "subagent": records[0]["spec"],
+    }))
+    if stale_completed:
+        session.task_store.add(Task(id="writer-delivery", content="旧验收任务", status=COMPLETED,
+                                    execution={"executor": "main_agent", "delivery_for": "writer"}))
+    else:
+        assert f"{sid}: succeeded/applied_unverified" in session.chat("继续验收子任务", resume=True)
+        assert session.task_store.get("writer").status == BLOCKED
+        assert session.task_store.get("writer-delivery").status == BLOCKED
+        assert all(message.get("content") != premature for message in session.messages)
+
+    assert session.chat("继续验收子任务", resume=True) == "全部交付完成"
+    assert session.last_run_status == "completed"
+    assert session.task_store.get("writer").status == COMPLETED
+    assert session.task_store.get("writer-delivery").status == COMPLETED
+    assert [(r["child_run_id"], r["delivery_status"]) for r in session.child_records] == [(sid, "integrated")]
+
+
 def test_parent_verified_delivery_completes_linked_task_and_survives_session_restart(tmp_path, monkeypatch):
     from app.agent.profiles import AgentProfile
     from app.agent.runtime import AgentSession

@@ -67,6 +67,23 @@ def test_small_schema_fluctuation_does_not_reset_failure(monkeypatch):
     assert len(calls) == 1
 
 
+def test_window_pressure_retries_after_early_compaction_failure(monkeypatch):
+    manager, _, estimate, calls, _ = setup(monkeypatch)
+    budget = ContextBudget.from_context_size(100_000, auto_compact_token_limit=20_000)
+    manager.budget = budget
+    estimate[0] = 20_001
+    assert not manager.compact_before_model_call([])
+    assert not manager.compact_before_model_call([])
+    assert len(calls) == 1
+
+    estimate[0] = budget.safe_input_limit + 1
+    for _ in range(2):
+        with pytest.raises(ContextBudgetExceeded):
+            manager.compact_before_model_call([])
+    assert len(calls) == 2
+    assert calls[1]["target_message_tokens"] > calls[0]["target_message_tokens"]
+
+
 def test_hard_limit_is_enforced_without_another_slow_attempt(monkeypatch):
     manager, clock, estimate, calls, emitted = setup(monkeypatch)
     manager.compact_before_model_call([])

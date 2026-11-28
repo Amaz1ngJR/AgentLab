@@ -181,6 +181,14 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
                 f"{sorted(allowed_efforts)} 之一，当前值: {reasoning_effort!r}"
             )
 
+    auto_compact_limit = None
+    if profile.provider == "openai_chatgpt":
+        value = _env("LLM_AUTO_COMPACT_TOKEN_LIMIT") or params.get("auto_compact_token_limit")
+        if value is not None:
+            auto_compact_limit = int(value)
+            if auto_compact_limit < 0:
+                raise ValueError("LLM_AUTO_COMPACT_TOKEN_LIMIT 必须是非负整数")
+
     return LLMConfig(
         provider=profile.provider,
         model=profile.model,
@@ -202,4 +210,5 @@ def load_config(profile_name: Optional[str] = None) -> LLMConfig:
             "LLM_CHATGPT_WEBSOCKET", default=params.get("chatgpt_websocket", True) is True,
         )),
         capabilities=list(profile.capabilities),
+        auto_compact_token_limit=auto_compact_limit,
     )

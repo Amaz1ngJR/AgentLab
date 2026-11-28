@@ -1,5 +1,6 @@
 """Recover tool evidence without granting general external-file access."""
 from app.tools.output_archive import read_output
+from app.tools.output_budget import OUTPUT_TOKEN_LIMIT_SCHEMA
 from app.tools.registry import Tool
 
 READ_TOOL_OUTPUT = Tool(
@@ -14,6 +15,7 @@ READ_TOOL_OUTPUT = Tool(
             "offset": {"type": "integer", "minimum": 1},
             "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
             "column_offset": {"type": "integer", "minimum": 0},
+            "max_output_tokens": OUTPUT_TOKEN_LIMIT_SCHEMA,
         },
         "required": ["output_id"],
         "additionalProperties": False,

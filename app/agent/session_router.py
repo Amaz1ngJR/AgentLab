@@ -139,10 +139,28 @@ class SessionRouter:
         bind_scope = getattr(getattr(session, "llm", None), "bind_cache_scope", None)
         if callable(bind_scope):
             bind_scope(session_id)
-        session.child_checkpoint = lambda records: self._storage.save_delegation_checkpoint(
-            session_id, messages=session.messages, tasks=session.task_store.snapshot(),
-            records=records, model_route=_model_route(session),
-        )
+
+        def bind_reasoning_recovery(llm):
+            bind = getattr(llm, "bind_reasoning_recovery", None)
+            if callable(bind):
+                bind(lambda route: self._storage.load_rejected_reasoning(session_id, route),
+                     lambda route, ids: self._storage.save_rejected_reasoning(session_id, route, ids))
+
+        session.bind_reasoning_recovery = bind_reasoning_recovery
+        bind_reasoning_recovery(getattr(session, "llm", None))
+        def checkpoint(records):
+            self._persist_compaction_sources(session, session_id)
+            self._storage.save_delegation_checkpoint(
+                session_id, messages=session.messages, tasks=session.task_store.snapshot(),
+                records=records, model_route=_model_route(session),
+            )
+
+        session.child_checkpoint = checkpoint
+
+    def _persist_compaction_sources(self, session, session_id):
+        ctx = getattr(session, "context_manager", None)
+        if ctx is not None:
+            ctx.persist_records(lambda record: self._storage.save_context_summary(session_id, record))
 
     def switch(self, session_id: str) -> bool:
         """切换到已有 session（内存或 SQLite 恢复），返回是否成功。"""
@@ -245,9 +263,10 @@ class SessionRouter:
         from app.attachments import AttachmentStore, strip_image_blocks
 
         cleaned, reference_count = strip_image_blocks(session.messages)
-        # 先更新内存和 SQLite，确保即使文件清理失败，后续也不会再引用已删除图片。
+        # Flush pending sources too, so a later save cannot restore cleared references.
+        self._persist_compaction_sources(session, target)
+        reference_count += self._storage.save_image_cleanup(target, cleaned)
         session.messages[:] = cleaned
-        self._storage.save_messages(target, session.messages)
         file_count = AttachmentStore().delete_session(target)
         return {"references": reference_count, "files": file_count}
 
@@ -270,6 +289,7 @@ class SessionRouter:
         sess = self._sessions.get(session_id)
         if sess is None:
             return
+        self._persist_compaction_sources(sess, session_id)
         self._storage.save_messages(session_id, sess.messages, model_route=_model_route(sess))
         # 标记最后活跃时间:让 resume_or_new 的"最近"= 最后对话时间,而非创建/
         # 重命名时间,避免每次启动恢复到从未对话过的空壳 session。只在确有消息时
@@ -279,12 +299,6 @@ class SessionRouter:
         store = getattr(sess, "task_store", None)
         if store is not None:
             self._storage.save_tasks(session_id, store.snapshot())
-        # 上下文压缩摘要审计:把本轮产生的 ContextSummary flush 到 context_summaries。
-        # 原始消息已由 save_messages 保留 —— 压缩只换"模型输入里的旧片段",不删原文。
-        ctx = getattr(sess, "context_manager", None)
-        if ctx is not None:
-            for summary in ctx.drain_records():
-                self._storage.save_context_summary(session_id, summary.to_record())
         # 编排 run 审计:有 goal 才记(单轮 legacy chat 不写 runs)
         goal = getattr(sess, "last_goal", "") or ""
         status = getattr(sess, "last_run_status", "") or ""

@@ -80,6 +80,14 @@ def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
     return sum(estimate_message_tokens(m) for m in messages)
 
 
+def estimate_active_messages_tokens(messages: list[dict[str, Any]]) -> int:
+    """Estimate rendered items without treating opaque transport bytes as text."""
+    return sum(estimate_message_tokens(
+        {key: value for key, value in item.items() if key != "encrypted_content"}
+        if item.get("type") in {"reasoning", "compaction"} else item
+    ) for item in messages)
+
+
 @dataclass
 class ContextBudget:
     """当前模型窗口下的各部分 token 预算。
@@ -95,6 +103,7 @@ class ContextBudget:
     recent_messages_budget: int
     evidence_budget: int
     context_limit_source: str = "default"
+    auto_compact_token_limit: int | None = None
 
     @property
     def input_budget(self) -> int:
@@ -104,11 +113,18 @@ class ContextBudget:
     @property
     def warn_threshold(self) -> int:
         """预计输入超过这个值就该发 context_budget_warning。"""
-        return int(self.input_budget * WARN_RATIO)
+        window_warning = int(self.input_budget * WARN_RATIO)
+        if self.compact_threshold < self.window_compact_threshold:
+            return min(window_warning, self.compact_threshold * 9 // 10)
+        return window_warning
 
     @property
     def compact_threshold(self) -> int:
         """预计输入超过这个值就必须在下次模型调用前压缩旧历史。"""
+        return min(self.window_compact_threshold, self.auto_compact_token_limit or self.window_compact_threshold)
+
+    @property
+    def window_compact_threshold(self) -> int:
         return int(self.input_budget * COMPACT_RATIO)
 
     @property
@@ -128,9 +144,10 @@ class ContextBudget:
     def from_llm(cls, llm) -> "ContextBudget":
         """从运行时模型能力构造预算，窗口来源由路由器解析。"""
         window = getattr(llm, "context_window", None)
+        auto_limit = positive_int(getattr(llm, "auto_compact_token_limit", None))
         if isinstance(window, ContextWindow):
-            return cls.from_context_size(window.tokens, source=window.source)
-        return cls.from_context_size(getattr(llm, "context_size", None))
+            return cls.from_context_size(window.tokens, source=window.source, auto_compact_token_limit=auto_limit)
+        return cls.from_context_size(getattr(llm, "context_size", None), auto_compact_token_limit=auto_limit)
 
     @classmethod
     def from_context_size(
@@ -139,6 +156,7 @@ class ContextBudget:
         *,
         reserved_output_tokens: Optional[int] = None,
         source: str | None = None,
+        auto_compact_token_limit: int | None = None,
     ) -> "ContextBudget":
         """按已解析的窗口计算预算；默认预留窗口的25%输出空间，最多8192。"""
         declared = positive_int(context_size)
@@ -155,6 +173,7 @@ class ContextBudget:
         return cls(
             model_context_limit=limit,
             context_limit_source=source or ("config" if declared else "default"),
+            auto_compact_token_limit=auto_compact_token_limit,
             reserved_output_tokens=reserved,
             system_and_tools_budget=int(usable * 0.15),
             memory_budget=int(usable * 0.10),

@@ -288,6 +288,44 @@ def test_exec_command_returns_exit_code_and_removes_completed_session(tmp_path, 
         manager.close_all()
 
 
+@pytest.mark.parametrize(("tool_name", "running", "max_tokens", "text"), [
+    ("exec_command", True, 3200, "中" * 3600),
+    ("write_stdin", False, 3200, "中\\\t" * 1800),
+    ("write_stdin", True, 128, "中" * 3600),
+])
+def test_command_session_budget_preserves_json_and_output_reference(
+    tmp_path, monkeypatch, tool_name, running, max_tokens, text,
+):
+    import re
+    from types import SimpleNamespace
+    from app.agent.context_budget import estimate_tokens
+    from app.agent.tool_batch import ToolCallBatch
+    from app.config.loader import use_workspace_root
+    from app.models.protocol import ToolCall
+    from app.tools.output_budget import fits_output
+
+    monkeypatch.setenv("AGENTLAB_OUTPUT_CACHE_DIR", str(tmp_path / "archive"))
+    reads = iter([text, ""])
+    session = SimpleNamespace(id="session-test", alive=running, exit_code=7,
+                              read_until_idle=lambda **_: next(reads))
+    manager = SimpleNamespace(open_argv=lambda *_, **__: (session.id, session),
+                              get=lambda _: session, close=lambda _: None)
+    args = {"max_output_tokens": max_tokens}
+    args.update({"command": "sample"} if tool_name == "exec_command" else {"session_id": session.id})
+    call = ToolCall("call", tool_name, args)
+
+    with use_workspace_root(tmp_path):
+        raw = _tools(manager)[tool_name].executor(args)
+        assert fits_output(raw)
+        assert ToolCallBatch({}, [call]).limit_output(call, raw, False) == raw
+        result = json.loads(raw)
+    assert result["status"] == ("running" if running else "exited")
+    assert result["session_id" if running else "exit_code"] == (session.id if running else 7)
+    body, reference = result["output"].rsplit("\n", 1)
+    assert estimate_tokens(body) <= max_tokens
+    assert re.search(r"out_[a-f0-9]{64}", reference)
+
+
 def test_command_session_poll_and_stdin_share_approval_and_process(tmp_path, command_backend):
     from app.config.loader import use_workspace_root
     from app.tools.registry import ToolRegistry

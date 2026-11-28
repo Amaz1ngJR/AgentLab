@@ -179,6 +179,18 @@ def test_run_shell_truncates_long_output(monkeypatch, tmp_path):
     assert len(out) < MAX_OUTPUT_BYTES + 500  # 截断说明及完整输出引用
 
 
+def test_shell_explicit_token_budget_keeps_status_and_archive(monkeypatch, tmp_path):
+    from app.agent.context_budget import estimate_tokens
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("AGENTLAB_OUTPUT_CACHE_DIR", str(tmp_path / "archive"))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: _make_completed(stdout="证据" * 1000))
+    out = _run_shell({"command": "sample", "max_output_tokens": 128})
+    preview, status = out.split("[exit code: 0]", 1)
+    assert estimate_tokens(preview) <= 128
+    assert "read_tool_output" in status
+
+
 def test_run_shell_empty_command_refused():
     with pytest.raises(ToolExecutionError, match="refused:"):
         _run_shell({"command": ""})

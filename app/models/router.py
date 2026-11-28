@@ -42,6 +42,7 @@ class ModelRouter:
         self._breaker = ProviderCircuitBreaker()
         self._retry_sleep = retry_sleep
         self._last_request: dict | None = None
+        self._last_cache_hit_ratio: float | None = None
         self._cache_group = uuid.uuid4().hex
         self._cache_key_rejected = False
 
@@ -52,6 +53,18 @@ class ModelRouter:
         bind_conversation = getattr(self._adapter, "bind_conversation", None)
         if callable(bind_conversation):
             bind_conversation()
+
+    def bind_reasoning_recovery(self, load, save) -> None:
+        bind = getattr(self._adapter, "bind_reasoning_recovery", None)
+        if callable(bind):
+            bind(load, save)
+
+    @property
+    def auto_compact_token_limit(self) -> int | None:
+        configured = getattr(getattr(self._adapter, "_cfg", None), "auto_compact_token_limit", None)
+        if configured is None and self.provider == "openai_chatgpt":
+            return self.context_window.tokens * 9 // 10
+        return configured
 
     @property
     def replays_encrypted_reasoning(self) -> bool:
@@ -98,6 +111,34 @@ class ModelRouter:
     def fork_snapshot(self) -> dict | None:
         """Only the last successfully completed request; never expose SDK state."""
         return copy.deepcopy(self._last_request)
+
+    def has_warm_prefix(self, messages, *, system, tools) -> bool:
+        return (self._last_cache_hit_ratio or 0) >= 0.8 and self._matching_prefix(messages, system, tools)
+
+    def _matching_prefix(self, messages, system, tools) -> bool:
+        previous = self._last_request
+        if previous is None:
+            return False
+        ordered_tools = sorted(tools, key=lambda tool: tool["name"]) if tools else None
+        history = previous["messages"]
+        return (previous["system"] == system and (previous["tools"] or None) == ordered_tools
+                and messages[:len(history)] == history)
+
+    def active_context_tokens(self, messages, *, system, tools) -> int | None:
+        if self.provider != "openai_chatgpt" or not self._matching_prefix(messages, system, tools):
+            return None
+        previous = self._last_request
+        measured = previous.get("input_tokens")
+        if type(measured) is not int or measured <= 0:
+            return None
+        boundary = len(previous["messages"])
+        output = previous["output_items"]
+        output_tokens = previous.get("output_tokens")
+        if output and type(output_tokens) is int and output_tokens >= 0 and messages[boundary:boundary + len(output)] == output:
+            measured += output_tokens
+            boundary += len(output)
+        from app.agent.context_budget import estimate_active_messages_tokens
+        return measured + estimate_active_messages_tokens(messages[boundary:])
 
     @property
     def model(self) -> str:
@@ -224,7 +265,13 @@ class ModelRouter:
                 # Only local inference can keep retrying through an unattended run.
                 max_retries=None if retry_until_cancelled and self.configured_provider == "ollama" else 2,
             )
+        usage = getattr(response, "usage", None) or {}
+        if self.provider == "openai_chatgpt":
+            request["input_tokens"] = usage.get("input_tokens")
+            request["output_tokens"] = usage.get("output_tokens")
+            request["output_items"] = copy.deepcopy(getattr(response, "provider_payload", None) or [])
         self._last_request = request
+        self._last_cache_hit_ratio = self.cache_hit_ratio(usage)
         return response
 
     def format_tool_results(self, results: list[ToolResult]) -> list[dict]:

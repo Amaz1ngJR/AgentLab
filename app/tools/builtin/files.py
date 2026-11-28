@@ -29,12 +29,12 @@ from collections import OrderedDict
 from pathlib import Path
 
 from app.config.loader import workspace_root
+from app.agent.context_budget import estimate_tokens
+from app.tools.output_budget import TOOL_OUTPUT_MAX_CHARS, TOOL_OUTPUT_MAX_TOKENS, TOOL_PAGE_MAX_TOKENS, fit_prefix
 from app.tools.registry import Tool, ToolExecutionError, is_approval_granted
 
 # ── 读取上限 ──────────────────────────────────────────────────────────────────
-# 单页字符上限。刻意低于 executor 的 TOOL_OUTPUT_MAX_CHARS(10_000):超过它的
-# 输出会被全局截成"头 + 省略标记 + 尾",模型既看不清中间也没法续读。分页让
-# read_file 永远输出结构化、可续读的完整页,不触发那次截断。
+# 同时限制字符和估算 token，为行号、路径和续读提示留空间。
 MAX_READ_CHARS = 9_000
 DEFAULT_READ_LINES = 80        # 默认先精读小行段，limit 可显式扩大
 MAX_READ_LINES = 2_000         # 单次请求的行数上限
@@ -204,7 +204,8 @@ def _read_start(path, offset):
     return key, points, line, points.get(line, 0)
 
 
-def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS, _trusted_path: Path | None = None):
+def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS, max_tokens: int = TOOL_PAGE_MAX_TOKENS,
+               json_content: bool = False, _trusted_path: Path | None = None, plain_page: bool = False):
     """按行分页读取文本文件。
 
     返回单页内容(最多 DEFAULT_READ_LINES 行 / MAX_READ_CHARS 字符)。大文件不会
@@ -229,6 +230,16 @@ def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS, _trusted_path: Pa
         args.get("limit"), DEFAULT_READ_LINES, minimum=1, maximum=MAX_READ_LINES,
     )
 
+    if plain_page:
+        # Bound the largest rendered header/footer possible for this request,
+        # before deciding how many characters the continuation can skip.
+        last = offset + limit
+        envelope = str(path) + _page_range(offset, last) + _page_footer(limit, last, column_offset + max_chars)
+        max_chars = min(max_chars, TOOL_OUTPUT_MAX_CHARS - len(envelope))
+        max_tokens = min(max_tokens, TOOL_OUTPUT_MAX_TOKENS - estimate_tokens(envelope))
+        if max_chars < 1 or max_tokens < 2:
+            raise ToolExecutionError("文件路径过长，分页提示超出预算；请使用 read_files")
+
     # 二进制探测:只读前 8KB。NUL 字节在文本文件里几乎不出现,出现即拒绝,
     # 避免把二进制内容灌进模型上下文。
     try:
@@ -242,9 +253,17 @@ def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS, _trusted_path: Pa
         )
 
     lines_out: list[str] = []
-    chars = 0
+    chars = tokens = 0
     last_line = offset - 1
     has_more = False
+
+    def encode(text):
+        return json.dumps(text, ensure_ascii=False)[1:-1] if json_content else text
+
+    def fits_fragment(text):
+        encoded = encode(text)
+        return len(encoded) <= max_chars and estimate_tokens(encoded) <= max_tokens
+
     key, points, start_line, cookie = _read_start(path, offset)
     try:
         # newline="" 保留原始换行符；readline 允许保存 TextIO seek cookie。
@@ -266,15 +285,20 @@ def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS, _trusted_path: Pa
                 if column > len(line):
                     raise ToolExecutionError("column_offset 超出当前行长度")
                 line = line[column:]
-                if chars + len(line) > max_chars:
+                encoded = encode(line[:max_chars])
+                line_tokens = estimate_tokens(encoded)
+                if (len(line) > max_chars or chars + len(encoded) > max_chars
+                        or tokens + line_tokens > max_tokens):
                     has_more = True
                     if not lines_out:
-                        lines_out.append(line[:max_chars])
+                        fragment = fit_prefix(line[:max_chars], fits_fragment)
+                        lines_out.append(fragment)
                         last_line = lineno
-                        next_column = column + max_chars
+                        next_column = column + len(fragment)
                     break
                 lines_out.append(line)
-                chars += len(line)
+                chars += len(encoded)
+                tokens += line_tokens
                 last_line = lineno
                 points[lineno + 1] = fh.tell()
     except OSError as exc:
@@ -295,8 +319,17 @@ def _read_page(args: dict, *, max_chars: int = MAX_READ_CHARS, _trusted_path: Pa
                   "next_column": next_column, "truncated": has_more}
 
 
+def _page_range(offset, last_line):
+    return f" (lines {offset}-{last_line})\n"
+
+
+def _page_footer(limit, next_offset, next_column):
+    column = f" column_offset={next_column}" if next_column is not None else ""
+    return f"\n[...单页上限 {limit} 行 / {MAX_READ_CHARS} 字符;继续请传 offset={next_offset}{column}]"
+
+
 def _read_file(args: dict) -> str:
-    path, page = _read_page(args)
+    path, page = _read_page(args, plain_page=True)
     offset = page["start_line"]
     last_line = page["end_line"]
     has_more = page["truncated"]
@@ -310,13 +343,8 @@ def _read_file(args: dict) -> str:
     body = page["content"]
     # 只有真的分页了才加页眉页脚,普通小文件的返回值保持原样(向后兼容)。
     if offset > 1 or has_more:
-        header = f"{path} (lines {offset}-{last_line})\n"
-        footer = (
-            f"\n[...单页上限 {limit} 行 / {MAX_READ_CHARS} 字符;"
-            f"继续请传 offset={page['next_offset']}"
-            + (f" column_offset={page['next_column']}" if page.get("next_column") is not None else "") + "]"
-            if has_more else ""
-        )
+        header = str(path) + _page_range(offset, last_line)
+        footer = _page_footer(limit, page["next_offset"], page["next_column"]) if has_more else ""
         return header + body + footer
     return body
 

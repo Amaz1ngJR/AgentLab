@@ -87,6 +87,7 @@ class ContextSummary:
     token_count_before: int = 0
     token_count_after: int = 0
     compression_model_profile: str = ""
+    source_messages: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
     def to_message_text(self, available_skills: list[str] | None = None) -> str:
         """渲染成注入历史的摘要消息正文(人读 + 模型读都友好的紧凑文本)。
@@ -149,6 +150,7 @@ class ContextSummary:
             "token_count_before": self.token_count_before,
             "token_count_after": self.token_count_after,
             "compression_model_profile": self.compression_model_profile,
+            "source_messages": self.source_messages,
         }
 
 
@@ -541,6 +543,7 @@ class ContextCompressor:
         if time.monotonic() >= deadline:
             return CompactionResult(False, reason="压缩达到整体耗时上限，保留原始历史",
                                     code="timeout")
+        summary.source_messages = copy.deepcopy(messages)
         messages[:] = candidate
         result = CompactionResult(True, summary=summary)
         if fallback_reason:

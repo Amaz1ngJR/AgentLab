@@ -10,6 +10,7 @@ from app.agent.cancel import Cancelled
 from app.agent.subagent_runtime import RestrictedToolRegistry
 from app.agent.tool_batch import ToolCallBatch
 from app.models.protocol import ToolCall
+from app.tools.output_budget import fits_output
 
 
 def test_nested_child_read_requests_overlap_and_reserve_budgets(tmp_path):
@@ -63,6 +64,49 @@ def test_batch_total_budget_and_explicit_continuations(tmp_path):
     result = json.loads(output)
     assert len(result['files']) + len(result['pending_indices']) == 12
     assert all(item['truncated'] and item['next_offset'] >= 1 for item in result['files'])
+
+
+def test_batch_merges_overlapping_file_ranges_once(tmp_path):
+    (tmp_path / "file.txt").write_text("one\ntwo\nthree\nfour\nfive\n", encoding="utf-8")
+    with use_workspace_root(tmp_path):
+        result = json.loads(read_files({"requests": [
+            {"path": "file.txt", "offset": 1, "limit": 3},
+            {"path": "file.txt", "offset": 3, "limit": 2},
+        ]}))
+    assert result["pending_indices"] == []
+    page, = result["files"]
+    assert page["index"] == 0 and page["covered_indices"] == [1]
+    assert page["content"] == "one\ntwo\nthree\nfour\n"
+
+
+@pytest.mark.parametrize('text', [
+    '中' * 2200 + '\\' * 2100 + '\n后一行\n',
+    '\t' * 6000 + '\n后一行\n',
+])
+def test_batch_paginates_escaped_long_lines_without_dropping_content(tmp_path, text):
+    (tmp_path / 'data.txt').write_text(text, encoding='utf-8', newline='')
+    request = {'path': 'data.txt'}
+    call = ToolCall('read', 'read_files', {})
+    runtime_batch = ToolCallBatch({}, [])
+    parts = []
+    with use_workspace_root(tmp_path):
+        for _ in range(4):
+            output = read_files({'requests': [request]})
+            assert fits_output(output, 9000)
+            assert runtime_batch.limit_output(call, output, False) == output
+            result = json.loads(output)
+            assert result['pending_indices'] == []
+            page, = result['files']
+            assert page['content']
+            parts.append(page['content'])
+            if not page['truncated']:
+                break
+            request['offset'] = page['next_offset']
+            request['column_offset'] = page['next_column'] or 0
+            if len(parts) == 1:
+                assert request['offset'] == 1 and request['column_offset'] == len(parts[0])
+    assert len(parts) > 1
+    assert ''.join(parts) == text
 
 
 def test_batch_refuses_external_path_before_reading(tmp_path):

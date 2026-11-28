@@ -29,6 +29,7 @@ models:
     base_url_env: ANTHROPIC_BASE_URL
     capabilities: [chat, tools, vision]
     params:
+      prompt_cache_enabled: true
       temperature: 0.2
       # 单轮输出上限。Claude 的扩展思考内容与正文共用这份预算，4096 会在
       # 推理未结束时被截断（stop_reason=max_tokens），正文/工具调用都拿不到。

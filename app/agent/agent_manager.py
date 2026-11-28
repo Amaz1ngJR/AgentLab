@@ -7,6 +7,7 @@ import threading
 import re
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -47,6 +48,13 @@ class ChildRun:
     retained_messages: list[dict] | None = None
     retained_system: str | None = None
     retained_llm: object | None = None
+
+    def can_adopt_current(self) -> bool:
+        result = self.result
+        return (self.done.is_set() and not self.spec.read_only and self.spec.workspace_mode == "shared"
+                and bool(self.spec.file_scope) and result is not None and result.status != "succeeded"
+                and result.delivery_status in {"applied_unverified", "no_changes"}
+                and result.metrics.get("shared_artifact") is not None)
 
     def reserves_write_scope(self) -> bool:
         """Closing releases a stopped writer, never a worker still cancelling."""
@@ -90,6 +98,7 @@ class AgentManager:
         self._wait_tool_results: dict[str, tuple[str, dict[str, dict]]] = {}
         self._closed = False
         self._restored: set[str] = set()
+        self._adoption_prompted: set[str] = set()  # per parent turn, not persisted
         self._emit = on_event or (lambda event: None)
         self._checkpoint = checkpoint or (lambda records: None)
         self._unsubscribe = cancel.add_callback(self.cancel_all)
@@ -235,6 +244,8 @@ class AgentManager:
                         "required tools unavailable: " + ", ".join(sorted(missing))
                         + "; provide evidence in context or handle this task in the parent")
             child_llm = _resume_from.retained_llm if _resume_from is not None else fork()
+            if _resume_from is None and getattr(child_llm, "provider", None) == "openai_chatgpt":
+                child_llm.bind_cache_scope(sid)
             spec = SubagentSpec(sid, instruction, role=role, read_only=read_only, file_scope=scopes, workspace_mode=workspace_mode,
                                tools=tuple(sorted(selected)),
                                max_steps=max_steps, max_tool_calls=max_tool_calls,
@@ -347,7 +358,10 @@ class AgentManager:
                         _resume_from.retained_llm = None
                         _resume_from.retained_system = None
                     child.finished = time.time()
-                    child.done.set()
+                    retained = child.retained_llm is child_llm
+                if not retained:
+                    self._close_child_llm(child_llm)
+                child.done.set()
 
             # Daemon bounds shutdown latency; unfinished writers remain cancelling
             # and the owning session retains their scope lock until actual exit.
@@ -370,6 +384,8 @@ class AgentManager:
                 self.tools_left += max_tool_calls
                 if _resume_from is not None:
                     _resume_from.continuation_id = None
+                else:
+                    self._close_child_llm(child_llm)
                 try:
                     self._save()
                 except Exception:
@@ -595,11 +611,14 @@ class AgentManager:
     @staticmethod
     def _bounded_wait_result(result: dict) -> dict:
         """Fit complete per-result envelopes, never cut a batch's serialized JSON."""
-        from app.agent.executor import TOOL_OUTPUT_MAX_CHARS
         from app.agent.subagent_runtime import bounded_result
-        def size():
-            return len(json.dumps(result, ensure_ascii=False))
-        if size() <= TOOL_OUTPUT_MAX_CHARS:
+        from app.tools.output_budget import TOOL_OUTPUT_MAX_CHARS, TOOL_OUTPUT_MAX_TOKENS, fits_output
+        from app.agent.context_budget import estimate_tokens
+
+        def encoded():
+            return json.dumps(result, ensure_ascii=False)
+
+        if fits_output(encoded()):
             return result
         originals = result["agents"]
         result["agents"] = [{
@@ -610,9 +629,12 @@ class AgentManager:
                            "timeout": 0, "output_offset": 0, "output_limit": 1000},
             **{key: agent[key] for key in ("output_offset", "next_output_offset") if key in agent},
         } for agent in originals]
-        # Budget serialized characters (including JSON escapes), not raw string length.
+        # Reserve an equal share of remaining serialized space for each summary.
         for index, (agent, original) in enumerate(zip(result["agents"], originals)):
-            allowance = max(0, (TOOL_OUTPUT_MAX_CHARS - size()) // (len(originals) - index) - 32)
+            current = encoded()
+            remaining = len(originals) - index
+            allowance = max(0, (TOOL_OUTPUT_MAX_CHARS - len(current)) // remaining - 32)
+            token_allowance = max(0, (TOOL_OUTPUT_MAX_TOKENS - estimate_tokens(current)) // remaining - 32)
             text = original["summary"] or original.get("error", "")
             paged = "output_offset" in original
             def excerpt(limit):
@@ -620,7 +642,8 @@ class AgentManager:
             low, high = 0, len(text)
             while low < high:
                 mid = (low + high + 1) // 2
-                if len(json.dumps(excerpt(mid), ensure_ascii=False)) - 2 <= allowance:
+                preview = json.dumps(excerpt(mid), ensure_ascii=False)[1:-1]
+                if len(preview) <= allowance and estimate_tokens(preview) <= token_allowance:
                     low = mid
                 else:
                     high = mid - 1
@@ -679,16 +702,35 @@ class AgentManager:
             raise ToolExecutionError("child is no longer accepting input")
         return {"child_run_id": sid, "accepted": True, "mode": mode}
 
-    def close(self, sid: str) -> dict:
-        child = self._get(sid)
-        child.closed = True
+    @staticmethod
+    def _close_child_llm(llm):
+        close = getattr(llm, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _clear_checkpoint(self, child):
+        # A continuation owns the client once it starts, even while the old
+        # checkpoint is still available to recover a failed continuation.
+        llm = child.retained_llm if not child.continuation_id else None
         child.retained_messages = None
         child.retained_llm = None
         child.retained_system = None
-        if not child.done.is_set():
-            child.token.cancel()
-        if child.continuation_id:
-            self.close(child.continuation_id)
+        return llm
+
+    def close(self, sid: str) -> dict:
+        with self._lock:
+            child = self._get(sid)
+            child.closed = True
+            llm = self._clear_checkpoint(child)
+            if not child.done.is_set():
+                child.token.cancel()
+            continuation = child.continuation_id
+        self._close_child_llm(llm)
+        if continuation:
+            self.close(continuation)
         self._save()
         return self.snapshot(sid)
 
@@ -858,7 +900,22 @@ class AgentManager:
         self._save()
         return True
 
-    def settle_before_final(self, messages: list[dict]) -> bool:
+    def pending_adoptions(self, scope: Callable[[str], bool] | None = None) -> dict[str, ChildRun]:
+        return {sid: child for sid, child in self.children.items()
+                if (scope is None or scope(sid)) and child.can_adopt_current()
+                and not child.superseded_by and child.continuation_id not in self.children}
+
+    def defer_writer_text(self) -> bool:
+        # A running writer may finish during streaming. Don't display a final claim before settlement.
+        return bool(self.pending_adoptions()) or any(
+            not c.spec.read_only and not c.done.is_set() for c in self.children.values())
+
+    def delivery_blocker(self, delivery_errors: dict[str, str], scope: Callable[[str], bool] | None = None) -> str:
+        errors = [error for sid, error in delivery_errors.items() if scope is None or scope(sid)]
+        return "委派尚未交付：" + "; ".join([*self.unresolved(scope), *errors])
+
+    def settle_before_final(self, messages: list[dict], *, can_follow_up: bool = True,
+                            delivery_errors=(), adoption_scope: Callable[[str], bool] | None = None) -> bool:
         # A parent cannot claim completion while required children still run.
         active = [sid for sid, child in self.children.items() if not child.done.is_set()]
         if active:
@@ -869,12 +926,26 @@ class AgentManager:
         if any(not child.done.is_set() for child in self.children.values()):
             messages.append({"role": "user", "content": "子任务仍在运行或停止中；请等待或关闭，不得宣称委派已完成。"})
             return True
-        return delivered
+        adoptions = self.pending_adoptions(adoption_scope)
+        pending = {sid: child.spec.file_scope for sid, child in adoptions.items()
+                   if sid not in self._adoption_prompted and sid not in delivery_errors}
+        if (pending and self.allowed and can_follow_up and self.rounds_left > 0 and self.tools_left > 0
+                and not self.cancel.cancelled and time.monotonic() < self.deadline):
+            self._adoption_prompted.update(pending)
+            messages.append({"role": "user", "content": (
+                "收尾前仍有共享写入待验收（sid → file_scope）：" + json.dumps(pending, ensure_ascii=False)
+                + "。核对父任务接管后的当前范围。如果满足目标，分别调用 integrate_agent，传入对应 sid、"
+                "adopt_current=true 和针对该范围的实际 checks，按原审批策略验收。不要重派子任务；"
+                "若证据不足、审批被拒或检查失败，说明哪一项未交付，不要宣称完成。")})
+            return True
+        return delivered and (can_follow_up or not adoptions)
 
-    def unresolved(self) -> list[str]:
+    def unresolved(self, scope: Callable[[str], bool] | None = None) -> list[str]:
         """Keep historical failures immutable; only the latest continuation gates delivery."""
         unresolved = []
         for sid, child in self.children.items():
+            if scope is not None and not scope(sid):
+                continue
             if child.superseded_by or child.continuation_id in self.children:
                 continue
             if child.done.is_set():
@@ -893,16 +964,17 @@ class AgentManager:
         return unresolved
 
     def finish(self):
-        self._closed = True
+        with self._lock:
+            self._closed = True
         if self._deadline_timer is not None:
             self._deadline_timer.cancel()
         self.cancel_all()
         deadline = time.monotonic() + 0.25
         for child in self.children.values():
             child.done.wait(max(0, deadline - time.monotonic()))
-            child.retained_messages = None
-            child.retained_llm = None
-            child.retained_system = None
+            with self._lock:
+                llm = self._clear_checkpoint(child)
+            self._close_child_llm(llm)
         self.pump()
         self._save()
         self._unsubscribe()

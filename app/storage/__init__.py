@@ -248,6 +248,15 @@ class Storage:
             PRIMARY KEY(session_id, child_run_id),
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         )""")
+        self._con.execute("""CREATE TABLE IF NOT EXISTS rejected_reasoning (
+            session_id TEXT NOT NULL, route TEXT NOT NULL, item_id TEXT NOT NULL,
+            PRIMARY KEY(session_id, route, item_id),
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )""")
+        self._con.execute("""CREATE TABLE IF NOT EXISTS context_compaction_sources (
+            summary_id INTEGER PRIMARY KEY, messages_json TEXT NOT NULL,
+            FOREIGN KEY(summary_id) REFERENCES context_summaries(id) ON DELETE CASCADE
+        )""")
         self._con.commit()
         # Loop Engineering 相关表(goal_specs/loop_runs/loop_iterations/
         # verification_results/worktrees/subagent_runs)。与上面的核心表共用同一连接,
@@ -356,8 +365,22 @@ class Storage:
             con.execute("DELETE FROM tool_executions WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM tasks WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM runs WHERE session_id=?", (session_id,))
+            con.execute("DELETE FROM context_compaction_sources WHERE summary_id IN "
+                        "(SELECT id FROM context_summaries WHERE session_id=?)", (session_id,))
             con.execute("DELETE FROM context_summaries WHERE session_id=?", (session_id,))
+            con.execute("DELETE FROM rejected_reasoning WHERE session_id=?", (session_id,))
             con.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+
+    def load_rejected_reasoning(self, session_id: str, route: str) -> set[str]:
+        with self._runtime_lock:
+            return {row[0] for row in self._con.execute(
+                "SELECT item_id FROM rejected_reasoning WHERE session_id=? AND route=?", (session_id, route),
+            )}
+
+    def save_rejected_reasoning(self, session_id: str, route: str, item_ids: set[str]) -> None:
+        with self._tx() as con:
+            con.executemany("INSERT OR IGNORE INTO rejected_reasoning VALUES (?, ?, ?)",
+                            ((session_id, route, item_id) for item_id in item_ids))
 
     def list_sessions(self, include_archived: bool = False,
                       workspace: Optional[str] = None) -> list[dict]:
@@ -727,7 +750,7 @@ class Storage:
         record 是 ContextSummary.to_record() 的输出:summary_json / source_message_range
         / source_run_ids / token_count_before/after / compression_model_profile。
         summary_json 已是 JSON 文本(其字符串值在压缩阶段已脱敏),这里再兜底脱敏一次。
-        原始消息不在这里删除 —— 压缩只换"模型输入里的旧片段",原始消息由消息表保留。
+        压缩前的消息单独归档，供恢复和审计。
         """
         rng = record.get("source_message_range") or [0, 0]
         start = int(rng[0]) if len(rng) > 0 else 0
@@ -747,7 +770,38 @@ class Storage:
                  str(record.get("compression_model_profile", "")),
                  _now()),
             )
-            return cur.lastrowid
+            summary_id = cur.lastrowid
+            if record.get("source_messages"):
+                source = [_sanitize_message_for_storage(redact_value(m)) for m in record["source_messages"]]
+                con.execute("INSERT INTO context_compaction_sources VALUES (?, ?)",
+                            (summary_id, json.dumps(source, ensure_ascii=False)))
+            return summary_id
+
+    def load_context_compaction_source(self, summary_id: int) -> list[dict]:
+        with self._runtime_lock:
+            row = self._con.execute("SELECT messages_json FROM context_compaction_sources WHERE summary_id=?",
+                                    (summary_id,)).fetchone()
+        return json.loads(row[0]) if row else []
+
+    def save_image_cleanup(self, session_id: str, cleaned_messages: list[dict]) -> int:
+        """Commit the cleaned live history and its archived sources together."""
+        from app.attachments import strip_image_blocks
+
+        removed = 0
+        with self._tx() as con:
+            self.save_messages(session_id, cleaned_messages)
+            rows = con.execute(
+                "SELECT c.summary_id, c.messages_json FROM context_compaction_sources c "
+                "JOIN context_summaries s ON s.id=c.summary_id WHERE s.session_id=?", (session_id,),
+            )
+            for row in rows:
+                messages, count = strip_image_blocks(json.loads(row["messages_json"]))
+                if not count:
+                    continue
+                removed += count
+                con.execute("UPDATE context_compaction_sources SET messages_json=? WHERE summary_id=?",
+                            (json.dumps(messages, ensure_ascii=False), row["summary_id"]))
+        return removed
 
     def list_context_summaries(self, session_id: str, limit: int = 50) -> list[dict]:
         rows = self._con.execute(

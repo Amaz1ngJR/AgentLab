@@ -13,7 +13,8 @@ from typing import Any, Callable, Optional
 
 from app.agent import events
 from app.agent.cancel import Cancelled, CancelToken
-from app.agent.context_budget import ContextBudget, estimate_messages_tokens, estimate_message_tokens
+from app.agent.context_budget import (ContextBudget, estimate_active_messages_tokens, estimate_messages_tokens,
+                                      estimate_message_tokens, estimate_tokens)
 from app.agent.context_compaction import ContextCompressor, ContextSummary, _safe_split_point
 from app.agent.events import RunEvent
 
@@ -96,6 +97,10 @@ class ContextManager:
         self.last_summary: Optional[ContextSummary] = None
         self._warned = False  # 避免同一段历史反复发 warning
         self._failed_compaction: dict | None = None
+        self._context_model = None
+
+    def bind_context_model(self, llm) -> None:
+        self._context_model = llm
 
     def _remember_failure(self, estimated: int, reason: str) -> None:
         self._failed_compaction = {
@@ -109,12 +114,15 @@ class ContextManager:
         if not failure or failure["budget"] != (
                 self.budget.model_context_limit, self.budget.safe_input_limit, id(self._compressor)):
             return {}
-        growth = max(1024, int(self.budget.input_budget * 0.05))
+        growth = max(1024, int(min(self.budget.input_budget, self.budget.compact_threshold) * 0.05))
         remaining = max(0, failure["retry_at"] - time.monotonic())
         changed = abs(estimated - failure["input_tokens"]) >= growth
+        escalated_to_window_pressure = (
+            failure["input_tokens"] < self.budget.window_compact_threshold <= estimated
+        )
         return {"reason": failure["reason"], "remaining_seconds": remaining,
                 "required_change_tokens": growth, "input_changed": changed,
-                "blocked": remaining > 0 or not changed}
+                "blocked": (remaining > 0 or not changed) and not escalated_to_window_pressure}
 
     # ── 查询 ──────────────────────────────────────────────────────────────────
 
@@ -125,15 +133,24 @@ class ContextManager:
         system: str = "",
         tools: Optional[list[dict[str, Any]]] = None,
     ) -> int:
-        """估算模型输入：system + 历史消息 + Tool Schema。"""
+        """Use a measured prefix when available and estimate subsequent items."""
+        measured = getattr(self._context_model, "active_context_tokens", None)
+        if callable(measured):
+            total = measured(messages, system=system, tools=tools)
+            if total is not None:
+                return total
+        fixed = self._fixed_request_tokens(system, tools)
+        raw = fixed + estimate_messages_tokens(messages)
+        if (getattr(self._context_model, "provider", None) == "openai_chatgpt"
+                and raw <= self.budget.safe_input_limit):
+            return fixed + estimate_active_messages_tokens(messages)
+        return raw
+
+    @staticmethod
+    def _fixed_request_tokens(system, tools):
         import json
-        from app.agent.context_budget import estimate_tokens
         tool_text = json.dumps(tools, ensure_ascii=False) if tools else ""
-        return (
-            estimate_tokens(system)
-            + estimate_messages_tokens(messages)
-            + estimate_tokens(tool_text)
-        )
+        return estimate_tokens(system) + estimate_tokens(tool_text)
 
     def report(
         self,
@@ -148,7 +165,7 @@ class ContextManager:
         message_tokens = estimate_messages_tokens(messages)
         system_tokens = estimate_tokens(system)
         tool_tokens = estimate_tokens(json.dumps(tools, ensure_ascii=False)) if tools else 0
-        est = system_tokens + message_tokens + tool_tokens
+        est = self.estimate(messages, system=system, tools=tools)
         b = self.budget
         return {
             "model_context_limit": b.model_context_limit,
@@ -181,6 +198,8 @@ class ContextManager:
         tools: Optional[list[dict[str, Any]]] = None,
         on_progress=None,
         cancel: CancelToken | None = None,
+        preserve_cached_prefix: bool = False,
+        on_summary_usage=None,
     ) -> bool:
         """在任何模型请求前压缩超限历史，返回是否发生压缩。"""
         if cancel is not None:
@@ -188,10 +207,16 @@ class ContextManager:
         estimate = self.estimate(messages, system=system, tools=tools)
         if self.budget.status_for(estimate) != "compact":
             return False
+        defer_until = (self.budget.compact_threshold + self.budget.safe_input_limit) // 2
+        if self.budget.compact_threshold < self.budget.window_compact_threshold:
+            threshold = self.budget.compact_threshold
+            defer_until = min(defer_until, threshold + min(8_000, threshold // 8))
+        if preserve_cached_prefix and estimate < defer_until:
+            return False
         try:
             compacted = self.maybe_compact(
                 messages, system=system, tools=tools,
-                on_progress=on_progress, cancel=cancel,
+                on_progress=on_progress, cancel=cancel, on_summary_usage=on_summary_usage,
             )
         except Cancelled:
             raise
@@ -244,6 +269,7 @@ class ContextManager:
             cancel.raise_if_cancelled()
         est = self.estimate(messages, system=system, tools=tools)
         status = self.budget.status_for(est)
+        early = not force and not verification and status == "compact" and est < self.budget.window_compact_threshold
         if status == "ok":
             self._failed_compaction = None
 
@@ -287,10 +313,13 @@ class ContextManager:
         # 都判为 recent tail，split=0，最终错误报告“无可安全压缩的前缀”。
         if verification:
             recent_budgets = [min(self.budget.recent_messages_budget, 8_000)]
+        elif early:
+            recent_budgets = [min(self.budget.recent_messages_budget, self.budget.compact_threshold // 4), None]
         else:
             recent_budgets = [None] if force else [self.budget.recent_messages_budget, None]
-        fixed_tokens = est - estimate_messages_tokens(messages)
-        target = max(0, self.budget.safe_input_limit - fixed_tokens)
+        fixed_tokens = self._fixed_request_tokens(system, tools)
+        target_limit = self.budget.compact_threshold * 3 // 4 if early else self.budget.safe_input_limit
+        target = max(0, target_limit - fixed_tokens)
         summary_cap = getattr(self._compressor, "MAX_SUMMARY_OUTPUT_TOKENS", 4096)
         summary_budget = max(256, min(summary_cap, self.budget.summary_budget))
         summary_input = self.budget.safe_input_limit - self._compressor.summary_system_tokens - summary_budget - 64
@@ -304,6 +333,8 @@ class ContextManager:
             else self._compressor.timeout_for(messages, summary_input)
         )
         policies = {"min_savings": VERIFICATION_COMPACTION_MIN_SAVINGS} if verification else {}
+        if early:
+            policies["min_savings"] = min(12_000, self.budget.compact_threshold // 4)
         # 先尝试常规尾部预算；若仍超限，缩减到条数下限，始终对候选执行原子校验。
         for recent_budget in recent_budgets:
             try:
@@ -373,3 +404,10 @@ class ContextManager:
         out = self._pending_records
         self._pending_records = []
         return out
+
+    def persist_records(self, save) -> None:
+        while self._pending_records:
+            summary = self._pending_records[0]
+            save(summary.to_record())
+            summary.source_messages = []
+            del self._pending_records[0]

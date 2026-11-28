@@ -32,6 +32,7 @@ from app.tools.builtin.files import (
     _resolve_within_workspace,
 )
 from app.tools.registry import Tool, ToolExecutionError, current_cancel_token
+from app.tools.output_budget import OUTPUT_TOKEN_LIMIT_SCHEMA
 from app.tools.rtk_builtin import BuiltinRTK
 from app.util.process import run_process
 from app.util.process_sandbox import ProcessSandboxError, sandbox_command
@@ -60,6 +61,7 @@ def _build_argv(command: str) -> list[str]:
 def _run_shell(args: dict) -> str:
     """执行命令，并使用 AgentLab 内置 RTK 风格过滤器压缩输出。"""
     command = args.get("command", "")
+    max_tokens = args.get("max_output_tokens")
     if not command:
         raise ToolExecutionError("refused: empty command")
 
@@ -98,8 +100,11 @@ def _run_shell(args: dict) -> str:
                 details.append(part.rstrip())
         partial = "\n".join(details)
         from app.tools.output_archive import archive_output, output_reference
-        partial_path = archive_output(partial) if len(partial) > MAX_OUTPUT_BYTES else None
-        if len(partial) > MAX_OUTPUT_BYTES:
+        if max_tokens is not None:
+            partial, partial_path = _budget_shell_preview(partial, partial, max_tokens)
+        else:
+            partial_path = archive_output(partial) if len(partial) > MAX_OUTPUT_BYTES else None
+        if max_tokens is None and len(partial) > MAX_OUTPUT_BYTES:
             partial = "[...truncated partial output]\n" + partial[-MAX_OUTPUT_BYTES:]
         message = (
             f"timeout: command exceeded {timeout}s and was killed\n"
@@ -130,6 +135,8 @@ def _run_shell(args: dict) -> str:
     archive = archive_output(full) if compression.applied or len(body) > MAX_OUTPUT_BYTES else None
     if compression.applied and archive is None:
         body = full  # Do not discard evidence if full-output retention failed.
+    if max_tokens is not None:
+        body, archive = _budget_shell_preview(body, full, max_tokens, archive)
 
     parts: list[str] = []
     if body:
@@ -146,7 +153,7 @@ def _run_shell(args: dict) -> str:
 
     # 截断超长输出。把截断标记放末尾,模型能看见"原始输出多大",决定要不要
     # 改命令(比如加 head / tail)
-    if len(output) > MAX_OUTPUT_BYTES:
+    if max_tokens is None and len(output) > MAX_OUTPUT_BYTES:
         if archive is None:
             archive = archive_output(full)
         truncated = output[:MAX_OUTPUT_BYTES * 3 // 4] + "\n…\n" + output[-MAX_OUTPUT_BYTES // 4:]
@@ -160,6 +167,16 @@ def _run_shell(args: dict) -> str:
     return output
 
 
+def _budget_shell_preview(body, full, max_tokens, output_id=None):
+    from app.agent.context_budget import estimate_tokens
+    from app.tools.output_archive import archive_output
+    from app.tools.output_budget import truncate_tool_output
+
+    if estimate_tokens(body) <= max_tokens and len(body) <= MAX_OUTPUT_BYTES:
+        return body, output_id
+    return truncate_tool_output(body, MAX_OUTPUT_BYTES, max_tokens=max_tokens), output_id or archive_output(full)
+
+
 SHELL = Tool(
     name="shell",
     description=(
@@ -170,11 +187,13 @@ SHELL = Tool(
         "常见开发命令会先经内置 RTK 风格过滤器压缩，"
         "无需安装外部 rtk；过滤失败或收益不足时自动返回原始输出。"
         "默认超时 30 秒,可通过 timeout 字段指定更长(单位秒)。"
+        "查状态、退出码或验证结果时用较小的 max_output_tokens；需要具体证据时再分页查看。"
         "适用:跑测试、看 git 状态、构建项目、列文件等。"
     ),
     input_schema={
         "type": "object",
         "properties": {
+            "max_output_tokens": OUTPUT_TOKEN_LIMIT_SCHEMA,
             "command": {
                 "type": "string",
                 "minLength": 1,
